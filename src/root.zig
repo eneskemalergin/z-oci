@@ -28,7 +28,11 @@ pub const Platform = @import("Platform.zig");
 // v0.0.2: OCI types (in progress)
 pub const Descriptor = @import("Descriptor.zig");
 pub const Manifest = @import("Manifest.zig");
+pub const Index = @import("Index.zig");
+pub const OciImageIndex = Index.OciImageIndex;
+pub const DockerManifestList = Index.DockerManifestList;
+pub const MultiArchManifest = Index.MultiArchManifest;
 
-// TODO(v0.0.2): Reference, Index
+// TODO(v0.0.2): Reference
 // TODO(v0.0.3): ResolveError, ResolveResult, Config
 // TODO(v0.0.4): resolve, validate, getManifest
