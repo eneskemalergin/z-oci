@@ -16,11 +16,15 @@
 //!   Manifest     - OCI Image Manifest + Docker V2 Schema 2
 //!   Index        - OciImageIndex + DockerManifestList + MultiArchManifest
 //!
+//! ## v0.0.3: JSON Infrastructure + API Contracts
+//!
+//!   json         - parse(T, alloc, bytes) wrapper; std.json.Parsed(T) lifecycle
+//!   ResolveError - tagged error union with context fields
+//!   ResolveResult - resolve result struct; clone() + deinit()
+//!   Config       - config skeleton with CredentialProvider interface
+//!
 //! ## Coming in later milestones
 //!
-//!   ResolveError  - tagged error union                 (v0.0.3)
-//!   ResolveResult - result struct                      (v0.0.3)
-//!   Config        - config skeleton                    (v0.0.3)
 //!   resolve / validate / getManifest stubs             (v0.0.4)
 
 // v0.0.1: leaf types
@@ -36,5 +40,12 @@ pub const OciImageIndex = Index.OciImageIndex;
 pub const DockerManifestList = Index.DockerManifestList;
 pub const MultiArchManifest = Index.MultiArchManifest;
 pub const Reference = @import("Reference.zig");
-// TODO(v0.0.3): ResolveError, ResolveResult, Config
+
+// v0.0.3: JSON infrastructure + API contracts
+pub const json = @import("json.zig");
+pub const ResolveError = @import("ResolveError.zig").ResolveError;
+pub const ResolveResult = @import("ResolveResult.zig");
+pub const Config = @import("Config.zig").Config;
+pub const CredentialProvider = @import("Config.zig").CredentialProvider;
+pub const Credential = @import("Config.zig").Credential;
 // TODO(v0.0.4): resolve, validate, getManifest

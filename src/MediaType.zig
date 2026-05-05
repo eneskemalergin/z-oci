@@ -53,6 +53,25 @@ pub const MediaType = enum {
     pub fn isLegacy(self: MediaType) bool {
         return self == .docker_manifest_v1_signed;
     }
+
+    /// Parse a JSON media type string into a MediaType variant.
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !MediaType {
+        const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        defer switch (tok) {
+            .allocated_string => |s| allocator.free(s),
+            else => {},
+        };
+        const s: []const u8 = switch (tok) {
+            inline .string, .allocated_string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        return MediaType.fromString(s) orelse error.UnexpectedToken;
+    }
+
+    /// Stringify as the canonical OCI/Docker MIME type string.
+    pub fn jsonStringify(self: MediaType, jw: anytype) !void {
+        try jw.write(self.toString());
+    }
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────

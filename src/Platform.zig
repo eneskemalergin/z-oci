@@ -50,6 +50,69 @@ pub fn eql(a: Platform, b: Platform) bool {
     return true;
 }
 
+/// Parse a JSON platform object.
+/// OCI spec uses dot-named fields ("os.version", "os.features"); these map to
+/// the underscore Zig fields (os_version, os_features).
+pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Platform {
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+    var result = Platform{ .os = "", .architecture = "" };
+    var seen_os = false;
+    var seen_arch = false;
+    while (true) {
+        const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name: []const u8 = switch (tok) {
+            inline .string, .allocated_string => |s| s,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+        defer switch (tok) {
+            .allocated_string => |s| allocator.free(s),
+            else => {},
+        };
+        if (std.mem.eql(u8, field_name, "os")) {
+            result.os = try std.json.innerParse([]const u8, allocator, source, options);
+            seen_os = true;
+        } else if (std.mem.eql(u8, field_name, "architecture")) {
+            result.architecture = try std.json.innerParse([]const u8, allocator, source, options);
+            seen_arch = true;
+        } else if (std.mem.eql(u8, field_name, "variant")) {
+            result.variant = try std.json.innerParse(?[]const u8, allocator, source, options);
+        } else if (std.mem.eql(u8, field_name, "os.version")) {
+            result.os_version = try std.json.innerParse(?[]const u8, allocator, source, options);
+        } else if (std.mem.eql(u8, field_name, "os.features")) {
+            result.os_features = try std.json.innerParse(?[]const []const u8, allocator, source, options);
+        } else {
+            if (!options.ignore_unknown_fields) return error.UnknownField;
+            try source.skipValue();
+        }
+    }
+    if (!seen_os or !seen_arch) return error.MissingField;
+    return result;
+}
+
+/// Stringify to a JSON platform object using OCI spec field names.
+pub fn jsonStringify(self: Platform, jw: anytype) !void {
+    try jw.beginObject();
+    try jw.objectField("os");
+    try jw.write(self.os);
+    try jw.objectField("architecture");
+    try jw.write(self.architecture);
+    if (self.variant) |v| {
+        try jw.objectField("variant");
+        try jw.write(v);
+    }
+    if (self.os_version) |v| {
+        // OCI spec uses the dot form for these fields.
+        try jw.objectField("os.version");
+        try jw.write(v);
+    }
+    if (self.os_features) |v| {
+        try jw.objectField("os.features");
+        try jw.write(v);
+    }
+    try jw.endObject();
+}
+
 fn sliceEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;

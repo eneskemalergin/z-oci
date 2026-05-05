@@ -3,11 +3,11 @@
 //! Used in Index.zig to list per-platform manifests, and in Manifest.zig
 //! for the config and layer entries.
 //!
-//! JSON field mapping (camelCase in spec, snake_case here) is handled in
-//! json.zig at v0.0.3. For now this is a plain data struct.
+//! jsonParse and jsonStringify map camelCase JSON field names (mediaType,
+//! artifactType) to snake_case Zig fields.
 //!
-//! annotations is a string-keyed map in the OCI spec. Placeholder type
-//! is []const u8 until json.zig lands in v0.0.3.
+//! annotations stores the raw JSON value from the OCI spec annotations map.
+//! The value is a std.json.Value.object when present.
 
 const MediaType = @import("MediaType.zig").MediaType;
 const Digest = @import("Digest.zig");
@@ -24,12 +24,88 @@ size: u64,
 platform: ?Platform = null,
 /// OCI spec field: urls. Optional list of download URLs for the blob.
 urls: ?[]const []const u8 = null,
-/// OCI spec field: annotations. Placeholder until json.zig in v0.0.3.
-annotations: ?[]const u8 = null,
+/// OCI spec field: annotations. Value is std.json.Value.object when present.
+annotations: ?std.json.Value = null,
 /// OCI spec field: artifactType. Present when descriptor points to an artifact.
 artifact_type: ?[]const u8 = null,
 
 const Descriptor = @This();
+
+/// Parse a JSON descriptor object. Maps camelCase JSON names to Zig fields.
+pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Descriptor {
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+    var result = Descriptor{
+        .media_type = undefined,
+        .digest = undefined,
+        .size = undefined,
+    };
+    var seen_media_type = false;
+    var seen_digest = false;
+    var seen_size = false;
+    while (true) {
+        const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name: []const u8 = switch (tok) {
+            inline .string, .allocated_string => |s| s,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+        defer switch (tok) {
+            .allocated_string => |s| allocator.free(s),
+            else => {},
+        };
+        if (std.mem.eql(u8, field_name, "mediaType")) {
+            result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
+            seen_media_type = true;
+        } else if (std.mem.eql(u8, field_name, "digest")) {
+            result.digest = try std.json.innerParse(Digest, allocator, source, options);
+            seen_digest = true;
+        } else if (std.mem.eql(u8, field_name, "size")) {
+            result.size = try std.json.innerParse(u64, allocator, source, options);
+            seen_size = true;
+        } else if (std.mem.eql(u8, field_name, "platform")) {
+            result.platform = try std.json.innerParse(?Platform, allocator, source, options);
+        } else if (std.mem.eql(u8, field_name, "urls")) {
+            result.urls = try std.json.innerParse(?[]const []const u8, allocator, source, options);
+        } else if (std.mem.eql(u8, field_name, "annotations")) {
+            result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+        } else if (std.mem.eql(u8, field_name, "artifactType")) {
+            result.artifact_type = try std.json.innerParse(?[]const u8, allocator, source, options);
+        } else {
+            if (!options.ignore_unknown_fields) return error.UnknownField;
+            try source.skipValue();
+        }
+    }
+    if (!seen_media_type or !seen_digest or !seen_size) return error.MissingField;
+    return result;
+}
+
+/// Stringify to a JSON descriptor object with camelCase OCI field names.
+pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
+    try jw.beginObject();
+    try jw.objectField("mediaType");
+    try jw.write(self.media_type);
+    try jw.objectField("digest");
+    try jw.write(self.digest);
+    try jw.objectField("size");
+    try jw.write(self.size);
+    if (self.platform) |p| {
+        try jw.objectField("platform");
+        try jw.write(p);
+    }
+    if (self.urls) |u| {
+        try jw.objectField("urls");
+        try jw.write(u);
+    }
+    if (self.annotations) |a| {
+        try jw.objectField("annotations");
+        try jw.write(a);
+    }
+    if (self.artifact_type) |t| {
+        try jw.objectField("artifactType");
+        try jw.write(t);
+    }
+    try jw.endObject();
+}
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

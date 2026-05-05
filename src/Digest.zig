@@ -64,6 +64,29 @@ pub fn format(self: Digest, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{s}:{s}", .{ @tagName(self.algorithm), self.hex });
 }
 
+/// Parse a JSON string value as "algorithm:hex".
+/// The hex slice borrows from the scanner input buffer.
+pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Digest {
+    const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+    defer switch (tok) {
+        .allocated_string => |s| allocator.free(s),
+        else => {},
+    };
+    const s: []const u8 = switch (tok) {
+        inline .string, .allocated_string => |v| v,
+        else => return error.UnexpectedToken,
+    };
+    return Digest.parse(s) catch return error.UnexpectedToken;
+}
+
+/// Stringify as a JSON string "algorithm:hex".
+pub fn jsonStringify(self: Digest, jw: anytype) !void {
+    // Stack buffer: "sha256:" (7) + 64 hex = 71; extra headroom for future algorithms.
+    var buf: [128]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{s}:{s}", .{ @tagName(self.algorithm), self.hex }) catch unreachable;
+    try jw.write(s);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 //
 // parse -----------------------------------------------------------------------

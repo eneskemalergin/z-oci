@@ -4,8 +4,8 @@
 //! a config descriptor, and a list of layer descriptors. The media_type
 //! field tells them apart at runtime.
 //!
-//! JSON field mapping (schemaVersion, mediaType, etc.) is handled in
-//! json.zig at v0.0.3. annotations is a placeholder until then.
+//! jsonParse and jsonStringify map camelCase JSON field names (schemaVersion,
+//! mediaType) to snake_case Zig fields.
 
 const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;
@@ -19,10 +19,75 @@ media_type: MediaType,
 config: Descriptor,
 /// OCI spec field: layers. Ordered list of filesystem layer blobs.
 layers: []const Descriptor,
-/// OCI spec field: annotations. Placeholder until json.zig in v0.0.3.
-annotations: ?[]const u8 = null,
+/// OCI spec field: annotations. Value is std.json.Value.object when present.
+annotations: ?std.json.Value = null,
 
 const Manifest = @This();
+
+/// Parse a JSON manifest object. Maps camelCase JSON names to Zig fields.
+pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Manifest {
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+    var result = Manifest{
+        .schema_version = undefined,
+        .media_type = undefined,
+        .config = undefined,
+        .layers = undefined,
+    };
+    var seen_schema_version = false;
+    var seen_media_type = false;
+    var seen_config = false;
+    var seen_layers = false;
+    while (true) {
+        const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name: []const u8 = switch (tok) {
+            inline .string, .allocated_string => |s| s,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+        defer switch (tok) {
+            .allocated_string => |s| allocator.free(s),
+            else => {},
+        };
+        if (std.mem.eql(u8, field_name, "schemaVersion")) {
+            result.schema_version = try std.json.innerParse(u8, allocator, source, options);
+            seen_schema_version = true;
+        } else if (std.mem.eql(u8, field_name, "mediaType")) {
+            result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
+            seen_media_type = true;
+        } else if (std.mem.eql(u8, field_name, "config")) {
+            result.config = try std.json.innerParse(Descriptor, allocator, source, options);
+            seen_config = true;
+        } else if (std.mem.eql(u8, field_name, "layers")) {
+            result.layers = try std.json.innerParse([]const Descriptor, allocator, source, options);
+            seen_layers = true;
+        } else if (std.mem.eql(u8, field_name, "annotations")) {
+            result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+        } else {
+            if (!options.ignore_unknown_fields) return error.UnknownField;
+            try source.skipValue();
+        }
+    }
+    if (!seen_schema_version or !seen_media_type or !seen_config or !seen_layers) return error.MissingField;
+    return result;
+}
+
+/// Stringify to a JSON manifest object with camelCase OCI field names.
+pub fn jsonStringify(self: Manifest, jw: anytype) !void {
+    try jw.beginObject();
+    try jw.objectField("schemaVersion");
+    try jw.write(self.schema_version);
+    try jw.objectField("mediaType");
+    try jw.write(self.media_type);
+    try jw.objectField("config");
+    try jw.write(self.config);
+    try jw.objectField("layers");
+    try jw.write(self.layers);
+    if (self.annotations) |a| {
+        try jw.objectField("annotations");
+        try jw.write(a);
+    }
+    try jw.endObject();
+}
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

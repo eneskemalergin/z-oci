@@ -7,7 +7,8 @@
 //! MultiArchManifest is the tagged union callers use. It hides which spec
 //! variant is underneath and exposes descriptors() and filterByPlatform().
 //!
-//! JSON field mapping is deferred to json.zig at v0.0.3.
+//! jsonParse and jsonStringify on each type map camelCase JSON field names
+//! (schemaVersion, mediaType) to snake_case Zig fields.
 
 const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;
@@ -22,8 +23,66 @@ pub const OciImageIndex = struct {
     media_type: MediaType,
     /// OCI spec field: manifests. One entry per platform.
     manifests: []const Descriptor,
-    /// OCI spec field: annotations. Placeholder until json.zig in v0.0.3.
-    annotations: ?[]const u8 = null,
+    /// OCI spec field: annotations. Value is std.json.Value.object when present.
+    annotations: ?std.json.Value = null,
+
+    /// Parse a JSON OCI image index object.
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !OciImageIndex {
+        if (.object_begin != try source.next()) return error.UnexpectedToken;
+        var result = OciImageIndex{
+            .schema_version = undefined,
+            .media_type = undefined,
+            .manifests = undefined,
+        };
+        var seen_schema_version = false;
+        var seen_media_type = false;
+        var seen_manifests = false;
+        while (true) {
+            const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+            const field_name: []const u8 = switch (tok) {
+                inline .string, .allocated_string => |s| s,
+                .object_end => break,
+                else => return error.UnexpectedToken,
+            };
+            defer switch (tok) {
+                .allocated_string => |s| allocator.free(s),
+                else => {},
+            };
+            if (std.mem.eql(u8, field_name, "schemaVersion")) {
+                result.schema_version = try std.json.innerParse(u8, allocator, source, options);
+                seen_schema_version = true;
+            } else if (std.mem.eql(u8, field_name, "mediaType")) {
+                result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
+                seen_media_type = true;
+            } else if (std.mem.eql(u8, field_name, "manifests")) {
+                result.manifests = try std.json.innerParse([]const Descriptor, allocator, source, options);
+                seen_manifests = true;
+            } else if (std.mem.eql(u8, field_name, "annotations")) {
+                result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+            } else {
+                if (!options.ignore_unknown_fields) return error.UnknownField;
+                try source.skipValue();
+            }
+        }
+        if (!seen_schema_version or !seen_media_type or !seen_manifests) return error.MissingField;
+        return result;
+    }
+
+    /// Stringify to a JSON OCI image index with camelCase field names.
+    pub fn jsonStringify(self: OciImageIndex, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schemaVersion");
+        try jw.write(self.schema_version);
+        try jw.objectField("mediaType");
+        try jw.write(self.media_type);
+        try jw.objectField("manifests");
+        try jw.write(self.manifests);
+        if (self.annotations) |a| {
+            try jw.objectField("annotations");
+            try jw.write(a);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Docker Manifest List (application/vnd.docker.distribution.manifest.list.v2+json).
@@ -34,6 +93,58 @@ pub const DockerManifestList = struct {
     media_type: MediaType,
     /// Docker spec field: manifests. One entry per platform.
     manifests: []const Descriptor,
+
+    /// Parse a JSON Docker manifest list object.
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !DockerManifestList {
+        if (.object_begin != try source.next()) return error.UnexpectedToken;
+        var result = DockerManifestList{
+            .schema_version = undefined,
+            .media_type = undefined,
+            .manifests = undefined,
+        };
+        var seen_schema_version = false;
+        var seen_media_type = false;
+        var seen_manifests = false;
+        while (true) {
+            const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+            const field_name: []const u8 = switch (tok) {
+                inline .string, .allocated_string => |s| s,
+                .object_end => break,
+                else => return error.UnexpectedToken,
+            };
+            defer switch (tok) {
+                .allocated_string => |s| allocator.free(s),
+                else => {},
+            };
+            if (std.mem.eql(u8, field_name, "schemaVersion")) {
+                result.schema_version = try std.json.innerParse(u8, allocator, source, options);
+                seen_schema_version = true;
+            } else if (std.mem.eql(u8, field_name, "mediaType")) {
+                result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
+                seen_media_type = true;
+            } else if (std.mem.eql(u8, field_name, "manifests")) {
+                result.manifests = try std.json.innerParse([]const Descriptor, allocator, source, options);
+                seen_manifests = true;
+            } else {
+                if (!options.ignore_unknown_fields) return error.UnknownField;
+                try source.skipValue();
+            }
+        }
+        if (!seen_schema_version or !seen_media_type or !seen_manifests) return error.MissingField;
+        return result;
+    }
+
+    /// Stringify to a JSON Docker manifest list with camelCase field names.
+    pub fn jsonStringify(self: DockerManifestList, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schemaVersion");
+        try jw.write(self.schema_version);
+        try jw.objectField("mediaType");
+        try jw.write(self.media_type);
+        try jw.objectField("manifests");
+        try jw.write(self.manifests);
+        try jw.endObject();
+    }
 };
 
 /// Tagged union over OciImageIndex and DockerManifestList.
