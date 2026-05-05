@@ -56,8 +56,11 @@ pub const MediaType = enum {
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+//
+// fromString ------------------------------------------------------------------
 
-test "fromString: all known types round-trip" {
+test "fromString: all known types parse from their canonical MIME string" {
+    // Each type must round-trip through toString → fromString.
     const cases = [_]MediaType{
         .oci_manifest_v1,
         .oci_index_v1,
@@ -71,13 +74,32 @@ test "fromString: all known types round-trip" {
     }
 }
 
-test "fromString: unknown type returns null" {
-    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString("application/json"));
+test "fromString: empty string returns null" {
     try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(""));
+}
+
+test "fromString: completely unknown MIME type returns null" {
+    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString("application/json"));
+}
+
+test "fromString: plain text returns null" {
     try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString("text/plain"));
 }
 
-test "fromString: case-insensitive" {
+test "fromString: prefix of a known type does not match" {
+    // Guards against startsWith-style matching in the lookup.
+    const prefix = "application/vnd.oci.image.manifest.v1+jso"; // missing trailing 'n'
+    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(prefix));
+}
+
+test "fromString: known type with trailing suffix does not match" {
+    // Guards against contains-style matching.
+    const with_suffix = "application/vnd.oci.image.manifest.v1+json; charset=utf-8";
+    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(with_suffix));
+}
+
+test "fromString: matching is case-insensitive for all casing variants" {
+    // Verifies all three casing styles for one representative type.
     const lower = "application/vnd.oci.image.manifest.v1+json";
     const upper = "APPLICATION/VND.OCI.IMAGE.MANIFEST.V1+JSON";
     const mixed = "Application/Vnd.Oci.Image.Manifest.V1+Json";
@@ -86,15 +108,48 @@ test "fromString: case-insensitive" {
     try std.testing.expectEqual(MediaType.oci_manifest_v1, MediaType.fromString(mixed).?);
 }
 
-test "isMultiArch" {
+// isMultiArch -----------------------------------------------------------------
+
+test "isMultiArch: oci_index_v1 returns true" {
     try std.testing.expect(MediaType.oci_index_v1.isMultiArch());
+}
+
+test "isMultiArch: docker_manifest_list_v2 returns true" {
     try std.testing.expect(MediaType.docker_manifest_list_v2.isMultiArch());
+}
+
+test "isMultiArch: oci_manifest_v1 returns false" {
+    // Guards against isMultiArch returning true for single-arch types.
     try std.testing.expect(!MediaType.oci_manifest_v1.isMultiArch());
+}
+
+test "isMultiArch: docker_manifest_v2 returns false" {
     try std.testing.expect(!MediaType.docker_manifest_v2.isMultiArch());
 }
 
-test "isLegacy" {
+test "isMultiArch: docker_manifest_v1_signed returns false" {
+    try std.testing.expect(!MediaType.docker_manifest_v1_signed.isMultiArch());
+}
+
+// isLegacy --------------------------------------------------------------------
+
+test "isLegacy: docker_manifest_v1_signed returns true" {
     try std.testing.expect(MediaType.docker_manifest_v1_signed.isLegacy());
+}
+
+test "isLegacy: oci_manifest_v1 returns false" {
+    // Guards against isLegacy returning true for current types.
     try std.testing.expect(!MediaType.oci_manifest_v1.isLegacy());
+}
+
+test "isLegacy: oci_index_v1 returns false" {
+    try std.testing.expect(!MediaType.oci_index_v1.isLegacy());
+}
+
+test "isLegacy: docker_manifest_v2 returns false" {
     try std.testing.expect(!MediaType.docker_manifest_v2.isLegacy());
+}
+
+test "isLegacy: docker_manifest_list_v2 returns false" {
+    try std.testing.expect(!MediaType.docker_manifest_list_v2.isLegacy());
 }

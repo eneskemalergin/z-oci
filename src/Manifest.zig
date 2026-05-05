@@ -26,9 +26,10 @@ const Manifest = @This();
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-test "Manifest: construct OCI image manifest" {
-    const Digest = @import("Digest.zig");
+const Digest = @import("Digest.zig");
 
+test "Manifest: OCI image manifest stores all required fields" {
+    // Arrange
     const config = Descriptor{
         .media_type = .oci_manifest_v1,
         .digest = try Digest.parse("sha256:" ++ "a" ** 64),
@@ -40,69 +41,90 @@ test "Manifest: construct OCI image manifest" {
         .size = 4096,
     };
     const layers = [_]Descriptor{layer};
-
+    // Act
     const m = Manifest{
         .schema_version = 2,
         .media_type = .oci_manifest_v1,
         .config = config,
         .layers = &layers,
     };
-
+    // Assert
     try std.testing.expectEqual(@as(u8, 2), m.schema_version);
     try std.testing.expectEqual(MediaType.oci_manifest_v1, m.media_type);
     try std.testing.expectEqual(@as(u64, 256), m.config.size);
-    try std.testing.expectEqual(@as(usize, 1), m.layers.len);
-    try std.testing.expectEqual(@as(u64, 4096), m.layers[0].size);
+    try std.testing.expectEqualSlices(u8, "a" ** 64, m.config.digest.hex);
+}
+
+test "Manifest: annotations defaults to null" {
+    const stub = Descriptor{
+        .media_type = .oci_manifest_v1,
+        .digest = try Digest.parse("sha256:" ++ "a" ** 64),
+        .size = 0,
+    };
+    const m = Manifest{
+        .schema_version = 2,
+        .media_type = .oci_manifest_v1,
+        .config = stub,
+        .layers = &.{},
+    };
     try std.testing.expect(m.annotations == null);
 }
 
-test "Manifest: construct Docker V2 manifest" {
-    const Digest = @import("Digest.zig");
-
+test "Manifest: empty layers slice is valid" {
+    // A manifest with no layers is legal (e.g. scratch-based images).
     const config = Descriptor{
-        .media_type = .docker_manifest_v2,
+        .media_type = .oci_manifest_v1,
         .digest = try Digest.parse("sha256:" ++ "c" ** 64),
-        .size = 512,
+        .size = 128,
     };
-    const layer_a = Descriptor{
-        .media_type = .docker_manifest_v2,
-        .digest = try Digest.parse("sha256:" ++ "d" ** 64),
-        .size = 8192,
-    };
-    const layer_b = Descriptor{
-        .media_type = .docker_manifest_v2,
-        .digest = try Digest.parse("sha256:" ++ "e" ** 64),
-        .size = 16384,
-    };
-    const layers = [_]Descriptor{ layer_a, layer_b };
-
     const m = Manifest{
         .schema_version = 2,
-        .media_type = .docker_manifest_v2,
+        .media_type = .oci_manifest_v1,
+        .config = config,
+        .layers = &.{},
+    };
+    try std.testing.expectEqual(@as(usize, 0), m.layers.len);
+}
+
+test "Manifest: layers are stored in declaration order" {
+    // Guards against any reordering of the layers slice.
+    const config = Descriptor{
+        .media_type = .oci_manifest_v1,
+        .digest = try Digest.parse("sha256:" ++ "d" ** 64),
+        .size = 0,
+    };
+    const layer0 = Descriptor{
+        .media_type = .oci_manifest_v1,
+        .digest = try Digest.parse("sha256:" ++ "e" ** 64),
+        .size = 100,
+    };
+    const layer1 = Descriptor{
+        .media_type = .oci_manifest_v1,
+        .digest = try Digest.parse("sha256:" ++ "f" ** 64),
+        .size = 200,
+    };
+    const layers = [_]Descriptor{ layer0, layer1 };
+    const m = Manifest{
+        .schema_version = 2,
+        .media_type = .oci_manifest_v1,
         .config = config,
         .layers = &layers,
     };
-
-    try std.testing.expectEqual(MediaType.docker_manifest_v2, m.media_type);
     try std.testing.expectEqual(@as(usize, 2), m.layers.len);
-    try std.testing.expectEqualSlices(u8, "d" ** 64, m.layers[0].digest.hex);
-    try std.testing.expectEqualSlices(u8, "e" ** 64, m.layers[1].digest.hex);
+    try std.testing.expectEqualSlices(u8, "e" ** 64, m.layers[0].digest.hex);
+    try std.testing.expectEqualSlices(u8, "f" ** 64, m.layers[1].digest.hex);
 }
 
-test "Manifest: media_type distinguishes OCI from Docker" {
-    const Digest = @import("Digest.zig");
-
+test "Manifest: Docker V2 manifest has distinct media_type from OCI" {
+    // Guards against the two formats being accidentally interchangeable.
     const stub = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "f" ** 64),
+        .media_type = .docker_manifest_v2,
+        .digest = try Digest.parse("sha256:" ++ "0" ** 64),
         .size = 0,
     };
-    const layers: []const Descriptor = &.{};
-
-    const oci = Manifest{ .schema_version = 2, .media_type = .oci_manifest_v1, .config = stub, .layers = layers };
-    const docker = Manifest{ .schema_version = 2, .media_type = .docker_manifest_v2, .config = stub, .layers = layers };
-
+    const oci = Manifest{ .schema_version = 2, .media_type = .oci_manifest_v1, .config = stub, .layers = &.{} };
+    const docker = Manifest{ .schema_version = 2, .media_type = .docker_manifest_v2, .config = stub, .layers = &.{} };
+    try std.testing.expect(oci.media_type != docker.media_type);
     try std.testing.expect(!oci.media_type.isMultiArch());
     try std.testing.expect(!docker.media_type.isMultiArch());
-    try std.testing.expect(oci.media_type != docker.media_type);
 }

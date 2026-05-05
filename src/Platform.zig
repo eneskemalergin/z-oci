@@ -67,89 +67,195 @@ fn featuresEql(a: ?[]const []const u8, b: ?[]const []const u8) bool {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+//
+// match -----------------------------------------------------------------------
 
-test "match: exact os and arch" {
+test "match: os and architecture exact match returns true" {
+    // Arrange
     const candidate = Platform{ .os = "linux", .architecture = "amd64" };
     const filter = Platform{ .os = "linux", .architecture = "amd64" };
+    // Act + Assert
     try std.testing.expect(match(candidate, filter));
 }
 
-test "match: case-insensitive os and arch" {
+test "match: os and architecture are case-insensitive" {
+    // Guards against switching from eqlIgnoreCase to eql on required fields.
     const candidate = Platform{ .os = "Linux", .architecture = "AMD64" };
     const filter = Platform{ .os = "linux", .architecture = "amd64" };
     try std.testing.expect(match(candidate, filter));
 }
 
-test "match: os mismatch" {
+test "match: os mismatch returns false" {
     const candidate = Platform{ .os = "windows", .architecture = "amd64" };
     const filter = Platform{ .os = "linux", .architecture = "amd64" };
     try std.testing.expect(!match(candidate, filter));
 }
 
-test "match: arch mismatch" {
+test "match: architecture mismatch returns false" {
     const candidate = Platform{ .os = "linux", .architecture = "arm64" };
     const filter = Platform{ .os = "linux", .architecture = "amd64" };
     try std.testing.expect(!match(candidate, filter));
 }
 
-test "match: variant omitted in filter accepts any" {
+test "match: filter omits variant, candidate with variant still matches" {
+    // Verifies the partial match rule: omitting variant accepts any.
     const candidate = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
     const filter = Platform{ .os = "linux", .architecture = "arm64" };
     try std.testing.expect(match(candidate, filter));
 }
 
-test "match: variant specified must match" {
-    const candidate = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
-    const filter_match = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
-    const filter_miss = Platform{ .os = "linux", .architecture = "arm", .variant = "v6" };
-    try std.testing.expect(match(candidate, filter_match));
-    try std.testing.expect(!match(candidate, filter_miss));
+test "match: filter omits variant, candidate without variant also matches" {
+    const candidate = Platform{ .os = "linux", .architecture = "arm64" };
+    const filter = Platform{ .os = "linux", .architecture = "arm64" };
+    try std.testing.expect(match(candidate, filter));
 }
 
-test "match: variant specified but candidate has none" {
+test "match: filter specifies variant, candidate variant must match" {
+    const candidate = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
+    const filter = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
+    try std.testing.expect(match(candidate, filter));
+}
+
+test "match: filter specifies variant, different candidate variant returns false" {
+    const candidate = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
+    const filter = Platform{ .os = "linux", .architecture = "arm", .variant = "v6" };
+    try std.testing.expect(!match(candidate, filter));
+}
+
+test "match: variant comparison is case-insensitive" {
+    // "V8" in filter must match "v8" in candidate.
+    const candidate = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
+    const filter = Platform{ .os = "linux", .architecture = "arm64", .variant = "V8" };
+    try std.testing.expect(match(candidate, filter));
+}
+
+test "match: filter specifies variant, candidate has no variant returns false" {
     const candidate = Platform{ .os = "linux", .architecture = "arm64" };
     const filter = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
     try std.testing.expect(!match(candidate, filter));
 }
 
-test "match: os_version prefix" {
+test "match: os_version prefix match returns true" {
+    // Windows-style build strings: filter "10.0" matches "10.0.17763.1234".
     const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763.1234" };
     const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
     try std.testing.expect(match(candidate, filter));
 }
 
-test "match: os_version prefix mismatch" {
+test "match: os_version exact equality is a valid prefix match" {
+    // Filter "10.0" must match candidate "10.0" exactly (prefix of itself).
+    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
+    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
+    try std.testing.expect(match(candidate, filter));
+}
+
+test "match: os_version candidate shorter than filter returns false" {
+    // "10" is not a prefix of filter "10.0"; the comparison goes the wrong way.
+    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10" };
+    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
+    try std.testing.expect(!match(candidate, filter));
+}
+
+test "match: os_version prefix mismatch returns false" {
     const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763" };
     const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "11.0" };
     try std.testing.expect(!match(candidate, filter));
 }
 
-test "match: os_version in filter but candidate missing it" {
+test "match: filter specifies os_version, candidate missing it returns false" {
     const candidate = Platform{ .os = "windows", .architecture = "amd64" };
     const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
     try std.testing.expect(!match(candidate, filter));
 }
 
-test "eql: identical platforms" {
+test "match: os_features in filter are not checked" {
+    // Per OCI spec, os_features is not a filter criterion in match().
+    // A filter with os_features must still match a candidate without them.
+    const features = [_][]const u8{"feature-a"};
+    const candidate = Platform{ .os = "linux", .architecture = "amd64" };
+    const filter = Platform{ .os = "linux", .architecture = "amd64", .os_features = &features };
+    try std.testing.expect(match(candidate, filter));
+}
+
+// eql -------------------------------------------------------------------------
+
+test "eql: identical platforms with no optional fields return true" {
     const a = Platform{ .os = "linux", .architecture = "amd64" };
     const b = Platform{ .os = "linux", .architecture = "amd64" };
     try std.testing.expect(eql(a, b));
 }
 
-test "eql: case-sensitive, different case is not equal" {
+test "eql: comparison is case-sensitive, different casing returns false" {
+    // Guards against accidentally using eqlIgnoreCase in eql().
     const a = Platform{ .os = "Linux", .architecture = "amd64" };
     const b = Platform{ .os = "linux", .architecture = "amd64" };
     try std.testing.expect(!eql(a, b));
 }
 
-test "eql: variant differs" {
+test "eql: both variants null returns true" {
+    const a = Platform{ .os = "linux", .architecture = "arm64" };
+    const b = Platform{ .os = "linux", .architecture = "arm64" };
+    try std.testing.expect(eql(a, b));
+}
+
+test "eql: variant differs returns false" {
     const a = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
     const b = Platform{ .os = "linux", .architecture = "arm", .variant = "v8" };
     try std.testing.expect(!eql(a, b));
 }
 
-test "eql: one variant null" {
+test "eql: one variant null, one set returns false" {
     const a = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
     const b = Platform{ .os = "linux", .architecture = "arm64" };
+    try std.testing.expect(!eql(a, b));
+}
+
+test "eql: os_version differs returns false" {
+    const a = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763" };
+    const b = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.19041" };
+    try std.testing.expect(!eql(a, b));
+}
+
+test "eql: os_version one null, one set returns false" {
+    const a = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
+    const b = Platform{ .os = "windows", .architecture = "amd64" };
+    try std.testing.expect(!eql(a, b));
+}
+
+test "eql: os_features both null returns true" {
+    const a = Platform{ .os = "linux", .architecture = "amd64" };
+    const b = Platform{ .os = "linux", .architecture = "amd64" };
+    try std.testing.expect(eql(a, b));
+}
+
+test "eql: os_features one null, one non-null returns false" {
+    const features = [_][]const u8{"seccomp"};
+    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &features };
+    const b = Platform{ .os = "linux", .architecture = "amd64" };
+    try std.testing.expect(!eql(a, b));
+}
+
+test "eql: os_features same content returns true" {
+    const fa = [_][]const u8{ "seccomp", "apparmor" };
+    const fb = [_][]const u8{ "seccomp", "apparmor" };
+    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fa };
+    const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
+    try std.testing.expect(eql(a, b));
+}
+
+test "eql: os_features different content returns false" {
+    const fa = [_][]const u8{"seccomp"};
+    const fb = [_][]const u8{"apparmor"};
+    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fa };
+    const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
+    try std.testing.expect(!eql(a, b));
+}
+
+test "eql: os_features different order returns false" {
+    // eql checks element order; ["a","b"] != ["b","a"].
+    const fa = [_][]const u8{ "seccomp", "apparmor" };
+    const fb = [_][]const u8{ "apparmor", "seccomp" };
+    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fa };
+    const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
     try std.testing.expect(!eql(a, b));
 }

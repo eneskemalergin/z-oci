@@ -65,49 +65,113 @@ pub fn format(self: Digest, w: *std.Io.Writer) std.Io.Writer.Error!void {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+//
+// parse -----------------------------------------------------------------------
 
-test "parse: valid sha256" {
-    const hex = "a" ** 64;
-    const d = try parse("sha256:" ++ hex);
+test "parse: valid sha256 returns correct algorithm and hex" {
+    // Arrange
+    const input = "sha256:" ++ "a" ** 64;
+    // Act
+    const d = try parse(input);
+    // Assert: algorithm and hex are both correct.
     try std.testing.expectEqual(Algorithm.sha256, d.algorithm);
-    try std.testing.expectEqualSlices(u8, hex, d.hex);
+    try std.testing.expectEqualSlices(u8, "a" ** 64, d.hex);
 }
 
-test "parse: missing colon" {
+test "parse: hex slice borrows from input without copying" {
+    // Guards the zero-allocation contract: d.hex must point inside input,
+    // not into a separately allocated buffer.
+    const input = "sha256:" ++ "b" ** 64;
+    const d = try parse(input);
+    // "sha256:" is 7 bytes; hex starts at offset 7.
+    try std.testing.expectEqual(input.ptr + 7, d.hex.ptr);
+    try std.testing.expectEqual(@as(usize, 64), d.hex.len);
+}
+
+test "parse: uppercase hex chars are accepted" {
+    const d = try parse("sha256:" ++ "A" ** 64);
+    try std.testing.expectEqualSlices(u8, "A" ** 64, d.hex);
+}
+
+test "parse: mixed case hex is accepted" {
+    // All of 0-9, a-f, A-F must be valid hex digits.
+    const d = try parse("sha256:aAbBcCdDeEfF" ++ "0" ** 52);
+    try std.testing.expectEqual(Algorithm.sha256, d.algorithm);
+}
+
+test "parse: algorithm matching is case-sensitive, SHA256 uppercase is rejected" {
+    // Guards against accidentally using eqlIgnoreCase for the algorithm string.
+    // OCI spec uses lowercase algorithm names.
+    try std.testing.expectError(error.UnsupportedAlgorithm, parse("SHA256:" ++ "a" ** 64));
+}
+
+test "parse: empty input returns MissingColon" {
+    try std.testing.expectError(error.MissingColon, parse(""));
+}
+
+test "parse: colon at position zero gives empty algorithm string, returns UnsupportedAlgorithm" {
+    // Input ":aaa..." has a colon but the algorithm segment is empty.
+    try std.testing.expectError(error.UnsupportedAlgorithm, parse(":" ++ "a" ** 64));
+}
+
+test "parse: no colon anywhere returns MissingColon" {
     try std.testing.expectError(error.MissingColon, parse("sha256" ++ "a" ** 64));
 }
 
-test "parse: unsupported algorithm" {
+test "parse: unknown algorithm returns UnsupportedAlgorithm" {
     try std.testing.expectError(error.UnsupportedAlgorithm, parse("md5:" ++ "a" ** 32));
 }
 
-test "parse: hex too short" {
-    try std.testing.expectError(error.InvalidHexLength, parse("sha256:abc"));
+test "parse: empty hex after colon returns InvalidHexLength" {
+    // "sha256:" with no hex is a length of 0, not 64.
+    try std.testing.expectError(error.InvalidHexLength, parse("sha256:"));
 }
 
-test "parse: hex too long" {
+test "parse: hex 63 chars is one short, returns InvalidHexLength" {
+    // Off-by-one boundary below 64. Catches a <= vs < mistake.
+    try std.testing.expectError(error.InvalidHexLength, parse("sha256:" ++ "a" ** 63));
+}
+
+test "parse: hex 65 chars is one over, returns InvalidHexLength" {
+    // Off-by-one boundary above 64. Catches a <= vs < mistake.
     try std.testing.expectError(error.InvalidHexLength, parse("sha256:" ++ "a" ** 65));
 }
 
-test "parse: invalid hex char" {
-    try std.testing.expectError(error.InvalidHexChar, parse("sha256:" ++ "z" ** 64));
+test "parse: non-hex character anywhere in hex string returns InvalidHexChar" {
+    // 'z' is not in [0-9a-fA-F]. Placing it last guards against an early-exit bug.
+    try std.testing.expectError(error.InvalidHexChar, parse("sha256:" ++ "a" ** 63 ++ "z"));
 }
 
-test "parse: uppercase hex is valid" {
-    const hex = "A" ** 64;
-    const d = try parse("sha256:" ++ hex);
-    try std.testing.expectEqualSlices(u8, hex, d.hex);
+test "parse: non-hex character at start of hex string returns InvalidHexChar" {
+    // Guards against the validator only checking the tail.
+    try std.testing.expectError(error.InvalidHexChar, parse("sha256:z" ++ "a" ** 63));
 }
 
-test "eql: same digest" {
-    const hex = "abcdef1234567890" ** 4;
+// eql -------------------------------------------------------------------------
+
+test "eql: identical digests return true" {
+    const hex = "abcdef0123456789" ** 4;
     const a = try parse("sha256:" ++ hex);
     const b = try parse("sha256:" ++ hex);
     try std.testing.expect(eql(a, b));
 }
 
-test "eql: different hex" {
+test "eql: different hex returns false" {
     const a = try parse("sha256:" ++ "a" ** 64);
     const b = try parse("sha256:" ++ "b" ** 64);
+    try std.testing.expect(!eql(a, b));
+}
+
+test "eql: hex differing only in last character returns false" {
+    // Guards against an off-by-one in the comparison that skips the final byte.
+    const a = try parse("sha256:" ++ "a" ** 63 ++ "b");
+    const b = try parse("sha256:" ++ "a" ** 63 ++ "c");
+    try std.testing.expect(!eql(a, b));
+}
+
+test "eql: hex differing only in first character returns false" {
+    // Guards against an off-by-one that skips the first byte.
+    const a = try parse("sha256:a" ++ "b" ** 63);
+    const b = try parse("sha256:c" ++ "b" ** 63);
     try std.testing.expect(!eql(a, b));
 }

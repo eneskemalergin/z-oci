@@ -174,18 +174,23 @@ fn looksLikeRegistry(segment: []const u8) bool {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+//
+// parse: Docker Hub bare names ------------------------------------------------
 
-test "parse: bare name defaults to docker hub, library prefix, latest tag" {
+test "parse: bare name expands to docker hub, library prefix, and latest tag" {
+    // Arrange
     const alloc = std.testing.allocator;
+    // Act
     var ref = try parse(alloc, "ubuntu");
     defer ref.deinit(alloc);
+    // Assert: all three defaults are applied in one step.
     try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
     try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
     try std.testing.expectEqualSlices(u8, "latest", ref.tag.?);
     try std.testing.expect(ref.digest == null);
 }
 
-test "parse: bare name with explicit tag" {
+test "parse: bare name with explicit tag, library prefix still applied" {
     const alloc = std.testing.allocator;
     var ref = try parse(alloc, "ubuntu:22.04");
     defer ref.deinit(alloc);
@@ -194,7 +199,8 @@ test "parse: bare name with explicit tag" {
     try std.testing.expectEqualSlices(u8, "22.04", ref.tag.?);
 }
 
-test "parse: bare name with digest" {
+test "parse: bare name with digest, no tag, no latest default" {
+    // When a digest is present and no tag, tag stays null (no latest default).
     const alloc = std.testing.allocator;
     const hex = "a" ** 64;
     var ref = try parse(alloc, "ubuntu@sha256:" ++ hex);
@@ -206,60 +212,18 @@ test "parse: bare name with digest" {
     try std.testing.expectEqualSlices(u8, hex, ref.digest.?.hex);
 }
 
-test "parse: full path with explicit registry" {
+test "parse: tag with hyphens and dots is preserved exactly" {
+    // Tags like "20.04-slim" must not be truncated or modified.
     const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "ghcr.io/owner/repo:v1.0");
+    var ref = try parse(alloc, "ubuntu:20.04-slim");
     defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "ghcr.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "owner/repo", ref.repository);
-    try std.testing.expectEqualSlices(u8, "v1.0", ref.tag.?);
+    try std.testing.expectEqualSlices(u8, "20.04-slim", ref.tag.?);
 }
 
-test "parse: registry with port" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "localhost:5000/myimage:dev");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "localhost:5000", ref.registry);
-    try std.testing.expectEqualSlices(u8, "myimage", ref.repository);
-    try std.testing.expectEqualSlices(u8, "dev", ref.tag.?);
-}
+// parse: Docker Hub org paths -------------------------------------------------
 
-test "parse: nested repository path" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "registry.example.com/org/team/image:latest");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry.example.com", ref.registry);
-    try std.testing.expectEqualSlices(u8, "org/team/image", ref.repository);
-    try std.testing.expectEqualSlices(u8, "latest", ref.tag.?);
-}
-
-test "parse: tag and digest together (digest wins for refString)" {
-    const alloc = std.testing.allocator;
-    const hex = "b" ** 64;
-    var ref = try parse(alloc, "image:mytag@sha256:" ++ hex);
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "mytag", ref.tag.?);
-    try std.testing.expect(ref.digest != null);
-    try std.testing.expectEqualSlices(u8, "sha256:" ++ hex, ref.refString());
-}
-
-test "parse: docker.io alias normalized to registry-1.docker.io" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "docker.io/library/ubuntu:20.04");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
-    try std.testing.expectEqualSlices(u8, "20.04", ref.tag.?);
-}
-
-test "parse: index.docker.io alias normalized" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "index.docker.io/library/alpine:3.18");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-}
-
-test "parse: org path on Docker Hub (no library prefix)" {
+test "parse: org/image path on Docker Hub gets no library prefix" {
+    // "myorg/myimage" has a slash, so it is already a full path — no library/ prefix.
     const alloc = std.testing.allocator;
     var ref = try parse(alloc, "myorg/myimage:v2");
     defer ref.deinit(alloc);
@@ -268,43 +232,183 @@ test "parse: org path on Docker Hub (no library prefix)" {
     try std.testing.expectEqualSlices(u8, "v2", ref.tag.?);
 }
 
-test "parse: no tag and no digest defaults to latest" {
+// parse: explicit registries --------------------------------------------------
+
+test "parse: full registry/owner/repo:tag" {
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "ghcr.io/owner/repo:v1.0");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "ghcr.io", ref.registry);
+    try std.testing.expectEqualSlices(u8, "owner/repo", ref.repository);
+    try std.testing.expectEqualSlices(u8, "v1.0", ref.tag.?);
+}
+
+test "parse: registry with port is detected as registry" {
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "localhost:5000/myimage:dev");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "localhost:5000", ref.registry);
+    try std.testing.expectEqualSlices(u8, "myimage", ref.repository);
+    try std.testing.expectEqualSlices(u8, "dev", ref.tag.?);
+}
+
+test "parse: localhost without port is treated as registry" {
+    // "localhost" is a special case: no dot, no port, but always a registry.
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "localhost/myimage:dev");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "localhost", ref.registry);
+    try std.testing.expectEqualSlices(u8, "myimage", ref.repository);
+}
+
+test "parse: deeply nested repository path is preserved" {
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "registry.example.com/org/team/image:latest");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "registry.example.com", ref.registry);
+    try std.testing.expectEqualSlices(u8, "org/team/image", ref.repository);
+    try std.testing.expectEqualSlices(u8, "latest", ref.tag.?);
+}
+
+test "parse: registry with dot and port together" {
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "registry.example.com:443/repo:tag");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "registry.example.com:443", ref.registry);
+    try std.testing.expectEqualSlices(u8, "repo", ref.repository);
+    try std.testing.expectEqualSlices(u8, "tag", ref.tag.?);
+}
+
+test "parse: no tag and no digest defaults tag to latest" {
     const alloc = std.testing.allocator;
     var ref = try parse(alloc, "ghcr.io/owner/repo");
     defer ref.deinit(alloc);
     try std.testing.expectEqualSlices(u8, "latest", ref.tag.?);
 }
 
-test "parse: empty input returns error.Empty" {
+// parse: Docker Hub alias normalization ---------------------------------------
+
+test "parse: docker.io alias is normalized to registry-1.docker.io" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.Empty, parse(alloc, ""));
+    var ref = try parse(alloc, "docker.io/library/ubuntu:20.04");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
+    try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
+    try std.testing.expectEqualSlices(u8, "20.04", ref.tag.?);
 }
 
-test "parse: whitespace returns error.InvalidReference" {
+test "parse: index.docker.io alias is normalized to registry-1.docker.io" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidReference, parse(alloc, "ubuntu 22.04"));
+    var ref = try parse(alloc, "index.docker.io/library/alpine:3.18");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
+}
+
+test "parse: docker.io alias normalization is case-insensitive" {
+    // "DOCKER.IO" must normalize the same as "docker.io".
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "DOCKER.IO/library/ubuntu:latest");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
+}
+
+// parse: digest and tag together ----------------------------------------------
+
+test "parse: tag and digest together, both fields are set" {
+    const alloc = std.testing.allocator;
+    const hex = "b" ** 64;
+    var ref = try parse(alloc, "image:mytag@sha256:" ++ hex);
+    defer ref.deinit(alloc);
+    // Both must be stored.
+    try std.testing.expectEqualSlices(u8, "mytag", ref.tag.?);
+    try std.testing.expect(ref.digest != null);
+}
+
+test "parse: tag and digest together, refString returns digest not tag" {
+    // Digest is canonical. The tag is informational only.
+    const alloc = std.testing.allocator;
+    const hex = "b" ** 64;
+    var ref = try parse(alloc, "image:mytag@sha256:" ++ hex);
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "sha256:" ++ hex, ref.refString());
+}
+
+test "parse: digest only (no tag), refString returns the digest string" {
+    const alloc = std.testing.allocator;
+    const hex = "c" ** 64;
+    var ref = try parse(alloc, "ghcr.io/owner/repo@sha256:" ++ hex);
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "sha256:" ++ hex, ref.refString());
+}
+
+// parse: error cases ----------------------------------------------------------
+
+test "parse: empty input returns error.Empty" {
+    try std.testing.expectError(error.Empty, parse(std.testing.allocator, ""));
+}
+
+test "parse: space in input returns error.InvalidReference" {
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu 22.04"));
+}
+
+test "parse: tab character in input returns error.InvalidReference" {
+    // Guards against only checking space (0x20) and missing other control chars.
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu\t22.04"));
+}
+
+test "parse: newline in input returns error.InvalidReference" {
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu\n22.04"));
 }
 
 test "parse: leading @ returns error.InvalidReference" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidReference, parse(alloc, "@sha256:" ++ "a" ** 64));
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "@sha256:" ++ "a" ** 64));
 }
 
-test "parse: bad digest returns error.InvalidDigest" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidDigest, parse(alloc, "ubuntu@notadigest"));
+test "parse: invalid digest format returns error.InvalidDigest" {
+    try std.testing.expectError(error.InvalidDigest, parse(std.testing.allocator, "ubuntu@notadigest"));
 }
 
-test "repositoryPath returns repository" {
+// repositoryPath and refString ------------------------------------------------
+
+test "repositoryPath: returns the repository field" {
     const alloc = std.testing.allocator;
     var ref = try parse(alloc, "ghcr.io/owner/repo:v1.0");
     defer ref.deinit(alloc);
     try std.testing.expectEqualSlices(u8, "owner/repo", ref.repositoryPath());
 }
 
-test "refString returns tag when no digest" {
+test "refString: returns tag when no digest is set" {
     const alloc = std.testing.allocator;
     var ref = try parse(alloc, "ubuntu:22.04");
     defer ref.deinit(alloc);
     try std.testing.expectEqualSlices(u8, "22.04", ref.refString());
+}
+
+// lifecycle: memory management ------------------------------------------------
+
+test "parse and deinit: testing allocator detects no leaks" {
+    // The testing allocator fails the test if any allocation from parse()
+    // is not freed by deinit(). This is the primary memory-safety check.
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "ghcr.io/owner/repo:v1.0");
+    ref.deinit(alloc);
+    // If we reach here without a leak report, all fields were freed.
+}
+
+test "parse and deinit: digest ref frees digest_raw but not digest.hex" {
+    // digest_raw is an allocated copy of "sha256:hex". digest.hex borrows
+    // from the input. deinit must free digest_raw but not touch the input.
+    const alloc = std.testing.allocator;
+    const hex = "d" ** 64;
+    const input = "ghcr.io/owner/repo@sha256:" ++ hex;
+    var ref = try parse(alloc, input);
+    ref.deinit(alloc);
+    // No leak → digest_raw was freed. input is still valid (stack-allocated literal).
+}
+
+test "parse and deinit: tag+digest ref frees all three string allocations" {
+    const alloc = std.testing.allocator;
+    const hex = "e" ** 64;
+    var ref = try parse(alloc, "ghcr.io/owner/repo:v1@sha256:" ++ hex);
+    ref.deinit(alloc);
 }
