@@ -27,7 +27,8 @@ pub const Platform = @import("Platform.zig");
 
 // v0.0.2: OCI types (in progress)
 pub const Descriptor = @import("Descriptor.zig");
+pub const Manifest = @import("Manifest.zig");
 
-// TODO(v0.0.2): Reference, Manifest, Index
+// TODO(v0.0.2): Reference, Index
 // TODO(v0.0.3): ResolveError, ResolveResult, Config
 // TODO(v0.0.4): resolve, validate, getManifest
