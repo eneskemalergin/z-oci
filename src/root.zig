@@ -25,6 +25,9 @@ pub const Digest = @import("Digest.zig");
 pub const MediaType = @import("MediaType.zig").MediaType;
 pub const Platform = @import("Platform.zig");
 
-// TODO(v0.0.2): Reference, Descriptor, Manifest, Index
+// v0.0.2: OCI types (in progress)
+pub const Descriptor = @import("Descriptor.zig");
+
+// TODO(v0.0.2): Reference, Manifest, Index
 // TODO(v0.0.3): ResolveError, ResolveResult, Config
 // TODO(v0.0.4): resolve, validate, getManifest
