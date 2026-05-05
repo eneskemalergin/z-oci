@@ -19,3 +19,6 @@
 //!   2  auth failure
 //!   3  rate limited
 //!   4  network error
+
+// CLI is implemented in Phase 6. Stub keeps the build clean until then.
+pub fn main() void {}

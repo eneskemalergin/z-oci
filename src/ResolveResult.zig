@@ -59,6 +59,7 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
     var plat_arch: ?[]const u8 = null;
     var plat_variant: ?[]const u8 = null;
     var plat_os_version: ?[]const u8 = null;
+    var plat_os_features: ?[]const []const u8 = null;
 
     if (self.platform) |p| {
         plat_os = try allocator.dupe(u8, p.os);
@@ -75,15 +76,25 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
             plat_os_version = try allocator.dupe(u8, v);
             errdefer if (plat_os_version) |s| allocator.free(s);
         }
-        // os_features is not cloned: the field is not used by resolve() or
-        // filterByPlatform() in Phase 1, and cloning a slice of slices adds
-        // complexity without benefit yet.
+        if (p.os_features) |features| {
+            // Clone the outer slice, then clone each inner string.
+            const outer = try allocator.alloc([]const u8, features.len);
+            errdefer allocator.free(outer);
+            var n_cloned: usize = 0;
+            errdefer for (outer[0..n_cloned]) |s| allocator.free(s);
+            for (features, 0..) |feat, i| {
+                outer[i] = try allocator.dupe(u8, feat);
+                n_cloned += 1;
+            }
+            plat_os_features = outer;
+        }
 
         platform = Platform{
             .os = plat_os.?,
             .architecture = plat_arch.?,
             .variant = plat_variant,
             .os_version = plat_os_version,
+            .os_features = plat_os_features,
         };
     }
 
@@ -120,6 +131,10 @@ pub fn deinit(self: *ResolveResult, allocator: std.mem.Allocator) void {
         allocator.free(p.architecture);
         if (p.variant) |v| allocator.free(v);
         if (p.os_version) |v| allocator.free(v);
+        if (p.os_features) |features| {
+            for (features) |feat| allocator.free(feat);
+            allocator.free(features);
+        }
     }
 }
 
@@ -244,4 +259,74 @@ test "ResolveResult.clone: null platform clones as null" {
     defer cloned.deinit(std.testing.allocator);
 
     try std.testing.expect(cloned.platform == null);
+}
+
+test "ResolveResult.clone: clone is independent from original" {
+    // Mutating the original after cloning must not affect the clone.
+    // This verifies deep copy, not a shallow pointer copy.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const arena_alloc = arena.allocator();
+
+    var registry_buf = try arena_alloc.dupe(u8, "ghcr.io");
+    const original = ResolveResult{
+        .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "e" ** 64) },
+        .media_type = .oci_manifest_v1,
+        .platform = null,
+        .reference = Reference{
+            .registry = registry_buf,
+            .repository = try arena_alloc.dupe(u8, "owner/repo"),
+            .tag = null,
+            .digest = null,
+            .digest_raw = null,
+        },
+    };
+
+    var cloned = try original.clone(std.testing.allocator);
+    defer cloned.deinit(std.testing.allocator);
+
+    // Mutate the original registry string in-place after cloning.
+    registry_buf[0] = 'X';
+    arena.deinit();
+
+    // Clone must retain the unmodified value.
+    try std.testing.expectEqualSlices(u8, "ghcr.io", cloned.reference.registry);
+}
+
+test "ResolveResult.clone: os_features are deep copied" {
+    // os_features is a slice of slices. All levels must be cloned.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const features = [_][]const u8{
+        try arena_alloc.dupe(u8, "win32k"),
+        try arena_alloc.dupe(u8, "hyperv"),
+    };
+    const original = ResolveResult{
+        .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "f" ** 64) },
+        .media_type = .oci_manifest_v1,
+        .platform = Platform{
+            .os = try arena_alloc.dupe(u8, "windows"),
+            .architecture = try arena_alloc.dupe(u8, "amd64"),
+            .os_features = &features,
+        },
+        .reference = Reference{
+            .registry = try arena_alloc.dupe(u8, "mcr.microsoft.com"),
+            .repository = try arena_alloc.dupe(u8, "windows/servercore"),
+            .tag = null,
+            .digest = null,
+            .digest_raw = null,
+        },
+    };
+
+    var cloned = try original.clone(std.testing.allocator);
+    defer cloned.deinit(std.testing.allocator);
+
+    // Assert: all feature strings are cloned and readable.
+    const cf = cloned.platform.?.os_features.?;
+    try std.testing.expectEqual(@as(usize, 2), cf.len);
+    try std.testing.expectEqualSlices(u8, "win32k", cf[0]);
+    try std.testing.expectEqualSlices(u8, "hyperv", cf[1]);
+    // Pointers must differ: clone owns its own memory.
+    try std.testing.expect(cf.ptr != features[0..].ptr);
 }

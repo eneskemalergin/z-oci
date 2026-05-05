@@ -120,3 +120,14 @@ test "Config: rate_limit_enabled can be disabled" {
     const c = Config{ .rate_limit_enabled = false };
     try std.testing.expect(!c.rate_limit_enabled);
 }
+
+test "Config: ca_bundle_path stores and returns path" {
+    const c = Config{ .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt" };
+    try std.testing.expectEqualSlices(u8, "/etc/ssl/certs/ca-certificates.crt", c.ca_bundle_path.?);
+}
+
+test "Config: max_retries zero disables retries" {
+    // A caller that wants no retries must be able to set max_retries to 0.
+    const c = Config{ .max_retries = 0 };
+    try std.testing.expectEqual(@as(u8, 0), c.max_retries);
+}

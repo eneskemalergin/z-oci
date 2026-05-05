@@ -65,7 +65,8 @@ pub fn format(self: Digest, w: *std.Io.Writer) std.Io.Writer.Error!void {
 }
 
 /// Parse a JSON string value as "algorithm:hex".
-/// The hex slice borrows from the scanner input buffer.
+/// The hex slice is copied into the arena allocator so the returned Digest
+/// does not borrow from the scanner buffer.
 pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Digest {
     const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
     defer switch (tok) {
@@ -76,7 +77,11 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
         inline .string, .allocated_string => |v| v,
         else => return error.UnexpectedToken,
     };
-    return Digest.parse(s) catch return error.UnexpectedToken;
+    const d = Digest.parse(s) catch return error.UnexpectedToken;
+    // Dupe hex into the arena so the Digest does not borrow from the
+    // scanner input buffer. Callers can free the input after parse().
+    const hex_owned = try allocator.dupe(u8, d.hex);
+    return Digest{ .algorithm = d.algorithm, .hex = hex_owned };
 }
 
 /// Stringify as a JSON string "algorithm:hex".

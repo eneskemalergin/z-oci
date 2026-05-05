@@ -227,3 +227,64 @@ test "ResolveError: http_status null when not set" {
     } };
     try std.testing.expectEqual(@as(?u16, null), err.context().http_status);
 }
+
+test "ResolveError.format: all variants include their exact name" {
+    // Each variant must include the exact name string in its output.
+    const cases = [_]struct { err: ResolveError, name: []const u8 }{
+        .{ .err = .{ .auth_failed = .{ .registry = "r", .reference = "ref" } }, .name = "AuthFailed" },
+        .{ .err = .{ .not_found = .{ .registry = "r", .reference = "ref" } }, .name = "NotFound" },
+        .{ .err = .{ .rate_limited = .{ .registry = "r", .reference = "ref" } }, .name = "RateLimited" },
+        .{ .err = .{ .digest_mismatch = .{ .registry = "r", .reference = "ref" } }, .name = "DigestMismatch" },
+        .{ .err = .{ .platform_not_found = .{ .registry = "r", .reference = "ref" } }, .name = "PlatformNotFound" },
+        .{ .err = .{ .manifest_parse_error = .{ .registry = "r", .reference = "ref" } }, .name = "ManifestParseError" },
+        .{ .err = .{ .network_error = .{ .registry = "r", .reference = "ref" } }, .name = "NetworkError" },
+        .{ .err = .{ .unsupported_algorithm = .{ .registry = "r", .reference = "ref" } }, .name = "UnsupportedAlgorithm" },
+        .{ .err = .{ .content_type_mismatch = .{ .registry = "r", .reference = "ref" } }, .name = "ContentTypeMismatch" },
+        .{ .err = .{ .timeout = .{ .registry = "r", .reference = "ref" } }, .name = "Timeout" },
+        .{ .err = .{ .depth_limit_exceeded = .{ .registry = "r", .reference = "ref" } }, .name = "DepthLimitExceeded" },
+    };
+    for (cases) |tc| {
+        var buf: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try tc.err.format(&w);
+        // The exact variant name must appear at the start of the output.
+        try std.testing.expect(std.mem.startsWith(u8, w.buffered(), tc.name));
+    }
+}
+
+test "ResolveError.format: HTTP status appears only when set" {
+    // A variant without http_status must not emit any "HTTP" substring.
+    const without = ResolveError{ .auth_failed = .{
+        .registry = "r",
+        .reference = "ref",
+    } };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try without.format(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "HTTP") == null);
+
+    // A variant with http_status must include the status code.
+    const with_status = ResolveError{ .auth_failed = .{
+        .registry = "r",
+        .reference = "ref",
+        .http_status = 401,
+    } };
+    var buf2: [256]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    try with_status.format(&w2);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "401") != null);
+}
+
+test "ResolveError.format: registry and reference appear in output" {
+    // Both context strings must be present so logs are actionable.
+    const err = ResolveError{ .not_found = .{
+        .registry = "gcr.io",
+        .reference = "gcr.io/project/image:v2",
+    } };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try err.format(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "gcr.io") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "project/image") != null);
+}
