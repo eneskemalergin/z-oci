@@ -1,28 +1,30 @@
 //! z-oci: Pure Zig OCI/Docker Registry API v2 client.
 //!
-//! Read-only client for resolving container image references to pinned SHA256 digests.
-//! Built entirely on Zig 0.16 std: `std.http.Client`, `std.json`, `std.crypto.hash.sha2`.
+//! Read-only. Resolves container image references to pinned SHA256 digests.
+//! Built on Zig 0.16 std. Zero external dependencies.
 //!
-//! ## Module Map
+//! ## Phase 1: Types and API Surface (v0.0.1 to v0.0.4)
 //!
-//!   types.zig     - OCI data types (Digest, Platform, MediaType, Descriptor, Manifest)
-//!   digest.zig    - SHA256 hash validation
-//!   auth.zig      - Bearer token flow, CredentialProvider interface
-//!   client.zig    - Manifest fetch (HEAD/GET), digest extraction
-//!   platform.zig  - Multi-arch resolution, platform filtering
-//!   ratelimit.zig - Rate limit parsing, backoff logic
+//!   Digest       - algorithm + hex string, parse/validate
+//!   MediaType    - OCI/Docker MIME types, detection helpers
+//!   Platform     - os/arch/variant, partial match for multi-arch resolution
 //!
-//! ## Public API
+//! ## Coming in later milestones
 //!
-//!   resolve(allocator, client, config, ref, platform) → ResolveResult | ResolveError
-//!   validate(allocator, client, config, ref)          → bool | ResolveError
-//!   getManifest(allocator, client, config, ref, plat) → Parsed(Manifest) | ResolveError
+//!   Reference     - image reference parser             (v0.0.2)
+//!   Descriptor    - OCI content descriptor             (v0.0.2)
+//!   Manifest      - OCI Image Manifest + Docker V2     (v0.0.2)
+//!   Index         - OciImageIndex + DockerManifestList (v0.0.2)
+//!   ResolveError  - tagged error union                 (v0.0.3)
+//!   ResolveResult - result struct                      (v0.0.3)
+//!   Config        - config skeleton                    (v0.0.3)
+//!   resolve / validate / getManifest stubs             (v0.0.4)
 
-const std = @import("std");
+// v0.0.1: leaf types
+pub const Digest = @import("Digest.zig");
+pub const MediaType = @import("MediaType.zig").MediaType;
+pub const Platform = @import("Platform.zig");
 
-pub const types = @import("types.zig");
-pub const auth = @import("auth.zig");
-pub const client = @import("client.zig");
-pub const platform = @import("platform.zig");
-pub const ratelimit = @import("ratelimit.zig");
-pub const digest = @import("digest.zig");
+// TODO(v0.0.2): Reference, Descriptor, Manifest, Index
+// TODO(v0.0.3): ResolveError, ResolveResult, Config
+// TODO(v0.0.4): resolve, validate, getManifest

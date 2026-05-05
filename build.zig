@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("z_oci", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     // CLI executable (Phase 6)
