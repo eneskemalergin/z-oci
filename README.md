@@ -10,9 +10,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml">
+  <!-- <a href="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
-  </a>
+  </a> -->
+  <img src="https://img.shields.io/badge/version-0.0.1-8B5CF6?style=flat-square" alt="v0.0.1">
+  <img src="https://img.shields.io/badge/status-design%20%2F%20brainstorm-E57C23?style=flat-square" alt="Status: design / brainstorm">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -32,6 +34,7 @@
 
 Zig **0.16.0** or later.
 
+<!--
 ## Installation
 
 Add z-oci as a dependency in your `build.zig.zon`:
@@ -60,7 +63,9 @@ const z_oci = b.dependency("z_oci", .{
 });
 exe.root_module.addImport("z_oci", z_oci.module("z_oci"));
 ```
+-->
 
+<!--
 ## Quick start
 
 ### Resolve a tag to a pinned digest
@@ -136,7 +141,9 @@ const results = try z_oci.client.resolveMany(
     null,
 );
 ```
+-->
 
+<!--
 ## API
 
 ### `resolve`
@@ -247,6 +254,7 @@ All allocation goes through the `allocator` you pass. Two options:
 
 1. **Arena**: pass `arena.allocator()` and call `arena.deinit()` when done. No per-object cleanup needed.
 2. **GPA**: call `parsed.deinit()` on `Parsed(T)` values and free `ResolveResult` slices manually.
+-->
 
 ## Build steps
 
