@@ -3,18 +3,21 @@
 //! Read-only. Resolves container image references to pinned SHA256 digests.
 //! Built on Zig 0.16 std. Zero external dependencies.
 //!
-//! ## Phase 1: Types and API Surface (v0.0.1 to v0.0.4)
+//! ## v0.0.1: Leaf Types
 //!
 //!   Digest       - algorithm + hex string, parse/validate
 //!   MediaType    - OCI/Docker MIME types, detection helpers
 //!   Platform     - os/arch/variant, partial match for multi-arch resolution
 //!
+//! ## v0.0.2: Reference Parser + OCI Types
+//!
+//!   Reference    - image reference parser (full Docker/OCI grammar)
+//!   Descriptor   - OCI content descriptor
+//!   Manifest     - OCI Image Manifest + Docker V2 Schema 2
+//!   Index        - OciImageIndex + DockerManifestList + MultiArchManifest
+//!
 //! ## Coming in later milestones
 //!
-//!   Reference     - image reference parser             (v0.0.2)
-//!   Descriptor    - OCI content descriptor             (v0.0.2)
-//!   Manifest      - OCI Image Manifest + Docker V2     (v0.0.2)
-//!   Index         - OciImageIndex + DockerManifestList (v0.0.2)
 //!   ResolveError  - tagged error union                 (v0.0.3)
 //!   ResolveResult - result struct                      (v0.0.3)
 //!   Config        - config skeleton                    (v0.0.3)

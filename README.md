@@ -13,8 +13,8 @@
   <!-- <a href="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a> -->
-  <img src="https://img.shields.io/badge/version-0.0.1-8B5CF6?style=flat-square" alt="v0.0.1">
-  <img src="https://img.shields.io/badge/status-design%20%2F%20brainstorm-E57C23?style=flat-square" alt="Status: design / brainstorm">
+  <img src="https://img.shields.io/badge/version-0.0.2-8B5CF6?style=flat-square" alt="v0.0.2">
+  <img src="https://img.shields.io/badge/status-early%20development-E57C23?style=flat-square" alt="Status: early development">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -22,13 +22,23 @@
 
 ---
 
-- Resolves `registry/repo:tag` to `@sha256:...` digests. HEAD-first; GET for body verification.
-- Multi-arch platform filtering: OCI Image Index and Docker Manifest List, nested index recursion
-- OCI Bearer token auth with pluggable credential providers: Docker config, env vars, `docker-credential-*` helpers, anonymous
-- Rate-limit handling: reactive 429 backoff with exponential jitter; `RateLimit-*` and `X-RateLimit-*` headers; `Retry-After` quirk handling
-- Batch resolve (`resolveMany`) with shared token cache and session digest cache
-- Arena-allocated; caller-owned `*std.http.Client`; no hidden allocations
-- Built on `std.http.Client`, `std.json`, `std.crypto.hash.sha2`. Zero external dependencies.
+**What ships in v0.0.2:**
+
+- `Reference` parser: handles bare names, tags, digests, registries with ports, nested paths, Docker Hub aliases, and tag+digest refs
+- `Digest`: SHA-256 parse and validation, hex borrowing from caller input, no allocation
+- `MediaType`: OCI and Docker MIME type enum with `fromString`, `isMultiArch`, `isLegacy`
+- `Platform`: os/arch/variant struct with partial match (variant optional, os_version prefix) and strict `eql`
+- `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`: full OCI type system
+- `MultiArchManifest`: tagged union over both index types with `filterByPlatform`
+
+**Coming later:**
+
+- JSON parse/stringify with camelCase mapping for OCI spec fields
+- `resolve`: tag-to-digest resolution over HTTP, HEAD-first with GET fallback
+- Multi-arch resolution with platform fallback and nested index recursion
+- Bearer token auth with pluggable credential providers
+- Rate-limit handling: 429 backoff, `Retry-After`, exponential jitter
+- Batch resolve with shared token and digest cache
 
 ## Requirements
 
@@ -266,16 +276,25 @@ All allocation goes through the `allocator` you pass. Two options:
 
 ## Roadmap
 
-| Version | Phase | Description |
-| ------- | ----- | ----------- |
-| **v0.1.0** | Types & API Surface | OCI data types, error union, API signatures |
-| **v0.2.0** | Auth Engine | Bearer token flow, credential helpers |
-| **v0.3.0** | Manifest Resolution | HEAD/GET digest extraction, multi-arch |
-| **v0.4.0** | Rate Limiting | Backoff, batch API, session cache |
-| **v0.5.0** | Testing | Mock server, local registry, CI |
-| **v0.6.0** | CLI Tool | `z-oci resolve`, `validate`, `inspect` |
-| **v0.7.0** | Zencelot Integration | Container pinning workflow |
-| **v1.0.0** | Package Release | Zig package index, API docs |
+**Phase 1: Types, parsers, API contracts (v0.0.1 to v0.0.4)**
+
+| Version | Status | Description |
+| ------- | ------ | ----------- |
+| v0.0.1 | done | Leaf types: `Digest`, `MediaType`, `Platform` |
+| v0.0.2 | done | OCI types: `Reference`, `Descriptor`, `Manifest`, `Index` |
+| v0.0.3 | next | JSON infrastructure, `ResolveError`, `ResolveResult`, `Config` skeleton |
+| v0.0.4 | | Public function signatures, arena lifetime contract, fuzz tests |
+
+**Later phases**
+
+| Version | Description |
+| ------- | ----------- |
+| v0.1.0 | Auth engine: Bearer token flow, credential helpers |
+| v0.2.0 | Manifest resolution: HEAD/GET, multi-arch, nested index |
+| v0.3.0 | Rate limiting: backoff, batch API, session cache |
+| v0.4.0 | Testing: mock server, local registry, CI |
+| v0.5.0 | CLI: `z-oci resolve`, `validate`, `inspect` |
+| v1.0.0 | Package release: Zig package index, API docs |
 
 ## References
 
