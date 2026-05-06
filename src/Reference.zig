@@ -12,9 +12,9 @@
 //! When neither tag nor digest is present, tag defaults to "latest".
 //! When both tag and digest are present, digest wins for refString().
 //!
-//! Memory: parse() allocates all string fields into the provided allocator.
-//! deinit() frees them. digest.hex borrows from the caller's input slice
-//! (not from allocated memory) — consistent with Digest.zig.
+//! Memory: parse() allocates all owned string fields into the provided allocator.
+//! deinit() frees them. For digest references, digest_raw owns the full
+//! "sha256:..." string and digest.hex points into that owned allocation.
 
 const std = @import("std");
 const Digest = @import("Digest.zig");
@@ -26,7 +26,7 @@ registry: []const u8,
 repository: []const u8,
 /// Informational when digest is also present. refString() returns the digest then.
 tag: ?[]const u8,
-/// Parsed digest. .hex borrows from the caller's input; not freed by deinit.
+/// Parsed digest. .hex points into digest_raw when a digest is present.
 digest: ?Digest,
 /// "sha256:hex" — allocated copy used by refString(). Freed by deinit.
 digest_raw: ?[]const u8,
@@ -56,8 +56,12 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     if (std.mem.indexOfScalar(u8, input, '@')) |at_pos| {
         if (at_pos == 0) return error.InvalidReference;
         const raw = input[at_pos + 1 ..];
-        digest = Digest.parse(raw) catch return error.InvalidDigest;
+        const parsed_digest = Digest.parse(raw) catch return error.InvalidDigest;
         digest_raw = try allocator.dupe(u8, raw);
+        digest = Digest{
+            .algorithm = parsed_digest.algorithm,
+            .hex = digest_raw.?[digest_raw.?.len - parsed_digest.hex.len ..],
+        };
         rest = input[0..at_pos];
     }
     errdefer if (digest_raw) |dr| allocator.free(dr);
@@ -143,7 +147,7 @@ pub fn deinit(self: *Reference, allocator: std.mem.Allocator) void {
     allocator.free(self.repository);
     if (self.tag) |t| allocator.free(t);
     if (self.digest_raw) |dr| allocator.free(dr);
-    // digest.hex borrows from caller input; not our memory to free.
+    // digest.hex points inside digest_raw, so freeing digest_raw is enough.
 }
 
 /// Repository path for /v2/{name}/manifests/{ref} URL construction.
@@ -406,15 +410,28 @@ test "parse and deinit: testing allocator detects no leaks" {
     // If we reach here without a leak report, all fields were freed.
 }
 
-test "parse and deinit: digest ref frees digest_raw but not digest.hex" {
-    // digest_raw is an allocated copy of "sha256:hex". digest.hex borrows
-    // from the input. deinit must free digest_raw but not touch the input.
+test "parse: digest hex remains valid after caller input is freed" {
+    // Tighten the ownership contract: digest.hex must point into owned memory,
+    // not into the caller input slice.
+    const alloc = std.testing.allocator;
+    const input = try alloc.dupe(u8, "ghcr.io/owner/repo@sha256:" ++ "d" ** 64);
+    var ref = try parse(alloc, input);
+    alloc.free(input);
+    defer ref.deinit(alloc);
+
+    try std.testing.expect(ref.digest != null);
+    try std.testing.expectEqualSlices(u8, "d" ** 64, ref.digest.?.hex);
+}
+
+test "parse and deinit: digest ref frees digest_raw and owned digest hex" {
+    // digest_raw owns the full "sha256:hex" string. digest.hex points inside it.
+    // deinit must free that allocation exactly once.
     const alloc = std.testing.allocator;
     const hex = "d" ** 64;
     const input = "ghcr.io/owner/repo@sha256:" ++ hex;
     var ref = try parse(alloc, input);
     ref.deinit(alloc);
-    // No leak → digest_raw was freed. input is still valid (stack-allocated literal).
+    // No leak → digest_raw was freed and digest.hex needed no separate cleanup.
 }
 
 test "parse and deinit: tag+digest ref frees all three string allocations" {
