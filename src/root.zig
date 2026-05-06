@@ -49,3 +49,21 @@ pub const Config = @import("Config.zig").Config;
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
 // TODO(v0.0.4): resolve, validate, getManifest
+
+// Pulling every sub-module into the test build.
+// zig test only includes tests from the root file unless sub-modules are
+// referenced here. Each @import forces the compiler to compile that file in
+// test mode, which makes its test blocks visible to the test runner.
+test {
+    _ = @import("Digest.zig");
+    _ = @import("MediaType.zig");
+    _ = @import("Platform.zig");
+    _ = @import("Reference.zig");
+    _ = @import("Descriptor.zig");
+    _ = @import("Manifest.zig");
+    _ = @import("Index.zig");
+    _ = @import("json.zig");
+    _ = @import("ResolveError.zig");
+    _ = @import("ResolveResult.zig");
+    _ = @import("Config.zig");
+}

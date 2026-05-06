@@ -176,18 +176,30 @@ pub const MultiArchManifest = union(enum) {
 
 const Digest = @import("Digest.zig");
 
+const TestDescriptor = struct {
+    descriptor: Descriptor,
+    digest_hex: []u8,
+
+    fn deinit(self: TestDescriptor, allocator: std.mem.Allocator) void {
+        allocator.free(self.digest_hex);
+    }
+};
+
 // makeDescriptor builds a test Descriptor with all hex bytes set to hex_char.
 // hex_char must be a valid ASCII hex digit (0-9, a-f).
-fn makeDescriptor(hex_char: u8, os: []const u8, arch: []const u8) !Descriptor {
-    var hex_buf: [64]u8 = undefined;
-    @memset(&hex_buf, hex_char);
-    var digest_buf: [71]u8 = undefined; // "sha256:" + 64 chars
-    const digest_str = try std.fmt.bufPrint(&digest_buf, "sha256:{s}", .{hex_buf});
-    return Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse(digest_str),
-        .size = 512,
-        .platform = .{ .os = os, .architecture = arch },
+fn makeDescriptor(hex_char: u8, os: []const u8, arch: []const u8) !TestDescriptor {
+    const digest_hex = try std.testing.allocator.alloc(u8, 64);
+    errdefer std.testing.allocator.free(digest_hex);
+    @memset(digest_hex, hex_char);
+
+    return .{
+        .digest_hex = digest_hex,
+        .descriptor = Descriptor{
+            .media_type = .oci_manifest_v1,
+            .digest = .{ .algorithm = .sha256, .hex = digest_hex },
+            .size = 512,
+            .platform = .{ .os = os, .architecture = arch },
+        },
     };
 }
 
@@ -196,8 +208,10 @@ fn makeDescriptor(hex_char: u8, os: []const u8, arch: []const u8) !Descriptor {
 test "descriptors: OciImageIndex returns all entries" {
     // Arrange
     const amd64 = try makeDescriptor('a', "linux", "amd64");
+    defer amd64.deinit(std.testing.allocator);
     const arm64 = try makeDescriptor('b', "linux", "arm64");
-    const manifests = [_]Descriptor{ amd64, arm64 };
+    defer arm64.deinit(std.testing.allocator);
+    const manifests = [_]Descriptor{ amd64.descriptor, arm64.descriptor };
     // Act
     const m = MultiArchManifest{ .oci = .{
         .schema_version = 2,
@@ -210,7 +224,8 @@ test "descriptors: OciImageIndex returns all entries" {
 
 test "descriptors: DockerManifestList returns all entries" {
     const amd64 = try makeDescriptor('c', "linux", "amd64");
-    const manifests = [_]Descriptor{amd64};
+    defer amd64.deinit(std.testing.allocator);
+    const manifests = [_]Descriptor{amd64.descriptor};
     const m = MultiArchManifest{ .docker = .{
         .schema_version = 2,
         .media_type = .docker_manifest_list_v2,
@@ -233,8 +248,10 @@ test "descriptors: empty manifest list returns empty slice" {
 test "filterByPlatform: returns the matching descriptor" {
     // Arrange: two descriptors, only arm64 should match.
     const amd64 = try makeDescriptor('d', "linux", "amd64");
+    defer amd64.deinit(std.testing.allocator);
     const arm64 = try makeDescriptor('e', "linux", "arm64");
-    const manifests = [_]Descriptor{ amd64, arm64 };
+    defer arm64.deinit(std.testing.allocator);
+    const manifests = [_]Descriptor{ amd64.descriptor, arm64.descriptor };
     const m = MultiArchManifest{ .oci = .{
         .schema_version = 2,
         .media_type = .oci_index_v1,
@@ -250,7 +267,8 @@ test "filterByPlatform: returns the matching descriptor" {
 
 test "filterByPlatform: no matching platform returns null" {
     const amd64 = try makeDescriptor('f', "linux", "amd64");
-    const manifests = [_]Descriptor{amd64};
+    defer amd64.deinit(std.testing.allocator);
+    const manifests = [_]Descriptor{amd64.descriptor};
     const m = MultiArchManifest{ .oci = .{
         .schema_version = 2,
         .media_type = .oci_index_v1,
@@ -275,8 +293,10 @@ test "filterByPlatform: first matching descriptor wins, not the second" {
     // When two descriptors satisfy the filter, the first in the list is returned.
     // Guards against iterating backwards or using the last match.
     const first = try makeDescriptor('1', "linux", "amd64");
+    defer first.deinit(std.testing.allocator);
     const second = try makeDescriptor('2', "linux", "amd64");
-    const manifests = [_]Descriptor{ first, second };
+    defer second.deinit(std.testing.allocator);
+    const manifests = [_]Descriptor{ first.descriptor, second.descriptor };
     const m = MultiArchManifest{ .oci = .{
         .schema_version = 2,
         .media_type = .oci_index_v1,
@@ -290,9 +310,10 @@ test "filterByPlatform: first matching descriptor wins, not the second" {
 
 test "filterByPlatform: filter omits variant, descriptor with variant still matches" {
     // Verifies partial match: no variant in filter accepts any candidate variant.
-    var desc = try makeDescriptor('g', "linux", "arm");
-    desc.platform.?.variant = "v7";
-    const manifests = [_]Descriptor{desc};
+    var desc = try makeDescriptor('a', "linux", "arm");
+    defer desc.deinit(std.testing.allocator);
+    desc.descriptor.platform.?.variant = "v7";
+    const manifests = [_]Descriptor{desc.descriptor};
     const m = MultiArchManifest{ .oci = .{
         .schema_version = 2,
         .media_type = .oci_index_v1,
@@ -301,17 +322,17 @@ test "filterByPlatform: filter omits variant, descriptor with variant still matc
     const filter = Platform{ .os = "linux", .architecture = "arm" };
     const result = m.filterByPlatform(filter);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualSlices(u8, "g" ** 64, result.?.digest.hex);
+    try std.testing.expectEqualSlices(u8, "a" ** 64, result.?.digest.hex);
 }
 
 test "filterByPlatform: descriptor without platform field is skipped" {
     // A descriptor in an index may legitimately omit platform (e.g. attestation blobs).
     // It must not be matched even if the filter would otherwise match anything.
-    var digest_buf: [71]u8 = undefined;
-    const digest_str = try std.fmt.bufPrint(&digest_buf, "sha256:{s}", .{"h" ** 64});
+    const digest_hex = try std.testing.allocator.dupe(u8, "a" ** 64);
+    defer std.testing.allocator.free(digest_hex);
     const no_platform = Descriptor{
         .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse(digest_str),
+        .digest = .{ .algorithm = .sha256, .hex = digest_hex },
         .size = 100,
     };
     const manifests = [_]Descriptor{no_platform};
@@ -327,8 +348,9 @@ test "filterByPlatform: descriptor without platform field is skipped" {
 test "filterByPlatform: DockerManifestList variant finds the correct platform" {
     // Verifies that filterByPlatform works through the .docker union arm,
     // not just the .oci arm.
-    const arm64 = try makeDescriptor('k', "linux", "arm64");
-    const manifests = [_]Descriptor{arm64};
+    const arm64 = try makeDescriptor('a', "linux", "arm64");
+    defer arm64.deinit(std.testing.allocator);
+    const manifests = [_]Descriptor{arm64.descriptor};
     const m = MultiArchManifest{ .docker = .{
         .schema_version = 2,
         .media_type = .docker_manifest_list_v2,
@@ -337,5 +359,5 @@ test "filterByPlatform: DockerManifestList variant finds the correct platform" {
     const filter = Platform{ .os = "linux", .architecture = "arm64" };
     const result = m.filterByPlatform(filter);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualSlices(u8, "k" ** 64, result.?.digest.hex);
+    try std.testing.expectEqualSlices(u8, "a" ** 64, result.?.digest.hex);
 }
