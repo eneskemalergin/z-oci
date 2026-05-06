@@ -3,7 +3,7 @@
 //! Ownership notes:
 //! - CLI args come from `init.arena` and are treated as borrowed configuration
 //!   inputs for the duration of main.
-//! - The raw JSON buffer is temporary and freed after parsing.
+//! - The raw JSON bytes live in a bounded stack buffer and are discarded after parsing.
 //! - Each parsed index/list is a std.json.Parsed(T); its arena owns all string
 //!   slices exposed through descriptors(), so the selected Descriptor must not
 //!   outlive the surrounding `parsed` value.
@@ -65,8 +65,9 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    const bytes = try Io.Dir.cwd().readFileAlloc(init.io, index_path, init.gpa, .limited(32 * 1024));
-    defer init.gpa.free(bytes);
+    var bytes_buffer: [32 * 1024 + 1]u8 = undefined;
+    const bytes = try Io.Dir.cwd().readFile(init.io, index_path, &bytes_buffer);
+    if (bytes.len > 32 * 1024) return error.StreamTooLong;
 
     try stdout.print("path: {s}\n", .{index_path});
     try stdout.print("requested: {s}/{s}", .{ filter.os, filter.architecture });

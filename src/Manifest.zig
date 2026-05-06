@@ -95,6 +95,14 @@ pub fn jsonStringify(self: Manifest, jw: anytype) !void {
     try jw.endObject();
 }
 
+fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(value);
+    return aw;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 const Digest = @import("Digest.zig");
@@ -200,7 +208,7 @@ test "Manifest: Docker V2 manifest has distinct media_type from OCI" {
     try std.testing.expect(!docker.media_type.isMultiArch());
 }
 
-test "Manifest JSON: round-trip" {
+test "Manifest JSON: parses required fields" {
     const json_bytes =
         \\{
         \\  "schemaVersion": 2,
@@ -249,10 +257,8 @@ test "Manifest JSON: stringifies with camelCase field names" {
         .layers = &layers,
     };
 
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    var aw = try stringifyForTest(m);
     defer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(m);
     const out = aw.written();
 
     try std.testing.expect(std.mem.indexOf(u8, out, "\"schemaVersion\"") != null);
@@ -261,7 +267,7 @@ test "Manifest JSON: stringifies with camelCase field names" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"layers\"") != null);
 }
 
-test "Manifest JSON: annotations round-trip and deinit leak-free" {
+test "Manifest JSON: stringify/reparse preserves annotations leak-free" {
     const json_bytes =
         \\{
         \\  "schemaVersion": 2,
@@ -281,10 +287,8 @@ test "Manifest JSON: annotations round-trip and deinit leak-free" {
     const parsed = try json.parse(Manifest, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    var aw = try stringifyForTest(parsed.value);
     defer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(parsed.value);
     const out = aw.written();
 
     const reparsed = try json.parse(Manifest, std.testing.allocator, out);

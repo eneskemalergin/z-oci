@@ -1,7 +1,7 @@
 //! Inspect a manifest fixture and print a compact summary.
 //!
 //! Ownership notes:
-//! - The raw file bytes are temporary and are freed immediately after parsing.
+//! - The raw file bytes live in a bounded stack buffer and are discarded after parsing.
 //! - z_oci.json.parse returns std.json.Parsed(Manifest), which owns its own
 //!   arena-backed strings and must be deinitialized explicitly.
 //! - This example uses `init.gpa` for the parse arena because it keeps the
@@ -41,10 +41,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const manifest_path = if (args.len == 2) args[1] else default_manifest_path;
-    const bytes = try Io.Dir.cwd().readFileAlloc(init.io, manifest_path, init.gpa, .limited(32 * 1024));
-    defer init.gpa.free(bytes);
+    var bytes_buffer: [32 * 1024 + 1]u8 = undefined;
+    const bytes = try Io.Dir.cwd().readFile(init.io, manifest_path, &bytes_buffer);
+    if (bytes.len > 32 * 1024) return error.StreamTooLong;
 
-    // Parsed(Manifest) is self-contained, so freeing bytes after parse is safe.
+    // Parsed(Manifest) is self-contained, so the temporary buffer can be discarded after parse.
     const parsed = try z_oci.json.parse(z_oci.Manifest, init.gpa, bytes);
     defer parsed.deinit();
 

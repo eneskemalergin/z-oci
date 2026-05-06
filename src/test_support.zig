@@ -13,7 +13,7 @@ const Descriptor = @import("Descriptor.zig");
 /// std.json.Parsed(T), then free the raw bytes before returning.
 ///
 /// The caller owns the returned Parsed(T) arena and must call .deinit().
-pub fn parseFixture(comptime T: type, path: []const u8, max_bytes: usize) !std.json.Parsed(T) {
+pub fn parseFixture(comptime T: type, path: []const u8, comptime max_bytes: usize) !std.json.Parsed(T) {
     return parseFixtureWithAllocator(T, std.testing.allocator, path, max_bytes);
 }
 
@@ -21,17 +21,18 @@ fn parseFixtureWithAllocator(
     comptime T: type,
     allocator: std.mem.Allocator,
     path: []const u8,
-    max_bytes: usize,
+    comptime max_bytes: usize,
 ) !std.json.Parsed(T) {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        path,
-        allocator,
-        .limited(max_bytes),
-    );
-    defer allocator.free(bytes);
+    var bytes_buffer: [max_bytes + 1]u8 = undefined;
+    const bytes = try readBoundedFixture(path, &bytes_buffer, max_bytes);
 
     return json.parse(T, allocator, bytes);
+}
+
+fn readBoundedFixture(path: []const u8, buffer: []u8, max_bytes: usize) ![]u8 {
+    const bytes = try std.Io.Dir.cwd().readFile(std.testing.io, path, buffer);
+    if (bytes.len > max_bytes) return error.StreamTooLong;
+    return bytes;
 }
 
 test "test_support: parseFixture result survives helper buffer teardown" {

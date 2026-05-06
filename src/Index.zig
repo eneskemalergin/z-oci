@@ -177,6 +177,14 @@ pub const MultiArchManifest = union(enum) {
     }
 };
 
+fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(value);
+    return aw;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 const Digest = @import("Digest.zig");
@@ -368,7 +376,7 @@ test "filterByPlatform: DockerManifestList variant finds the correct platform" {
     try std.testing.expectEqualSlices(u8, "a" ** 64, result.?.digest.hex);
 }
 
-test "OciImageIndex JSON: round-trip" {
+test "OciImageIndex JSON: parses required fields" {
     const json_bytes =
         \\{
         \\  "schemaVersion": 2,
@@ -393,7 +401,7 @@ test "OciImageIndex JSON: round-trip" {
     try std.testing.expectEqualSlices(u8, "linux", parsed.value.manifests[0].platform.?.os);
 }
 
-test "DockerManifestList JSON: round-trip" {
+test "DockerManifestList JSON: parses required fields" {
     const json_bytes =
         \\{
         \\  "schemaVersion": 2,
@@ -418,7 +426,7 @@ test "DockerManifestList JSON: round-trip" {
     try std.testing.expectEqualSlices(u8, "arm64", parsed.value.manifests[0].platform.?.architecture);
 }
 
-test "OciImageIndex JSON: annotations round-trip and deinit leak-free" {
+test "OciImageIndex JSON: stringify/reparse preserves annotations leak-free" {
     const json_bytes =
         \\{
         \\  "schemaVersion": 2,
@@ -433,10 +441,8 @@ test "OciImageIndex JSON: annotations round-trip and deinit leak-free" {
     const parsed = try json.parse(OciImageIndex, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    var aw = try stringifyForTest(parsed.value);
     defer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(parsed.value);
     const out = aw.written();
 
     const reparsed = try json.parse(OciImageIndex, std.testing.allocator, out);

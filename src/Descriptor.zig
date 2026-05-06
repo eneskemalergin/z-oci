@@ -108,6 +108,14 @@ pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
     try jw.endObject();
 }
 
+fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(value);
+    return aw;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "Descriptor: all optional fields default to null" {
@@ -196,7 +204,7 @@ test "Descriptor: artifact_type field is stored and readable" {
     try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom+json", d.artifact_type.?);
 }
 
-test "Descriptor JSON: round-trip" {
+test "Descriptor JSON: parses required fields" {
     // Arrange
     const json_bytes =
         \\{
@@ -226,10 +234,8 @@ test "Descriptor JSON: stringifies with camelCase field names" {
     };
 
     // Act
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    var aw = try stringifyForTest(d);
     defer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(d);
     const out = aw.written();
 
     // Assert
@@ -238,7 +244,7 @@ test "Descriptor JSON: stringifies with camelCase field names" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"size\"") != null);
 }
 
-test "Descriptor JSON: round-trip with platform" {
+test "Descriptor JSON: parses platform fields" {
     // Arrange
     const json_bytes =
         \\{
@@ -260,7 +266,7 @@ test "Descriptor JSON: round-trip with platform" {
     try std.testing.expectEqualSlices(u8, "v8", parsed.value.platform.?.variant.?);
 }
 
-test "Descriptor JSON: optional fields round-trip and deinit leak-free" {
+test "Descriptor JSON: stringify/reparse preserves optional fields leak-free" {
     // Arrange: exercise every optional JSON branch on Descriptor.
     const json_bytes =
         \\{
@@ -279,10 +285,8 @@ test "Descriptor JSON: optional fields round-trip and deinit leak-free" {
     const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    var aw = try stringifyForTest(parsed.value);
     defer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(parsed.value);
     const out = aw.written();
 
     const reparsed = try json.parse(Descriptor, std.testing.allocator, out);

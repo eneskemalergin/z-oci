@@ -21,6 +21,7 @@
 const std = @import("std");
 const Digest = @import("Digest.zig");
 
+const docker_hub_library_prefix = "library/";
 const docker_hub_registry = "registry-1.docker.io";
 const docker_hub_aliases = [_][]const u8{ "docker.io", "index.docker.io", docker_hub_registry };
 
@@ -127,7 +128,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     errdefer allocator.free(registry_owned);
 
     const repository_owned = if (needs_library_prefix)
-        try std.fmt.allocPrint(allocator, "library/{s}", .{repo_str})
+        try duplicateLibraryRepositoryPath(allocator, repo_str)
     else
         try allocator.dupe(u8, repo_str);
     errdefer allocator.free(repository_owned);
@@ -145,6 +146,13 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
         .digest = digest,
         .digest_raw = digest_raw,
     };
+}
+
+fn duplicateLibraryRepositoryPath(allocator: std.mem.Allocator, repository: []const u8) ![]const u8 {
+    const owned = try allocator.alloc(u8, docker_hub_library_prefix.len + repository.len);
+    @memcpy(owned[0..docker_hub_library_prefix.len], docker_hub_library_prefix);
+    @memcpy(owned[docker_hub_library_prefix.len..], repository);
+    return owned;
 }
 
 pub fn deinit(self: *Reference, allocator: std.mem.Allocator) void {
