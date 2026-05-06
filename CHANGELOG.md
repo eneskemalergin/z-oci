@@ -11,6 +11,27 @@ Nothing yet.
 
 ---
 
+## [0.0.4] - 2026-05-05
+
+### Added
+
+- `root.zig`: public `resolve`, `validate`, and `getManifest` stubs. Each is callable and returns `error.NotYetImplemented` until the transport layer lands.
+- Ownership doc comments on the new public API surface. They explain the intended arena lifetime for single-shot calls, batch clone flows, and `std.json.Parsed(Manifest)` values.
+- Deterministic fuzz-style smoke tests for `Digest.parse`, `Reference.parse`, and `json.parse(Manifest, ...)`, each covering 10,000 pseudo-random inputs.
+- New `Platform.match` edge-case tests for empty strings, UTF-8 `os_version` prefixes, and very long variant strings.
+- A fuller `ResolveResult.clone` smoke test that tears the source arena down before validating the clone.
+
+### Fixed
+
+- `root.zig` test discovery now imports all sub-modules during `zig test`, so the full suite is actually executed.
+- `Reference.parse` now rejects `ubuntu:` and `myorg/` with `error.InvalidReference` instead of accepting an empty tag or trailing slash path.
+
+### Verified
+
+- `zig test src/root.zig --zig-lib-dir zig-0.16.0/lib/` passes with 161 tests.
+- `zig build test --summary all` passes and reports the same suite.
+- `zig build -Doptimize=ReleaseSmall` produces a 4.8 KB artifact at `zig-out/bin/z-oci`.
+
 ## [0.0.3] - 2026-05-06
 
 ### Added

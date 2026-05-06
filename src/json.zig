@@ -378,3 +378,25 @@ test "json: Platform round-trip with os.version and os.features" {
     try std.testing.expectEqual(@as(usize, 1), plat.os_features.?.len);
     try std.testing.expectEqualSlices(u8, "win32k", plat.os_features.?[0]);
 }
+
+test "json: 10000 pseudo-random manifest payloads never panic" {
+    // Fuzz-style smoke test. Malformed JSON must fail with an error, not a panic.
+    var seed: u64 = 0xabad_1dea;
+    var buf: [256]u8 = undefined;
+
+    for (0..10_000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const result = parse(Manifest, std.testing.allocator, buf[0..len]);
+        if (result) |parsed| {
+            var owned = parsed;
+            owned.deinit();
+        } else |_| {}
+    }
+}

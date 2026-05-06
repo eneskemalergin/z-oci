@@ -23,9 +23,13 @@
 //!   ResolveResult - resolve result struct; clone() + deinit()
 //!   Config       - config skeleton with CredentialProvider interface
 //!
-//! ## Coming in later milestones
+//! ## v0.0.4: Public API Stubs + Ownership Contract
 //!
-//!   resolve / validate / getManifest stubs             (v0.0.4)
+//!   resolve      - declare the public resolve surface before HTTP lands
+//!   validate     - declare the manifest existence check surface
+//!   getManifest  - declare the parsed manifest retrieval surface
+
+const std = @import("std");
 
 // v0.0.1: leaf types
 pub const Digest = @import("Digest.zig");
@@ -48,7 +52,73 @@ pub const ResolveResult = @import("ResolveResult.zig");
 pub const Config = @import("Config.zig").Config;
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
-// TODO(v0.0.4): resolve, validate, getManifest
+
+pub const ImplementationError = error{NotYetImplemented};
+
+/// Resolve an image reference to a pinned manifest digest.
+///
+/// Ownership contract:
+/// - The caller owns `allocator` and decides whether it is an arena, GPA, or something else.
+/// - In the intended Phase 2 flow, all borrowed slices in the returned ResolveResult live for
+///   as long as `allocator` keeps that memory alive.
+/// - For single-shot calls, an arena allocator is the intended pattern: use the result, copy what
+///   you need, then tear the arena down.
+/// - For batch operations that keep results longer, clone the ResolveResult into caller-owned
+///   memory before freeing the per-call arena.
+pub fn resolve(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+) ImplementationError!ResolveResult {
+    _ = allocator;
+    _ = client;
+    _ = config;
+    _ = ref;
+    _ = platform;
+    return error.NotYetImplemented;
+}
+
+/// Validate that a manifest reference still exists and is fetchable.
+///
+/// Ownership contract:
+/// - No owned data is returned from this API.
+/// - The caller still owns `allocator`; later implementations may use it for transient parsing and
+///   response handling even though this stub returns immediately.
+pub fn validate(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+) ImplementationError!bool {
+    _ = allocator;
+    _ = client;
+    _ = config;
+    _ = ref;
+    return error.NotYetImplemented;
+}
+
+/// Fetch and parse a manifest payload.
+///
+/// Ownership contract:
+/// - The returned std.json.Parsed(Manifest) owns an arena.
+/// - Call parsed.deinit() when finished.
+/// - Do not free the allocator backing that arena while the parsed value is still in use.
+pub fn getManifest(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+) ImplementationError!std.json.Parsed(Manifest) {
+    _ = allocator;
+    _ = client;
+    _ = config;
+    _ = ref;
+    _ = platform;
+    return error.NotYetImplemented;
+}
 
 // Pulling every sub-module into the test build.
 // zig test only includes tests from the root file unless sub-modules are
@@ -66,4 +136,19 @@ test {
     _ = @import("ResolveError.zig");
     _ = @import("ResolveResult.zig");
     _ = @import("Config.zig");
+}
+
+test "v0.0.4 stubs: public APIs return NotYetImplemented" {
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/alpine",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    try std.testing.expectError(error.NotYetImplemented, resolve(std.testing.allocator, &client, Config{}, ref, null));
+    try std.testing.expectError(error.NotYetImplemented, validate(std.testing.allocator, &client, Config{}, ref));
+    try std.testing.expectError(error.NotYetImplemented, getManifest(std.testing.allocator, &client, Config{}, ref, null));
 }

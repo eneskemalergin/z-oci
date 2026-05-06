@@ -203,3 +203,35 @@ test "eql: hex differing only in first character returns false" {
     const b = try parse("sha256:c" ++ "b" ** 63);
     try std.testing.expect(!eql(a, b));
 }
+
+test "parse: 10000 pseudo-random inputs either parse correctly or return a known error" {
+    // Fuzz-style smoke test. The parser must never panic on arbitrary bytes.
+    var seed: u64 = 0x5eed_d1ce_57;
+    var buf: [96]u8 = undefined;
+
+    for (0..10_000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const result = parse(buf[0..len]);
+        if (result) |digest| {
+            try std.testing.expectEqual(Algorithm.sha256, digest.algorithm);
+            try std.testing.expectEqual(@as(usize, 64), digest.hex.len);
+            for (digest.hex) |c| switch (c) {
+                '0'...'9', 'a'...'f', 'A'...'F' => {},
+                else => return error.TestUnexpectedResult,
+            };
+        } else |err| switch (err) {
+            error.MissingColon,
+            error.UnsupportedAlgorithm,
+            error.InvalidHexLength,
+            error.InvalidHexChar,
+            => {},
+        }
+    }
+}

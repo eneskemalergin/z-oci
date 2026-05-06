@@ -92,8 +92,11 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     const last_seg_start: usize = if (last_slash) |ls| ls + 1 else 0;
     const last_seg = path_str[last_seg_start..];
 
+    if (last_seg.len == 0) return error.InvalidReference;
+
     if (std.mem.indexOfScalar(u8, last_seg, ':')) |colon_in_seg| {
         tag_str = last_seg[colon_in_seg + 1 ..];
+        if (tag_str.?.len == 0) return error.InvalidReference;
         repo_str = path_str[0 .. last_seg_start + colon_in_seg];
     }
 
@@ -368,6 +371,14 @@ test "parse: invalid digest format returns error.InvalidDigest" {
     try std.testing.expectError(error.InvalidDigest, parse(std.testing.allocator, "ubuntu@notadigest"));
 }
 
+test "parse: trailing colon returns error.InvalidReference" {
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu:"));
+}
+
+test "parse: trailing slash returns error.InvalidReference" {
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "myorg/"));
+}
+
 // repositoryPath and refString ------------------------------------------------
 
 test "repositoryPath: returns the repository field" {
@@ -411,4 +422,34 @@ test "parse and deinit: tag+digest ref frees all three string allocations" {
     const hex = "e" ** 64;
     var ref = try parse(alloc, "ghcr.io/owner/repo:v1@sha256:" ++ hex);
     ref.deinit(alloc);
+}
+
+test "parse: 10000 pseudo-random inputs never panic and only return declared outcomes" {
+    // Fuzz-style smoke test. Success paths must deinit cleanly.
+    var seed: u64 = 0x51ce_b00c;
+    var buf: [128]u8 = undefined;
+
+    for (0..10_000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const result = parse(std.testing.allocator, buf[0..len]);
+        if (result) |ref| {
+            var owned = ref;
+            defer owned.deinit(std.testing.allocator);
+            try std.testing.expect(owned.repository.len > 0);
+            try std.testing.expect(owned.refString().len > 0);
+        } else |err| switch (err) {
+            error.Empty,
+            error.InvalidDigest,
+            error.InvalidReference,
+            error.OutOfMemory,
+            => {},
+        }
+    }
 }

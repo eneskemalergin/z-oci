@@ -322,3 +322,25 @@ test "eql: os_features different order returns false" {
     const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
     try std.testing.expect(!eql(a, b));
 }
+
+test "match: empty os and architecture still compare deterministically" {
+    // The type does not forbid empty strings. match() should still behave predictably.
+    const candidate = Platform{ .os = "", .architecture = "" };
+    const filter = Platform{ .os = "", .architecture = "" };
+    try std.testing.expect(match(candidate, filter));
+}
+
+test "match: unicode os_version uses byte-prefix semantics" {
+    // os_version is byte-oriented. UTF-8 content must still respect prefix matching.
+    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0-βeta" };
+    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0-" };
+    try std.testing.expect(match(candidate, filter));
+}
+
+test "match: very long variant string still matches exactly" {
+    // Guards against fixed-size assumptions in variant handling.
+    const long_variant = "v" ++ "x" ** 255;
+    const candidate = Platform{ .os = "linux", .architecture = "arm64", .variant = long_variant };
+    const filter = Platform{ .os = "linux", .architecture = "arm64", .variant = long_variant };
+    try std.testing.expect(match(candidate, filter));
+}

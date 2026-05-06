@@ -330,3 +330,54 @@ test "ResolveResult.clone: os_features are deep copied" {
     // Pointers must differ: clone owns its own memory.
     try std.testing.expect(cf.ptr != features[0..].ptr);
 }
+
+test "ResolveResult.clone: full smoke test survives arena teardown" {
+    // This is the Phase 1 memory-model smoke test: clone a fully populated value,
+    // tear the source arena down, then read every important field from the clone.
+    var cloned: ResolveResult = undefined;
+    {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const digest_hex = try arena_alloc.dupe(u8, "9" ** 64);
+        const digest_raw = try arena_alloc.dupe(u8, "sha256:" ++ "9" ** 64);
+        const features = [_][]const u8{
+            try arena_alloc.dupe(u8, "win32k"),
+            try arena_alloc.dupe(u8, "hyperv"),
+        };
+
+        const original = ResolveResult{
+            .digest = .{ .algorithm = .sha256, .hex = digest_hex },
+            .media_type = .docker_manifest_v2,
+            .platform = Platform{
+                .os = try arena_alloc.dupe(u8, "windows"),
+                .architecture = try arena_alloc.dupe(u8, "amd64"),
+                .variant = try arena_alloc.dupe(u8, "v1"),
+                .os_version = try arena_alloc.dupe(u8, "10.0.20348.2402"),
+                .os_features = &features,
+            },
+            .reference = Reference{
+                .registry = try arena_alloc.dupe(u8, "mcr.microsoft.com"),
+                .repository = try arena_alloc.dupe(u8, "windows/nanoserver"),
+                .tag = try arena_alloc.dupe(u8, "ltsc2022"),
+                .digest = .{ .algorithm = .sha256, .hex = digest_hex },
+                .digest_raw = digest_raw,
+            },
+        };
+
+        cloned = try original.clone(std.testing.allocator);
+    }
+    defer cloned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(u8, "9" ** 64, cloned.digest.hex);
+    try std.testing.expectEqualSlices(u8, "mcr.microsoft.com", cloned.reference.registry);
+    try std.testing.expectEqualSlices(u8, "windows/nanoserver", cloned.reference.repository);
+    try std.testing.expectEqualSlices(u8, "ltsc2022", cloned.reference.tag.?);
+    try std.testing.expectEqualSlices(u8, "sha256:" ++ "9" ** 64, cloned.reference.digest_raw.?);
+    try std.testing.expect(cloned.reference.digest != null);
+    try std.testing.expectEqualSlices(u8, cloned.digest.hex, cloned.reference.digest.?.hex);
+    try std.testing.expectEqualSlices(u8, "windows", cloned.platform.?.os);
+    try std.testing.expectEqualSlices(u8, "10.0.20348.2402", cloned.platform.?.os_version.?);
+    try std.testing.expectEqual(@as(usize, 2), cloned.platform.?.os_features.?.len);
+}
