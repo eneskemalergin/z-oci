@@ -1,4 +1,4 @@
-//! Client configuration skeleton.
+//! Resolver configuration skeleton.
 //!
 //! Config holds all settings the resolver needs: credentials, timeouts, and
 //! TLS options. All fields have defaults. A bare Config{} works for anonymous
@@ -38,7 +38,7 @@ pub const CredentialProvider = struct {
     }
 };
 
-/// Client configuration. All fields are optional with safe defaults.
+/// Resolver configuration. All fields are optional with safe defaults.
 /// A bare Config{} compiles and works for anonymous public registry access.
 pub const Config = struct {
     /// Credential provider for authenticated registries. Null means anonymous.
@@ -56,7 +56,7 @@ pub const Config = struct {
     /// Path to a CA bundle file for TLS verification. Null uses the system bundle.
     ca_bundle_path: ?[]const u8 = null,
 
-    /// When true, the client tracks and honors Retry-After headers from the registry.
+    /// When true, the resolver tracks and honors Retry-After headers from the registry.
     rate_limit_enabled: bool = true,
 };
 

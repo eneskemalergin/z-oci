@@ -1,9 +1,9 @@
-//! z-oci: Pure Zig OCI/Docker Registry API v2 client.
+//! z-oci: Pure Zig OCI/Docker Registry API v2 toolkit.
 //!
 //! Current scope:
 //! - offline OCI/Docker reference parsing and normalization
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
-//! - public resolver API stubs and ownership contracts ahead of Phase 2 HTTP work
+//! - public resolver-surface stubs and ownership contracts ahead of Phase 2 HTTP work
 //!
 //! Not yet implemented:
 //! - registry HTTP transport
@@ -114,6 +114,7 @@ test {
     _ = @import("ResolveError.zig");
     _ = @import("ResolveResult.zig");
     _ = @import("Config.zig");
+    _ = @import("test_support.zig");
 }
 
 test "public API stubs return NotYetImplemented" {

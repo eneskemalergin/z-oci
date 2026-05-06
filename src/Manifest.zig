@@ -69,6 +69,11 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
         }
     }
     if (!seen_schema_version or !seen_media_type or !seen_config or !seen_layers) return error.MissingField;
+    if (result.schema_version != 2) return error.UnexpectedToken;
+    switch (result.media_type) {
+        .oci_manifest_v1, .docker_manifest_v2 => {},
+        else => return error.UnexpectedToken,
+    }
     return result;
 }
 
@@ -290,16 +295,48 @@ test "Manifest JSON: annotations round-trip and deinit leak-free" {
     try std.testing.expect(reparsed.value.annotations != null);
 }
 
-test "Manifest JSON: parses upstream OCI manifest fixture with real config and layer media types" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        "fixtures/manifests/oci-image-manifest-spec-example.json",
-        std.testing.allocator,
-        .limited(16 * 1024),
-    );
-    defer std.testing.allocator.free(bytes);
+test "Manifest JSON: rejects schemaVersion other than 2" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 1,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        \\    "size": 64
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
 
-    const parsed = try json.parse(Manifest, std.testing.allocator, bytes);
+    try std.testing.expectError(error.UnexpectedToken, json.parse(Manifest, std.testing.allocator, json_bytes));
+}
+
+test "Manifest JSON: rejects index mediaType for manifest payloads" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:3434343434343434343434343434343434343434343434343434343434343434",
+        \\    "size": 64
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnexpectedToken, json.parse(Manifest, std.testing.allocator, json_bytes));
+}
+
+const test_support = @import("test_support.zig");
+
+test "Manifest JSON: parses upstream OCI manifest fixture with real config and layer media types" {
+    const parsed = try test_support.parseFixture(
+        Manifest,
+        "fixtures/manifests/oci-image-manifest-spec-example.json",
+        16 * 1024,
+    );
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
@@ -313,15 +350,11 @@ test "Manifest JSON: parses upstream OCI manifest fixture with real config and l
 }
 
 test "Manifest JSON: parses live busybox amd64 OCI manifest fixture" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try test_support.parseFixture(
+        Manifest,
         "fixtures/manifests/busybox-amd64-live-oci-manifest.json",
-        std.testing.allocator,
-        .limited(16 * 1024),
+        16 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try json.parse(Manifest, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
@@ -336,15 +369,11 @@ test "Manifest JSON: parses live busybox amd64 OCI manifest fixture" {
 }
 
 test "Manifest JSON: parses live Quay busybox amd64 Docker manifest fixture" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try test_support.parseFixture(
+        Manifest,
         "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json",
-        std.testing.allocator,
-        .limited(16 * 1024),
+        16 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try json.parse(Manifest, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);

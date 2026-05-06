@@ -66,6 +66,8 @@ pub const OciImageIndex = struct {
             }
         }
         if (!seen_schema_version or !seen_media_type or !seen_manifests) return error.MissingField;
+        if (result.schema_version != 2) return error.UnexpectedToken;
+        if (result.media_type != .oci_index_v1) return error.UnexpectedToken;
         return result;
     }
 
@@ -88,9 +90,9 @@ pub const OciImageIndex = struct {
 
 /// Docker Manifest List (application/vnd.docker.distribution.manifest.list.v2+json).
 pub const DockerManifestList = struct {
-    /// OCI spec field: schemaVersion. Always 2.
+    /// Docker schema 2 field: schemaVersion. Always 2.
     schema_version: u8,
-    /// OCI spec field: mediaType.
+    /// Docker schema 2 field: mediaType.
     media_type: MediaType,
     /// Docker spec field: manifests. One entry per platform.
     manifests: []const Descriptor,
@@ -132,6 +134,8 @@ pub const DockerManifestList = struct {
             }
         }
         if (!seen_schema_version or !seen_media_type or !seen_manifests) return error.MissingField;
+        if (result.schema_version != 2) return error.UnexpectedToken;
+        if (result.media_type != .docker_manifest_list_v2) return error.UnexpectedToken;
         return result;
     }
 
@@ -176,6 +180,7 @@ pub const MultiArchManifest = union(enum) {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 const Digest = @import("Digest.zig");
+const test_support = @import("test_support.zig");
 
 const TestDescriptor = struct {
     descriptor: Descriptor,
@@ -442,16 +447,60 @@ test "OciImageIndex JSON: annotations round-trip and deinit leak-free" {
     try std.testing.expect(reparsed.value.annotations != null);
 }
 
-test "OciImageIndex JSON: parses upstream OCI index fixture" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        "fixtures/indexes/oci-image-index-spec-example.json",
-        std.testing.allocator,
-        .limited(16 * 1024),
-    );
-    defer std.testing.allocator.free(bytes);
+test "OciImageIndex JSON: rejects schemaVersion other than 2" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 1,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": []
+        \\}
+    ;
 
-    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
+    try std.testing.expectError(error.UnexpectedToken, json.parse(OciImageIndex, std.testing.allocator, json_bytes));
+}
+
+test "OciImageIndex JSON: rejects docker manifest list mediaType" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+        \\  "manifests": []
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnexpectedToken, json.parse(OciImageIndex, std.testing.allocator, json_bytes));
+}
+
+test "DockerManifestList JSON: rejects schemaVersion other than 2" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 1,
+        \\  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+        \\  "manifests": []
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnexpectedToken, json.parse(DockerManifestList, std.testing.allocator, json_bytes));
+}
+
+test "DockerManifestList JSON: rejects OCI index mediaType" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": []
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnexpectedToken, json.parse(DockerManifestList, std.testing.allocator, json_bytes));
+}
+
+test "OciImageIndex JSON: parses upstream OCI index fixture" {
+    const parsed = try test_support.parseFixture(
+        OciImageIndex,
+        "fixtures/indexes/oci-image-index-spec-example.json",
+        16 * 1024,
+    );
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
@@ -467,15 +516,11 @@ test "OciImageIndex JSON: parses upstream OCI index fixture" {
 }
 
 test "DockerManifestList JSON: parses upstream Docker manifest list fixture" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try test_support.parseFixture(
+        DockerManifestList,
         "fixtures/indexes/docker-manifest-list-spec-example.json",
-        std.testing.allocator,
-        .limited(16 * 1024),
+        16 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try json.parse(DockerManifestList, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
@@ -490,15 +535,11 @@ test "DockerManifestList JSON: parses upstream Docker manifest list fixture" {
 }
 
 test "OciImageIndex JSON: parses live busybox OCI index fixture" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try test_support.parseFixture(
+        OciImageIndex,
         "fixtures/indexes/busybox-latest-live-oci-index.json",
-        std.testing.allocator,
-        .limited(32 * 1024),
+        32 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
@@ -514,15 +555,11 @@ test "OciImageIndex JSON: parses live busybox OCI index fixture" {
 }
 
 test "OciImageIndex JSON: live busybox fixture selects arm64 variant-bearing descriptor" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try test_support.parseFixture(
+        OciImageIndex,
         "fixtures/indexes/busybox-latest-live-oci-index.json",
-        std.testing.allocator,
-        .limited(32 * 1024),
+        32 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     const multi = MultiArchManifest{ .oci = parsed.value };
@@ -536,15 +573,11 @@ test "OciImageIndex JSON: live busybox fixture selects arm64 variant-bearing des
 }
 
 test "OciImageIndex JSON: live busybox fixture returns null when no platform matches" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try test_support.parseFixture(
+        OciImageIndex,
         "fixtures/indexes/busybox-latest-live-oci-index.json",
-        std.testing.allocator,
-        .limited(32 * 1024),
+        32 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     const multi = MultiArchManifest{ .oci = parsed.value };
@@ -552,15 +585,11 @@ test "OciImageIndex JSON: live busybox fixture returns null when no platform mat
 }
 
 test "DockerManifestList JSON: parses live Quay busybox manifest list fixture" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try test_support.parseFixture(
+        DockerManifestList,
         "fixtures/indexes/quay-prometheus-busybox-latest-live-docker-manifest-list.json",
-        std.testing.allocator,
-        .limited(16 * 1024),
+        16 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try json.parse(DockerManifestList, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
@@ -576,15 +605,11 @@ test "DockerManifestList JSON: parses live Quay busybox manifest list fixture" {
 }
 
 test "DockerManifestList JSON: live Quay fixture selects linux arm64 descriptor" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try test_support.parseFixture(
+        DockerManifestList,
         "fixtures/indexes/quay-prometheus-busybox-latest-live-docker-manifest-list.json",
-        std.testing.allocator,
-        .limited(16 * 1024),
+        16 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try json.parse(DockerManifestList, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     const multi = MultiArchManifest{ .docker = parsed.value };

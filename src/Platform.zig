@@ -2,7 +2,7 @@
 //!
 //! match() does partial matching. The filter only needs to specify what it cares about.
 //! Omitting variant accepts any variant (e.g. arm64 matches arm64/v8).
-//! os_version uses prefix matching for Windows builds.
+//! os_version uses dot-segment prefix matching for Windows builds.
 //!
 //! eql() is strict. Every field must match exactly.
 
@@ -21,7 +21,8 @@ const Platform = @This();
 /// Rules:
 ///   - os and architecture: case-insensitive exact match (required).
 ///   - variant: if filter specifies one, candidate must match. Omitting accepts any.
-///   - os_version: prefix match. filter "10.0" matches candidate "10.0.17763.1234".
+///   - os_version: dot-segment prefix match. filter "10.0" matches candidate "10.0.17763.1234"
+///     but not "10.01".
 ///   - os_features: not checked by match. Use eql for strict comparison.
 pub fn match(candidate: Platform, filter: Platform) bool {
     if (!std.ascii.eqlIgnoreCase(candidate.os, filter.os)) return false;
@@ -34,10 +35,15 @@ pub fn match(candidate: Platform, filter: Platform) bool {
 
     if (filter.os_version) |fv| {
         const cv = candidate.os_version orelse return false;
-        if (!std.mem.startsWith(u8, cv, fv)) return false;
+        if (!osVersionMatches(cv, fv)) return false;
     }
 
     return true;
+}
+
+fn osVersionMatches(candidate: []const u8, filter: []const u8) bool {
+    if (!std.mem.startsWith(u8, candidate, filter)) return false;
+    return candidate.len == filter.len or candidate[filter.len] == '.';
 }
 
 /// eql returns true only when every non-null field matches exactly (case-sensitive).
@@ -225,6 +231,12 @@ test "match: os_version prefix mismatch returns false" {
     try std.testing.expect(!match(candidate, filter));
 }
 
+test "match: os_version requires a dot-segment boundary" {
+    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.01" };
+    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
+    try std.testing.expect(!match(candidate, filter));
+}
+
 test "match: filter specifies os_version, candidate missing it returns false" {
     const candidate = Platform{ .os = "windows", .architecture = "amd64" };
     const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
@@ -330,10 +342,10 @@ test "match: empty os and architecture still compare deterministically" {
     try std.testing.expect(match(candidate, filter));
 }
 
-test "match: unicode os_version uses byte-prefix semantics" {
-    // os_version is byte-oriented. UTF-8 content must still respect prefix matching.
-    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0-βeta" };
-    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0-" };
+test "match: unicode os_version still uses byte semantics within dot boundaries" {
+    // os_version matching is still byte-oriented; only the boundary rule is stricter.
+    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.βeta" };
+    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
     try std.testing.expect(match(candidate, filter));
 }
 

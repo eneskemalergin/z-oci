@@ -19,6 +19,11 @@
 //!   2  auth failure
 //!   3  rate limited
 //!   4  network error
+//!
+//! Ownership model (Phase 6 target):
+//! - command-line args and short-lived parsing buffers should live in a per-run arena
+//! - any ResolveResult kept after that arena must be cloned into caller-owned memory
+//! - any std.json.Parsed(...) returned by library helpers must be deinitialized before exit
 
 // CLI is implemented in Phase 6. Stub keeps the build clean until then.
 pub fn main() void {}

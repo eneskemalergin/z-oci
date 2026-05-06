@@ -299,16 +299,14 @@ test "Descriptor JSON: optional fields round-trip and deinit leak-free" {
     try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", reparsed.value.artifact_type.?);
 }
 
-test "Descriptor JSON: parses upstream OCI descriptor fixture" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
-        std.testing.allocator,
-        .limited(16 * 1024),
-    );
-    defer std.testing.allocator.free(bytes);
+const test_support = @import("test_support.zig");
 
-    const parsed = try json.parse(Descriptor, std.testing.allocator, bytes);
+test "Descriptor JSON: parses upstream OCI descriptor fixture" {
+    const parsed = try test_support.parseFixture(
+        Descriptor,
+        "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
+        16 * 1024,
+    );
     defer parsed.deinit();
 
     try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);

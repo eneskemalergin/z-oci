@@ -1,3 +1,13 @@
+//! Inspect a manifest fixture and print a compact summary.
+//!
+//! Ownership notes:
+//! - The raw file bytes are temporary and are freed immediately after parsing.
+//! - z_oci.json.parse returns std.json.Parsed(Manifest), which owns its own
+//!   arena-backed strings and must be deinitialized explicitly.
+//! - This example uses `init.gpa` for the parse arena because it keeps the
+//!   parsed value alive across the reporting loop, then tears it down with
+//!   `parsed.deinit()` before exit.
+
 const std = @import("std");
 const Io = std.Io;
 const z_oci = @import("z_oci");
@@ -34,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
     const bytes = try Io.Dir.cwd().readFileAlloc(init.io, manifest_path, init.gpa, .limited(32 * 1024));
     defer init.gpa.free(bytes);
 
+    // Parsed(Manifest) is self-contained, so freeing bytes after parse is safe.
     const parsed = try z_oci.json.parse(z_oci.Manifest, init.gpa, bytes);
     defer parsed.deinit();
 

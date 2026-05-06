@@ -7,7 +7,8 @@
 //! Everything else is treated as a Docker Hub path, and single-component
 //! names get "library/" prepended.
 //!
-//! docker.io and index.docker.io are normalized to registry-1.docker.io.
+//! docker.io, index.docker.io, and case variants of registry-1.docker.io are
+//! normalized to registry-1.docker.io.
 //!
 //! When neither tag nor digest is present, tag defaults to "latest".
 //! When both tag and digest are present, digest wins for refString().
@@ -21,7 +22,7 @@ const std = @import("std");
 const Digest = @import("Digest.zig");
 
 const docker_hub_registry = "registry-1.docker.io";
-const docker_hub_aliases = [_][]const u8{ "docker.io", "index.docker.io" };
+const docker_hub_aliases = [_][]const u8{ "docker.io", "index.docker.io", docker_hub_registry };
 
 /// Owned registry hostname.
 registry: []const u8,
@@ -108,11 +109,12 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     }
 
     if (repo_str.len == 0) return error.InvalidReference;
+    try validateRepositoryPath(repo_str);
 
     // Step 4: Docker Hub single-component names get "library/" prefix.
     // "ubuntu" becomes "library/ubuntu"; "myorg/ubuntu" stays as-is.
     const needs_library_prefix =
-        std.mem.eql(u8, registry_str, docker_hub_registry) and
+        std.ascii.eqlIgnoreCase(registry_str, docker_hub_registry) and
         std.mem.indexOfScalar(u8, repo_str, '/') == null;
 
     // Step 5: default tag "latest" when no tag and no digest.
@@ -181,6 +183,35 @@ fn looksLikeRegistry(segment: []const u8) bool {
         return true;
     }
     return false;
+}
+
+fn validateRepositoryPath(repository: []const u8) ParseError!void {
+    var start: usize = 0;
+    while (start < repository.len) {
+        const end = std.mem.indexOfScalarPos(u8, repository, start, '/') orelse repository.len;
+        const segment = repository[start..end];
+        if (!isValidRepositoryComponent(segment)) return error.InvalidReference;
+        start = end + 1;
+    }
+}
+
+fn isValidRepositoryComponent(segment: []const u8) bool {
+    if (segment.len == 0) return false;
+    if (!isRepositoryAlphaNum(segment[0])) return false;
+    if (!isRepositoryAlphaNum(segment[segment.len - 1])) return false;
+
+    for (segment) |c| {
+        switch (c) {
+            'a'...'z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        }
+    }
+
+    return true;
+}
+
+fn isRepositoryAlphaNum(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -322,6 +353,14 @@ test "parse: docker.io alias normalization is case-insensitive" {
     try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
 }
 
+test "parse: canonical docker hub hostname is normalized case-insensitively" {
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "REGISTRY-1.DOCKER.IO/ubuntu:latest");
+    defer ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
+    try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
+}
+
 // parse: digest and tag together ----------------------------------------------
 
 test "parse: tag and digest together, both fields are set" {
@@ -353,37 +392,49 @@ test "parse: digest only (no tag), refString returns the digest string" {
 
 // parse: error cases ----------------------------------------------------------
 
-test "parse: empty input returns error.Empty" {
+test "parse: rejects empty input with error.Empty" {
     try std.testing.expectError(error.Empty, parse(std.testing.allocator, ""));
 }
 
-test "parse: space in input returns error.InvalidReference" {
+test "parse: rejects space in input with error.InvalidReference" {
     try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu 22.04"));
 }
 
-test "parse: tab character in input returns error.InvalidReference" {
+test "parse: rejects tab character in input with error.InvalidReference" {
     // Guards against only checking space (0x20) and missing other control chars.
     try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu\t22.04"));
 }
 
-test "parse: newline in input returns error.InvalidReference" {
+test "parse: rejects newline in input with error.InvalidReference" {
     try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu\n22.04"));
 }
 
-test "parse: leading @ returns error.InvalidReference" {
+test "parse: rejects leading @ with error.InvalidReference" {
     try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "@sha256:" ++ "a" ** 64));
 }
 
-test "parse: invalid digest format returns error.InvalidDigest" {
+test "parse: rejects invalid digest format with error.InvalidDigest" {
     try std.testing.expectError(error.InvalidDigest, parse(std.testing.allocator, "ubuntu@notadigest"));
 }
 
-test "parse: trailing colon returns error.InvalidReference" {
+test "parse: rejects trailing colon with error.InvalidReference" {
     try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu:"));
 }
 
-test "parse: trailing slash returns error.InvalidReference" {
+test "parse: rejects trailing slash with error.InvalidReference" {
     try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "myorg/"));
+}
+
+test "parse: rejects uppercase repository component with error.InvalidReference" {
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ghcr.io/Owner/repo:latest"));
+}
+
+test "parse: rejects empty repository path segment with error.InvalidReference" {
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ghcr.io/owner//repo:latest"));
+}
+
+test "parse: rejects repository component with colon with error.InvalidReference" {
+    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ghcr.io/owner:team/repo:latest"));
 }
 
 // repositoryPath and refString ------------------------------------------------
@@ -521,6 +572,46 @@ test "parse and deinit: tag+digest ref frees all three string allocations" {
     const hex = "e" ** 64;
     var ref = try parse(alloc, "ghcr.io/owner/repo:v1@sha256:" ++ hex);
     ref.deinit(alloc);
+}
+
+test "parse: allocation failures do not leak partially constructed references" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, input: []const u8) !void {
+            var ref = try parse(allocator, input);
+            defer ref.deinit(allocator);
+
+            try std.testing.expectEqualSlices(u8, "ghcr.io", ref.registry);
+            try std.testing.expectEqualSlices(u8, "owner/repo", ref.repository);
+            try std.testing.expectEqualSlices(u8, "v1", ref.tag.?);
+            try std.testing.expect(ref.digest != null);
+        }
+    }.run, .{"ghcr.io/owner/repo:v1@sha256:" ++ "f" ** 64});
+}
+
+test "parse: mixed success and failure cases leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const valid_inputs = [_][]const u8{
+        "ubuntu:22.04",
+        "ghcr.io/owner/repo:v1@sha256:" ++ "a" ** 64,
+        "REGISTRY-1.DOCKER.IO/ubuntu:latest",
+    };
+    const invalid_cases = [_]struct { []const u8, ParseError }{
+        .{ "ghcr.io/Owner/repo@sha256:" ++ "b" ** 64, error.InvalidReference },
+        .{ "ghcr.io/owner/repo@notadigest", error.InvalidDigest },
+        .{ "ghcr.io/owner//repo:latest", error.InvalidReference },
+    };
+
+    for (valid_inputs) |input| {
+        var ref = try parse(alloc, input);
+        ref.deinit(alloc);
+    }
+
+    for (invalid_cases) |case| {
+        try std.testing.expectError(case[1], parse(alloc, case[0]));
+    }
 }
 
 test "parse: 10000 pseudo-random inputs never panic and only return declared outcomes" {

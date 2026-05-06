@@ -1,4 +1,4 @@
-//! Error type for OCI registry operations.
+//! Error type for OCI registry resolution operations.
 //!
 //! Each variant carries context: the registry hostname and the full reference
 //! string. http_status is set when the server returned an HTTP response code.
@@ -25,7 +25,7 @@ pub const NotFound = struct {
     http_status: ?u16 = null,
 };
 
-/// The client hit a rate limit imposed by the registry.
+/// The resolution attempt hit a rate limit imposed by the registry.
 pub const RateLimited = struct {
     registry: []const u8,
     reference: []const u8,
@@ -60,7 +60,7 @@ pub const NetworkError = struct {
     http_status: ?u16 = null,
 };
 
-/// The digest algorithm in the response is not supported by this client.
+/// The digest algorithm in the response is not supported by the resolver.
 pub const UnsupportedAlgorithm = struct {
     registry: []const u8,
     reference: []const u8,

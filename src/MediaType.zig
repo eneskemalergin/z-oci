@@ -1,6 +1,6 @@
 //! OCI and Docker media types for manifest negotiation.
 //!
-//! Covers all types the client needs to request and handle.
+//! Covers all types the resolver needs to recognize and, later, negotiate.
 //! Unknown content-types return null from fromString. The caller decides how to react.
 //! Legacy v1 signed manifests are recognized and flagged for rejection.
 
@@ -21,7 +21,7 @@ pub const MediaType = enum {
     docker_container_image_v1,
     docker_layer_gzip,
     docker_layer_foreign_gzip,
-    /// Legacy schema 1. Recognized so the client can reject it cleanly.
+    /// Legacy schema 1. Recognized so the resolver can reject it cleanly.
     docker_manifest_v1_signed,
 
     const mime_table = [_]struct { []const u8, MediaType }{
@@ -79,7 +79,7 @@ pub const MediaType = enum {
         };
     }
 
-    /// True for the legacy v1 signed manifest. The client rejects these on receipt.
+    /// True for the legacy v1 signed manifest. The resolver rejects these on receipt.
     pub fn isLegacy(self: MediaType) bool {
         return self == .docker_manifest_v1_signed;
     }

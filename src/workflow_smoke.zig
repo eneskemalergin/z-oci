@@ -1,16 +1,19 @@
+//! Small offline workflow smoke matrix.
+//!
+//! These tests sit above the owning unit tests and below any future integration
+//! layer. They exercise the current toolkit the way a real user would: parse a
+//! fixture, derive a reference URL component, select a platform, and keep a
+//! cloned result alive past arena teardown.
+
 const std = @import("std");
 const z_oci = @import("z_oci");
 
 test "workflow smoke: parse manifest fixture, stringify, and reparse" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try parseWorkflowFixture(
+        z_oci.Manifest,
         "fixtures/manifests/busybox-amd64-live-oci-manifest.json",
-        std.testing.allocator,
-        .limited(32 * 1024),
+        32 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try z_oci.json.parse(z_oci.Manifest, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -55,15 +58,11 @@ test "workflow smoke: parse image reference and derive repository path and ref s
 }
 
 test "workflow smoke: parse index fixture, select platform, and assert descriptor digest" {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+    const parsed = try parseWorkflowFixture(
+        z_oci.OciImageIndex,
         "fixtures/indexes/busybox-latest-live-oci-index.json",
-        std.testing.allocator,
-        .limited(32 * 1024),
+        32 * 1024,
     );
-    defer std.testing.allocator.free(bytes);
-
-    const parsed = try z_oci.json.parse(z_oci.OciImageIndex, std.testing.allocator, bytes);
     defer parsed.deinit();
 
     const multi = z_oci.MultiArchManifest{ .oci = parsed.value };
@@ -110,4 +109,19 @@ test "workflow smoke: ResolveResult clone survives arena teardown" {
     try std.testing.expectEqualSlices(u8, "linux", cloned.platform.?.os);
     try std.testing.expectEqualSlices(u8, "arm64", cloned.platform.?.architecture);
     try std.testing.expectEqualSlices(u8, "v8", cloned.platform.?.variant.?);
+}
+
+// Kept local on purpose: workflow_smoke builds as its own root module under
+// `zig build test`, so importing test_support.zig here would make that file
+// belong to two modules at once.
+fn parseWorkflowFixture(comptime T: type, path: []const u8, max_bytes: usize) !std.json.Parsed(T) {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .limited(max_bytes),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    return z_oci.json.parse(T, std.testing.allocator, bytes);
 }

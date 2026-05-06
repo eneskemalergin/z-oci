@@ -1,3 +1,11 @@
+//! Normalize an image reference using arena-scoped temporary allocations.
+//!
+//! Ownership notes:
+//! - argv is materialized into `init.arena`, so `args` and the parsed Reference
+//!   live for the duration of main without manual deinit.
+//! - Reference.parse allocates owned fields, but here they are intentionally
+//!   tied to the process arena because the example only prints and exits.
+
 const std = @import("std");
 const Io = std.Io;
 const z_oci = @import("z_oci");
@@ -29,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
+    // The parsed reference borrows from arena-owned allocations for this short-lived CLI.
     const reference = try z_oci.Reference.parse(arena, args[1]);
 
     try stdout.print("registry: {s}\n", .{reference.registry});

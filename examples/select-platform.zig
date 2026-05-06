@@ -1,3 +1,13 @@
+//! Select one platform descriptor from an OCI index or Docker manifest list.
+//!
+//! Ownership notes:
+//! - CLI args come from `init.arena` and are treated as borrowed configuration
+//!   inputs for the duration of main.
+//! - The raw JSON buffer is temporary and freed after parsing.
+//! - Each parsed index/list is a std.json.Parsed(T); its arena owns all string
+//!   slices exposed through descriptors(), so the selected Descriptor must not
+//!   outlive the surrounding `parsed` value.
+
 const std = @import("std");
 const Io = std.Io;
 const z_oci = @import("z_oci");
@@ -67,6 +77,7 @@ pub fn main(init: std.process.Init) !void {
     if (z_oci.json.parse(z_oci.OciImageIndex, init.gpa, bytes)) |parsed| {
         defer parsed.deinit();
         const multi = z_oci.MultiArchManifest{ .oci = parsed.value };
+        // `selected` borrows from `parsed`, so it is only used within this scope.
         const selected = multi.filterByPlatform(filter) orelse {
             try printNoMatch(stderr, parsed.value.media_type.toString(), multi.descriptors(), filter);
             return error.NoMatchingPlatform;
@@ -76,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
         const parsed = try z_oci.json.parse(z_oci.DockerManifestList, init.gpa, bytes);
         defer parsed.deinit();
         const multi = z_oci.MultiArchManifest{ .docker = parsed.value };
+        // `selected` borrows from `parsed`, so it is only used within this scope.
         const selected = multi.filterByPlatform(filter) orelse {
             try printNoMatch(stderr, parsed.value.media_type.toString(), multi.descriptors(), filter);
             return error.NoMatchingPlatform;

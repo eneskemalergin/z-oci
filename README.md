@@ -164,17 +164,19 @@ Public roadmap summary:
 | v0.0.5 | done | Public-surface tightening, docs cleanup, ownership notes, and test colocation |
 | v0.0.6 | done | Real OCI/Docker fixtures, offline examples, and fixture-backed smoke coverage |
 | v0.0.7 | done | Explicit offline workflow contract, workflow smoke matrix, and release-readiness docs pass |
+| v0.1.0 | next | Release hardening: quality audit, leak checks, artifact review, binary-size investigation, and docs health |
 | Phase 2 | planned | Registry HTTP transport, auth flows, and real resolver behavior |
 
 **Later phases**
 
 | Version | Description |
 | ------- | ----------- |
-| v0.1.0 | Auth engine: Bearer token flow, credential helpers |
-| v0.2.0 | Manifest resolution: HEAD/GET, multi-arch, nested index |
-| v0.3.0 | Rate limiting: backoff, batch API, session cache |
-| v0.4.0 | Testing: mock server, local registry, CI |
-| v0.5.0 | CLI: `z-oci resolve`, `validate`, `inspect` |
+| v0.1.0 | Public offline release: quality audit, leak checks, artifact review, binary-size investigation, and docs health |
+| v0.2.0 | Auth engine: Bearer token flow, credential helpers |
+| v0.3.0 | Manifest resolution: HEAD/GET, multi-arch, nested index |
+| v0.4.0 | Rate limiting: backoff, batch API, session cache |
+| v0.5.0 | Testing: mock server, local registry, CI |
+| v0.6.0 | CLI: `z-oci resolve`, `validate`, `inspect` |
 | v1.0.0 | Package release: Zig package index, API docs |
 
 ## References
