@@ -113,9 +113,19 @@ pub fn main() !void {
 | ------- | ------------ |
 | `zig build` | Compile the library |
 | `zig build test` | Run all unit tests |
+| `zig build examples` | Build all offline example programs |
+| `zig build examples-smoke` | Run a small smoke pass over the offline example programs |
 | `zig build run` | Run the CLI (once implemented) |
 
 Live registry fixtures under `fixtures/` are intentional snapshots, not always-current network fetches. `zig build test` validates them in CI because they stay fast; when refreshing them, recapture from the exact URLs and `Accept` headers recorded in `fixtures/SOURCES.md`.
+
+## Offline examples
+
+The current offline example programs are small usage paths over the shipped parser and fixture surface:
+
+- `zig build example-normalize-reference -- ubuntu:22.04`
+- `zig build example-inspect-manifest`
+- `zig build example-select-platform`
 
 ## Roadmap
 
