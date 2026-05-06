@@ -388,6 +388,85 @@ test "parse: trailing slash returns error.InvalidReference" {
 
 // repositoryPath and refString ------------------------------------------------
 
+const ReferenceCorpusCase = struct {
+    input: []const u8,
+    registry: []const u8,
+    repository: []const u8,
+    repository_path: []const u8,
+    ref_string: []const u8,
+};
+
+test "real-world corpus: common registry references normalize to expected repositoryPath and refString values" {
+    const cases = [_]ReferenceCorpusCase{
+        .{
+            .input = "ubuntu",
+            .registry = "registry-1.docker.io",
+            .repository = "library/ubuntu",
+            .repository_path = "library/ubuntu",
+            .ref_string = "latest",
+        },
+        .{
+            .input = "docker.io/library/busybox:latest",
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .repository_path = "library/busybox",
+            .ref_string = "latest",
+        },
+        .{
+            .input = "ghcr.io/opencontainers/distribution-spec:v1.1.0",
+            .registry = "ghcr.io",
+            .repository = "opencontainers/distribution-spec",
+            .repository_path = "opencontainers/distribution-spec",
+            .ref_string = "v1.1.0",
+        },
+        .{
+            .input = "quay.io/prometheus/busybox:latest",
+            .registry = "quay.io",
+            .repository = "prometheus/busybox",
+            .repository_path = "prometheus/busybox",
+            .ref_string = "latest",
+        },
+        .{
+            .input = "mcr.microsoft.com/dotnet/runtime:8.0",
+            .registry = "mcr.microsoft.com",
+            .repository = "dotnet/runtime",
+            .repository_path = "dotnet/runtime",
+            .ref_string = "8.0",
+        },
+        .{
+            .input = "registry.k8s.io/pause:3.10",
+            .registry = "registry.k8s.io",
+            .repository = "pause",
+            .repository_path = "pause",
+            .ref_string = "3.10",
+        },
+        .{
+            .input = "localhost:5001/team/api:dev",
+            .registry = "localhost:5001",
+            .repository = "team/api",
+            .repository_path = "team/api",
+            .ref_string = "dev",
+        },
+        .{
+            .input = "registry-1.docker.io/library/busybox@sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .repository_path = "library/busybox",
+            .ref_string = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+        },
+    };
+
+    for (cases) |case| {
+        var ref = try parse(std.testing.allocator, case.input);
+        defer ref.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualSlices(u8, case.registry, ref.registry);
+        try std.testing.expectEqualSlices(u8, case.repository, ref.repository);
+        try std.testing.expectEqualSlices(u8, case.repository_path, ref.repositoryPath());
+        try std.testing.expectEqualSlices(u8, case.ref_string, ref.refString());
+    }
+}
+
 test "repositoryPath: returns the repository field" {
     const alloc = std.testing.allocator;
     var ref = try parse(alloc, "ghcr.io/owner/repo:v1.0");
