@@ -11,12 +11,32 @@ Nothing yet.
 
 ---
 
+## [0.1.0] - 2026-05-05
+
+### Changed
+
+- Release-facing docs, package metadata, examples, and plan notes now consistently describe `z-oci` as a public offline toolkit release rather than a pre-release milestone snapshot.
+- `build.zig.zon` now packages `examples/`, `fixtures/`, and `assets/` alongside `src/` so the documented offline examples, fixture-backed tests, and README asset references remain valid for package consumers.
+- The JSON-heavy tests in `Descriptor.zig`, `Manifest.zig`, and `Index.zig` now use clearer names that distinguish parse-only coverage from real stringify/reparse coverage.
+
+### Fixed
+
+- Bounded JSON reads in examples, workflow smoke, and shared fixture helpers no longer allocate temporary whole-file buffers on the heap.
+- The Docker Hub `library/` prefix path in `Reference.parse` no longer goes through `std.fmt.allocPrint`, avoiding unnecessary formatter overhead on a hot normalization path.
+- A partial-construction cleanup bug in `ResolveResult.clone` that leaked optional platform fields on later allocation failure has been fixed and covered by allocation-failure tests.
+
+### Verified
+
+- `zig build test --summary all` passes with unit tests, workflow smoke coverage, and example smoke coverage.
+- `zig build -Doptimize=ReleaseSmall` passes.
+- Artifact-size measurements were recorded for the stub CLI, example binaries, and root test binary in Debug and `ReleaseSmall` modes.
+
 ## [0.0.7] - 2026-05-05
 
 ### Added
 
 - `src/workflow_smoke.zig` now defines a small offline workflow smoke matrix covering:
-    - manifest fixture parse -> stringify -> reparse
+    - manifest fixture parse -> stringify summary fields
     - reference parse -> `repositoryPath()` and `refString()`
     - index fixture parse -> platform selection -> descriptor digest assertion
     - `ResolveResult.clone()` surviving arena teardown

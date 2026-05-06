@@ -10,11 +10,8 @@
 </p>
 
 <p align="center">
-  <!-- <a href="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml">
-    <img src="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
-  </a> -->
-  <img src="https://img.shields.io/badge/version-0.0.7-8B5CF6?style=flat-square" alt="v0.0.7">
-  <img src="https://img.shields.io/badge/status-early%20development-E57C23?style=flat-square" alt="Status: early development">
+  <img src="https://img.shields.io/badge/version-0.1.0-8B5CF6?style=flat-square" alt="v0.1.0">
+  <img src="https://img.shields.io/badge/status-public%20offline%20release-2D7D46?style=flat-square" alt="Status: public offline release">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -22,7 +19,7 @@
 
 ---
 
-**What ships in v0.0.7:**
+**What ships in v0.1.0:**
 
 - `Digest`, `MediaType`, and `Platform`: leaf types with parser, matching, and formatting behavior
 - `Reference`: full Docker/OCI reference parser with owned-lifetime semantics
@@ -45,7 +42,7 @@
 
 ## Supported Offline Workflows
 
-`v0.0.7` treats the current library as an offline toolkit, not a partial network client. The supported workflows are intentionally narrow:
+`v0.1.0` treats the current library as an offline toolkit, not a partial network client. The supported workflows are intentionally narrow:
 
 - reference normalization and decomposition through `Reference.parse`, `repositoryPath()`, and `refString()`
 - digest parsing and syntactic validation through `Digest.parse` and digest-pinned references
@@ -134,7 +131,7 @@ pub fn main() !void {
 
 | Command | What it does |
 | ------- | ------------ |
-| `zig build` | Compile the library |
+| `zig build` | Build and install the current stub CLI plus the package module |
 | `zig build test` | Run all unit tests |
 | `zig build examples` | Build all offline example programs |
 | `zig build examples-smoke` | Run a small smoke pass over the offline example programs |
@@ -142,6 +139,18 @@ pub fn main() !void {
 | `zig build run` | Run the CLI (once implemented) |
 
 Live registry fixtures under `fixtures/` are intentional snapshots, not always-current network fetches. `zig build test` validates them in CI because they stay fast; when refreshing them, recapture from the exact URLs and `Accept` headers recorded in `fixtures/SOURCES.md`.
+
+The published Zig package includes `src/`, `examples/`, `fixtures/`, `assets/`, `README.md`, `CHANGELOG.md`, and the build files so the documented offline examples and fixture-backed tests remain usable from the packaged release.
+
+## Included test types
+
+The current release gate covers the codebase from a few complementary angles:
+
+- unit tests colocated with the owning modules
+- fixture-backed JSON and parser tests against checked-in OCI/Docker payloads
+- deterministic fuzz-style parser and JSON smoke tests
+- allocator, leak, and allocation-failure tests on owned-lifetime paths
+- example smoke coverage and workflow smoke coverage for offline usage paths
 
 ## Offline examples
 
@@ -164,14 +173,14 @@ Public roadmap summary:
 | v0.0.5 | done | Public-surface tightening, docs cleanup, ownership notes, and test colocation |
 | v0.0.6 | done | Real OCI/Docker fixtures, offline examples, and fixture-backed smoke coverage |
 | v0.0.7 | done | Explicit offline workflow contract, workflow smoke matrix, and release-readiness docs pass |
-| v0.1.0 | next | Release hardening: quality audit, leak checks, artifact review, binary-size investigation, and docs health |
+| v0.1.0 | done | Public offline release: hardening audit, allocator checks, artifact review, package review, and docs alignment |
 | Phase 2 | planned | Registry HTTP transport, auth flows, and real resolver behavior |
 
 **Later phases**
 
 | Version | Description |
 | ------- | ----------- |
-| v0.1.0 | Public offline release: quality audit, leak checks, artifact review, binary-size investigation, and docs health |
+| v0.1.0 | Public offline release: quality audit, leak checks, artifact review, binary-size investigation, package review, and docs health |
 | v0.2.0 | Auth engine: Bearer token flow, credential helpers |
 | v0.3.0 | Manifest resolution: HEAD/GET, multi-arch, nested index |
 | v0.4.0 | Rate limiting: backoff, batch API, session cache |
