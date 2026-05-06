@@ -81,12 +81,14 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
 
         if (p.variant) |v| {
             plat_variant = try allocator.dupe(u8, v);
-            errdefer if (plat_variant) |s| allocator.free(s);
         }
+        errdefer if (plat_variant) |s| allocator.free(s);
+
         if (p.os_version) |v| {
             plat_os_version = try allocator.dupe(u8, v);
-            errdefer if (plat_os_version) |s| allocator.free(s);
         }
+        errdefer if (plat_os_version) |s| allocator.free(s);
+
         if (p.os_features) |features| {
             // Clone the outer slice, then clone each inner string.
             const outer = try allocator.alloc([]const u8, features.len);

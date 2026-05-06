@@ -14,15 +14,24 @@ const Descriptor = @import("Descriptor.zig");
 ///
 /// The caller owns the returned Parsed(T) arena and must call .deinit().
 pub fn parseFixture(comptime T: type, path: []const u8, max_bytes: usize) !std.json.Parsed(T) {
+    return parseFixtureWithAllocator(T, std.testing.allocator, path, max_bytes);
+}
+
+fn parseFixtureWithAllocator(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) !std.json.Parsed(T) {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
         path,
-        std.testing.allocator,
+        allocator,
         .limited(max_bytes),
     );
-    defer std.testing.allocator.free(bytes);
+    defer allocator.free(bytes);
 
-    return json.parse(T, std.testing.allocator, bytes);
+    return json.parse(T, allocator, bytes);
 }
 
 test "test_support: parseFixture result survives helper buffer teardown" {
@@ -47,6 +56,32 @@ test "test_support: parseFixture enforces the max-bytes limit" {
         error.StreamTooLong,
         parseFixture(
             Descriptor,
+            "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
+            32,
+        ),
+    );
+}
+
+test "test_support: fixture helper success and failure paths leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    for (0..8) |_| {
+        const parsed = try parseFixtureWithAllocator(
+            Descriptor,
+            allocator,
+            "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
+            16 * 1024,
+        );
+        parsed.deinit();
+    }
+
+    try std.testing.expectError(
+        error.StreamTooLong,
+        parseFixtureWithAllocator(
+            Descriptor,
+            allocator,
             "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
             32,
         ),

@@ -87,6 +87,91 @@ test "json: Parsed(T) does not borrow from input bytes" {
     try std.testing.expectEqualSlices(u8, "e" ** 64, parsed.value.digest.hex);
 }
 
+test "json: allocation failures do not leak partially parsed arena state" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 7023
+        \\  },
+        \\  "layers": [
+        \\    {
+        \\      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\      "size": 32654
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            const parsed = try parse(Manifest, allocator, bytes);
+            defer parsed.deinit();
+
+            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
+            try std.testing.expectEqualSlices(u8, "b" ** 64, parsed.value.layers[0].digest.hex);
+        }
+    }.run, .{json_bytes});
+}
+
+test "json: repeated success and parse failures leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const valid_manifest =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 17
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+    const invalid_cases = [_]struct { []const u8, anyerror }{
+        .{
+            \\{
+            \\  "schemaVersion": 2,
+            \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            \\  "layers": []
+            \\}
+            ,
+            error.MissingField,
+        },
+        .{
+            \\{
+            \\  "schemaVersion": 2,
+            \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            \\  "config": {
+            \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+            \\    "digest": "not-a-digest",
+            \\    "size": 1
+            \\  },
+            \\  "layers": []
+            \\}
+            ,
+            error.UnexpectedToken,
+        },
+    };
+
+    for (0..16) |_| {
+        const parsed = try parse(Manifest, allocator, valid_manifest);
+        parsed.deinit();
+    }
+
+    for (invalid_cases) |case| {
+        try std.testing.expectError(case[1], parse(Manifest, allocator, case[0]));
+    }
+}
+
 // Error paths — missing required fields ---------------------------------------
 
 test "json: Descriptor missing required field returns error" {
