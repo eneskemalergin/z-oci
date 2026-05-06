@@ -11,6 +11,27 @@ Nothing yet.
 
 ---
 
+## [0.0.7] - 2026-05-05
+
+### Added
+
+- `src/workflow_smoke.zig` now defines a small offline workflow smoke matrix covering:
+    - manifest fixture parse -> stringify -> reparse
+    - reference parse -> `repositoryPath()` and `refString()`
+    - index fixture parse -> platform selection -> descriptor digest assertion
+    - `ResolveResult.clone()` surviving arena teardown
+- `build.zig` now exposes `zig build workflow-smoke` and includes that workflow-smoke layer in `zig build test`.
+
+### Changed
+
+- `README.md` now explicitly documents the supported offline workflows and adds a dedicated `What Phase 2 Adds` section.
+- Public roadmap and shipped-surface language now treat `v0.0.7` as the offline usefulness and release-readiness pass ahead of `v0.1.0`.
+
+### Verified
+
+- `zig build workflow-smoke --summary all` passes.
+- `zig build test --summary all` passes with unit tests, example smoke coverage, and the workflow smoke matrix.
+
 ## [0.0.6] - 2026-05-05
 
 ### Added

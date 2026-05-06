@@ -13,7 +13,7 @@
   <!-- <a href="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a> -->
-  <img src="https://img.shields.io/badge/version-0.0.6-8B5CF6?style=flat-square" alt="v0.0.6">
+  <img src="https://img.shields.io/badge/version-0.0.7-8B5CF6?style=flat-square" alt="v0.0.7">
   <img src="https://img.shields.io/badge/status-early%20development-E57C23?style=flat-square" alt="Status: early development">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
@@ -22,7 +22,7 @@
 
 ---
 
-**What ships in v0.0.6:**
+**What ships in v0.0.7:**
 
 - `Digest`, `MediaType`, and `Platform`: leaf types with parser, matching, and formatting behavior
 - `Reference`: full Docker/OCI reference parser with owned-lifetime semantics
@@ -33,6 +33,7 @@
 - `resolve`, `validate`, and `getManifest`: public API stubs with documented ownership contracts
 - real offline OCI/Docker fixture set with provenance in `fixtures/SOURCES.md`
 - three offline example programs plus `examples-smoke` build coverage
+- explicit offline workflow smoke matrix via `zig build workflow-smoke`
 
 **What works now:**
 
@@ -42,6 +43,16 @@
 - run small end-to-end offline workflows through checked-in examples and fixture-backed smoke coverage
 - exercise the intended resolver memory model without any network code
 
+## Supported Offline Workflows
+
+`v0.0.7` treats the current library as an offline toolkit, not a partial network client. The supported workflows are intentionally narrow:
+
+- reference normalization and decomposition through `Reference.parse`, `repositoryPath()`, and `refString()`
+- digest parsing and syntactic validation through `Digest.parse` and digest-pinned references
+- offline manifest and index inspection from checked-in OCI/Docker JSON fixtures
+- platform selection from parsed multi-arch indices and manifest lists
+- ownership-aware cloning of `ResolveResult` values that outlive a short-lived arena
+
 **What does not work yet:**
 
 - registry HTTP transport
@@ -49,6 +60,15 @@
 - real tag-to-digest resolution
 - manifest fetching from registries
 - batch resolve and caching behavior
+
+## What Phase 2 Adds
+
+Phase 2 starts when the public resolver stubs stop returning `error.NotYetImplemented`. That phase adds:
+
+- registry HTTP transport
+- auth and token exchange
+- real `resolve`, `validate`, and `getManifest` behavior
+- tag-to-digest resolution, manifest fetching, and transport-level retry or rate-limit handling
 
 ## Requirements
 
@@ -118,6 +138,7 @@ pub fn main() !void {
 | `zig build test` | Run all unit tests |
 | `zig build examples` | Build all offline example programs |
 | `zig build examples-smoke` | Run a small smoke pass over the offline example programs |
+| `zig build workflow-smoke` | Run the offline workflow smoke-test matrix |
 | `zig build run` | Run the CLI (once implemented) |
 
 Live registry fixtures under `fixtures/` are intentional snapshots, not always-current network fetches. `zig build test` validates them in CI because they stay fast; when refreshing them, recapture from the exact URLs and `Accept` headers recorded in `fixtures/SOURCES.md`.
@@ -142,7 +163,7 @@ Public roadmap summary:
 | v0.0.4 | done | Public function signatures, arena lifetime contract, fuzz tests |
 | v0.0.5 | done | Public-surface tightening, docs cleanup, ownership notes, and test colocation |
 | v0.0.6 | done | Real OCI/Docker fixtures, offline examples, and fixture-backed smoke coverage |
-| v0.0.7 | next | Polished offline workflows ahead of `v0.1.0` |
+| v0.0.7 | done | Explicit offline workflow contract, workflow smoke matrix, and release-readiness docs pass |
 | Phase 2 | planned | Registry HTTP transport, auth flows, and real resolver behavior |
 
 **Later phases**

@@ -39,9 +39,23 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const workflow_smoke_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/workflow_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "z_oci", .module = mod },
+        },
+    }) });
+    const run_workflow_smoke_tests = b.addRunArtifact(workflow_smoke_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_workflow_smoke_tests.step);
+
+    const workflow_smoke_step = b.step("workflow-smoke", "Run offline workflow smoke tests");
+    workflow_smoke_step.dependOn(&run_workflow_smoke_tests.step);
 
     // Offline example programs
     const normalize_reference_example = b.addExecutable(.{
