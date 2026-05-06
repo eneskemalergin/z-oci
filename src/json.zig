@@ -93,6 +93,45 @@ test "json: Descriptor round-trip with platform" {
     try std.testing.expectEqualSlices(u8, "v8", d.platform.?.variant.?);
 }
 
+test "json: Descriptor optional fields round-trip and deinit leak-free" {
+    // Arrange: exercise every optional JSON branch on Descriptor.
+    const json_bytes =
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        \\  "size": 512,
+        \\  "urls": ["https://example.com/blob"],
+        \\  "annotations": {
+        \\    "org.opencontainers.image.source": "https://github.com/example/repo"
+        \\  },
+        \\  "artifactType": "application/vnd.example.sbom.v1"
+        \\}
+    ;
+
+    // Act
+    const parsed = try parse(Descriptor, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(parsed.value);
+    const out = aw.written();
+
+    const reparsed = try parse(Descriptor, std.testing.allocator, out);
+    defer reparsed.deinit();
+
+    // Assert
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"urls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"artifactType\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.source") != null);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.value.urls.?.len);
+    try std.testing.expectEqualSlices(u8, "https://example.com/blob", reparsed.value.urls.?[0]);
+    try std.testing.expect(reparsed.value.annotations != null);
+    try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", reparsed.value.artifact_type.?);
+}
+
 // Manifest round-trip ---------------------------------------------------------
 
 test "json: Manifest round-trip" {
@@ -161,6 +200,43 @@ test "json: Manifest stringifies with camelCase field names" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"layers\"") != null);
 }
 
+test "json: Manifest annotations round-trip and deinit leak-free" {
+    // Arrange
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\    "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        \\    "size": 64
+        \\  },
+        \\  "layers": [],
+        \\  "annotations": {
+        \\    "org.opencontainers.image.ref.name": "stable"
+        \\  }
+        \\}
+    ;
+
+    // Act
+    const parsed = try parse(Manifest, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(parsed.value);
+    const out = aw.written();
+
+    const reparsed = try parse(Manifest, std.testing.allocator, out);
+    defer reparsed.deinit();
+
+    // Assert
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.ref.name") != null);
+    try std.testing.expect(reparsed.value.annotations != null);
+}
+
 // OciImageIndex round-trip ----------------------------------------------------
 
 test "json: OciImageIndex round-trip" {
@@ -217,6 +293,38 @@ test "json: DockerManifestList round-trip" {
     try std.testing.expectEqual(MediaType.docker_manifest_list_v2, lst.media_type);
     try std.testing.expectEqual(@as(usize, 1), lst.manifests.len);
     try std.testing.expectEqualSlices(u8, "arm64", lst.manifests[0].platform.?.architecture);
+}
+
+test "json: OciImageIndex annotations round-trip and deinit leak-free" {
+    // Arrange
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": [],
+        \\  "annotations": {
+        \\    "org.opencontainers.image.description": "multi-arch index"
+        \\  }
+        \\}
+    ;
+
+    // Act
+    const parsed = try parse(Index.OciImageIndex, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(parsed.value);
+    const out = aw.written();
+
+    const reparsed = try parse(Index.OciImageIndex, std.testing.allocator, out);
+    defer reparsed.deinit();
+
+    // Assert
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.description") != null);
+    try std.testing.expect(reparsed.value.annotations != null);
 }
 
 // Lifecycle test: Parsed(T).deinit frees all memory --------------------------
@@ -396,7 +504,31 @@ test "json: 10000 pseudo-random manifest payloads never panic" {
         const result = parse(Manifest, std.testing.allocator, buf[0..len]);
         if (result) |parsed| {
             var owned = parsed;
-            owned.deinit();
+            defer owned.deinit();
+
+            try std.testing.expect(owned.value.schema_version <= std.math.maxInt(u8));
+            try std.testing.expect(owned.value.media_type.toString().len > 0);
+            try std.testing.expectEqual(@as(usize, 64), owned.value.config.digest.hex.len);
+            for (owned.value.config.digest.hex) |c| switch (c) {
+                '0'...'9', 'a'...'f', 'A'...'F' => {},
+                else => return error.TestUnexpectedResult,
+            };
+            for (owned.value.layers) |layer| {
+                try std.testing.expect(layer.media_type.toString().len > 0);
+                try std.testing.expectEqual(@as(usize, 64), layer.digest.hex.len);
+            }
+
+            var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer aw.deinit();
+            var ws: std.json.Stringify = .{ .writer = &aw.writer };
+            try ws.write(owned.value);
+
+            const reparsed = try parse(Manifest, std.testing.allocator, aw.written());
+            defer reparsed.deinit();
+            try std.testing.expectEqual(owned.value.schema_version, reparsed.value.schema_version);
+            try std.testing.expectEqual(owned.value.media_type, reparsed.value.media_type);
+            try std.testing.expectEqualSlices(u8, owned.value.config.digest.hex, reparsed.value.config.digest.hex);
+            try std.testing.expectEqual(owned.value.layers.len, reparsed.value.layers.len);
         } else |_| {}
     }
 }

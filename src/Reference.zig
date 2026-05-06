@@ -459,8 +459,31 @@ test "parse: 10000 pseudo-random inputs never panic and only return declared out
         if (result) |ref| {
             var owned = ref;
             defer owned.deinit(std.testing.allocator);
+
             try std.testing.expect(owned.repository.len > 0);
-            try std.testing.expect(owned.refString().len > 0);
+            try std.testing.expect(owned.registry.len > 0);
+            try std.testing.expectEqualSlices(u8, owned.repository, owned.repositoryPath());
+            try std.testing.expect(owned.repository[owned.repository.len - 1] != '/');
+
+            for (owned.registry) |c| try std.testing.expect(c > ' ');
+            for (owned.repository) |c| try std.testing.expect(c > ' ');
+
+            if (owned.digest) |digest| {
+                try std.testing.expectEqual(Digest.Algorithm.sha256, digest.algorithm);
+                try std.testing.expect(owned.digest_raw != null);
+                try std.testing.expectEqualSlices(u8, owned.digest_raw.?, owned.refString());
+                try std.testing.expect(std.mem.startsWith(u8, owned.digest_raw.?, "sha256:"));
+                try std.testing.expectEqual(@as(usize, 64), digest.hex.len);
+                for (digest.hex) |c| switch (c) {
+                    '0'...'9', 'a'...'f', 'A'...'F' => {},
+                    else => return error.TestUnexpectedResult,
+                };
+            } else {
+                try std.testing.expect(owned.tag != null);
+                try std.testing.expect(owned.tag.?.len > 0);
+                try std.testing.expectEqualSlices(u8, owned.tag.?, owned.refString());
+                for (owned.tag.?) |c| try std.testing.expect(c > ' ');
+            }
         } else |err| switch (err) {
             error.Empty,
             error.InvalidDigest,
