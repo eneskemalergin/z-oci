@@ -47,6 +47,12 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
     const digest_hex = try allocator.dupe(u8, self.digest.hex);
     errdefer allocator.free(digest_hex);
 
+    const reference_digest_hex: ?[]const u8 = if (self.reference.digest) |d|
+        try allocator.dupe(u8, d.hex)
+    else
+        null;
+    errdefer if (reference_digest_hex) |hex| allocator.free(hex);
+
     const digest_raw: ?[]const u8 = if (self.reference.digest_raw) |dr|
         try allocator.dupe(u8, dr)
     else
@@ -111,7 +117,7 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
             .tag = tag,
             .digest = if (self.reference.digest) |d| Digest{
                 .algorithm = d.algorithm,
-                .hex = digest_hex,
+                .hex = reference_digest_hex.?,
             } else null,
             .digest_raw = digest_raw,
         },
@@ -124,6 +130,9 @@ pub fn deinit(self: *ResolveResult, allocator: std.mem.Allocator) void {
     allocator.free(self.reference.registry);
     allocator.free(self.reference.repository);
     if (self.reference.tag) |t| allocator.free(t);
+    if (self.reference.digest) |d| {
+        if (d.hex.ptr != self.digest.hex.ptr) allocator.free(d.hex);
+    }
     allocator.free(self.digest.hex);
     if (self.reference.digest_raw) |dr| allocator.free(dr);
     if (self.platform) |p| {
@@ -380,4 +389,33 @@ test "ResolveResult.clone: full smoke test survives arena teardown" {
     try std.testing.expectEqualSlices(u8, "windows", cloned.platform.?.os);
     try std.testing.expectEqualSlices(u8, "10.0.20348.2402", cloned.platform.?.os_version.?);
     try std.testing.expectEqual(@as(usize, 2), cloned.platform.?.os_features.?.len);
+}
+
+test "ResolveResult.clone: reference digest remains distinct from resolved digest" {
+    // The resolved manifest digest and the original reference digest are related,
+    // but they are not guaranteed to be the same slice or even the same value.
+    // clone() must preserve both independently.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const original = ResolveResult{
+        .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "a" ** 64) },
+        .media_type = .oci_manifest_v1,
+        .platform = null,
+        .reference = Reference{
+            .registry = try arena_alloc.dupe(u8, "ghcr.io"),
+            .repository = try arena_alloc.dupe(u8, "owner/repo"),
+            .tag = null,
+            .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "b" ** 64) },
+            .digest_raw = try arena_alloc.dupe(u8, "sha256:" ++ "b" ** 64),
+        },
+    };
+
+    var cloned = try original.clone(std.testing.allocator);
+    defer cloned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(u8, "a" ** 64, cloned.digest.hex);
+    try std.testing.expectEqualSlices(u8, "b" ** 64, cloned.reference.digest.?.hex);
+    try std.testing.expect(!std.mem.eql(u8, cloned.digest.hex, cloned.reference.digest.?.hex));
 }
