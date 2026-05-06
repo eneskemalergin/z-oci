@@ -11,6 +11,37 @@ Nothing yet.
 
 ---
 
+## [0.0.6] - 2026-05-05
+
+### Added
+
+- `fixtures/` now contains a typed offline fixture set spanning spec-derived OCI/Docker examples plus live public-registry snapshots from Docker Hub and Quay.
+- `fixtures/SOURCES.md` now records provenance, exact capture URLs, and exact `Accept` headers for the live snapshots.
+- Three offline example programs were added under `examples/`:
+    - `normalize-reference.zig`
+    - `inspect-manifest.zig`
+    - `select-platform.zig`
+- `build.zig` now exposes explicit example steps plus `examples-smoke` for a minimal usage-path pass.
+- `Reference.zig` now includes a real-world parser corpus covering Docker Hub, GHCR, Quay, MCR, `registry.k8s.io`, localhost with port, nested paths, and digest-pinned inputs.
+- `Index.zig` now includes additional fixture-driven platform-selection tests for real `arm64`, variant-bearing selection, and a dedicated no-match regression.
+
+### Changed
+
+- README examples and build-step documentation now reflect the current offline toolkit and example entrypoints.
+- The `inspect-manifest` example now prints a compact manifest summary with type-family distinctions and total compressed layer size.
+- The `select-platform` example now reports available platforms when no exact match exists, making the failure path useful as an offline inspection flow.
+
+### Fixed
+
+- `MediaType.zig` now recognizes real OCI and Docker config/layer media types used by live manifests, which previously caused legitimate upstream payloads to fail parsing.
+- Example build and run wiring was updated to match Zig 0.16 build and stdlib APIs.
+
+### Verified
+
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with the real fixture and parser corpus coverage.
+- `zig build examples-smoke --summary all` passes and exercises the three offline example programs.
+- `zig build test --summary all` passes deterministically offline with fixture-backed tests and example smoke coverage.
+
 ## [0.0.5] - 2026-05-05
 
 ### Changed
@@ -51,7 +82,7 @@ Nothing yet.
 - `zig build test --summary all` passes and reports the same suite.
 - `zig build -Doptimize=ReleaseSmall` produces a 4.8 KB artifact at `zig-out/bin/z-oci`.
 
-## [0.0.3] - 2026-05-06
+## [0.0.3] - 2026-05-05
 
 ### Added
 

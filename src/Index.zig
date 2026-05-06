@@ -513,6 +513,44 @@ test "OciImageIndex JSON: parses live busybox OCI index fixture" {
     try std.testing.expectEqual(@as(u64, 610), selected.?.size);
 }
 
+test "OciImageIndex JSON: live busybox fixture selects arm64 variant-bearing descriptor" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/indexes/busybox-latest-live-oci-index.json",
+        std.testing.allocator,
+        .limited(32 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    const multi = MultiArchManifest{ .oci = parsed.value };
+    const selected = multi.filterByPlatform(.{ .os = "linux", .architecture = "arm64", .variant = "v8" });
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, selected.?.media_type);
+    try std.testing.expectEqualSlices(u8, "c4e5b27bf840ba1ebd5568b6b914f6926f3559b2ad4f505b1f37aae483b907d6", selected.?.digest.hex);
+    try std.testing.expect(selected.?.platform != null);
+    try std.testing.expectEqualSlices(u8, "arm64", selected.?.platform.?.architecture);
+    try std.testing.expectEqualSlices(u8, "v8", selected.?.platform.?.variant.?);
+}
+
+test "OciImageIndex JSON: live busybox fixture returns null when no platform matches" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/indexes/busybox-latest-live-oci-index.json",
+        std.testing.allocator,
+        .limited(32 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    const multi = MultiArchManifest{ .oci = parsed.value };
+    try std.testing.expect(multi.filterByPlatform(.{ .os = "windows", .architecture = "amd64" }) == null);
+}
+
 test "DockerManifestList JSON: parses live Quay busybox manifest list fixture" {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -535,4 +573,25 @@ test "DockerManifestList JSON: parses live Quay busybox manifest list fixture" {
     try std.testing.expectEqual(MediaType.docker_manifest_v2, selected.?.media_type);
     try std.testing.expectEqualSlices(u8, "35e7e430350711653810b2b3cc889fec2a6e0175c078e4114964c7252c411209", selected.?.digest.hex);
     try std.testing.expectEqual(@as(u64, 736), selected.?.size);
+}
+
+test "DockerManifestList JSON: live Quay fixture selects linux arm64 descriptor" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/indexes/quay-prometheus-busybox-latest-live-docker-manifest-list.json",
+        std.testing.allocator,
+        .limited(16 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(DockerManifestList, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    const multi = MultiArchManifest{ .docker = parsed.value };
+    const selected = multi.filterByPlatform(.{ .os = "linux", .architecture = "arm64" });
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqual(MediaType.docker_manifest_v2, selected.?.media_type);
+    try std.testing.expectEqualSlices(u8, "8f03274c62c8fff16d451d31ad57a6af6873c882273833368782231ebd07d0cf", selected.?.digest.hex);
+    try std.testing.expect(selected.?.platform != null);
+    try std.testing.expectEqualSlices(u8, "arm64", selected.?.platform.?.architecture);
 }

@@ -13,7 +13,7 @@
   <!-- <a href="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a> -->
-  <img src="https://img.shields.io/badge/version-0.0.5-8B5CF6?style=flat-square" alt="v0.0.5">
+  <img src="https://img.shields.io/badge/version-0.0.6-8B5CF6?style=flat-square" alt="v0.0.6">
   <img src="https://img.shields.io/badge/status-early%20development-E57C23?style=flat-square" alt="Status: early development">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
@@ -22,7 +22,7 @@
 
 ---
 
-**What ships in v0.0.5:**
+**What ships in v0.0.6:**
 
 - `Digest`, `MediaType`, and `Platform`: leaf types with parser, matching, and formatting behavior
 - `Reference`: full Docker/OCI reference parser with owned-lifetime semantics
@@ -31,12 +31,15 @@
 - `json.parse(T, allocator, bytes)`: OCI-friendly JSON wrapper over `std.json.Parsed(T)`
 - `ResolveError`, `ResolveResult`, and `Config`: public contract types for the future resolver surface
 - `resolve`, `validate`, and `getManifest`: public API stubs with documented ownership contracts
+- real offline OCI/Docker fixture set with provenance in `fixtures/SOURCES.md`
+- three offline example programs plus `examples-smoke` build coverage
 
 **What works now:**
 
 - normalize and validate image references offline
 - parse, inspect, and re-stringify OCI manifests and indexes offline
 - select platform-matching descriptors from parsed multi-arch data
+- run small end-to-end offline workflows through checked-in examples and fixture-backed smoke coverage
 - exercise the intended resolver memory model without any network code
 
 **What does not work yet:**
@@ -138,8 +141,8 @@ Public roadmap summary:
 | v0.0.3 | done | JSON infrastructure, `ResolveError`, `ResolveResult`, `Config` skeleton |
 | v0.0.4 | done | Public function signatures, arena lifetime contract, fuzz tests |
 | v0.0.5 | done | Public-surface tightening, docs cleanup, ownership notes, and test colocation |
-| v0.0.6 | next | Offline examples and real OCI-shaped fixtures |
-| v0.0.7 | planned | Polished offline workflows ahead of `v0.1.0` |
+| v0.0.6 | done | Real OCI/Docker fixtures, offline examples, and fixture-backed smoke coverage |
+| v0.0.7 | next | Polished offline workflows ahead of `v0.1.0` |
 | Phase 2 | planned | Registry HTTP transport, auth flows, and real resolver behavior |
 
 **Later phases**

@@ -1,6 +1,6 @@
 .{
     .name = .z_oci,
-    .version = "0.0.5",
+    .version = "0.0.6",
     .fingerprint = 0xdf1b7d028191db04, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
