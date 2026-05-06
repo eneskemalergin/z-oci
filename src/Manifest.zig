@@ -289,3 +289,70 @@ test "Manifest JSON: annotations round-trip and deinit leak-free" {
     try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.ref.name") != null);
     try std.testing.expect(reparsed.value.annotations != null);
 }
+
+test "Manifest JSON: parses upstream OCI manifest fixture with real config and layer media types" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/manifests/oci-image-manifest-spec-example.json",
+        std.testing.allocator,
+        .limited(16 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(Manifest, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+    try std.testing.expectEqual(MediaType.oci_config_v1, parsed.value.config.media_type);
+    try std.testing.expectEqual(@as(u64, 7023), parsed.value.config.size);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.layers.len);
+    try std.testing.expectEqual(MediaType.oci_layer_v1_tar_gzip, parsed.value.layers[0].media_type);
+    try std.testing.expectEqual(@as(u64, 73109), parsed.value.layers[2].size);
+    try std.testing.expect(parsed.value.annotations != null);
+}
+
+test "Manifest JSON: parses live busybox amd64 OCI manifest fixture" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/manifests/busybox-amd64-live-oci-manifest.json",
+        std.testing.allocator,
+        .limited(16 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(Manifest, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+    try std.testing.expectEqual(MediaType.oci_config_v1, parsed.value.config.media_type);
+    try std.testing.expectEqualSlices(u8, "925ff61909aebae4bcc9bc04bb96a8bd15cd2271f13159fe95ce4338824531dd", parsed.value.config.digest.hex);
+    try std.testing.expectEqual(@as(u64, 459), parsed.value.config.size);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
+    try std.testing.expectEqual(MediaType.oci_layer_v1_tar_gzip, parsed.value.layers[0].media_type);
+    try std.testing.expectEqual(@as(u64, 2211398), parsed.value.layers[0].size);
+    try std.testing.expect(parsed.value.annotations != null);
+}
+
+test "Manifest JSON: parses live Quay busybox amd64 Docker manifest fixture" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json",
+        std.testing.allocator,
+        .limited(16 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(Manifest, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.docker_manifest_v2, parsed.value.media_type);
+    try std.testing.expectEqual(MediaType.docker_container_image_v1, parsed.value.config.media_type);
+    try std.testing.expectEqualSlices(u8, "e00da1501c19257e522754fabd8c68feadcd501657722353d0583852343aad0d", parsed.value.config.digest.hex);
+    try std.testing.expectEqual(@as(u64, 891), parsed.value.config.size);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.layers.len);
+    try std.testing.expectEqual(MediaType.docker_layer_gzip, parsed.value.layers[0].media_type);
+    try std.testing.expectEqual(@as(u64, 324609), parsed.value.layers[1].size);
+}

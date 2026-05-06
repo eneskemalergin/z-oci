@@ -115,6 +115,8 @@ pub fn main() !void {
 | `zig build test` | Run all unit tests |
 | `zig build run` | Run the CLI (once implemented) |
 
+Live registry fixtures under `fixtures/` are intentional snapshots, not always-current network fetches. `zig build test` validates them in CI because they stay fast; when refreshing them, recapture from the exact URLs and `Accept` headers recorded in `fixtures/SOURCES.md`.
+
 ## Roadmap
 
 Public roadmap summary:

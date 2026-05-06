@@ -9,16 +9,36 @@ const std = @import("std");
 pub const MediaType = enum {
     oci_manifest_v1,
     oci_index_v1,
+    oci_config_v1,
+    oci_empty_v1,
+    oci_layer_v1_tar,
+    oci_layer_v1_tar_gzip,
+    oci_layer_v1_tar_zstd,
+    oci_layer_nondistributable_v1_tar,
+    oci_layer_nondistributable_v1_tar_gzip,
     docker_manifest_v2,
     docker_manifest_list_v2,
+    docker_container_image_v1,
+    docker_layer_gzip,
+    docker_layer_foreign_gzip,
     /// Legacy schema 1. Recognized so the client can reject it cleanly.
     docker_manifest_v1_signed,
 
     const mime_table = [_]struct { []const u8, MediaType }{
         .{ "application/vnd.oci.image.manifest.v1+json", .oci_manifest_v1 },
         .{ "application/vnd.oci.image.index.v1+json", .oci_index_v1 },
+        .{ "application/vnd.oci.image.config.v1+json", .oci_config_v1 },
+        .{ "application/vnd.oci.empty.v1+json", .oci_empty_v1 },
+        .{ "application/vnd.oci.image.layer.v1.tar", .oci_layer_v1_tar },
+        .{ "application/vnd.oci.image.layer.v1.tar+gzip", .oci_layer_v1_tar_gzip },
+        .{ "application/vnd.oci.image.layer.v1.tar+zstd", .oci_layer_v1_tar_zstd },
+        .{ "application/vnd.oci.image.layer.nondistributable.v1.tar", .oci_layer_nondistributable_v1_tar },
+        .{ "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip", .oci_layer_nondistributable_v1_tar_gzip },
         .{ "application/vnd.docker.distribution.manifest.v2+json", .docker_manifest_v2 },
         .{ "application/vnd.docker.distribution.manifest.list.v2+json", .docker_manifest_list_v2 },
+        .{ "application/vnd.docker.container.image.v1+json", .docker_container_image_v1 },
+        .{ "application/vnd.docker.image.rootfs.diff.tar.gzip", .docker_layer_gzip },
+        .{ "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip", .docker_layer_foreign_gzip },
         .{ "application/vnd.docker.distribution.manifest.v1+prettyjws", .docker_manifest_v1_signed },
     };
 
@@ -35,8 +55,18 @@ pub const MediaType = enum {
         return switch (self) {
             .oci_manifest_v1 => "application/vnd.oci.image.manifest.v1+json",
             .oci_index_v1 => "application/vnd.oci.image.index.v1+json",
+            .oci_config_v1 => "application/vnd.oci.image.config.v1+json",
+            .oci_empty_v1 => "application/vnd.oci.empty.v1+json",
+            .oci_layer_v1_tar => "application/vnd.oci.image.layer.v1.tar",
+            .oci_layer_v1_tar_gzip => "application/vnd.oci.image.layer.v1.tar+gzip",
+            .oci_layer_v1_tar_zstd => "application/vnd.oci.image.layer.v1.tar+zstd",
+            .oci_layer_nondistributable_v1_tar => "application/vnd.oci.image.layer.nondistributable.v1.tar",
+            .oci_layer_nondistributable_v1_tar_gzip => "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
             .docker_manifest_v2 => "application/vnd.docker.distribution.manifest.v2+json",
             .docker_manifest_list_v2 => "application/vnd.docker.distribution.manifest.list.v2+json",
+            .docker_container_image_v1 => "application/vnd.docker.container.image.v1+json",
+            .docker_layer_gzip => "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            .docker_layer_foreign_gzip => "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
             .docker_manifest_v1_signed => "application/vnd.docker.distribution.manifest.v1+prettyjws",
         };
     }
@@ -83,8 +113,18 @@ test "fromString: all known types parse from their canonical MIME string" {
     const cases = [_]MediaType{
         .oci_manifest_v1,
         .oci_index_v1,
+        .oci_config_v1,
+        .oci_empty_v1,
+        .oci_layer_v1_tar,
+        .oci_layer_v1_tar_gzip,
+        .oci_layer_v1_tar_zstd,
+        .oci_layer_nondistributable_v1_tar,
+        .oci_layer_nondistributable_v1_tar_gzip,
         .docker_manifest_v2,
         .docker_manifest_list_v2,
+        .docker_container_image_v1,
+        .docker_layer_gzip,
+        .docker_layer_foreign_gzip,
         .docker_manifest_v1_signed,
     };
     for (cases) |mt| {

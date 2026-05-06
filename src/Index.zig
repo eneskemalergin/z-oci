@@ -441,3 +441,98 @@ test "OciImageIndex JSON: annotations round-trip and deinit leak-free" {
     try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.description") != null);
     try std.testing.expect(reparsed.value.annotations != null);
 }
+
+test "OciImageIndex JSON: parses upstream OCI index fixture" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/indexes/oci-image-index-spec-example.json",
+        std.testing.allocator,
+        .limited(16 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value.media_type);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.manifests.len);
+    try std.testing.expectEqualSlices(u8, "ppc64le", parsed.value.manifests[0].platform.?.architecture);
+    try std.testing.expect(parsed.value.annotations != null);
+
+    const multi = MultiArchManifest{ .oci = parsed.value };
+    const selected = multi.filterByPlatform(.{ .os = "linux", .architecture = "amd64" });
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualSlices(u8, "5b0bcabd1ed22e9fb1310cf6c2dec7cdef19f0ad69efa1f392e94a4333501270", selected.?.digest.hex);
+}
+
+test "DockerManifestList JSON: parses upstream Docker manifest list fixture" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/indexes/docker-manifest-list-spec-example.json",
+        std.testing.allocator,
+        .limited(16 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(DockerManifestList, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.docker_manifest_list_v2, parsed.value.media_type);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.manifests.len);
+    try std.testing.expectEqualSlices(u8, "amd64", parsed.value.manifests[1].platform.?.architecture);
+
+    const multi = MultiArchManifest{ .docker = parsed.value };
+    const selected = multi.filterByPlatform(.{ .os = "linux", .architecture = "amd64" });
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualSlices(u8, "5b0bcabd1ed22e9fb1310cf6c2dec7cdef19f0ad69efa1f392e94a4333501270", selected.?.digest.hex);
+}
+
+test "OciImageIndex JSON: parses live busybox OCI index fixture" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/indexes/busybox-latest-live-oci-index.json",
+        std.testing.allocator,
+        .limited(32 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value.media_type);
+    try std.testing.expect(parsed.value.manifests.len >= 8);
+
+    const multi = MultiArchManifest{ .oci = parsed.value };
+    const selected = multi.filterByPlatform(.{ .os = "linux", .architecture = "amd64" });
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, selected.?.media_type);
+    try std.testing.expectEqualSlices(u8, "b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65", selected.?.digest.hex);
+    try std.testing.expectEqual(@as(u64, 610), selected.?.size);
+}
+
+test "DockerManifestList JSON: parses live Quay busybox manifest list fixture" {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/indexes/quay-prometheus-busybox-latest-live-docker-manifest-list.json",
+        std.testing.allocator,
+        .limited(16 * 1024),
+    );
+    defer std.testing.allocator.free(bytes);
+
+    const parsed = try json.parse(DockerManifestList, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.docker_manifest_list_v2, parsed.value.media_type);
+    try std.testing.expectEqual(@as(usize, 6), parsed.value.manifests.len);
+
+    const multi = MultiArchManifest{ .docker = parsed.value };
+    const selected = multi.filterByPlatform(.{ .os = "linux", .architecture = "amd64" });
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqual(MediaType.docker_manifest_v2, selected.?.media_type);
+    try std.testing.expectEqualSlices(u8, "35e7e430350711653810b2b3cc889fec2a6e0175c078e4114964c7252c411209", selected.?.digest.hex);
+    try std.testing.expectEqual(@as(u64, 736), selected.?.size);
+}
