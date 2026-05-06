@@ -11,6 +11,25 @@ Nothing yet.
 
 ---
 
+## [0.0.5] - 2026-05-05
+
+### Changed
+
+- `README.md` now reflects the current offline Phase 1 toolkit instead of the old `v0.0.2` shape and outdated `client`/`types` examples.
+- `root.zig` module docs now describe the current package surface and ownership model without embedding milestone history.
+- Ownership notes in `Reference.zig` and `ResolveResult.zig` were tightened so owned vs borrowed fields are clearer.
+- Type-specific JSON contract tests were moved out of `json.zig` and back into `Descriptor.zig`, `Manifest.zig`, and `Index.zig`.
+
+### Fixed
+
+- Public documentation no longer implies the registry client already exists.
+- JSON behavior tests are now colocated with the types that own that behavior.
+
+### Verified
+
+- Focused file-scoped tests for moved JSON slices passed during the `v0.0.5` cleanup.
+- `zig build test --summary all` passes after the full cleanup pass.
+
 ## [0.0.4] - 2026-05-05
 
 ### Added

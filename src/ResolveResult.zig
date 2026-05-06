@@ -6,6 +6,11 @@
 //!
 //! The original ResolveResult (not a clone) does not need deinit — the
 //! caller's arena teardown handles all cleanup.
+//!
+//! Ownership:
+//! - values returned from future resolve calls borrow from the per-call allocator
+//! - `clone()` produces a fully owned copy of every string slice
+//! - the cloned `reference.digest.hex` may be distinct from `digest.hex` and is freed accordingly
 
 const std = @import("std");
 const Digest = @import("Digest.zig");
@@ -13,14 +18,14 @@ const MediaType = @import("MediaType.zig").MediaType;
 const Platform = @import("Platform.zig");
 const Reference = @import("Reference.zig");
 
-/// The pinned digest of the resolved manifest.
+/// The pinned digest of the resolved manifest. Borrowed in originals, owned in clones.
 digest: Digest,
 /// The manifest media type (OCI or Docker).
 media_type: MediaType,
 /// The platform if resolution targeted a specific platform. Null for
 /// single-arch manifests or when platform was not requested.
 platform: ?Platform,
-/// The parsed image reference.
+/// The parsed image reference. Borrowed in originals, deep-copied by clone().
 reference: Reference,
 
 const ResolveResult = @This();

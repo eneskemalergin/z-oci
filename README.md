@@ -6,14 +6,14 @@
 <h1 align="center">z-oci</h1>
 
 <p align="center">
-  Pure Zig OCI/Docker Registry API v2 client. Resolves image references to pinned SHA256 digests. Zero dependencies, Zig 0.16 std only.
+    Pure Zig OCI/Docker Registry API v2 toolkit. Offline reference parsing, OCI JSON handling, and resolver API contracts. Zero dependencies, Zig 0.16 std only.
 </p>
 
 <p align="center">
   <!-- <a href="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/z-oci/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a> -->
-  <img src="https://img.shields.io/badge/version-0.0.2-8B5CF6?style=flat-square" alt="v0.0.2">
+  <img src="https://img.shields.io/badge/version-0.0.5-8B5CF6?style=flat-square" alt="v0.0.5">
   <img src="https://img.shields.io/badge/status-early%20development-E57C23?style=flat-square" alt="Status: early development">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
@@ -22,49 +22,38 @@
 
 ---
 
-**What ships in v0.0.2:**
+**What ships in v0.0.5:**
 
-- `Reference` parser: handles bare names, tags, digests, registries with ports, nested paths, Docker Hub aliases, and tag+digest refs
-- `Digest`: SHA-256 parse and validation, hex borrowing from caller input, no allocation
-- `MediaType`: OCI and Docker MIME type enum with `fromString`, `isMultiArch`, `isLegacy`
-- `Platform`: os/arch/variant struct with partial match (variant optional, os_version prefix) and strict `eql`
-- `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`: full OCI type system
-- `MultiArchManifest`: tagged union over both index types with `filterByPlatform`
+- `Digest`, `MediaType`, and `Platform`: leaf types with parser, matching, and formatting behavior
+- `Reference`: full Docker/OCI reference parser with owned-lifetime semantics
+- `Descriptor`, `Manifest`, `OciImageIndex`, and `DockerManifestList`: OCI/Docker data model types
+- `MultiArchManifest`: platform selection over multi-arch indices and manifest lists
+- `json.parse(T, allocator, bytes)`: OCI-friendly JSON wrapper over `std.json.Parsed(T)`
+- `ResolveError`, `ResolveResult`, and `Config`: public contract types for the future resolver surface
+- `resolve`, `validate`, and `getManifest`: public API stubs with documented ownership contracts
 
-**Coming later:**
+**What works now:**
 
-- JSON parse/stringify with camelCase mapping for OCI spec fields
-- `resolve`: tag-to-digest resolution over HTTP, HEAD-first with GET fallback
-- Multi-arch resolution with platform fallback and nested index recursion
-- Bearer token auth with pluggable credential providers
-- Rate-limit handling: 429 backoff, `Retry-After`, exponential jitter
-- Batch resolve with shared token and digest cache
+- normalize and validate image references offline
+- parse, inspect, and re-stringify OCI manifests and indexes offline
+- select platform-matching descriptors from parsed multi-arch data
+- exercise the intended resolver memory model without any network code
+
+**What does not work yet:**
+
+- registry HTTP transport
+- auth and token exchange
+- real tag-to-digest resolution
+- manifest fetching from registries
+- batch resolve and caching behavior
 
 ## Requirements
 
 Zig **0.16.0** or later.
 
-<!--
-## Installation
+## Example use today
 
-Add z-oci as a dependency in your `build.zig.zon`:
-
-```zig
-.dependencies = .{
-    .z_oci = .{
-        .url = "https://github.com/eneskemalergin/z-oci/archive/refs/tags/v0.1.0.tar.gz",
-        .hash = "<run zig fetch to get the hash>",
-    },
-},
-```
-
-Or use `zig fetch` to add it automatically:
-
-```sh
-zig fetch --save https://github.com/eneskemalergin/z-oci/archive/refs/tags/v0.1.0.tar.gz
-```
-
-Then wire it up in your `build.zig`:
+In `build.zig`, import the package into your executable module:
 
 ```zig
 const z_oci = b.dependency("z_oci", .{
@@ -73,198 +62,50 @@ const z_oci = b.dependency("z_oci", .{
 });
 exe.root_module.addImport("z_oci", z_oci.module("z_oci"));
 ```
--->
 
-<!--
-## Quick start
-
-### Resolve a tag to a pinned digest
+### Normalize an image reference
 
 ```zig
 const std = @import("std");
 const z_oci = @import("z_oci");
 
 pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+    var ref = try z_oci.Reference.parse(std.heap.page_allocator, "ubuntu:22.04");
+    defer ref.deinit(std.heap.page_allocator);
 
-    var http_client = std.http.Client{ .allocator = arena.allocator() };
-    defer http_client.deinit();
-
-    const config = z_oci.client.Config{
-        .credential_provider = .anonymous,
-    };
-
-    const result = try z_oci.client.resolve(
-        arena.allocator(),
-        &http_client,
-        config,
-        "library/alpine:latest",
-        null, // platform: null uses host platform
-    );
-
-    // result.digest     → "sha256:a856..."
-    // result.media_type → "application/vnd.oci.image.manifest.v1+json"
-    // result.platform   → null (single-arch) or Platform{...}
-    std.debug.print("digest: {s}\n", .{result.digest});
+    std.debug.print("registry: {s}\n", .{ref.registry});
+    std.debug.print("repository: {s}\n", .{ref.repository});
+    std.debug.print("ref: {s}\n", .{ref.refString()});
 }
 ```
 
-### Validate a pinned digest
+### Parse a manifest JSON payload offline
 
 ```zig
-const exists = try z_oci.client.validate(
-    arena.allocator(),
-    &http_client,
-    config,
-    "library/alpine@sha256:a856...",
-);
+const std = @import("std");
+const z_oci = @import("z_oci");
+
+pub fn main() !void {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 256
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    const parsed = try z_oci.json.parse(z_oci.Manifest, std.heap.page_allocator, json_bytes);
+    defer parsed.deinit();
+
+    std.debug.print("schemaVersion: {d}\n", .{parsed.value.schema_version});
+    std.debug.print("mediaType: {s}\n", .{parsed.value.media_type.toString()});
+}
 ```
-
-### Inspect full manifest metadata
-
-```zig
-const parsed = try z_oci.client.getManifest(
-    arena.allocator(),
-    &http_client,
-    config,
-    "library/alpine:latest",
-    null,
-);
-// parsed.value is a z_oci.types.Manifest
-```
-
-### Batch resolve
-
-```zig
-const refs = &[_][]const u8{
-    "library/alpine:latest",
-    "library/ubuntu:22.04",
-    "library/debian:bookworm",
-};
-
-const results = try z_oci.client.resolveMany(
-    arena.allocator(),
-    &http_client,
-    config,
-    refs,
-    null,
-);
-```
--->
-
-<!--
-## API
-
-### `resolve`
-
-```zig
-pub fn resolve(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    config: Config,
-    ref: []const u8,
-    platform: ?types.Platform,
-) ResolveError!ResolveResult
-```
-
-Resolves `registry/repo:tag` or `registry/repo@sha256:...` to a pinned digest. Uses HEAD for fast extraction, falls back to GET for body verification. For multi-arch images, selects the manifest matching `platform` (defaults to host platform when `null`).
-
-### `validate`
-
-```zig
-pub fn validate(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    config: Config,
-    ref: []const u8,
-) ResolveError!bool
-```
-
-HEAD-checks whether a pinned digest reference still exists in the registry. Returns `true` if present, `false` on 404.
-
-### `getManifest`
-
-```zig
-pub fn getManifest(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    config: Config,
-    ref: []const u8,
-    platform: ?types.Platform,
-) ResolveError!types.Parsed(types.Manifest)
-```
-
-Fetches and returns the full manifest for inspection. `Parsed(T)` is an arena-backed wrapper; free with `parsed.deinit()` or deinit the arena.
-
-### `resolveMany`
-
-```zig
-pub fn resolveMany(
-    allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
-    config: Config,
-    refs: []const []const u8,
-    platform: ?types.Platform,
-) ResolveError![]ResolveResult
-```
-
-Batch resolve with a shared `TokenCache` and session digest cache. Amortizes token requests across all refs in the batch.
-
-### `ResolveResult`
-
-```zig
-pub const ResolveResult = struct {
-    digest:     []const u8,   // "sha256:<hex>"
-    media_type: []const u8,   // normalized Content-Type
-    platform:   ?types.Platform, // null for single-arch manifests
-};
-```
-
-### `Config`
-
-```zig
-pub const Config = struct {
-    credential_provider: auth.CredentialProvider,
-    max_retries:         u32 = 3,
-    connect_timeout_ms:  u64 = 5_000,
-    read_timeout_ms:     u64 = 30_000,
-};
-```
-
-### `ResolveError`
-
-| Error | Cause |
-| ----- | ----- |
-| `Unauthorized` | Auth challenge failed or credentials rejected |
-| `NotFound` | Image reference does not exist |
-| `ContentTypeMismatch` | Legacy schema 1 or unexpected media type |
-| `ManifestParseError` | JSON decode failed or nesting depth exceeded |
-| `PlatformNotFound` | No manifest in the index matches the requested platform |
-| `RateLimitExceeded` | 429 persisted after all retries with backoff |
-| `NetworkError` | `std.http.Client` connection or read failure |
-| `OutOfMemory` | Allocator exhausted |
-
-### Core types
-
-| Type | Description |
-| ---- | ----------- |
-| `types.Digest` | Algorithm + raw bytes. Parses/formats `"sha256:<hex>"`. |
-| `types.MediaType` | Known OCI and Docker media type constants with detection helpers. |
-| `types.Platform` | `os`, `arch`, `variant`, `os.version`, `os.features`. Partial match. |
-| `types.Descriptor` | OCI content descriptor: `mediaType`, `digest`, `size`, `platform`, `annotations`. |
-| `types.Manifest` | OCI Image Manifest + Docker V2 Schema 2. |
-| `types.OciImageIndex` | OCI Image Index for multi-arch. |
-| `types.DockerManifestList` | Docker Manifest List for multi-arch. |
-| `auth.CredentialProvider` | Pluggable interface: anonymous, env vars, Docker config, process helpers. |
-
-### Memory model
-
-All allocation goes through the `allocator` you pass. Two options:
-
-1. **Arena**: pass `arena.allocator()` and call `arena.deinit()` when done. No per-object cleanup needed.
-2. **GPA**: call `parsed.deinit()` on `Parsed(T)` values and free `ResolveResult` slices manually.
--->
 
 ## Build steps
 
@@ -276,14 +117,18 @@ All allocation goes through the `allocator` you pass. Two options:
 
 ## Roadmap
 
-**Phase 1: Types, parsers, API contracts (v0.0.1 to v0.0.4)**
+Public roadmap summary:
 
 | Version | Status | Description |
 | ------- | ------ | ----------- |
 | v0.0.1 | done | Leaf types: `Digest`, `MediaType`, `Platform` |
 | v0.0.2 | done | OCI types: `Reference`, `Descriptor`, `Manifest`, `Index` |
-| v0.0.3 | next | JSON infrastructure, `ResolveError`, `ResolveResult`, `Config` skeleton |
-| v0.0.4 | | Public function signatures, arena lifetime contract, fuzz tests |
+| v0.0.3 | done | JSON infrastructure, `ResolveError`, `ResolveResult`, `Config` skeleton |
+| v0.0.4 | done | Public function signatures, arena lifetime contract, fuzz tests |
+| v0.0.5 | done | Public-surface tightening, docs cleanup, ownership notes, and test colocation |
+| v0.0.6 | next | Offline examples and real OCI-shaped fixtures |
+| v0.0.7 | planned | Polished offline workflows ahead of `v0.1.0` |
+| Phase 2 | planned | Registry HTTP transport, auth flows, and real resolver behavior |
 
 **Later phases**
 

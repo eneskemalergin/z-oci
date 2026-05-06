@@ -14,6 +14,7 @@ const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;
 const Descriptor = @import("Descriptor.zig");
 const Platform = @import("Platform.zig");
+const json = @import("json.zig");
 
 /// OCI Image Index (application/vnd.oci.image.index.v1+json).
 pub const OciImageIndex = struct {
@@ -360,4 +361,83 @@ test "filterByPlatform: DockerManifestList variant finds the correct platform" {
     const result = m.filterByPlatform(filter);
     try std.testing.expect(result != null);
     try std.testing.expectEqualSlices(u8, "a" ** 64, result.?.digest.hex);
+}
+
+test "OciImageIndex JSON: round-trip" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": [
+        \\    {
+        \\      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\      "size": 512,
+        \\      "platform": { "os": "linux", "architecture": "amd64" }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const parsed = try json.parse(OciImageIndex, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value.media_type);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.manifests.len);
+    try std.testing.expectEqualSlices(u8, "linux", parsed.value.manifests[0].platform.?.os);
+}
+
+test "DockerManifestList JSON: round-trip" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+        \\  "manifests": [
+        \\    {
+        \\      "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\      "size": 1024,
+        \\      "platform": { "os": "linux", "architecture": "arm64" }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const parsed = try json.parse(DockerManifestList, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.docker_manifest_list_v2, parsed.value.media_type);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.manifests.len);
+    try std.testing.expectEqualSlices(u8, "arm64", parsed.value.manifests[0].platform.?.architecture);
+}
+
+test "OciImageIndex JSON: annotations round-trip and deinit leak-free" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": [],
+        \\  "annotations": {
+        \\    "org.opencontainers.image.description": "multi-arch index"
+        \\  }
+        \\}
+    ;
+
+    const parsed = try json.parse(OciImageIndex, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(parsed.value);
+    const out = aw.written();
+
+    const reparsed = try json.parse(OciImageIndex, std.testing.allocator, out);
+    defer reparsed.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.description") != null);
+    try std.testing.expect(reparsed.value.annotations != null);
 }

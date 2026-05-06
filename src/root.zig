@@ -1,42 +1,21 @@
 //! z-oci: Pure Zig OCI/Docker Registry API v2 client.
 //!
-//! Read-only. Resolves container image references to pinned SHA256 digests.
-//! Built on Zig 0.16 std. Zero external dependencies.
+//! Current scope:
+//! - offline OCI/Docker reference parsing and normalization
+//! - OCI manifest, index, and descriptor types with JSON round-trip support
+//! - public resolver API stubs and ownership contracts ahead of Phase 2 HTTP work
 //!
-//! ## v0.0.1: Leaf Types
-//!
-//!   Digest       - algorithm + hex string, parse/validate
-//!   MediaType    - OCI/Docker MIME types, detection helpers
-//!   Platform     - os/arch/variant, partial match for multi-arch resolution
-//!
-//! ## v0.0.2: Reference Parser + OCI Types
-//!
-//!   Reference    - image reference parser (full Docker/OCI grammar)
-//!   Descriptor   - OCI content descriptor
-//!   Manifest     - OCI Image Manifest + Docker V2 Schema 2
-//!   Index        - OciImageIndex + DockerManifestList + MultiArchManifest
-//!
-//! ## v0.0.3: JSON Infrastructure + API Contracts
-//!
-//!   json         - parse(T, alloc, bytes) wrapper; std.json.Parsed(T) lifecycle
-//!   ResolveError - tagged error union with context fields
-//!   ResolveResult - resolve result struct; clone() + deinit()
-//!   Config       - config skeleton with CredentialProvider interface
-//!
-//! ## v0.0.4: Public API Stubs + Ownership Contract
-//!
-//!   resolve      - declare the public resolve surface before HTTP lands
-//!   validate     - declare the manifest existence check surface
-//!   getManifest  - declare the parsed manifest retrieval surface
+//! Not yet implemented:
+//! - registry HTTP transport
+//! - auth flows and token exchange
+//! - real `resolve`, `validate`, and `getManifest` behavior
 
 const std = @import("std");
 
-// v0.0.1: leaf types
 pub const Digest = @import("Digest.zig");
 pub const MediaType = @import("MediaType.zig").MediaType;
 pub const Platform = @import("Platform.zig");
 
-// v0.0.2: OCI types
 pub const Descriptor = @import("Descriptor.zig");
 pub const Manifest = @import("Manifest.zig");
 pub const Index = @import("Index.zig");
@@ -45,7 +24,6 @@ pub const DockerManifestList = Index.DockerManifestList;
 pub const MultiArchManifest = Index.MultiArchManifest;
 pub const Reference = @import("Reference.zig");
 
-// v0.0.3: JSON infrastructure + API contracts
 pub const json = @import("json.zig");
 pub const ResolveError = @import("ResolveError.zig").ResolveError;
 pub const ResolveResult = @import("ResolveResult.zig");
@@ -138,7 +116,7 @@ test {
     _ = @import("Config.zig");
 }
 
-test "v0.0.4 stubs: public APIs return NotYetImplemented" {
+test "public API stubs return NotYetImplemented" {
     var client: std.http.Client = undefined;
     const ref = Reference{
         .registry = "registry-1.docker.io",

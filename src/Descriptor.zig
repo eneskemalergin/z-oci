@@ -12,6 +12,7 @@
 const MediaType = @import("MediaType.zig").MediaType;
 const Digest = @import("Digest.zig");
 const Platform = @import("Platform.zig");
+const json = @import("json.zig");
 const std = @import("std");
 
 /// OCI spec field: mediaType
@@ -193,4 +194,107 @@ test "Descriptor: artifact_type field is stored and readable" {
         .artifact_type = "application/vnd.example.sbom+json",
     };
     try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom+json", d.artifact_type.?);
+}
+
+test "Descriptor JSON: round-trip" {
+    // Arrange
+    const json_bytes =
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "size": 1234
+        \\}
+    ;
+
+    // Act
+    const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    // Assert
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+    try std.testing.expectEqual(Digest.Algorithm.sha256, parsed.value.digest.algorithm);
+    try std.testing.expectEqualSlices(u8, "a" ** 64, parsed.value.digest.hex);
+    try std.testing.expectEqual(@as(u64, 1234), parsed.value.size);
+}
+
+test "Descriptor JSON: stringifies with camelCase field names" {
+    // Arrange
+    const d = Descriptor{
+        .media_type = .oci_index_v1,
+        .digest = try Digest.parse("sha256:" ++ "b" ** 64),
+        .size = 512,
+    };
+
+    // Act
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(d);
+    const out = aw.written();
+
+    // Assert
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"mediaType\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"digest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"size\"") != null);
+}
+
+test "Descriptor JSON: round-trip with platform" {
+    // Arrange
+    const json_bytes =
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\  "size": 256,
+        \\  "platform": { "os": "linux", "architecture": "arm64", "variant": "v8" }
+        \\}
+    ;
+
+    // Act
+    const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    // Assert
+    try std.testing.expect(parsed.value.platform != null);
+    try std.testing.expectEqualSlices(u8, "linux", parsed.value.platform.?.os);
+    try std.testing.expectEqualSlices(u8, "arm64", parsed.value.platform.?.architecture);
+    try std.testing.expectEqualSlices(u8, "v8", parsed.value.platform.?.variant.?);
+}
+
+test "Descriptor JSON: optional fields round-trip and deinit leak-free" {
+    // Arrange: exercise every optional JSON branch on Descriptor.
+    const json_bytes =
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        \\  "size": 512,
+        \\  "urls": ["https://example.com/blob"],
+        \\  "annotations": {
+        \\    "org.opencontainers.image.source": "https://github.com/example/repo"
+        \\  },
+        \\  "artifactType": "application/vnd.example.sbom.v1"
+        \\}
+    ;
+
+    // Act
+    const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(parsed.value);
+    const out = aw.written();
+
+    const reparsed = try json.parse(Descriptor, std.testing.allocator, out);
+    defer reparsed.deinit();
+
+    // Assert
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"urls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"artifactType\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.source") != null);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.value.urls.?.len);
+    try std.testing.expectEqualSlices(u8, "https://example.com/blob", reparsed.value.urls.?[0]);
+    try std.testing.expect(reparsed.value.annotations != null);
+    try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", reparsed.value.artifact_type.?);
 }

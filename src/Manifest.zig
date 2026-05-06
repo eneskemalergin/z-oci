@@ -10,6 +10,7 @@
 const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;
 const Descriptor = @import("Descriptor.zig");
+const json = @import("json.zig");
 
 /// OCI spec field: schemaVersion. Always 2 for current formats.
 schema_version: u8,
@@ -192,4 +193,99 @@ test "Manifest: Docker V2 manifest has distinct media_type from OCI" {
     try std.testing.expect(oci.media_type != docker.media_type);
     try std.testing.expect(!oci.media_type.isMultiArch());
     try std.testing.expect(!docker.media_type.isMultiArch());
+}
+
+test "Manifest JSON: round-trip" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 256
+        \\  },
+        \\  "layers": [
+        \\    {
+        \\      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\      "size": 4096
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const parsed = try json.parse(Manifest, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+    try std.testing.expectEqual(@as(u64, 256), parsed.value.config.size);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
+    try std.testing.expectEqual(@as(u64, 4096), parsed.value.layers[0].size);
+}
+
+test "Manifest JSON: stringifies with camelCase field names" {
+    const config = Descriptor{
+        .media_type = .oci_manifest_v1,
+        .digest = try Digest.parse("sha256:" ++ "a" ** 64),
+        .size = 256,
+    };
+    const layer = Descriptor{
+        .media_type = .oci_manifest_v1,
+        .digest = try Digest.parse("sha256:" ++ "b" ** 64),
+        .size = 4096,
+    };
+    const layers = [_]Descriptor{layer};
+    const m = Manifest{
+        .schema_version = 2,
+        .media_type = .oci_manifest_v1,
+        .config = config,
+        .layers = &layers,
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(m);
+    const out = aw.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"schemaVersion\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"mediaType\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"config\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"layers\"") != null);
+}
+
+test "Manifest JSON: annotations round-trip and deinit leak-free" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\    "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        \\    "size": 64
+        \\  },
+        \\  "layers": [],
+        \\  "annotations": {
+        \\    "org.opencontainers.image.ref.name": "stable"
+        \\  }
+        \\}
+    ;
+
+    const parsed = try json.parse(Manifest, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(parsed.value);
+    const out = aw.written();
+
+    const reparsed = try json.parse(Manifest, std.testing.allocator, out);
+    defer reparsed.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.ref.name") != null);
+    try std.testing.expect(reparsed.value.annotations != null);
 }

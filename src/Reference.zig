@@ -12,9 +12,10 @@
 //! When neither tag nor digest is present, tag defaults to "latest".
 //! When both tag and digest are present, digest wins for refString().
 //!
-//! Memory: parse() allocates all owned string fields into the provided allocator.
-//! deinit() frees them. For digest references, digest_raw owns the full
-//! "sha256:..." string and digest.hex points into that owned allocation.
+//! Ownership:
+//! - `registry`, `repository`, `tag`, and `digest_raw` are owned allocations.
+//! - `digest.hex` is not separately owned; it points inside `digest_raw`.
+//! - Call `deinit()` exactly once for parsed values you keep outside an arena.
 
 const std = @import("std");
 const Digest = @import("Digest.zig");
@@ -22,7 +23,9 @@ const Digest = @import("Digest.zig");
 const docker_hub_registry = "registry-1.docker.io";
 const docker_hub_aliases = [_][]const u8{ "docker.io", "index.docker.io" };
 
+/// Owned registry hostname.
 registry: []const u8,
+/// Owned repository path.
 repository: []const u8,
 /// Informational when digest is also present. refString() returns the digest then.
 tag: ?[]const u8,
