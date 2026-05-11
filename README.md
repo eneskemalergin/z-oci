@@ -32,40 +32,15 @@
 - three offline example programs plus `examples-smoke` build coverage
 - explicit offline workflow smoke matrix via `zig build workflow-smoke`
 
-**What works now:**
-
-- normalize and validate image references offline
-- parse, inspect, and re-stringify OCI manifests and indexes offline
-- select platform-matching descriptors from parsed multi-arch data
-- run small end-to-end offline workflows through checked-in examples and fixture-backed smoke coverage
-- exercise the intended resolver memory model without any network code
-
 ## Supported Offline Workflows
 
-`v0.1.0` treats the current library as an offline toolkit, not a partial network client. The supported workflows are intentionally narrow:
+v0.1.0 is an offline toolkit. Not a partial network client. It handles:
 
 - reference normalization and decomposition through `Reference.parse`, `repositoryPath()`, and `refString()`
 - digest parsing and syntactic validation through `Digest.parse` and digest-pinned references
 - offline manifest and index inspection from checked-in OCI/Docker JSON fixtures
 - platform selection from parsed multi-arch indices and manifest lists
-- ownership-aware cloning of `ResolveResult` values that outlive a short-lived arena
-
-**What does not work yet:**
-
-- registry HTTP transport
-- auth and token exchange
-- real tag-to-digest resolution
-- manifest fetching from registries
-- batch resolve and caching behavior
-
-## What Phase 2 Adds
-
-Phase 2 starts when the public resolver stubs stop returning `error.NotYetImplemented`. That phase adds:
-
-- registry HTTP transport
-- auth and token exchange
-- real `resolve`, `validate`, and `getManifest` behavior
-- tag-to-digest resolution, manifest fetching, and transport-level retry or rate-limit handling
+- clone `ResolveResult` values out of a short-lived arena
 
 ## Requirements
 
@@ -138,23 +113,11 @@ pub fn main() !void {
 | `zig build workflow-smoke` | Run the offline workflow smoke-test matrix |
 | `zig build run` | Run the CLI (once implemented) |
 
-Live registry fixtures under `fixtures/` are intentional snapshots, not always-current network fetches. `zig build test` validates them in CI because they stay fast; when refreshing them, recapture from the exact URLs and `Accept` headers recorded in `fixtures/SOURCES.md`.
+Fixtures under `fixtures/` are checked-in snapshots, not live fetches. `zig build test` validates them in CI. To refresh, recapture from the URLs and `Accept` headers in `fixtures/SOURCES.md`.
 
-The published Zig package includes `src/`, `examples/`, `fixtures/`, `assets/`, `README.md`, `CHANGELOG.md`, and the build files so the documented offline examples and fixture-backed tests remain usable from the packaged release.
-
-## Included test types
-
-The current release gate covers the codebase from a few complementary angles:
-
-- unit tests colocated with the owning modules
-- fixture-backed JSON and parser tests against checked-in OCI/Docker payloads
-- deterministic fuzz-style parser and JSON smoke tests
-- allocator, leak, and allocation-failure tests on owned-lifetime paths
-- example smoke coverage and workflow smoke coverage for offline usage paths
+The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, and build files. Documented examples and tests work from a dependency fetch.
 
 ## Offline examples
-
-The current offline example programs are small usage paths over the shipped parser and fixture surface:
 
 - `zig build example-normalize-reference -- ubuntu:22.04`
 - `zig build example-inspect-manifest`
@@ -162,31 +125,18 @@ The current offline example programs are small usage paths over the shipped pars
 
 ## Roadmap
 
-Public roadmap summary:
+Done: v0.0.1 -> v0.1.0 (offline toolkit).
 
-| Version | Status | Description |
-| ------- | ------ | ----------- |
-| v0.0.1 | done | Leaf types: `Digest`, `MediaType`, `Platform` |
-| v0.0.2 | done | OCI types: `Reference`, `Descriptor`, `Manifest`, `Index` |
-| v0.0.3 | done | JSON infrastructure, `ResolveError`, `ResolveResult`, `Config` skeleton |
-| v0.0.4 | done | Public function signatures, arena lifetime contract, fuzz tests |
-| v0.0.5 | done | Public-surface tightening, docs cleanup, ownership notes, and test colocation |
-| v0.0.6 | done | Real OCI/Docker fixtures, offline examples, and fixture-backed smoke coverage |
-| v0.0.7 | done | Explicit offline workflow contract, workflow smoke matrix, and release-readiness docs pass |
-| v0.1.0 | done | Public offline release: hardening audit, allocator checks, artifact review, package review, and docs alignment |
-| Phase 2 | planned | Registry HTTP transport, auth flows, and real resolver behavior |
-
-**Later phases**
-
-| Version | Description |
-| ------- | ----------- |
-| v0.1.0 | Public offline release: quality audit, leak checks, artifact review, binary-size investigation, package review, and docs health |
-| v0.2.0 | Auth engine: Bearer token flow, credential helpers |
-| v0.3.0 | Manifest resolution: HEAD/GET, multi-arch, nested index |
-| v0.4.0 | Rate limiting: backoff, batch API, session cache |
-| v0.5.0 | Testing: mock server, local registry, CI |
-| v0.6.0 | CLI: `z-oci resolve`, `validate`, `inspect` |
-| v1.0.0 | Package release: Zig package index, API docs |
+- Auth engine: Bearer token flow, credential helpers (v0.2.0)
+- Manifest resolution: HEAD/GET, multi-arch, nested index (v0.3.0)
+- Rate limiting: backoff, batch API, session cache (v0.4.0)
+- Testing: mock server, local registry, CI (v0.5.0)
+- CLI: `z-oci resolve`, `validate`, `inspect` (v0.6.0)
+- Zencelot (v0.7.0)
+- Zencelot Integration (v0.8.0)
+- Stabilization (v0.9.0)
+- Package release: Zig package index, API docs (v1.0.0)
+- Registry HTTP transport, auth flows, and real resolver behavior (Phase 2)
 
 ## References
 
