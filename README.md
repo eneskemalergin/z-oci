@@ -143,7 +143,6 @@ Done: v0.0.1 -> v0.1.0 (offline toolkit).
 - [OCI Distribution Specification](https://github.com/opencontainers/distribution-spec): the registry API this client implements
 - [OCI Image Layout Specification](https://github.com/opencontainers/image-spec): manifest and descriptor formats
 - [Docker Registry HTTP API V2](https://docs.docker.com/registry/spec/api/): Docker Hub compatibility layer
-- [zig.pkg index](https://pkg.ziglang.org): the Zig community package index where this library will be listed
 
 ## License
 
