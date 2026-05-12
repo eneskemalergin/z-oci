@@ -8,6 +8,7 @@ const std = @import("std");
 const ConfigModule = @import("Config.zig");
 const Config = ConfigModule.Config;
 const Credential = ConfigModule.Credential;
+const CredentialHandle = ConfigModule.CredentialHandle;
 const CredentialProvider = ConfigModule.CredentialProvider;
 const Reference = @import("Reference.zig");
 
@@ -163,12 +164,33 @@ pub const AuthReferenceView = struct {
     }
 };
 
+pub const AuthenticateRequest = struct {
+    registry: []const u8,
+    challenge: BearerChallenge,
+
+    pub fn init(registry: []const u8, challenge: BearerChallenge) AuthError!AuthenticateRequest {
+        try validateRealmUrl(challenge.realm);
+        return .{
+            .registry = registry,
+            .challenge = challenge,
+        };
+    }
+
+    pub fn scope(self: AuthenticateRequest) ?[]const u8 {
+        return self.challenge.scope;
+    }
+
+    pub fn service(self: AuthenticateRequest) ?[]const u8 {
+        return self.challenge.service;
+    }
+};
+
 pub const ProbeHttpResponse = struct {
     status: std.http.Status,
-    www_authenticate: ?[]const u8 = null,
+    www_authenticate_headers: []const []const u8 = &.{},
 
     pub fn classify(self: ProbeHttpResponse) AuthError!ProbeResult {
-        return classifyProbeResponse(self.status, self.www_authenticate);
+        return classifyProbeResponse(self.status, self.www_authenticate_headers);
     }
 };
 
@@ -223,14 +245,17 @@ pub const AuthEngine = struct {
     pub fn authenticate(
         self: *AuthEngine,
         client: *std.http.Client,
-        registry: []const u8,
-        scope: []const u8,
+        request: AuthenticateRequest,
     ) AuthError!?Token {
         _ = self;
         _ = client;
-        _ = registry;
-        _ = scope;
+        _ = request;
         return error.NotYetImplemented;
+    }
+
+    pub fn credentialForRegistry(self: AuthEngine, registry: []const u8) ?CredentialHandle {
+        const provider = self.config.credential_provider orelse return null;
+        return provider.getCredential(registry);
     }
 };
 
@@ -253,14 +278,34 @@ pub fn referenceView(ref: Reference) AuthReferenceView {
 
 pub fn classifyProbeResponse(
     status: std.http.Status,
-    www_authenticate: ?[]const u8,
+    www_authenticate_headers: []const []const u8,
 ) AuthError!ProbeResult {
     return switch (status) {
         .ok => .ok,
-        .unauthorized => .{ .auth_required = try parseAuthenticateHeader(www_authenticate orelse return error.MissingAuthenticateHeader) },
+        .unauthorized => .{ .auth_required = try parseAuthenticateHeaders(www_authenticate_headers) },
         .not_found => .not_found,
         else => error.UnsupportedProbeStatus,
     };
+}
+
+pub fn parseAuthenticateHeaders(raw_headers: []const []const u8) AuthError!AuthChallenge {
+    if (raw_headers.len == 0) return error.MissingAuthenticateHeader;
+
+    var saw_unsupported = false;
+    for (raw_headers) |raw| {
+        const challenge = parseAuthenticateHeader(raw) catch |err| switch (err) {
+            error.UnsupportedAuthenticateScheme => {
+                saw_unsupported = true;
+                continue;
+            },
+            else => |parse_err| return parse_err,
+        };
+
+        return challenge;
+    }
+
+    if (saw_unsupported) return error.UnsupportedAuthenticateScheme;
+    return error.MissingAuthenticateHeader;
 }
 
 pub fn parseAuthenticateHeader(raw: []const u8) AuthError!AuthChallenge {
@@ -308,18 +353,28 @@ fn parseBearerChallenge(params: []const u8) AuthError!BearerChallenge {
 
         if (std.ascii.eqlIgnoreCase(name, "realm")) {
             if (challenge.realm.len != 0) return error.InvalidAuthenticateHeader;
+            if (value.len == 0) return error.InvalidAuthenticateHeader;
             challenge.realm = value;
         } else if (std.ascii.eqlIgnoreCase(name, "service")) {
             if (challenge.service != null) return error.InvalidAuthenticateHeader;
+            if (value.len == 0) return error.InvalidAuthenticateHeader;
             challenge.service = value;
         } else if (std.ascii.eqlIgnoreCase(name, "scope")) {
             if (challenge.scope != null) return error.InvalidAuthenticateHeader;
+            if (value.len == 0) return error.InvalidAuthenticateHeader;
             challenge.scope = value;
         }
     }
 
     if (challenge.realm.len == 0) return error.InvalidAuthenticateHeader;
+    try validateRealmUrl(challenge.realm);
     return challenge;
+}
+
+fn validateRealmUrl(realm: []const u8) AuthError!void {
+    const parsed = std.Uri.parse(realm) catch return error.InsecureRealmUrl;
+    if (!std.ascii.eqlIgnoreCase(parsed.scheme, "https")) return error.InsecureRealmUrl;
+    if (parsed.host == null) return error.InsecureRealmUrl;
 }
 
 fn parseAuthParamValue(raw: []const u8) AuthError![]const u8 {
@@ -330,8 +385,16 @@ fn parseAuthParamValue(raw: []const u8) AuthError![]const u8 {
         if (trimmed.len < 2 or trimmed[trimmed.len - 1] != '"') {
             return error.InvalidAuthenticateHeader;
         }
-        if (std.mem.indexOfScalar(u8, trimmed[1 .. trimmed.len - 1], '"') != null) {
-            return error.InvalidAuthenticateHeader;
+        var i: usize = 1;
+        while (i < trimmed.len - 1) : (i += 1) {
+            switch (trimmed[i]) {
+                '\\' => {
+                    if (i + 1 >= trimmed.len - 1) return error.InvalidAuthenticateHeader;
+                    i += 1;
+                },
+                '"' => return error.InvalidAuthenticateHeader,
+                else => {},
+            }
         }
         return trimmed[1 .. trimmed.len - 1];
     }
@@ -352,6 +415,9 @@ fn nextCommaSeparatedChunk(raw: []const u8, cursor: *usize) AuthError!?[]const u
     while (i < raw.len) : (i += 1) {
         switch (raw[i]) {
             '"' => in_quotes = !in_quotes,
+            '\\' => if (in_quotes and i + 1 < raw.len) {
+                i += 1;
+            },
             ',' => if (!in_quotes) {
                 cursor.* = i + 1;
                 return raw[start..i];
@@ -371,6 +437,9 @@ fn findNextChallengeStart(raw: []const u8, start: usize) AuthError!?usize {
     while (i < raw.len) : (i += 1) {
         switch (raw[i]) {
             '"' => in_quotes = !in_quotes,
+            '\\' => if (in_quotes and i + 1 < raw.len) {
+                i += 1;
+            },
             ',' => if (!in_quotes) {
                 var candidate = i + 1;
                 while (candidate < raw.len and isAuthWhitespace(raw[candidate])) : (candidate += 1) {}
@@ -431,10 +500,14 @@ test "auth scaffolding: types compile with representative values" {
 test "auth scaffolding: engine authenticate remains a stub" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry-1.docker.io",
+        .{ .realm = "https://auth.example.test/token", .scope = "repository:library/ubuntu:pull" },
+    );
 
     try std.testing.expectError(
         error.NotYetImplemented,
-        engine.authenticate(&client, "registry-1.docker.io", "repository:library/ubuntu:pull"),
+        engine.authenticate(&client, request),
     );
 }
 
@@ -451,7 +524,7 @@ test "auth scaffolding: explicit helper process context is optional" {
 test "auth scaffolding: phase2 config review keeps only v0.1.1-relevant fields" {
     const provider = CredentialProvider{
         .getCredentialFn = struct {
-            fn get(_: []const u8) ?Credential {
+            fn get(_: []const u8) ?CredentialHandle {
                 return null;
             }
         }.get,
@@ -477,17 +550,17 @@ test "auth scaffolding: provider credentials borrow provider-owned storage" {
         var username = [_]u8{ 'u', 's', 'e', 'r' };
         var secret = [_]u8{ 't', 'o', 'k', 'e', 'n' };
 
-        fn get(registry: []const u8) ?Credential {
+        fn get(registry: []const u8) ?CredentialHandle {
             if (!std.mem.eql(u8, registry, "ghcr.io")) return null;
-            return .{
+            return .{ .credential = .{
                 .username = username[0..],
                 .secret = secret[0..],
-            };
+            } };
         }
     };
 
     const provider = CredentialProvider{ .getCredentialFn = State.get };
-    const cred = provider.getCredential("ghcr.io").?;
+    const cred = provider.getCredential("ghcr.io").?.credential;
 
     try std.testing.expectEqual(@intFromPtr(cred.username.ptr), @intFromPtr(&State.username[0]));
     try std.testing.expectEqual(@intFromPtr(cred.secret.ptr), @intFromPtr(&State.secret[0]));
@@ -495,6 +568,22 @@ test "auth scaffolding: provider credentials borrow provider-owned storage" {
     State.secret[0] = 'T';
     try std.testing.expectEqual(@as(u8, 'T'), cred.secret[0]);
     State.secret[0] = 't';
+}
+
+test "auth scaffolding: engine can request credential handle" {
+    const provider = CredentialProvider{
+        .getCredentialFn = struct {
+            fn get(registry: []const u8) ?CredentialHandle {
+                if (!std.mem.eql(u8, registry, "ghcr.io")) return null;
+                return .{ .credential = .{ .username = "user", .secret = "token" } };
+            }
+        }.get,
+    };
+    const engine = AuthEngine.init(std.testing.allocator, .{ .credential_provider = &provider });
+    const handle = engine.credentialForRegistry("ghcr.io").?;
+
+    try std.testing.expectEqualStrings("user", handle.credential.username);
+    try std.testing.expectEqualStrings("token", handle.credential.secret);
 }
 
 test "auth scaffolding: cached token owns duplicated secret bytes" {
@@ -556,6 +645,13 @@ test "parseAuthenticateHeader: parses bearer challenge" {
     try std.testing.expectEqualStrings("https://auth.example.test/token", challenge.bearer.realm);
     try std.testing.expectEqualStrings("registry.example.test", challenge.bearer.service.?);
     try std.testing.expectEqualStrings("repository:owner/image:pull", challenge.bearer.scope.?);
+}
+
+test "parseAuthenticateHeader: rejects insecure bearer realm url" {
+    try std.testing.expectError(
+        error.InsecureRealmUrl,
+        parseAuthenticateHeader("Bearer realm=\"http://auth.example.test/token\""),
+    );
 }
 
 test "parseAuthenticateHeader: table-driven bearer parsing matrix" {
@@ -642,6 +738,29 @@ test "parseAuthenticateHeader: malformed quoted values are invalid" {
     );
 }
 
+test "parseAuthenticateHeader: quoted escapes do not break bearer parsing" {
+    const challenge = try parseAuthenticateHeader(
+        "Bearer realm=\"https://auth.example.test/token\",service=\"registry\\\"quoted\\\".example.test\",scope=\"repository:owner/image:pull\"",
+    );
+
+    try std.testing.expect(challenge == .bearer);
+    try std.testing.expectEqualStrings("https://auth.example.test/token", challenge.bearer.realm);
+    try std.testing.expectEqualStrings("registry\\\"quoted\\\".example.test", challenge.bearer.service.?);
+    try std.testing.expectEqualStrings("repository:owner/image:pull", challenge.bearer.scope.?);
+}
+
+test "parseAuthenticateHeader: empty optional bearer values are invalid" {
+    try std.testing.expectError(
+        error.InvalidAuthenticateHeader,
+        parseAuthenticateHeader("Bearer realm=\"https://auth.example.test/token\",service=\"\""),
+    );
+
+    try std.testing.expectError(
+        error.InvalidAuthenticateHeader,
+        parseAuthenticateHeader("Bearer realm=\"https://auth.example.test/token\",scope=\"\""),
+    );
+}
+
 test "parseAuthenticateHeader: missing realm is invalid" {
     try std.testing.expectError(
         error.InvalidAuthenticateHeader,
@@ -657,23 +776,37 @@ test "parseAuthenticateHeader: unsupported scheme is rejected" {
 }
 
 test "classifyProbeResponse: classifies ok unauthorized and not found" {
-    try std.testing.expectEqual(ProbeResult.ok, try classifyProbeResponse(.ok, null));
+    try std.testing.expectEqual(ProbeResult.ok, try classifyProbeResponse(.ok, &.{}));
 
     const auth_required = try classifyProbeResponse(
         .unauthorized,
-        "Bearer realm=\"https://auth.example.test/token\"",
+        &.{"Bearer realm=\"https://auth.example.test/token\""},
     );
     try std.testing.expect(auth_required == .auth_required);
     try std.testing.expectEqualStrings("https://auth.example.test/token", auth_required.auth_required.bearer.realm);
 
-    try std.testing.expectEqual(ProbeResult.not_found, try classifyProbeResponse(.not_found, null));
+    try std.testing.expectEqual(ProbeResult.not_found, try classifyProbeResponse(.not_found, &.{}));
 }
 
 test "classifyProbeResponse: unauthorized without header fails explicitly" {
     try std.testing.expectError(
         error.MissingAuthenticateHeader,
-        classifyProbeResponse(.unauthorized, null),
+        classifyProbeResponse(.unauthorized, &.{}),
     );
+}
+
+test "classifyProbeResponse: repeated headers select bearer across values" {
+    const result = try classifyProbeResponse(
+        .unauthorized,
+        &.{
+            "Basic realm=\"registry.example.test\"",
+            "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
+        },
+    );
+
+    try std.testing.expect(result == .auth_required);
+    try std.testing.expectEqualStrings("https://auth.example.test/token", result.auth_required.bearer.realm);
+    try std.testing.expectEqualStrings("registry.example.test", result.auth_required.bearer.service.?);
 }
 
 test "ProbeHttpResponse: mock probe cases classify deterministically" {
@@ -682,7 +815,7 @@ test "ProbeHttpResponse: mock probe cases classify deterministically" {
         expected: enum { ok, auth_required, not_found, missing_header },
     }{
         .{ .response = .{ .status = .ok }, .expected = .ok },
-        .{ .response = .{ .status = .unauthorized, .www_authenticate = "Bearer realm=\"https://auth.example.test/token\"" }, .expected = .auth_required },
+        .{ .response = .{ .status = .unauthorized, .www_authenticate_headers = &.{"Bearer realm=\"https://auth.example.test/token\""} }, .expected = .auth_required },
         .{ .response = .{ .status = .unauthorized }, .expected = .missing_header },
         .{ .response = .{ .status = .not_found }, .expected = .not_found },
     };
@@ -699,4 +832,20 @@ test "ProbeHttpResponse: mock probe cases classify deterministically" {
             .missing_header => try std.testing.expectError(error.MissingAuthenticateHeader, case.response.classify()),
         }
     }
+}
+
+test "AuthenticateRequest: carries parsed challenge data for token exchange" {
+    const request = try AuthenticateRequest.init(
+        "registry-1.docker.io",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:library/ubuntu:pull",
+        },
+    );
+
+    try std.testing.expectEqualStrings("registry-1.docker.io", request.registry);
+    try std.testing.expectEqualStrings("https://auth.example.test/token", request.challenge.realm);
+    try std.testing.expectEqualStrings("registry.example.test", request.service().?);
+    try std.testing.expectEqualStrings("repository:library/ubuntu:pull", request.scope().?);
 }

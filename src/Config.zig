@@ -20,6 +20,15 @@ pub const Credential = struct {
     secret: []const u8,
 };
 
+pub const CredentialHandle = struct {
+    credential: Credential,
+    release_fn: ?*const fn (credential: Credential) void = null,
+
+    pub fn release(self: CredentialHandle) void {
+        if (self.release_fn) |release_fn| release_fn(self.credential);
+    }
+};
+
 /// Interface for supplying credentials per registry.
 /// Callers implement getCredentialFn and plug it in via Config.
 ///
@@ -30,10 +39,10 @@ pub const CredentialProvider = struct {
     /// Returns credentials for the given registry hostname, or null for
     /// anonymous access. The returned Credential slices must remain valid
     /// for the duration of the resolve call.
-    getCredentialFn: *const fn (registry: []const u8) ?Credential,
+    getCredentialFn: *const fn (registry: []const u8) ?CredentialHandle,
 
     /// Convenience wrapper so callers do not need to reach into the function pointer.
-    pub fn getCredential(self: CredentialProvider, registry: []const u8) ?Credential {
+    pub fn getCredential(self: CredentialProvider, registry: []const u8) ?CredentialHandle {
         return self.getCredentialFn(registry);
     }
 };
@@ -77,7 +86,7 @@ test "Config: credential_provider slot accepts a provider" {
     // Arrange: a no-op provider that returns null for all registries.
     const provider = CredentialProvider{
         .getCredentialFn = struct {
-            fn get(_: []const u8) ?Credential {
+            fn get(_: []const u8) ?CredentialHandle {
                 return null;
             }
         }.get,
@@ -93,9 +102,9 @@ test "Config: credential_provider returns credentials for a registry" {
     // Arrange
     const provider = CredentialProvider{
         .getCredentialFn = struct {
-            fn get(registry: []const u8) ?Credential {
+            fn get(registry: []const u8) ?CredentialHandle {
                 if (std.mem.eql(u8, registry, "ghcr.io")) {
-                    return Credential{ .username = "user", .secret = "token" };
+                    return .{ .credential = .{ .username = "user", .secret = "token" } };
                 }
                 return null;
             }
@@ -106,8 +115,32 @@ test "Config: credential_provider returns credentials for a registry" {
     const cred = c.credential_provider.?.getCredential("ghcr.io");
     // Assert
     try std.testing.expect(cred != null);
-    try std.testing.expectEqualSlices(u8, "user", cred.?.username);
-    try std.testing.expectEqualSlices(u8, "token", cred.?.secret);
+    try std.testing.expectEqualSlices(u8, "user", cred.?.credential.username);
+    try std.testing.expectEqualSlices(u8, "token", cred.?.credential.secret);
+}
+
+test "Config: credential handle release hook can tear down secrets" {
+    const State = struct {
+        var released = false;
+
+        fn release(_: Credential) void {
+            released = true;
+        }
+
+        fn get(registry: []const u8) ?CredentialHandle {
+            if (!std.mem.eql(u8, registry, "ghcr.io")) return null;
+            return .{
+                .credential = .{ .username = "user", .secret = "token" },
+                .release_fn = release,
+            };
+        }
+    };
+
+    const provider = CredentialProvider{ .getCredentialFn = State.get };
+    const handle = provider.getCredential("ghcr.io").?;
+    try std.testing.expect(!State.released);
+    handle.release();
+    try std.testing.expect(State.released);
 }
 
 test "Config: timeout fields accept custom values" {

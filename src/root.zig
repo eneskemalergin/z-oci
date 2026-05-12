@@ -30,7 +30,9 @@ pub const AuthEngine = auth.AuthEngine;
 pub const AuthError = auth.AuthError;
 pub const AuthChallenge = auth.AuthChallenge;
 pub const BearerChallenge = auth.BearerChallenge;
+pub const AuthenticateRequest = auth.AuthenticateRequest;
 pub const ProbeResult = auth.ProbeResult;
+pub const ProbeHttpResponse = auth.ProbeHttpResponse;
 pub const Token = auth.Token;
 pub const TokenResponse = auth.TokenResponse;
 pub const TokenCacheKey = auth.TokenCacheKey;
@@ -40,6 +42,7 @@ pub const ResolveResult = @import("ResolveResult.zig");
 pub const Config = @import("Config.zig").Config;
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
+pub const CredentialHandle = @import("Config.zig").CredentialHandle;
 
 pub const ImplementationError = error{NotYetImplemented};
 
