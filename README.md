@@ -54,10 +54,13 @@ The auth subsystem is now a real Phase 2 slice rather than a placeholder. Curren
 - Bearer challenge parsing with HTTPS realm validation
 - token request building from parsed challenge data, including GET-first and POST fallback shapes
 - optional Basic auth header construction for credentialed token exchange
-- deterministic credential lookup: explicit config provider -> injected environment map -> anonymous fallback
+- deterministic credential lookup: explicit config provider -> injected environment map -> Docker config/helper sources -> anonymous fallback
 - fixed environment variable names for the env-backed path: `Z_OCI_REGISTRY_HOST`, `Z_OCI_REGISTRY_USER`, and `Z_OCI_REGISTRY_TOKEN`
+- Docker config discovery through `DOCKER_CONFIG`, `HOME`, and `USERPROFILE`
+- Docker `auths`, `credHelpers`, and `credsStore` support with registry helper -> inline auth -> global store precedence
+- helper-backed credential lookup through `std.process.spawn`, including timeout handling and repeated-run safety coverage
 
-Docker config parsing, credential helpers, token caching, and live registry manifest fetch remain future Phase 2 and Phase 3 work.
+Token caching and live registry manifest fetch remain future Phase 2 and Phase 3 work.
 
 ## Requirements
 
@@ -148,10 +151,10 @@ The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, a
     - v0.1.2: `/v2/` probe and Bearer challenge parsing
     - v0.1.3: token exchange with GET-first and POST fallback
     - v0.1.4: basic credential chain with config, env, and anonymous lookup
+    - v0.1.5: Docker config parsing, helper-backed credentials, timeout handling, and Docker-source auth-chain integration
 
 Next up:
 
-- Docker credential sources and helper integration (v0.1.5)
 - token cache and auth retry policy (v0.1.6)
 - auth hardening, docs, and release gate (v0.1.7 / v0.2.0)
 - Manifest resolution: HEAD/GET, multi-arch, nested index (v0.3.0)

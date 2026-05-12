@@ -11,6 +11,32 @@ Nothing yet.
 
 ---
 
+## [0.1.5] - 2026-05-12
+
+### Added
+
+- Docker credential source support now covers Docker config discovery via `DOCKER_CONFIG`, `HOME`, and `USERPROFILE`, plus owned parsing of `auths`, `credHelpers`, and `credsStore`.
+- Inline Docker `auths` decoding now handles real registry entries including Docker Hub historical keys, normal host keys such as `ghcr.io`, and host-plus-port self-hosted registries.
+- Docker helper execution now runs through `std.process.spawn` with stdin-driven helper protocol support, bounded stdout/stderr handling, helper JSON parsing, and teardown-safe owned credential handles.
+- Additional auth tests now cover Docker-source precedence, helper protocol behavior, timeout handling, helper failure propagation, and repeated-run recovery after helper timeout or failure.
+
+### Changed
+
+- `AuthEngine` now extends the credential chain from explicit config -> environment map -> anonymous to explicit config -> environment map -> Docker sources -> anonymous.
+- Docker-source lookup now uses explicit precedence of registry-specific helper -> inline auth -> global `credsStore`, while preserving Docker Hub normalization to `https://index.docker.io/v1/` where required.
+- `authenticate(...)` now consumes helper-backed Docker credentials in the real auth path, and configured helper failures or timeouts remain terminal for that Docker credential source instead of degrading silently.
+
+### Fixed
+
+- Docker helper timeout handling now enforces deterministic child termination and repeated-run safety rather than allowing a hung helper to stall the auth path indefinitely.
+- Docker-derived copied secrets now consistently flow through `CredentialHandle` teardown hooks so helper-owned bytes are zeroed and freed after use.
+
+### Verified
+
+- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 220 tests.
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 267 tests.
+- `zig build test --summary all` passes with 271/271 tests.
+
 ## [0.1.4] - 2026-05-11
 
 ### Added
