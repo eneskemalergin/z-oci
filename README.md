@@ -19,57 +19,40 @@
 
 ---
 
-**Current scope on `phase2-auth`:**
+## Overview
 
-- `Digest`, `MediaType`, and `Platform`: leaf types with parser, matching, and formatting behavior
-- `Reference`: full Docker/OCI reference parser with owned-lifetime semantics
-- `Descriptor`, `Manifest`, `OciImageIndex`, and `DockerManifestList`: OCI/Docker data model types
-- `MultiArchManifest`: platform selection over multi-arch indices and manifest lists
-- `json.parse(T, allocator, bytes)`: OCI-friendly JSON wrapper over `std.json.Parsed(T)`
-- `ResolveError`, `ResolveResult`, and `Config`: public contract types for the future resolver surface
-- Phase 2 auth engine exports: `/v2/` probe classification, `WWW-Authenticate` parsing, token-request construction, token-response parsing, and credential-provider plumbing
-- `resolve`, `validate`, and `getManifest`: public API stubs with documented ownership contracts; real manifest HTTP fetch is still not implemented
-- real offline OCI/Docker fixture set with provenance in `fixtures/SOURCES.md`
-- three offline example programs plus `examples-smoke` build coverage
-- explicit offline workflow smoke matrix via `zig build workflow-smoke`
+z-oci currently provides:
 
-## Current Supported Workflows
+- Docker and OCI reference parsing and normalization through `Reference`
+- OCI manifest, index, descriptor, digest, media-type, and platform types
+- `json.parse(T, allocator, bytes)` as a thin OCI-friendly wrapper over `std.json`
+- offline fixture-driven manifest and index inspection
+- a Phase 2 auth engine for `/v2/` probe classification, bearer challenge parsing, token exchange, credential lookup, and token caching
+- public resolver-surface stubs with documented ownership and auth handoff contracts
 
-The current codebase handles:
+For release-by-release detail, see [CHANGELOG.md](CHANGELOG.md). For milestone planning, see [plan/phase2-plan.md](plan/phase2-plan.md).
 
-- reference normalization and decomposition through `Reference.parse`, `repositoryPath()`, and `refString()`
-- digest parsing and syntactic validation through `Digest.parse` and digest-pinned references
-- offline manifest and index inspection from checked-in OCI/Docker JSON fixtures
-- platform selection from parsed multi-arch indices and manifest lists
-- clone `ResolveResult` values out of a short-lived arena
-- auth-only Phase 2 flows: `/v2/` probe classification, Bearer challenge parsing, GET plus POST-fallback token exchange, and deterministic credential lookup ordering
+## What Works Today
 
-It does not yet implement live manifest fetch, digest verification over registry responses, or real `resolve`, `validate`, and `getManifest` behavior.
+- Parse and normalize image references, including Docker Hub canonicalization.
+- Parse digests, manifests, indices, and descriptors from local JSON payloads.
+- Select platforms from parsed multi-arch indices and manifest lists.
+- Run offline example programs and workflow smoke coverage from checked-in fixtures.
+- Use the Phase 2 auth engine to classify registry challenges, build token requests, exchange tokens, resolve credentials, and reuse cached bearer tokens.
 
-## Auth Engine Status
+The current code does not yet perform live manifest fetch, digest verification over registry responses, or real `resolve`, `validate`, and `getManifest` behavior.
 
-The auth subsystem is now a real Phase 2 slice rather than a placeholder. Current auth coverage includes:
+## Auth Scope
 
-- `/v2/` probe response classification and repeated `WWW-Authenticate` header handling
-- Bearer challenge parsing with HTTPS realm validation
-- token request building from parsed challenge data, including GET-first and POST fallback shapes
-- optional Basic auth header construction for credentialed token exchange
-- deterministic credential lookup: explicit config provider -> injected environment map -> Docker config/helper sources -> anonymous fallback
-- fixed environment variable names for the env-backed path: `Z_OCI_REGISTRY_HOST`, `Z_OCI_REGISTRY_USER`, and `Z_OCI_REGISTRY_TOKEN`
-- Docker config discovery through `DOCKER_CONFIG`, `HOME`, and `USERPROFILE`
-- Docker `auths`, `credHelpers`, and `credsStore` support with registry helper -> inline auth -> global store precedence
-- helper-backed credential lookup through `std.process.spawn`, including timeout handling and repeated-run safety coverage
-- engine-owned token cache storage keyed by `realm + service + scope`
-- TTL-aware token reuse with refresh-window expiry handling and exact-key cache invalidation helpers for the future upstream-`401` retry path
+The auth engine is implemented and tested, but it is still a library slice rather than a fully wired resolver. The public seam that Phase 3 will consume is already exported through `AuthReferenceView`, `referenceView(...)`, `ProbeHttpResponse.classify()`, `AuthenticateRequest`, `AuthEngine.authenticate(...)`, and `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)`.
 
-Live registry manifest fetch and the final auth hardening/release-prep pass remain future Phase 2 and Phase 3 work.
+Named registry hardening in `v0.1.7` is intentionally narrow:
 
-**Next active auth milestone (`v0.1.7`):**
+- explicitly registry-hardened: Docker Hub, GHCR, and Quay
+- explicitly covered through a generic self-hosted bearer-registry test path: GitLab Container Registry and Harbor
+- deferred or documentation-only: other registries that either follow the generic bearer flow without dedicated fixtures yet, or depend on cloud IAM and provider-specific helpers
 
-- registry-specific auth hardening for Docker Hub, GHCR, Quay, and any other explicitly supported registries
-- final code-quality and ownership review across the Phase 2 auth surface
-- Phase 3 handoff definition for how manifest resolution consumes the auth engine
-- final docs and release gate checks before merging the Phase 2 branch back to `main`
+If you need the detailed support matrix or the exact auth hardening changes in this release, use [CHANGELOG.md](CHANGELOG.md) instead of this README.
 
 ## Requirements
 
@@ -133,18 +116,15 @@ pub fn main() !void {
 
 ## Build steps
 
-| Command | What it does |
-| ------- | ------------ |
-| `zig build` | Build and install the current stub CLI plus the package module |
-| `zig build test` | Run all unit tests |
-| `zig build examples` | Build all offline example programs |
-| `zig build examples-smoke` | Run a small smoke pass over the offline example programs |
-| `zig build workflow-smoke` | Run the offline workflow smoke-test matrix |
-| `zig build run` | Run the CLI (once implemented) |
+- `zig build`: build and install the current stub CLI plus the package module
+- `zig build test`: run all unit tests
+- `zig build examples`: build the offline example programs
+- `zig build examples-smoke`: run a small smoke pass over the example programs
+- `zig build workflow-smoke`: run the offline workflow smoke-test matrix
 
-Fixtures under `fixtures/` are checked-in snapshots, not live fetches. `zig build test` validates them in CI. To refresh, recapture from the URLs and `Accept` headers in `fixtures/SOURCES.md`.
+Fixtures under `fixtures/` are checked-in snapshots, not live fetches. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
 
-The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, and build files. Documented examples and tests work from a dependency fetch.
+The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, and the build files, so the documented examples and tests work from a dependency fetch.
 
 ## Offline examples
 
@@ -152,29 +132,19 @@ The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, a
 - `zig build example-inspect-manifest`
 - `zig build example-select-platform`
 
+See [examples](examples) for the source of the packaged examples.
+
 ## Roadmap
 
-- Done on `main`: v0.0.1 -> v0.1.0: offline toolkit baseline
-- Done on `phase2-auth` so far:
-    - v0.1.1: auth surface and type scaffolding
-    - v0.1.2: `/v2/` probe and Bearer challenge parsing
-    - v0.1.3: token exchange with GET-first and POST fallback
-    - v0.1.4: basic credential chain with config, env, and anonymous lookup
-    - v0.1.5: Docker config parsing, helper-backed credentials, timeout handling, and Docker-source auth-chain integration
-    - v0.1.6: token caching keyed by `realm + service + scope`, expiry-aware reuse, exact-key invalidation, and cache hardening coverage
+Planned implementation areas:
 
-Next up:
+- manifest resolution with HEAD/GET and multi-arch selection
+- rate limiting and backoff behavior
+- broader transport and registry testing
+- CLI commands for resolve, validate, and inspect
+- packaging, API docs, and stabilization
 
-- auth hardening, docs, and release gate (v0.1.7 / v0.2.0)
-- Manifest resolution: HEAD/GET, multi-arch, nested index (v0.3.0)
-- Rate limiting: backoff, batch API, session cache (v0.4.0)
-- Testing: mock server, local registry, CI (v0.5.0)
-- CLI: `z-oci resolve`, `validate`, `inspect` (v0.6.0)
-- Zencelot (v0.7.0)
-- Zencelot Integration (v0.8.0)
-- Stabilization (v0.9.0)
-- Package release: Zig package index, API docs (v1.0.0)
-- Registry HTTP transport, auth flows, and real resolver behavior (Phase 2)
+Detailed milestone notes live in [plan/phase2-plan.md](plan/phase2-plan.md).
 
 ## References
 

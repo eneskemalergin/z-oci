@@ -29,10 +29,12 @@ pub const json = @import("json.zig");
 pub const AuthEngine = auth.AuthEngine;
 pub const AuthError = auth.AuthError;
 pub const AuthChallenge = auth.AuthChallenge;
+pub const AuthReferenceView = auth.AuthReferenceView;
 pub const BearerChallenge = auth.BearerChallenge;
 pub const AuthenticateRequest = auth.AuthenticateRequest;
 pub const ProbeResult = auth.ProbeResult;
 pub const ProbeHttpResponse = auth.ProbeHttpResponse;
+pub const referenceView = auth.referenceView;
 pub const Token = auth.Token;
 pub const TokenResponse = auth.TokenResponse;
 pub const TokenCacheKey = auth.TokenCacheKey;
@@ -56,6 +58,16 @@ pub const ImplementationError = error{NotYetImplemented};
 ///   you need, then tear the arena down.
 /// - For batch operations that keep results longer, clone the ResolveResult into caller-owned
 ///   memory before freeing the per-call arena.
+///
+/// Phase 3 auth handoff contract:
+/// - derive `AuthReferenceView` from the normalized `Reference` with `referenceView(ref)`
+/// - probe `view.probeUriAlloc(...)` first; only enter auth when `ProbeHttpResponse.classify()`
+///   returns `.auth_required`
+/// - turn that bearer challenge into `AuthenticateRequest.init(view.registry, challenge)` and call
+///   `AuthEngine.authenticate(...)`
+/// - attach the returned bearer token to the retried HEAD/GET request; if that retry comes back
+///   `401`, call `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)` once for the same
+///   request and surface failure after that single retry
 pub fn resolve(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -77,6 +89,10 @@ pub fn resolve(
 /// - No owned data is returned from this API.
 /// - The caller still owns `allocator`; later implementations may use it for transient parsing and
 ///   response handling even though this stub returns immediately.
+///
+/// Phase 3 auth handoff contract:
+/// - validation follows the same probe -> classify -> authenticate -> retry-once flow as `resolve`
+/// - validation must treat `.not_found` as terminal and must not attempt auth in that case
 pub fn validate(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -96,6 +112,11 @@ pub fn validate(
 /// - The returned std.json.Parsed(Manifest) owns an arena.
 /// - Call parsed.deinit() when finished.
 /// - Do not free the allocator backing that arena while the parsed value is still in use.
+///
+/// Phase 3 auth handoff contract:
+/// - manifest GET uses the same `AuthReferenceView` and `AuthenticateRequest` boundary as `resolve`
+/// - auth owns token exchange and cache invalidation; manifest fetch owns Accept negotiation,
+///   response status handling, and JSON parsing
 pub fn getManifest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,

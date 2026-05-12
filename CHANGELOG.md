@@ -3,13 +3,42 @@
 
 All notable changes to z-oci are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows [Semantic Versioning](https://semver.org/).
 
-Versions listed here are not yet tagged in git. Tags will follow once the library reaches a stable public API.
+Versions listed here may be prepared ahead of the matching git tag. Tags follow once the release is cut.
 
 ## [Unreleased]
 
-### Planned
+## [0.1.7] - 2026-05-11
 
-- `v0.1.7` will focus on registry-specific auth hardening, Phase 3 handoff cleanup, and the final release-prep/docs gate before the Phase 2 branch is ready to merge.
+### Added
+
+- Auth token request building now expands space-delimited bearer challenge scopes into repeated `scope=` query parameters, matching the Docker registry token-auth contract instead of collapsing them into a single encoded value.
+- Auth request-builder coverage now includes documented Docker Hub, GHCR, and Quay token endpoint examples so registry-specific realm and service values stay pinned in tests.
+- Docker Hub env-backed auth now composes with Phase 1 reference normalization, so `docker.io/...` references that normalize to `registry-1.docker.io` still pick up configured Docker Hub credentials.
+- Docker Hub auth coverage now explicitly distinguishes authenticated and anonymous token requests, proving optional basic auth is attached only when a Docker Hub credential source matches.
+- Plain-host credential matching is now case-insensitive for registry auth inputs, which hardens GHCR and Quay flows against mixed-case registry hosts.
+- Helper-backed credential lookup now canonicalizes registry server names before invoking Docker helpers, so GHCR and Quay helper flows no longer depend on caller casing.
+- The Phase 3 auth-resolver handoff is now explicit in the public code docs and exports: resolver code consumes `AuthReferenceView`, `referenceView(...)`, `ProbeHttpResponse.classify()`, `AuthenticateRequest`, `AuthEngine.authenticate(...)`, and the one-shot cached-401 retry hook `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)` with documented ownership and retry guarantees.
+- Public docs now distinguish shipped Phase 2 auth-engine behavior from still-unimplemented Phase 3 resolver work, so `resolve`, `validate`, and `getManifest` are not presented as live manifest-fetch APIs yet.
+- The `v0.1.7` registry scope is now explicit: Docker Hub, GHCR, and Quay remain the named registry-hardened targets, GitLab and Harbor now have explicit mock coverage through a generic self-hosted bearer-registry validation target, other standards-based registries like Artifactory, `registry.k8s.io`, `mcr.microsoft.com`, and BioContainers distribution paths remain documentation-only, and cloud-provider registries such as Google Artifact Registry, ECR, ACR, OCIR, IBM Cloud Container Registry, Alibaba ACR, and DigitalOcean Container Registry are deferred to later support work.
+- Auth bug-hunt coverage now includes empty-query token requests, conflicting duplicate token fields, empty refresh tokens, and eager eviction of expired cached tokens before cache misses.
+- Release-gate allocation-failure coverage now extends beyond cache insertion to token-response ownership and token-request construction, so owned auth paths fail cleanly without leaks when allocations are denied.
+
+### Fixed
+
+- Token-response parsing now rejects conflicting `access_token` vs `token` payloads and empty `refresh_token` values instead of silently accepting ambiguous or malformed token bodies.
+- Token-response parsing now preserves `OutOfMemory` instead of collapsing allocator failures into `InvalidTokenResponse`.
+- Owned `refresh_token` bytes are now zeroed before free during `TokenResponse.deinit()`, bringing refresh-token teardown in line with access-token teardown.
+- Token-response construction no longer leaks the already-owned access token if refresh-token duplication fails mid-parse.
+- GET token requests built from bearer challenges without `service` or `scope` no longer emit a trailing `?` on the auth realm URL.
+- Expired cached tokens are now dropped eagerly on lookup, and the cache path no longer carries dead single-use invalidation helpers.
+
+### Verified
+
+- Live `GET /v2/` challenge checks confirm Docker Hub returns `realm="https://auth.docker.io/token",service="registry.docker.io"`, GHCR returns `realm="https://ghcr.io/token",service="ghcr.io"`, and Quay returns `realm="https://quay.io/v2/auth",service="quay.io"`.
+- Live repository challenge checks confirm GHCR returns a repository-scoped bearer challenge for public manifests, while public Quay manifests can still succeed anonymously without forcing auth.
+- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 246 tests.
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 293 tests.
+- `zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes with 297/297 tests.
 
 ---
 
