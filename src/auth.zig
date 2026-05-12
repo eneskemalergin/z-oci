@@ -157,6 +157,19 @@ pub const AuthReferenceView = struct {
     registry: []const u8,
     repository_path: []const u8,
     ref_string: []const u8,
+
+    pub fn probeUriAlloc(self: AuthReferenceView, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "https://{s}/v2/", .{self.registry});
+    }
+};
+
+pub const ProbeHttpResponse = struct {
+    status: std.http.Status,
+    www_authenticate: ?[]const u8 = null,
+
+    pub fn classify(self: ProbeHttpResponse) AuthError!ProbeResult {
+        return classifyProbeResponse(self.status, self.www_authenticate);
+    }
 };
 
 /// Explicit process boundary for helper execution.
@@ -254,21 +267,38 @@ pub fn parseAuthenticateHeader(raw: []const u8) AuthError!AuthChallenge {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return error.MissingAuthenticateHeader;
 
-    const space_index = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
-    const scheme = trimmed[0..space_index];
-    const remainder = std.mem.trim(u8, trimmed[space_index..], " \t");
+    var cursor: usize = 0;
+    while (cursor < trimmed.len) {
+        const next_challenge = try findNextChallengeStart(trimmed, cursor);
+        const end = next_challenge orelse trimmed.len;
+        const chunk = std.mem.trim(u8, trimmed[cursor..end], " \t,");
+        if (chunk.len == 0) return error.InvalidAuthenticateHeader;
 
-    if (!std.ascii.eqlIgnoreCase(scheme, "Bearer")) {
-        return error.UnsupportedAuthenticateScheme;
+        const challenge = try parseChallengeChunk(chunk);
+        if (challenge == .bearer) return challenge;
+
+        cursor = next_challenge orelse break;
     }
 
-    return .{ .bearer = try parseBearerChallenge(remainder) };
+    return error.UnsupportedAuthenticateScheme;
+}
+
+fn parseChallengeChunk(raw: []const u8) AuthError!AuthChallenge {
+    const space_index = std.mem.indexOfAny(u8, raw, " \t") orelse raw.len;
+    const scheme = raw[0..space_index];
+    const remainder = std.mem.trim(u8, raw[space_index..], " \t");
+
+    if (std.ascii.eqlIgnoreCase(scheme, "Bearer")) {
+        return .{ .bearer = try parseBearerChallenge(remainder) };
+    }
+
+    return .{ .other = scheme };
 }
 
 fn parseBearerChallenge(params: []const u8) AuthError!BearerChallenge {
     var challenge = BearerChallenge{ .realm = "" };
-    var parts = std.mem.splitScalar(u8, params, ',');
-    while (parts.next()) |part| {
+    var cursor: usize = 0;
+    while (try nextCommaSeparatedChunk(params, &cursor)) |part| {
         const trimmed = std.mem.trim(u8, part, " \t");
         if (trimmed.len == 0) continue;
 
@@ -300,10 +330,75 @@ fn parseAuthParamValue(raw: []const u8) AuthError![]const u8 {
         if (trimmed.len < 2 or trimmed[trimmed.len - 1] != '"') {
             return error.InvalidAuthenticateHeader;
         }
+        if (std.mem.indexOfScalar(u8, trimmed[1 .. trimmed.len - 1], '"') != null) {
+            return error.InvalidAuthenticateHeader;
+        }
         return trimmed[1 .. trimmed.len - 1];
     }
 
+    if (std.mem.indexOfScalar(u8, trimmed, '"') != null) {
+        return error.InvalidAuthenticateHeader;
+    }
+
     return trimmed;
+}
+
+fn nextCommaSeparatedChunk(raw: []const u8, cursor: *usize) AuthError!?[]const u8 {
+    if (cursor.* >= raw.len) return null;
+
+    const start = cursor.*;
+    var in_quotes = false;
+    var i = start;
+    while (i < raw.len) : (i += 1) {
+        switch (raw[i]) {
+            '"' => in_quotes = !in_quotes,
+            ',' => if (!in_quotes) {
+                cursor.* = i + 1;
+                return raw[start..i];
+            },
+            else => {},
+        }
+    }
+
+    if (in_quotes) return error.InvalidAuthenticateHeader;
+    cursor.* = raw.len;
+    return raw[start..];
+}
+
+fn findNextChallengeStart(raw: []const u8, start: usize) AuthError!?usize {
+    var in_quotes = false;
+    var i = start;
+    while (i < raw.len) : (i += 1) {
+        switch (raw[i]) {
+            '"' => in_quotes = !in_quotes,
+            ',' => if (!in_quotes) {
+                var candidate = i + 1;
+                while (candidate < raw.len and isAuthWhitespace(raw[candidate])) : (candidate += 1) {}
+                if (candidate >= raw.len) continue;
+                if (isChallengeStart(raw[candidate..])) return candidate;
+            },
+            else => {},
+        }
+    }
+
+    if (in_quotes) return error.InvalidAuthenticateHeader;
+    return null;
+}
+
+fn isChallengeStart(raw: []const u8) bool {
+    var token_end: usize = 0;
+    while (token_end < raw.len and !isAuthWhitespace(raw[token_end]) and raw[token_end] != ',' and raw[token_end] != '=') : (token_end += 1) {}
+    if (token_end == 0) return false;
+    if (token_end == raw.len) return true;
+    if (!isAuthWhitespace(raw[token_end])) return false;
+
+    var value_start = token_end;
+    while (value_start < raw.len and isAuthWhitespace(raw[value_start])) : (value_start += 1) {}
+    return value_start > token_end and (value_start == raw.len or raw[value_start] != '=');
+}
+
+fn isAuthWhitespace(char: u8) bool {
+    return char == ' ' or char == '\t';
 }
 
 test "auth scaffolding: types compile with representative values" {
@@ -439,6 +534,19 @@ test "auth scaffolding: reference view consumes normalized Reference outputs" {
     try std.testing.expectEqualStrings("22.04", view.ref_string);
 }
 
+test "auth scaffolding: probe uri uses normalized registry from reference view" {
+    var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:22.04");
+    defer ref.deinit(std.testing.allocator);
+
+    const view = referenceView(ref);
+    const probe_uri = try view.probeUriAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(probe_uri);
+
+    try std.testing.expectEqualStrings("https://registry-1.docker.io/v2/", probe_uri);
+    try std.testing.expectEqualStrings("library/ubuntu", view.repository_path);
+    try std.testing.expectEqualStrings("22.04", view.ref_string);
+}
+
 test "parseAuthenticateHeader: parses bearer challenge" {
     const challenge = try parseAuthenticateHeader(
         "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\",scope=\"repository:owner/image:pull\"",
@@ -450,6 +558,52 @@ test "parseAuthenticateHeader: parses bearer challenge" {
     try std.testing.expectEqualStrings("repository:owner/image:pull", challenge.bearer.scope.?);
 }
 
+test "parseAuthenticateHeader: table-driven bearer parsing matrix" {
+    const cases = [_]struct {
+        raw: []const u8,
+        realm: []const u8,
+        service: ?[]const u8,
+        scope: ?[]const u8,
+    }{
+        .{
+            .raw = "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\",scope=\"repository:owner/image:pull\"",
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+        .{
+            .raw = "bearer realm=\"https://auth.example.test/token\", foo=\"ignored\", service=registry.example.test",
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = null,
+        },
+        .{
+            .raw = "Basic realm=\"registry.example.test\", Bearer realm=\"https://auth.example.test/token\", scope=\"repository:owner/image:pull,push\"",
+            .realm = "https://auth.example.test/token",
+            .service = null,
+            .scope = "repository:owner/image:pull,push",
+        },
+    };
+
+    for (cases) |case| {
+        const challenge = try parseAuthenticateHeader(case.raw);
+        try std.testing.expect(challenge == .bearer);
+        try std.testing.expectEqualStrings(case.realm, challenge.bearer.realm);
+
+        if (case.service) |service| {
+            try std.testing.expectEqualStrings(service, challenge.bearer.service.?);
+        } else {
+            try std.testing.expect(challenge.bearer.service == null);
+        }
+
+        if (case.scope) |scope| {
+            try std.testing.expectEqualStrings(scope, challenge.bearer.scope.?);
+        } else {
+            try std.testing.expect(challenge.bearer.scope == null);
+        }
+    }
+}
+
 test "parseAuthenticateHeader: bearer scheme is case-insensitive and ignores unknown params" {
     const challenge = try parseAuthenticateHeader(
         "bearer realm=\"https://auth.example.test/token\",foo=\"bar\",service=registry.example.test",
@@ -459,6 +613,33 @@ test "parseAuthenticateHeader: bearer scheme is case-insensitive and ignores unk
     try std.testing.expectEqualStrings("https://auth.example.test/token", challenge.bearer.realm);
     try std.testing.expectEqualStrings("registry.example.test", challenge.bearer.service.?);
     try std.testing.expect(challenge.bearer.scope == null);
+}
+
+test "parseAuthenticateHeader: selects bearer from multiple challenges" {
+    const challenge = try parseAuthenticateHeader(
+        "Basic realm=\"registry.example.test\", Bearer realm=\"https://auth.example.test/token\", service=\"registry.example.test\", scope=\"repository:owner/image:pull,push\"",
+    );
+
+    try std.testing.expect(challenge == .bearer);
+    try std.testing.expectEqualStrings("https://auth.example.test/token", challenge.bearer.realm);
+    try std.testing.expectEqualStrings("registry.example.test", challenge.bearer.service.?);
+    try std.testing.expectEqualStrings("repository:owner/image:pull,push", challenge.bearer.scope.?);
+}
+
+test "parseAuthenticateHeader: duplicate bearer params are invalid" {
+    try std.testing.expectError(
+        error.InvalidAuthenticateHeader,
+        parseAuthenticateHeader(
+            "Bearer realm=\"https://auth.example.test/token\", realm=\"https://duplicate.example.test/token\"",
+        ),
+    );
+}
+
+test "parseAuthenticateHeader: malformed quoted values are invalid" {
+    try std.testing.expectError(
+        error.InvalidAuthenticateHeader,
+        parseAuthenticateHeader("Bearer realm=\"https://auth.example.test/token"),
+    );
 }
 
 test "parseAuthenticateHeader: missing realm is invalid" {
@@ -493,4 +674,29 @@ test "classifyProbeResponse: unauthorized without header fails explicitly" {
         error.MissingAuthenticateHeader,
         classifyProbeResponse(.unauthorized, null),
     );
+}
+
+test "ProbeHttpResponse: mock probe cases classify deterministically" {
+    const cases = [_]struct {
+        response: ProbeHttpResponse,
+        expected: enum { ok, auth_required, not_found, missing_header },
+    }{
+        .{ .response = .{ .status = .ok }, .expected = .ok },
+        .{ .response = .{ .status = .unauthorized, .www_authenticate = "Bearer realm=\"https://auth.example.test/token\"" }, .expected = .auth_required },
+        .{ .response = .{ .status = .unauthorized }, .expected = .missing_header },
+        .{ .response = .{ .status = .not_found }, .expected = .not_found },
+    };
+
+    for (cases) |case| {
+        switch (case.expected) {
+            .ok => try std.testing.expectEqual(ProbeResult.ok, try case.response.classify()),
+            .auth_required => {
+                const result = try case.response.classify();
+                try std.testing.expect(result == .auth_required);
+                try std.testing.expectEqualStrings("https://auth.example.test/token", result.auth_required.bearer.realm);
+            },
+            .not_found => try std.testing.expectEqual(ProbeResult.not_found, try case.response.classify()),
+            .missing_header => try std.testing.expectError(error.MissingAuthenticateHeader, case.response.classify()),
+        }
+    }
 }
