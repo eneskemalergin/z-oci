@@ -6,11 +6,13 @@ JSON files in this directory are zebrac output snapshots from milestone releases
 
 | Operation | Mean wall time | Mean RSS | Samples |
 |---|---|---|---|
-| reference-parse (10k iters) | ~341ms | 4.69 MB | 12 |
-| digest-parse (10k iters) | ~1.2ms | 4.69 MB | 1705 |
-| manifest-parse (10k iters) | ~343ms | 4.69 MB | 12 |
-| challenge-parse (10k iters) | ~62ms | 4.70 MB | 65 |
-| platform-match (10k iters) | ~8.8ms | 4.70 MB | 450 |
+| reference-parse (10k iters) | ~341ms | 4.69 MB | ~12 |
+| digest-parse (10k iters) | ~1.2ms | 4.69 MB | ~1700 |
+| manifest-parse (10k iters) | ~343ms | 4.69 MB | ~12 |
+| challenge-parse (10k iters) | ~62ms | 4.70 MB | ~65 |
+| platform-match (10k iters) | ~8.8ms | 4.70 MB | ~450 |
+| authenticate-miss (1k iters) | ~145ms | 4.73 MB | ~28 |
+| authenticate-hit (1k iters) | ~35ms | 4.70 MB | ~115 |
 
 Per-operation internal timing (from `z-oci-bench --counting`):
 
@@ -21,6 +23,8 @@ Per-operation internal timing (from `z-oci-bench --counting`):
 | manifest-parse | 46.2 us | 3 |
 | challenge-parse | 5.6 us | 0 |
 | platform-match | 0.15 us | 0 |
+| authenticate-miss | 145 us | ~13 |
+| authenticate-hit | 31 us | 4 |
 
 ## Regenerating
 
@@ -31,5 +35,7 @@ zig build -Doptimize=ReleaseFast
   './zig-out/bin/z-oci-bench digest-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench manifest-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench challenge-parse --iterations 10000' \
-  './zig-out/bin/z-oci-bench platform-match --iterations 10000'
+  './zig-out/bin/z-oci-bench platform-match --iterations 10000' \
+  './zig-out/bin/z-oci-bench authenticate-miss --iterations 1000' \
+  './zig-out/bin/z-oci-bench authenticate-hit --iterations 1000'
 ```

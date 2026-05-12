@@ -642,3 +642,73 @@ test "parse: 10000 pseudo-random inputs never panic and only return declared out
         }
     }
 }
+
+test "parse: 1000x repeated parse/deinit with varying inputs under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const inputs = [_][]const u8{
+        "ubuntu:22.04",
+        "ghcr.io/owner/repo:v1@sha256:" ++ "a" ** 64,
+        "REGISTRY-1.DOCKER.IO/ubuntu:latest",
+        "localhost:5000/myimage:dev",
+        "registry.example.com:443/repo:tag",
+        "myorg/myimage:v2",
+    };
+
+    for (0..1000) |i| {
+        const input = inputs[i % inputs.len];
+        var ref = try parse(alloc, input);
+        ref.deinit(alloc);
+    }
+}
+
+test "parse: 1000x repeated parse with random-like valid inputs under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const registries = [_][]const u8{ "ghcr.io", "docker.io", "quay.io", "gcr.io", "localhost:5000", "" };
+    const repos = [_][]const u8{ "owner/repo", "library/ubuntu", "team/project/service", "myimage", "a/b/c/d" };
+    const tags = [_][]const u8{ "latest", "v1.0", "22.04-slim", "" };
+
+    var seed: u64 = 0x5e_ed_b0_0c;
+    for (0..1000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const reg = registries[@as(usize, @truncate(seed)) % registries.len];
+        seed = seed *% 6364136223846793005 +% 1;
+        const repo = repos[@as(usize, @truncate(seed)) % repos.len];
+        seed = seed *% 6364136223846793005 +% 1;
+        const tag = tags[@as(usize, @truncate(seed)) % tags.len];
+
+        var buf: [256]u8 = undefined;
+        var input: []const u8 = undefined;
+        if (reg.len == 0) {
+            if (tag.len == 0) {
+                input = repo;
+            } else {
+                const s = try std.fmt.bufPrint(&buf, "{s}:{s}", .{ repo, tag });
+                input = s;
+            }
+        } else {
+            if (tag.len == 0) {
+                const s = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ reg, repo });
+                input = s;
+            } else {
+                const s = try std.fmt.bufPrint(&buf, "{s}/{s}:{s}", .{ reg, repo, tag });
+                input = s;
+            }
+        }
+
+        const result = parse(alloc, input);
+        if (result) |ref| {
+            var owned = ref;
+            defer owned.deinit(alloc);
+            try std.testing.expect(owned.registry.len > 0);
+            try std.testing.expect(owned.repository.len > 0);
+        } else |err| switch (err) {
+            error.InvalidReference, error.InvalidDigest, error.Empty, error.OutOfMemory => {},
+        }
+    }
+}

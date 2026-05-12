@@ -11,6 +11,8 @@ const usage =
     \\  manifest-parse    json.parse(Manifest) throughput
     \\  challenge-parse   parseAuthenticateHeader throughput
     \\  platform-match    Platform.match throughput
+    \\  authenticate-miss AuthEngine.authenticate (cache miss per iteration)
+    \\  authenticate-hit  AuthEngine.authenticate (cached token, second call)
     \\  all               run every operation sequentially
     \\
     \\Options:
@@ -52,6 +54,8 @@ pub fn main(init: std.process.Init) !void {
         try benchManifestParse(io, iterations, counting);
         try benchChallengeParse(io, iterations, counting);
         try benchPlatformMatch(io, iterations, counting);
+        try benchAuthenticateMiss(io, iterations, counting);
+        try benchAuthenticateHit(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "reference-parse")) {
         try benchReferenceParse(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "digest-parse")) {
@@ -62,6 +66,10 @@ pub fn main(init: std.process.Init) !void {
         try benchChallengeParse(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "platform-match")) {
         try benchPlatformMatch(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "authenticate-miss")) {
+        try benchAuthenticateMiss(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "authenticate-hit")) {
+        try benchAuthenticateHit(io, iterations, counting);
     } else {
         var ebuf: [1024]u8 = undefined;
         var ew = Io.File.stderr().writer(io, &ebuf);
@@ -172,7 +180,7 @@ const CountingAllocator = struct {
         @memcpy(new_mem[0..memory.len], memory);
         self.inner.rawFree(memory, alignment, ra);
         self.bytes_freed += memory.len;
-        self.current_bytes -= memory.len;
+        self.current_bytes -|= memory.len;
         return new_mem;
     }
 
@@ -180,7 +188,7 @@ const CountingAllocator = struct {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.inner.rawFree(buf, alignment, ra);
         self.bytes_freed += buf.len;
-        self.current_bytes -= buf.len;
+        self.current_bytes -|= buf.len;
     }
 };
 
@@ -278,4 +286,95 @@ fn benchPlatformMatch(io: Io, iterations: usize, counting: bool) !void {
     const elapsed = nanoTime() - start;
 
     printReport("platform-match", "candidate linux/arm64/v8 vs filter linux/arm64", io, iterations, elapsed, 0, 0);
+}
+
+fn benchAuthenticateMiss(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const ExchangeState = struct {
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(allocator);
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "bench-token",
+            \\  "expires_in": 3600
+            \\}
+            };
+        }
+    };
+
+    var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{}, ExchangeState.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+
+    {
+        const request = try z_oci.AuthenticateRequest.init("registry.example.test", .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:bench/image:pull",
+        });
+        var response = (try engine.authenticate(&client, request)).?;
+        response.deinit(alloc);
+    }
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |i| {
+        var buf: [128]u8 = undefined;
+        const scope = try std.fmt.bufPrint(&buf, "repository:bench/image{d}:pull", .{i});
+        const request = try z_oci.AuthenticateRequest.init("registry.example.test", .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = scope,
+        });
+        var response = (try engine.authenticate(&client, request)).?;
+        response.deinit(alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("authenticate-miss", "unique scope per call", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const ExchangeState = struct {
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(allocator);
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "bench-token",
+            \\  "expires_in": 3600
+            \\}
+            };
+        }
+    };
+
+    var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{}, ExchangeState.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+
+    const request = try z_oci.AuthenticateRequest.init("registry.example.test", .{
+        .realm = "https://auth.example.test/token",
+        .service = "registry.example.test",
+        .scope = "repository:bench/image:pull",
+    });
+
+    // First call: populate cache
+    {
+        var response = (try engine.authenticate(&client, request)).?;
+        response.deinit(alloc);
+    }
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        var response = (try engine.authenticate(&client, request)).?;
+        response.deinit(alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("authenticate-hit", "same scope, cached", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
 }

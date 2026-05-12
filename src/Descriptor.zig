@@ -373,3 +373,21 @@ test "Descriptor JSON: wrong type for numeric field returns error" {
     // An error is expected; exact error type varies by JSON library internals.
     try std.testing.expectError(error.InvalidCharacter, json.parse(Descriptor, std.testing.allocator, json_bytes));
 }
+
+test "Descriptor JSON: 1000x repeated parse/deinit under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const json_bytes =
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "size": 1234
+        \\}
+    ;
+    for (0..1000) |_| {
+        const parsed = try json.parse(Descriptor, allocator, json_bytes);
+        parsed.deinit();
+    }
+}

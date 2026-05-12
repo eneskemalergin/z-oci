@@ -25,4 +25,18 @@ jobs:
         run: zig build examples-smoke
 
       - name: zig fmt check
-        run: zig fmt --check src/ examples/ build.zig
+        run: zig fmt --check src/ examples/ build.zig benchmarks/
+
+      - name: zig build bench
+        run: zig build bench -Doptimize=ReleaseFast
+
+      - name: zebrac baseline (informational)
+        run: |
+          ./tools/zebrac -d 3000 --json bench-results.json \
+            './zig-out/bin/z-oci-bench digest-parse --iterations 10000' \
+            './zig-out/bin/z-oci-bench platform-match --iterations 10000'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench-results.json

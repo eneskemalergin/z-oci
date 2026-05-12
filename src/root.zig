@@ -6,6 +6,17 @@
 //! - auth engine: /v2/ probe, challenge parsing, token exchange, credential providers
 //! - public resolver-surface stubs and ownership contracts ahead of Phase 3 HTTP work
 //!
+//! Ownership conventions:
+//! - Functions taking an allocator produce owned storage that the caller must
+//!   free (pattern B): `Reference.parse(gpa, "img")` → caller calls `ref.deinit(gpa)`.
+//! - Functions returning `std.json.Parsed(T)` own an arena (pattern A): the caller
+//!   calls `parsed.deinit()` to free everything.
+//! - `AuthEngine` wraps persistent cache storage with its own `deinit()`.
+//!   Engine-created tokens (`TokenResponse`) are caller-owned → `.deinit(allocator)`.
+//! - Types that never allocate: `Digest` (borrowed view), `MediaType` (enum),
+//!   `Platform` (struct of slices), `AuthChallenge`/`BearerChallenge` (borrowed views).
+//!   These need no deinit.
+//!
 //! Not yet implemented:
 //! - manifest fetch (HEAD/GET) and digest verification
 //! - real `resolve`, `validate`, and `getManifest` behavior

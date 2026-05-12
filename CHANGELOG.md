@@ -12,22 +12,30 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 ### Added
 
 - `benchmarks/` directory: benchmark CLI (`z-oci-bench`), baselines directory, and build system wiring (`zig build bench`).
-- `CountingAllocator` allocator wrapper that tracks bytes allocated/freed, peak concurrent bytes, and allocation count.
-- Five benchmark subcommands: `reference-parse`, `digest-parse`, `manifest-parse`, `challenge-parse`, `platform-match`.
-- `zebrac`-based statistical sampling integrated: `./tools/zebrac zig-out/bin/z-oci-bench <op>` collects wall-clock, RSS, and CPU perf counter metrics.
-- v0.1.9 baseline committed to `benchmarks/baselines/v0.1.9.json` (5 operations, 4 seconds each).
+- `CountingAllocator` allocator wrapper tracking bytes allocated/freed, peak concurrent bytes, and allocation count.
+- Seven benchmark subcommands: `reference-parse`, `digest-parse`, `manifest-parse`, `challenge-parse`, `platform-match`, `authenticate-miss`, `authenticate-hit`.
+- `zebrac`-based statistical sampling: `./tools/zebrac zig-out/bin/z-oci-bench <op>` collects wall-clock, RSS, and CPU perf counter metrics.
+- v0.1.9 baseline committed to `benchmarks/baselines/v0.1.9.json` (7 operations).
+- Memory stress tests: 7 new DebugAllocator tests at 1000x iterations each (auth engine 3 variants, Reference.parse 2 variants, all JSON types, parseDockerConfig). 358 total tests, up from 348.
+- CI workflow updated with `zig build bench`, `zebrac` informational baseline step, and `zig fmt --check benchmarks/`.
+- Token cache sizing documented in `AuthEngine` doc comment (unbounded by design for CLI use).
+- Arena lifecycle conventions documented in `root.zig` module docs.
+- `authenticate-miss` bench: unique scope per call, ~145μs/iter, ~13 allocs/call.
+- `authenticate-hit` bench: same cached scope, ~31μs/iter, 4 allocs/call (cache clone only).
 
 ### Changed
 
 - `build.zig` now builds and installs the `z-oci-bench` binary.
+- Counting allocator uses saturating subtract to survive cross-allocator frees in complex paths.
 
 ### Verified
 
-- `zig build test --summary all` passes (348/348 tests, examples-smoke, workflow-smoke).
-- `zig build ---Doptimize=ReleaseSmall` passes.
+- `zig build test --summary all` passes (358/358 tests, examples-smoke, workflow-smoke).
+- `zig build -Doptimize=ReleaseSmall` passes.
 - `zig fmt --check src/ examples/ build.zig benchmarks/` passes.
-- `zig build bench` compiles and runs all 5 benchmark operations.
-- `./tools/zebrac` generates the baseline JSON correctly.
+- `zig build bench` compiles and runs all 7 benchmark operations.
+- `./tools/zebrac` generates the updated baseline JSON.
+- Zero-allocation confirmed: `Digest.parse`, `Platform.match`, `parseAuthenticateHeader`, `classifyProbeResponse`, `tokenCacheKeysEqual`, `referenceView`.
 
 ## [0.1.8] - 2026-05-12
 

@@ -709,3 +709,53 @@ test "DockerManifestList JSON: repeated parse rounds leave no residual allocatio
         parsed.deinit();
     }
 }
+
+test "OciImageIndex JSON: 1000x repeated parse/deinit under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": [
+        \\    {
+        \\      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\      "size": 512,
+        \\      "platform": { "os": "linux", "architecture": "amd64" }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    for (0..1000) |_| {
+        const parsed = try json.parse(OciImageIndex, allocator, json_bytes);
+        parsed.deinit();
+    }
+}
+
+test "DockerManifestList JSON: 1000x repeated parse/deinit under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+        \\  "manifests": [
+        \\    {
+        \\      "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\      "size": 1024,
+        \\      "platform": { "os": "linux", "architecture": "arm64" }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    for (0..1000) |_| {
+        const parsed = try json.parse(DockerManifestList, allocator, json_bytes);
+        parsed.deinit();
+    }
+}

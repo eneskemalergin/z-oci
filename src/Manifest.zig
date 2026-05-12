@@ -448,3 +448,26 @@ test "Manifest JSON: missing layers returns MissingField" {
     ;
     try std.testing.expectError(error.MissingField, json.parse(Manifest, std.testing.allocator, json_bytes));
 }
+
+test "Manifest JSON: 1000x repeated parse/deinit under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 1
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+    for (0..1000) |_| {
+        const parsed = try json.parse(Manifest, allocator, json_bytes);
+        parsed.deinit();
+    }
+}

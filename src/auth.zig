@@ -445,6 +445,15 @@ pub const AuthEngine = struct {
     now_unix_seconds_fn: NowUnixSecondsFn = currentUnixSeconds,
     environ_map: ?*const std.process.Environ.Map = null,
     docker_config: ?DockerConfig = null,
+    /// Per-scope token cache with no eviction policy beyond TTL expiry.
+    ///
+    /// Cache identity: realm + service + scope. Entries older than
+    /// valid_until_unix_seconds (accounting for the fixed refresh window)
+    /// are dropped on lookup. The cache is an ArrayList with no maximum
+    /// size — for short-lived CLI use (10-50 images per run), the worst-case
+    /// is ~50 entries × ~200 bytes ≈ 10 KB. If long-lived daemon operation
+    /// is ever required, add a max_cache_entries config field with LRU
+    /// eviction and cap the ArrayList.
     token_cache: std.ArrayList(TokenCacheEntry) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
@@ -3843,4 +3852,156 @@ test "classifyProbeResponse: unsupported status code returns error" {
         error.UnsupportedProbeStatus,
         classifyProbeResponse(.bad_request, &.{}),
     );
+}
+
+// Memory stress tests ---------------------------------------------------------
+
+test "AuthEngine: 1000x repeated authenticate (cache miss then hit) under DebugAllocator" {
+    const State = struct {
+        var calls: usize = 0;
+        var fake_now: u64 = 1_000;
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(allocator);
+            calls += 1;
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "stress-token",
+            \\  "expires_in": 90
+            \\}
+            };
+        }
+
+        fn now(_: *std.http.Client) u64 {
+            return fake_now;
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    State.calls = 0;
+    State.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, State.exchange);
+    defer engine.deinit();
+    engine.now_unix_seconds_fn = State.now;
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    for (0..1000) |_| {
+        State.fake_now += 1;
+        var response = (try engine.authenticate(&client, request)).?;
+        defer response.deinit(allocator);
+        try std.testing.expectEqualStrings("stress-token", response.access_token.value);
+    }
+
+    try std.testing.expect(State.calls >= 1);
+    try std.testing.expect(engine.token_cache.items.len >= 1);
+}
+
+test "AuthEngine: 1000x authenticate with short-lived tokens under DebugAllocator" {
+    const State = struct {
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(allocator);
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "steady-token",
+            \\  "expires_in": 1
+            \\}
+            };
+        }
+
+        fn now(_: *std.http.Client) u64 {
+            return 1_000;
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, State.exchange);
+    defer engine.deinit();
+    engine.now_unix_seconds_fn = State.now;
+    var client: std.http.Client = undefined;
+
+    for (0..1000) |_| {
+        const request = try AuthenticateRequest.init(
+            "registry.example.test",
+            .{ .realm = "https://auth.example.test/token" },
+        );
+        var response = (try engine.authenticate(&client, request)).?;
+        defer response.deinit(allocator);
+        try std.testing.expectEqualStrings("steady-token", response.access_token.value);
+    }
+}
+
+test "AuthEngine: 1000x fresh engine per authenticate stays leak-free under DebugAllocator" {
+    const State = struct {
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(allocator);
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "fresh-engine-token",
+            \\  "expires_in": 90
+            \\}
+            };
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    for (0..1000) |_| {
+        var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, State.exchange);
+        defer engine.deinit();
+        var client: std.http.Client = undefined;
+        const request = try AuthenticateRequest.init(
+            "registry.example.test",
+            .{ .realm = "https://auth.example.test/token" },
+        );
+        var response = (try engine.authenticate(&client, request)).?;
+        defer response.deinit(allocator);
+        try std.testing.expectEqualStrings("fresh-engine-token", response.access_token.value);
+    }
+}
+
+test "parseDockerConfig: 1000x repeated parse/deinit under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const config_json =
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    },
+        \\    "https://index.docker.io/v1/": {
+        \\      "auth": "ZG9ja2VydXNlcjpzZWNyZXQ="
+        \\    },
+        \\    "registry.example.com": {
+        \\      "auth": "aW50ZXJuYWwtdXNlcjp0b2tlbg=="
+        \\    }
+        \\  },
+        \\  "credHelpers": {
+        \\    "ghcr.io": "secretservice",
+        \\    "gcr.io": "gcloud"
+        \\  },
+        \\  "credsStore": "pass"
+        \\}
+    ;
+    for (0..1000) |_| {
+        var docker_config = try parseDockerConfig(allocator, config_json);
+        docker_config.deinit(allocator);
+    }
 }
