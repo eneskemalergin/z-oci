@@ -5,6 +5,7 @@
 //! AuthError stays separate from ResolveError until Phase 3 wires auth
 //! through the public resolver surface.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const ConfigModule = @import("Config.zig");
 const Config = ConfigModule.Config;
@@ -71,6 +72,20 @@ pub const userprofile_dir_var = "USERPROFILE";
 pub const docker_hub_auth_key = "https://index.docker.io/v1/";
 
 const docker_config_file_size_limit = 1024 * 1024;
+const docker_helper_stdout_limit = 64 * 1024;
+const docker_helper_stderr_limit = 64 * 1024;
+
+pub const DockerCredentialHelperRunner = *const fn (
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    helper_suffix: []const u8,
+    server_url: []const u8,
+) AuthError!CredentialHandle;
+
+const ParsedDockerCredentialHelperResponse = struct {
+    Username: ?[]const u8 = null,
+    Secret: ?[]const u8 = null,
+};
 
 const DockerCredentialHelperLookup = struct {
     server_url: []const u8,
@@ -366,6 +381,7 @@ pub const ProbeHttpResponse = struct {
 /// `io` through every auth call immediately.
 pub const HelperProcessContext = struct {
     io: std.Io,
+    runner: DockerCredentialHelperRunner = runDockerCredentialHelperBySuffix,
 };
 
 /// Phase 2 auth engine.
@@ -522,6 +538,28 @@ pub const AuthEngine = struct {
 
         if (self.docker_config) |docker_config| {
             if (docker_config.credentialForRegistry(registry)) |handle| return handle;
+        }
+
+        return null;
+    }
+
+    fn dockerCredentialForRegistry(self: AuthEngine, registry: []const u8) AuthError!?CredentialHandle {
+        const docker_config = self.docker_config orelse return null;
+
+        if (self.helper_process_context) |context| {
+            if (docker_config.registrySpecificHelperLookupForRegistry(registry)) |helper_lookup| {
+                return try context.runner(self.allocator, context.io, helper_lookup.helper_suffix, helper_lookup.server_url);
+            }
+        }
+
+        if (docker_config.authCredentialForRegistry(registry)) |credential| {
+            return .{ .credential = credential };
+        }
+
+        if (self.helper_process_context) |context| {
+            if (docker_config.globalHelperLookupForRegistry(registry)) |helper_lookup| {
+                return try context.runner(self.allocator, context.io, helper_lookup.helper_suffix, helper_lookup.server_url);
+            }
         }
 
         return null;
@@ -698,6 +736,134 @@ fn isValidDockerHelperSuffix(helper_suffix: []const u8) bool {
     }
 
     return true;
+}
+
+fn runDockerCredentialHelperBySuffix(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    helper_suffix: []const u8,
+    server_url: []const u8,
+) AuthError!CredentialHandle {
+    const command = try dockerCredentialHelperCommandAlloc(allocator, helper_suffix);
+    defer allocator.free(command);
+
+    const argv = [_][]const u8{ command, "get" };
+    return runDockerCredentialHelperCommand(allocator, io, &argv, server_url);
+}
+
+fn runDockerCredentialHelperCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    server_url: []const u8,
+) AuthError!CredentialHandle {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HelperFailed,
+    };
+    defer child.kill(io);
+
+    var stderr_task = io.concurrent(readStreamAlloc, .{ allocator, io, child.stderr.?, .limited(docker_helper_stderr_limit) }) catch {
+        return error.HelperFailed;
+    };
+    var stderr_task_completed = false;
+    defer if (!stderr_task_completed) {
+        if (stderr_task.cancel(io)) |stderr_contents| allocator.free(stderr_contents) else |_| {}
+    };
+
+    {
+        var stdin_writer = child.stdin.?.writer(io, &.{});
+        stdin_writer.interface.writeAll(server_url) catch |err| switch (err) {
+            error.WriteFailed => return error.HelperFailed,
+        };
+        stdin_writer.interface.writeByte('\n') catch |err| switch (err) {
+            error.WriteFailed => return error.HelperFailed,
+        };
+        stdin_writer.interface.flush() catch |err| switch (err) {
+            error.WriteFailed => return error.HelperFailed,
+        };
+    }
+    child.stdin.?.close(io);
+    child.stdin = null;
+
+    var stdout_reader = child.stdout.?.reader(io, &.{});
+    const stdout_contents = stdout_reader.interface.allocRemaining(allocator, .limited(docker_helper_stdout_limit)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ReadFailed => return error.HelperFailed,
+        else => return error.HelperFailed,
+    };
+    defer {
+        std.crypto.secureZero(u8, stdout_contents);
+        allocator.free(stdout_contents);
+    }
+
+    const stderr_contents = stderr_task.await(io) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HelperFailed,
+    };
+    stderr_task_completed = true;
+    defer allocator.free(stderr_contents);
+
+    switch (child.wait(io) catch return error.HelperFailed) {
+        .exited => |code| if (code != 0) return error.HelperFailed,
+        else => return error.HelperFailed,
+    }
+
+    return parseDockerCredentialHelperResponse(allocator, stdout_contents);
+}
+
+fn parseDockerCredentialHelperResponse(
+    allocator: std.mem.Allocator,
+    helper_stdout: []const u8,
+) AuthError!CredentialHandle {
+    const parsed = json.parse(ParsedDockerCredentialHelperResponse, allocator, helper_stdout) catch return error.HelperFailed;
+    defer parsed.deinit();
+
+    const username = parsed.value.Username orelse return error.HelperFailed;
+    const secret = parsed.value.Secret orelse return error.HelperFailed;
+    if (username.len == 0 or secret.len == 0) return error.HelperFailed;
+
+    return ownedDockerHelperCredentialHandle(username, secret);
+}
+
+fn ownedDockerHelperCredentialHandle(username: []const u8, secret: []const u8) AuthError!CredentialHandle {
+    const owned_username = try std.heap.page_allocator.dupe(u8, username);
+    errdefer std.heap.page_allocator.free(owned_username);
+
+    const owned_secret = try std.heap.page_allocator.dupe(u8, secret);
+    errdefer std.heap.page_allocator.free(owned_secret);
+
+    return .{
+        .credential = .{
+            .username = owned_username,
+            .secret = owned_secret,
+        },
+        .release_fn = releaseOwnedDockerHelperCredential,
+    };
+}
+
+fn releaseOwnedDockerHelperCredential(credential: ConfigModule.Credential) void {
+    std.heap.page_allocator.free(@constCast(credential.username));
+    std.crypto.secureZero(u8, @constCast(credential.secret));
+    std.heap.page_allocator.free(@constCast(credential.secret));
+}
+
+fn readStreamAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    limit: std.Io.Limit,
+) ![]u8 {
+    var file_reader: std.Io.File.Reader = .initStreaming(file, io, &.{});
+    return file_reader.interface.allocRemaining(allocator, limit) catch |err| switch (err) {
+        error.ReadFailed => return file_reader.err.?,
+        else => |e| return e,
+    };
 }
 
 fn dockerConfigRegistryKeyMatches(config_key: []const u8, registry: []const u8) bool {
@@ -1518,6 +1684,144 @@ test "AuthEngine.loadDockerConfigFromEnvironment: missing file is a clean miss" 
 
     try std.testing.expect(!(try engine.loadDockerConfigFromEnvironment(io)));
     try std.testing.expect(engine.credentialForRegistry("ghcr.io") == null);
+}
+
+test "parseDockerCredentialHelperResponse: accepts helper JSON and token-style usernames" {
+    const handle = try parseDockerCredentialHelperResponse(std.testing.allocator,
+        \\{
+        \\  "Username": "<token>",
+        \\  "Secret": "eyJhbGciOi..."
+        \\}
+    );
+    defer handle.release();
+
+    try std.testing.expectEqualStrings("<token>", handle.credential.username);
+    try std.testing.expectEqualStrings("eyJhbGciOi...", handle.credential.secret);
+}
+
+test "parseDockerCredentialHelperResponse: rejects malformed helper payloads" {
+    try std.testing.expectError(error.HelperFailed, parseDockerCredentialHelperResponse(std.testing.allocator,
+        \\{
+        \\  "Username": "david"
+        \\}
+    ));
+    try std.testing.expectError(error.HelperFailed, parseDockerCredentialHelperResponse(std.testing.allocator,
+        \\{
+        \\  "Username": "david",
+        \\  "Secret": ""
+        \\}
+    ));
+    try std.testing.expectError(error.HelperFailed, parseDockerCredentialHelperResponse(std.testing.allocator, "not-json"));
+}
+
+test "runDockerCredentialHelperCommand: writes stdin and parses stdout" {
+    if (builtin.os.tag == .windows) return;
+
+    const handle = try runDockerCredentialHelperCommand(
+        std.testing.allocator,
+        std.testing.io,
+        &.{
+            "/bin/sh",
+            "-c",
+            "IFS= read -r server || exit 7\n[ \"$1\" = get ] || exit 9\n[ \"$server\" = \"https://index.docker.io/v1/\" ] || exit 8\nprintf '{\"Username\":\"david\",\"Secret\":\"passw0rd1\"}'\n",
+            "docker-credential-secretservice",
+            "get",
+        },
+        docker_hub_auth_key,
+    );
+    defer handle.release();
+
+    try std.testing.expectEqualStrings("david", handle.credential.username);
+    try std.testing.expectEqualStrings("passw0rd1", handle.credential.secret);
+}
+
+test "runDockerCredentialHelperCommand: rejects non-zero exit and malformed JSON" {
+    if (builtin.os.tag == .windows) return;
+
+    try std.testing.expectError(error.HelperFailed, runDockerCredentialHelperCommand(
+        std.testing.allocator,
+        std.testing.io,
+        &.{
+            "/bin/sh",
+            "-c",
+            "echo helper failed >&2\nexit 3\n",
+            "docker-credential-secretservice",
+            "get",
+        },
+        "ghcr.io",
+    ));
+
+    try std.testing.expectError(error.HelperFailed, runDockerCredentialHelperCommand(
+        std.testing.allocator,
+        std.testing.io,
+        &.{
+            "/bin/sh",
+            "-c",
+            "IFS= read -r _ || exit 7\nprintf 'not-json'\n",
+            "docker-credential-secretservice",
+            "get",
+        },
+        "ghcr.io",
+    ));
+}
+
+test "AuthEngine.dockerCredentialForRegistry: helper path beats inline auth when helper context exists" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn runner(_: std.mem.Allocator, _: std.Io, helper_suffix: []const u8, server_url: []const u8) AuthError!CredentialHandle {
+            calls += 1;
+            if (!std.mem.eql(u8, helper_suffix, "secretservice")) return error.HelperFailed;
+            if (!std.mem.eql(u8, server_url, "ghcr.io")) return error.HelperFailed;
+            return try ownedDockerHelperCredentialHandle("helper-user", "helper-secret");
+        }
+    };
+
+    var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  },
+        \\  "credHelpers": {
+        \\    "ghcr.io": "secretservice"
+        \\  }
+        \\}
+    );
+    defer engine.deinit();
+    engine.helper_process_context = .{
+        .io = std.testing.io,
+        .runner = State.runner,
+    };
+
+    const handle = (try engine.dockerCredentialForRegistry("ghcr.io")).?;
+    defer handle.release();
+
+    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    try std.testing.expectEqualStrings("helper-user", handle.credential.username);
+    try std.testing.expectEqualStrings("helper-secret", handle.credential.secret);
+}
+
+test "AuthEngine.dockerCredentialForRegistry: inline auth remains available without helper context" {
+    var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  },
+        \\  "credHelpers": {
+        \\    "ghcr.io": "secretservice"
+        \\  }
+        \\}
+    );
+    defer engine.deinit();
+
+    const handle = (try engine.dockerCredentialForRegistry("ghcr.io")).?;
+
+    try std.testing.expectEqualStrings("octocat", handle.credential.username);
+    try std.testing.expectEqualStrings("ghp_example", handle.credential.secret);
 }
 
 test "buildTokenHttpRequest: get request includes query parameters" {
