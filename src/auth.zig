@@ -7,10 +7,10 @@
 const std = @import("std");
 const ConfigModule = @import("Config.zig");
 const Config = ConfigModule.Config;
-const Credential = ConfigModule.Credential;
 const CredentialHandle = ConfigModule.CredentialHandle;
 const CredentialProvider = ConfigModule.CredentialProvider;
 const Reference = @import("Reference.zig");
+const json = @import("json.zig");
 
 /// Internal Phase 2 auth-only error set.
 ///
@@ -19,15 +19,47 @@ const Reference = @import("Reference.zig");
 /// 3 threads auth failures through real resolve/validate/getManifest behavior.
 pub const AuthError = error{
     NotYetImplemented,
+    OutOfMemory,
     MissingAuthenticateHeader,
     UnsupportedAuthenticateScheme,
     InvalidAuthenticateHeader,
     UnsupportedProbeStatus,
     InsecureRealmUrl,
     InvalidTokenResponse,
+    TokenExchangeFailed,
     HelperFailed,
     HelperTimedOut,
 };
+
+pub const TokenRequestMethod = enum {
+    get,
+    post,
+};
+
+pub const TokenHttpRequest = struct {
+    method: TokenRequestMethod,
+    url: []u8,
+    authorization: ?[]u8 = null,
+    content_type: ?[]const u8 = null,
+    body: ?[]u8 = null,
+
+    pub fn deinit(self: TokenHttpRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        if (self.authorization) |authorization| allocator.free(authorization);
+        if (self.body) |body| allocator.free(body);
+    }
+};
+
+pub const TokenExchangeResponse = struct {
+    status: std.http.Status,
+    body: []const u8,
+};
+
+pub const TokenHttpExchanger = *const fn (
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    request: TokenHttpRequest,
+) AuthError!TokenExchangeResponse;
 
 /// Borrowed Bearer challenge data parsed from the authenticate header.
 ///
@@ -61,11 +93,26 @@ pub const Token = struct {
     expires_in_seconds: ?u64 = null,
 };
 
+pub const token_refresh_window_seconds: u64 = 5;
+
 pub const TokenResponse = struct {
-    /// Borrows from the parsed token-response payload.
+    /// Owned token-response payload.
     access_token: Token,
     /// Explicit non-goal for `v0.2.0`; parsed only so later phases can choose
     /// to ignore or surface it deliberately.
+    refresh_token: ?[]const u8 = null,
+
+    pub fn deinit(self: *TokenResponse, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, @constCast(self.access_token.value));
+        allocator.free(self.access_token.value);
+        if (self.refresh_token) |refresh_token| allocator.free(refresh_token);
+    }
+};
+
+const ParsedTokenBody = struct {
+    access_token: ?[]const u8 = null,
+    token: ?[]const u8 = null,
+    expires_in: ?u64 = null,
     refresh_token: ?[]const u8 = null,
 };
 
@@ -214,6 +261,7 @@ pub const AuthEngine = struct {
     allocator: std.mem.Allocator,
     config: Config,
     helper_process_context: ?HelperProcessContext = null,
+    token_http_exchanger: ?TokenHttpExchanger = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
         return .{
@@ -234,6 +282,18 @@ pub const AuthEngine = struct {
         };
     }
 
+    pub fn initWithTokenHttpExchanger(
+        allocator: std.mem.Allocator,
+        config: Config,
+        token_http_exchanger: TokenHttpExchanger,
+    ) AuthEngine {
+        return .{
+            .allocator = allocator,
+            .config = config,
+            .token_http_exchanger = token_http_exchanger,
+        };
+    }
+
     pub fn helperProcessContext(self: AuthEngine) ?HelperProcessContext {
         return self.helper_process_context;
     }
@@ -246,11 +306,34 @@ pub const AuthEngine = struct {
         self: *AuthEngine,
         client: *std.http.Client,
         request: AuthenticateRequest,
-    ) AuthError!?Token {
-        _ = self;
-        _ = client;
-        _ = request;
-        return error.NotYetImplemented;
+    ) AuthError!?TokenResponse {
+        const exchanger = self.token_http_exchanger orelse return error.NotYetImplemented;
+        try validateRealmUrl(request.challenge.realm);
+
+        const credential_handle = self.credentialForRegistry(request.registry);
+        defer if (credential_handle) |handle| handle.release();
+
+        const get_request = try buildTokenHttpRequest(
+            self.allocator,
+            request,
+            .get,
+            if (credential_handle) |handle| handle.credential else null,
+        );
+        const get_response = try exchanger(self.allocator, client, get_request);
+        if (get_response.status == .ok) {
+            return try parseTokenResponse(self.allocator, get_response.body);
+        }
+
+        const post_request = try buildTokenHttpRequest(
+            self.allocator,
+            request,
+            .post,
+            if (credential_handle) |handle| handle.credential else null,
+        );
+        const post_response = try exchanger(self.allocator, client, post_request);
+        if (post_response.status != .ok) return error.TokenExchangeFailed;
+
+        return try parseTokenResponse(self.allocator, post_response.body);
     }
 
     pub fn credentialForRegistry(self: AuthEngine, registry: []const u8) ?CredentialHandle {
@@ -273,6 +356,96 @@ pub fn referenceView(ref: Reference) AuthReferenceView {
         .registry = ref.registry,
         .repository_path = ref.repositoryPath(),
         .ref_string = ref.refString(),
+    };
+}
+
+pub fn buildTokenHttpRequest(
+    allocator: std.mem.Allocator,
+    request: AuthenticateRequest,
+    method: TokenRequestMethod,
+    credential: ?ConfigModule.Credential,
+) AuthError!TokenHttpRequest {
+    try validateRealmUrl(request.challenge.realm);
+
+    const query = try buildTokenQueryAlloc(allocator, request);
+    defer allocator.free(query);
+
+    const url = switch (method) {
+        .get => try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.challenge.realm, query }),
+        .post => try allocator.dupe(u8, request.challenge.realm),
+    };
+    errdefer allocator.free(url);
+
+    const authorization = if (credential) |cred|
+        try buildBasicAuthorizationAlloc(allocator, cred)
+    else
+        null;
+    errdefer if (authorization) |header| allocator.free(header);
+
+    const body = switch (method) {
+        .get => null,
+        .post => try allocator.dupe(u8, query),
+    };
+
+    return .{
+        .method = method,
+        .url = url,
+        .authorization = authorization,
+        .content_type = if (method == .post) "application/x-www-form-urlencoded" else null,
+        .body = body,
+    };
+}
+
+pub fn buildTokenQueryAlloc(allocator: std.mem.Allocator, request: AuthenticateRequest) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+
+    var first = true;
+    if (request.service()) |service| {
+        writeFormField(&aw.writer, &first, "service", service) catch return error.OutOfMemory;
+    }
+    if (request.scope()) |scope| {
+        writeFormField(&aw.writer, &first, "scope", scope) catch return error.OutOfMemory;
+    }
+
+    return aw.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: ConfigModule.Credential) ![]u8 {
+    const joined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ credential.username, credential.secret });
+    defer allocator.free(joined);
+
+    const encoder = std.base64.standard.Encoder;
+    const encoded_len = encoder.calcSize(joined.len);
+    const buffer = try allocator.alloc(u8, "Basic ".len + encoded_len);
+    errdefer allocator.free(buffer);
+
+    @memcpy(buffer[0.."Basic ".len], "Basic ");
+    _ = encoder.encode(buffer["Basic ".len..], joined);
+    return buffer;
+}
+
+pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) !TokenResponse {
+    const parsed = json.parse(ParsedTokenBody, allocator, body) catch return error.InvalidTokenResponse;
+    defer parsed.deinit();
+
+    const token_value = parsed.value.access_token orelse parsed.value.token orelse return error.InvalidTokenResponse;
+    if (token_value.len == 0) return error.InvalidTokenResponse;
+
+    const expires_in_seconds = if (parsed.value.expires_in) |expires_in| blk: {
+        if (expires_in == 0 or expires_in > std.math.maxInt(u32)) return error.InvalidTokenResponse;
+        break :blk expires_in;
+    } else 60;
+
+    return .{
+        .access_token = .{
+            .value = try allocator.dupe(u8, token_value),
+            .expires_in_seconds = expires_in_seconds,
+        },
+        .refresh_token = if (parsed.value.refresh_token) |refresh_token|
+            try allocator.dupe(u8, refresh_token)
+        else
+            null,
     };
 }
 
@@ -375,6 +548,18 @@ fn validateRealmUrl(realm: []const u8) AuthError!void {
     const parsed = std.Uri.parse(realm) catch return error.InsecureRealmUrl;
     if (!std.ascii.eqlIgnoreCase(parsed.scheme, "https")) return error.InsecureRealmUrl;
     if (parsed.host == null) return error.InsecureRealmUrl;
+}
+
+fn writeFormField(writer: *std.Io.Writer, first: *bool, key: []const u8, value: []const u8) std.Io.Writer.Error!void {
+    if (!first.*) try writer.writeByte('&');
+    first.* = false;
+    try writer.writeAll(key);
+    try writer.writeByte('=');
+    try std.Uri.Component.percentEncode(writer, value, isFormValueChar);
+}
+
+fn isFormValueChar(char: u8) bool {
+    return std.ascii.isAlphanumeric(char) or char == '-' or char == '_' or char == '.' or char == '~';
 }
 
 fn parseAuthParamValue(raw: []const u8) AuthError![]const u8 {
@@ -497,7 +682,7 @@ test "auth scaffolding: types compile with representative values" {
     _ = helper_process_context;
 }
 
-test "auth scaffolding: engine authenticate remains a stub" {
+test "auth scaffolding: engine authenticate remains a stub without exchanger" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -505,10 +690,7 @@ test "auth scaffolding: engine authenticate remains a stub" {
         .{ .realm = "https://auth.example.test/token", .scope = "repository:library/ubuntu:pull" },
     );
 
-    try std.testing.expectError(
-        error.NotYetImplemented,
-        engine.authenticate(&client, request),
-    );
+    try std.testing.expectError(error.NotYetImplemented, engine.authenticate(&client, request));
 }
 
 test "auth scaffolding: explicit helper process context is optional" {
@@ -584,6 +766,278 @@ test "auth scaffolding: engine can request credential handle" {
 
     try std.testing.expectEqualStrings("user", handle.credential.username);
     try std.testing.expectEqualStrings("token", handle.credential.secret);
+}
+
+test "buildTokenHttpRequest: get request includes query parameters" {
+    const request = try AuthenticateRequest.init(
+        "registry-1.docker.io",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:library/ubuntu:pull",
+        },
+    );
+
+    var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
+    defer http_request.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(TokenRequestMethod.get, http_request.method);
+    try std.testing.expectEqualStrings(
+        "https://auth.example.test/token?service=registry.example.test&scope=repository%3Alibrary%2Fubuntu%3Apull",
+        http_request.url,
+    );
+    try std.testing.expect(http_request.authorization == null);
+    try std.testing.expect(http_request.body == null);
+}
+
+test "buildTokenHttpRequest: post request includes body and optional basic auth" {
+    const request = try AuthenticateRequest.init(
+        "ghcr.io",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "ghcr.io",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    var http_request = try buildTokenHttpRequest(
+        std.testing.allocator,
+        request,
+        .post,
+        .{ .username = "user", .secret = "token" },
+    );
+    defer http_request.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(TokenRequestMethod.post, http_request.method);
+    try std.testing.expectEqualStrings("https://auth.example.test/token", http_request.url);
+    try std.testing.expectEqualStrings("application/x-www-form-urlencoded", http_request.content_type.?);
+    try std.testing.expectEqualStrings("service=ghcr.io&scope=repository%3Aowner%2Fimage%3Apull", http_request.body.?);
+    try std.testing.expectEqualStrings("Basic dXNlcjp0b2tlbg==", http_request.authorization.?);
+}
+
+test "parseTokenResponse: prefers access_token and preserves refresh token" {
+    var response = try parseTokenResponse(std.testing.allocator,
+        \\{
+        \\  "token": "fallback-token",
+        \\  "access_token": "preferred-token",
+        \\  "expires_in": 300,
+        \\  "refresh_token": "ignored-for-now"
+        \\}
+    );
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("preferred-token", response.access_token.value);
+    try std.testing.expectEqual(@as(?u64, 300), response.access_token.expires_in_seconds);
+    try std.testing.expectEqualStrings("ignored-for-now", response.refresh_token.?);
+}
+
+test "parseTokenResponse: falls back to token and defaults expiry" {
+    var response = try parseTokenResponse(std.testing.allocator,
+        \\{
+        \\  "token": "fallback-token"
+        \\}
+    );
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("fallback-token", response.access_token.value);
+    try std.testing.expectEqual(@as(?u64, 60), response.access_token.expires_in_seconds);
+    try std.testing.expect(response.refresh_token == null);
+}
+
+test "parseTokenResponse: malformed payloads are rejected" {
+    const cases = [_][]const u8{
+        "{\"expires_in\": 60}",
+        "{\"access_token\": \"\"}",
+        "{\"access_token\": \"value\", \"expires_in\": -1}",
+        "{\"access_token\": \"value\", \"expires_in\": 0}",
+        "{\"access_token\": \"value\", \"expires_in\": 4294967296}",
+        "not-json",
+    };
+
+    for (cases) |case| {
+        try std.testing.expectError(error.InvalidTokenResponse, parseTokenResponse(std.testing.allocator, case));
+    }
+}
+
+test "AuthEngine.authenticate: uses post fallback after get failure" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+
+            if (calls == 1) {
+                if (request.method != .get) return error.TokenExchangeFailed;
+                return .{ .status = .unauthorized, .body = "" };
+            }
+
+            if (request.method != .post) return error.TokenExchangeFailed;
+            if (request.content_type == null or !std.mem.eql(u8, request.content_type.?, "application/x-www-form-urlencoded")) {
+                return error.TokenExchangeFailed;
+            }
+            if (request.body == null or !std.mem.eql(u8, request.body.?, "service=registry.example.test&scope=repository%3Aowner%2Fimage%3Apull")) {
+                return error.TokenExchangeFailed;
+            }
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "post-token",
+            \\  "expires_in": 120
+            \\}
+            };
+        }
+    };
+
+    State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    var response = (try engine.authenticate(&client, request)).?;
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqualStrings("post-token", response.access_token.value);
+    try std.testing.expectEqual(@as(?u64, 120), response.access_token.expires_in_seconds);
+}
+
+test "AuthEngine.authenticate: returns get response without post fallback when get succeeds" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+            if (request.method != .get) return error.TokenExchangeFailed;
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "get-token",
+            \\  "expires_in": 90
+            \\}
+            };
+        }
+    };
+
+    State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{ .realm = "https://auth.example.test/token" },
+    );
+
+    var response = (try engine.authenticate(&client, request)).?;
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    try std.testing.expectEqualStrings("get-token", response.access_token.value);
+    try std.testing.expectEqual(@as(?u64, 90), response.access_token.expires_in_seconds);
+}
+
+test "AuthEngine.authenticate: uses credential handle for optional basic auth" {
+    const ProviderState = struct {
+        var released = false;
+
+        fn release(_: ConfigModule.Credential) void {
+            released = true;
+        }
+
+        fn get(_: []const u8) ?CredentialHandle {
+            return .{
+                .credential = .{ .username = "user", .secret = "token" },
+                .release_fn = release,
+            };
+        }
+    };
+
+    const ExchangeState = struct {
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            if (request.authorization == null or !std.mem.eql(u8, request.authorization.?, "Basic dXNlcjp0b2tlbg==")) {
+                return error.TokenExchangeFailed;
+            }
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "credential-token"
+            \\}
+            };
+        }
+    };
+
+    ProviderState.released = false;
+    const provider = CredentialProvider{ .getCredentialFn = ProviderState.get };
+    var engine = AuthEngine.initWithTokenHttpExchanger(
+        std.testing.allocator,
+        .{ .credential_provider = &provider },
+        ExchangeState.exchange,
+    );
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "ghcr.io",
+        .{ .realm = "https://auth.example.test/token" },
+    );
+
+    var response = (try engine.authenticate(&client, request)).?;
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("credential-token", response.access_token.value);
+    try std.testing.expect(ProviderState.released);
+}
+
+test "AuthEngine.authenticate: repeated success and failure runs stay leak-free" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+
+            return switch ((calls - 1) % 4) {
+                0 => .{ .status = .ok, .body =
+                \\{
+                \\  "access_token": "steady-token",
+                \\  "expires_in": 75
+                \\}
+                },
+                1 => .{ .status = .ok, .body = "not-json" },
+                2, 3 => .{ .status = .unauthorized, .body = "" },
+                else => unreachable,
+            };
+        }
+    };
+
+    State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{ .realm = "https://auth.example.test/token" },
+    );
+
+    var iteration: usize = 0;
+    while (iteration < 6) : (iteration += 1) {
+        const result = engine.authenticate(&client, request);
+        switch (iteration % 3) {
+            0 => {
+                var response = (try result).?;
+                defer response.deinit(std.testing.allocator);
+                try std.testing.expectEqualStrings("steady-token", response.access_token.value);
+            },
+            1 => try std.testing.expectError(error.InvalidTokenResponse, result),
+            else => try std.testing.expectError(error.TokenExchangeFailed, result),
+        }
+    }
+}
+
+test "token response: refresh window policy is fixed for short-lived cli use" {
+    try std.testing.expectEqual(@as(u64, 5), token_refresh_window_seconds);
 }
 
 test "auth scaffolding: cached token owns duplicated secret bytes" {
