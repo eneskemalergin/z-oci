@@ -108,15 +108,7 @@ pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
     try jw.endObject();
 }
 
-fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    errdefer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(value);
-    return aw;
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 
 test "Descriptor: all optional fields default to null" {
     // Verifies the zero-default invariant. Any new optional field that forgets
@@ -234,7 +226,7 @@ test "Descriptor JSON: stringifies with camelCase field names" {
     };
 
     // Act
-    var aw = try stringifyForTest(d);
+    var aw = try json.stringifyForTest(d);
     defer aw.deinit();
     const out = aw.written();
 
@@ -285,7 +277,7 @@ test "Descriptor JSON: stringify/reparse preserves optional fields leak-free" {
     const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
-    var aw = try stringifyForTest(parsed.value);
+    var aw = try json.stringifyForTest(parsed.value);
     defer aw.deinit();
     const out = aw.written();
 
@@ -317,4 +309,67 @@ test "Descriptor JSON: parses upstream OCI descriptor fixture" {
     try std.testing.expectEqual(@as(u64, 123), parsed.value.size);
     try std.testing.expectEqualSlices(u8, "87923725d74f4bfb94c9e86d64170f7521aad8221a5de834851470ca142da630", parsed.value.digest.hex);
     try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", parsed.value.artifact_type.?);
+}
+
+test "Descriptor JSON: missing mediaType returns MissingField" {
+    const json_bytes =
+        \\{
+        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "size": 1234
+        \\}
+    ;
+    try std.testing.expectError(error.MissingField, json.parse(Descriptor, std.testing.allocator, json_bytes));
+}
+
+test "Descriptor JSON: allocation failures do not leak" {
+    const json_bytes =
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "size": 1234,
+        \\  "urls": ["https://example.com/blob"],
+        \\  "artifactType": "application/vnd.example.sbom.v1"
+        \\}
+    ;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            const parsed = try json.parse(Descriptor, allocator, bytes);
+            defer parsed.deinit();
+            try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+        }
+    }.run, .{json_bytes});
+}
+
+test "Descriptor JSON: repeated parse rounds leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const json_bytes =
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "size": 1234
+        \\}
+    ;
+    for (0..16) |_| {
+        const parsed = try json.parse(Descriptor, allocator, json_bytes);
+        parsed.deinit();
+    }
+}
+
+test "Descriptor JSON: not-an-object token returns error" {
+    try std.testing.expectError(error.UnexpectedToken, json.parse(Descriptor, std.testing.allocator, "null"));
+}
+
+test "Descriptor JSON: wrong type for numeric field returns error" {
+    const json_bytes =
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\  "size": "not-a-number"
+        \\}
+    ;
+    // An error is expected; exact error type varies by JSON library internals.
+    try std.testing.expectError(error.InvalidCharacter, json.parse(Descriptor, std.testing.allocator, json_bytes));
 }

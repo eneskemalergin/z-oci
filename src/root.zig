@@ -46,6 +46,7 @@ pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
 pub const CredentialHandle = @import("Config.zig").CredentialHandle;
 
+/// Placeholder error returned by stub APIs until the network transport layer lands in Phase 3.
 pub const ImplementationError = error{NotYetImplemented};
 
 /// Resolve an image reference to a pinned manifest digest.

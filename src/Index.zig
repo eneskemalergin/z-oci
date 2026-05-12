@@ -153,7 +153,7 @@ pub const DockerManifestList = struct {
 };
 
 /// Tagged union over OciImageIndex and DockerManifestList.
-/// Use this type in resolvers — do not branch on the spec variant outside this file.
+/// Use this type in resolvers. Do not branch on the spec variant outside this file.
 pub const MultiArchManifest = union(enum) {
     oci: OciImageIndex,
     docker: DockerManifestList,
@@ -177,15 +177,7 @@ pub const MultiArchManifest = union(enum) {
     }
 };
 
-fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    errdefer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(value);
-    return aw;
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 
 const Digest = @import("Digest.zig");
 const test_support = @import("test_support.zig");
@@ -441,7 +433,7 @@ test "OciImageIndex JSON: stringify/reparse preserves annotations leak-free" {
     const parsed = try json.parse(OciImageIndex, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
-    var aw = try stringifyForTest(parsed.value);
+    var aw = try json.stringifyForTest(parsed.value);
     defer aw.deinit();
     const out = aw.written();
 
@@ -625,4 +617,95 @@ test "DockerManifestList JSON: live Quay fixture selects linux arm64 descriptor"
     try std.testing.expectEqualSlices(u8, "8f03274c62c8fff16d451d31ad57a6af6873c882273833368782231ebd07d0cf", selected.?.digest.hex);
     try std.testing.expect(selected.?.platform != null);
     try std.testing.expectEqualSlices(u8, "arm64", selected.?.platform.?.architecture);
+}
+
+test "OciImageIndex JSON: allocation failures do not leak" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": [
+        \\    {
+        \\      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\      "size": 512,
+        \\      "platform": { "os": "linux", "architecture": "amd64" }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            const parsed = try json.parse(OciImageIndex, allocator, bytes);
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+        }
+    }.run, .{json_bytes});
+}
+
+test "OciImageIndex JSON: repeated parse rounds leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": [
+        \\    {
+        \\      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\      "size": 512,
+        \\      "platform": { "os": "linux", "architecture": "amd64" }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    for (0..16) |_| {
+        const parsed = try json.parse(OciImageIndex, allocator, json_bytes);
+        parsed.deinit();
+    }
+}
+
+test "DockerManifestList JSON: allocation failures do not leak" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+        \\  "manifests": [
+        \\    {
+        \\      "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\      "size": 1024,
+        \\      "platform": { "os": "linux", "architecture": "arm64" }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            const parsed = try json.parse(DockerManifestList, allocator, bytes);
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+        }
+    }.run, .{json_bytes});
+}
+
+test "DockerManifestList JSON: repeated parse rounds leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+        \\  "manifests": []
+        \\}
+    ;
+    for (0..16) |_| {
+        const parsed = try json.parse(DockerManifestList, allocator, json_bytes);
+        parsed.deinit();
+    }
 }

@@ -95,15 +95,7 @@ pub fn jsonStringify(self: Manifest, jw: anytype) !void {
     try jw.endObject();
 }
 
-fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    errdefer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(value);
-    return aw;
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 
 const Digest = @import("Digest.zig");
 
@@ -257,7 +249,7 @@ test "Manifest JSON: stringifies with camelCase field names" {
         .layers = &layers,
     };
 
-    var aw = try stringifyForTest(m);
+    var aw = try json.stringifyForTest(m);
     defer aw.deinit();
     const out = aw.written();
 
@@ -287,7 +279,7 @@ test "Manifest JSON: stringify/reparse preserves annotations leak-free" {
     const parsed = try json.parse(Manifest, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
-    var aw = try stringifyForTest(parsed.value);
+    var aw = try json.stringifyForTest(parsed.value);
     defer aw.deinit();
     const out = aw.written();
 
@@ -388,4 +380,71 @@ test "Manifest JSON: parses live Quay busybox amd64 Docker manifest fixture" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.layers.len);
     try std.testing.expectEqual(MediaType.docker_layer_gzip, parsed.value.layers[0].media_type);
     try std.testing.expectEqual(@as(u64, 324609), parsed.value.layers[1].size);
+}
+
+test "Manifest JSON: allocation failures do not leak" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 7023
+        \\  },
+        \\  "layers": [
+        \\    {
+        \\      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\      "size": 32654
+        \\    }
+        \\  ]
+        \\}
+    ;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            const parsed = try json.parse(Manifest, allocator, bytes);
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
+        }
+    }.run, .{json_bytes});
+}
+
+test "Manifest JSON: repeated parse rounds leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 1
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+    for (0..16) |_| {
+        const parsed = try json.parse(Manifest, allocator, json_bytes);
+        parsed.deinit();
+    }
+}
+
+test "Manifest JSON: missing layers returns MissingField" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        \\    "size": 64
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(error.MissingField, json.parse(Manifest, std.testing.allocator, json_bytes));
 }

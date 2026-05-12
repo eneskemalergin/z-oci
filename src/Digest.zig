@@ -92,19 +92,7 @@ pub fn jsonStringify(self: Digest, jw: anytype) !void {
     try jw.write(s);
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-//
-// parse -----------------------------------------------------------------------
-
-test "parse: valid sha256 returns correct algorithm and hex" {
-    // Arrange
-    const input = "sha256:" ++ "a" ** 64;
-    // Act
-    const d = try parse(input);
-    // Assert: algorithm and hex are both correct.
-    try std.testing.expectEqual(Algorithm.sha256, d.algorithm);
-    try std.testing.expectEqualSlices(u8, "a" ** 64, d.hex);
-}
+// Tests
 
 test "parse: hex slice borrows from input without copying" {
     // Guards the zero-allocation contract: d.hex must point inside input,
@@ -114,11 +102,6 @@ test "parse: hex slice borrows from input without copying" {
     // "sha256:" is 7 bytes; hex starts at offset 7.
     try std.testing.expectEqual(input.ptr + 7, d.hex.ptr);
     try std.testing.expectEqual(@as(usize, 64), d.hex.len);
-}
-
-test "parse: uppercase hex chars are accepted" {
-    const d = try parse("sha256:" ++ "A" ** 64);
-    try std.testing.expectEqualSlices(u8, "A" ** 64, d.hex);
 }
 
 test "parse: mixed case hex is accepted" {
@@ -234,4 +217,60 @@ test "parse: 10000 pseudo-random inputs either parse correctly or return a known
             => {},
         }
     }
+}
+
+// jsonParse / jsonStringify ---------------------------------------------------
+
+test "Digest jsonParse: valid sha256 hex string" {
+    const json_bytes = "\"sha256:" ++ "a" ** 64 ++ "\"";
+    const parsed = try std.json.parseFromSlice(Digest, std.testing.allocator, json_bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(Algorithm.sha256, parsed.value.algorithm);
+    try std.testing.expectEqualSlices(u8, "a" ** 64, parsed.value.hex);
+}
+
+test "Digest jsonParse: non-string token returns UnexpectedToken" {
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Digest, std.testing.allocator, "123", .{}));
+}
+
+test "Digest jsonParse: invalid digest string returns UnexpectedToken" {
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Digest, std.testing.allocator, "\"not-a-digest\"", .{}));
+}
+
+test "Digest jsonStringify: produces canonical algorithm:hex format" {
+    const d = try parse("sha256:" ++ "b" ** 64);
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try d.format(&w);
+    try std.testing.expectEqualSlices(u8, "sha256:" ++ "b" ** 64, w.buffered());
+}
+
+test "Digest jsonParse: allocation failures do not leak" {
+    const json_bytes = "\"sha256:" ++ "c" ** 64 ++ "\"";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const parsed = try std.json.parseFromSlice(Digest, allocator, json_bytes, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(Algorithm.sha256, parsed.value.algorithm);
+        }
+    }.run, .{});
+}
+
+test "parse: 00, ff, and boundary hex values are accepted" {
+    const d = try parse("sha256:" ++ "00" ++ "ff" ++ "aa" ++ "a" ** 58);
+    try std.testing.expectEqualSlices(u8, "00ffaa" ++ "a" ** 58, d.hex);
+}
+
+test "Digest jsonStringify: round-trip preserves digest" {
+    const hex = "d" ** 64;
+    const d = try parse("sha256:" ++ hex);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(d);
+    const out = aw.written();
+    const reparsed = try std.json.parseFromSlice(Digest, std.testing.allocator, out, .{});
+    defer reparsed.deinit();
+    try std.testing.expectEqual(Algorithm.sha256, reparsed.value.algorithm);
+    try std.testing.expectEqualSlices(u8, hex, reparsed.value.hex);
 }

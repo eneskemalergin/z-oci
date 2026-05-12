@@ -7,6 +7,38 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-05-12
+
+### Added
+
+- CI workflow (`.github/workflows/ci.yml`) now runs `zig build test`, `examples-smoke`, and `zig fmt --check` on every push and PR to `main` and `phase2-auth`.
+- 59 new tests across all modules: JSON round-trip, allocation-failure, DebugAllocator leak detection, fuzz coverage for auth header parsers, edge-case tests for Config and ResolveError formats, and allocation-failure safety for every JSON-backed type.
+- Fuzz coverage now spans 40,000 pseudo-random inputs across Digest parse, Reference parse, JSON manifest parse, and auth header/challenge parser paths.
+- Allocation-failure coverage (`checkAllAllocationFailures`) now covers Digest, MediaType, Platform, Descriptor, Manifest, OciImageIndex, DockerManifestList, json.parse, auth token response, auth token request, and auth cache insertion.
+
+### Changed
+
+- `MediaType.toString()` now derives from `mime_table` instead of duplicating every MIME string in a second switch. Adding a new media type now requires touching exactly one table.
+- `stringifyForTest` extracted from 3 files to `json.zig` as a shared test helper.
+- `dockerConfigRegistryKeyMatches` now reuses the shared `isDockerHubRegistryAlias` helper instead of duplicating the alias list inline.
+- Doc comments stripped of em-dashes throughout (`Reference.zig`, `ResolveResult.zig`, `Config.zig`, `Index.zig`, `json.zig`).
+- Section headers normalized from `// ----` box-drawing characters to plain `//` comments across all source files.
+- `zig fmt` formatting pass applied across `src/`, `examples/`, and `build.zig`.
+- `build.zig.zon` version bumped to `0.1.8`.
+
+### Removed
+
+- 6 redundant tests removed: 4 simple leak checks in `Reference.zig` (covered by DebugAllocator test), 2 happy-path parse checks in `Digest.zig` (covered by 10k fuzz test and mixed-case test).
+- 1 duplicate null-release-fn test in `Config.zig`.
+- 1 O(n**2) redundant variant-prefix test in `ResolveError.zig`.
+
+### Verified
+
+- `zig build test --summary all` passes with 344/344 tests (up from 297 at v0.1.7), plus examples-smoke and workflow-smoke.
+- `zig build -Doptimize=ReleaseSmall` produces a working artifact.
+- `zig fmt --check src/ examples/ build.zig` passes with zero formatting changes.
+- `zig build examples-smoke` passes (3 offline example programs parse fixtures and print correct output).
+
 ## [0.1.7] - 2026-05-11
 
 ### Added

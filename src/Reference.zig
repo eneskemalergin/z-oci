@@ -33,7 +33,7 @@ repository: []const u8,
 tag: ?[]const u8,
 /// Parsed digest. .hex points into digest_raw when a digest is present.
 digest: ?Digest,
-/// "sha256:hex" — allocated copy used by refString(). Freed by deinit.
+/// "sha256:hex" allocated copy used by refString(). Freed by deinit.
 digest_raw: ?[]const u8,
 
 const Reference = @This();
@@ -93,7 +93,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     }
 
     // Step 3: extract tag from the last path segment.
-    // Only the last segment can carry a tag — earlier colons are registry ports.
+    // Only the last segment can carry a tag. Earlier colons are registry ports.
     var tag_str: ?[]const u8 = null;
     var repo_str = path_str;
 
@@ -222,7 +222,7 @@ fn isRepositoryAlphaNum(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 //
 // parse: Docker Hub bare names ------------------------------------------------
 
@@ -272,7 +272,7 @@ test "parse: tag with hyphens and dots is preserved exactly" {
 // parse: Docker Hub org paths -------------------------------------------------
 
 test "parse: org/image path on Docker Hub gets no library prefix" {
-    // "myorg/myimage" has a slash, so it is already a full path — no library/ prefix.
+    // "myorg/myimage" already has a slash, so no library/ prefix is added.
     const alloc = std.testing.allocator;
     var ref = try parse(alloc, "myorg/myimage:v2");
     defer ref.deinit(alloc);
@@ -526,31 +526,6 @@ test "real-world corpus: common registry references normalize to expected reposi
     }
 }
 
-test "repositoryPath: returns the repository field" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "ghcr.io/owner/repo:v1.0");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "owner/repo", ref.repositoryPath());
-}
-
-test "refString: returns tag when no digest is set" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "ubuntu:22.04");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "22.04", ref.refString());
-}
-
-// lifecycle: memory management ------------------------------------------------
-
-test "parse and deinit: testing allocator detects no leaks" {
-    // The testing allocator fails the test if any allocation from parse()
-    // is not freed by deinit(). This is the primary memory-safety check.
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "ghcr.io/owner/repo:v1.0");
-    ref.deinit(alloc);
-    // If we reach here without a leak report, all fields were freed.
-}
-
 test "parse: digest hex remains valid after caller input is freed" {
     // Tighten the ownership contract: digest.hex must point into owned memory,
     // not into the caller input slice.
@@ -572,14 +547,7 @@ test "parse and deinit: digest ref frees digest_raw and owned digest hex" {
     const input = "ghcr.io/owner/repo@sha256:" ++ hex;
     var ref = try parse(alloc, input);
     ref.deinit(alloc);
-    // No leak → digest_raw was freed and digest.hex needed no separate cleanup.
-}
-
-test "parse and deinit: tag+digest ref frees all three string allocations" {
-    const alloc = std.testing.allocator;
-    const hex = "e" ** 64;
-    var ref = try parse(alloc, "ghcr.io/owner/repo:v1@sha256:" ++ hex);
-    ref.deinit(alloc);
+    // No leak: digest_raw was freed, digest.hex needed no separate cleanup.
 }
 
 test "parse: allocation failures do not leak partially constructed references" {

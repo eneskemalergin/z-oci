@@ -4,7 +4,7 @@
 //! Call clone() to produce an independent copy that outlives that arena.
 //! Call deinit() on the clone when it is no longer needed.
 //!
-//! The original ResolveResult (not a clone) does not need deinit — the
+//! The original ResolveResult (not a clone) does not need deinit. The
 //! caller's arena teardown handles all cleanup.
 //!
 //! Ownership:
@@ -132,7 +132,7 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
 }
 
 /// deinit frees all slices allocated by clone().
-/// Do not call on the original ResolveResult — its memory belongs to the arena.
+/// Do not call on the original ResolveResult. Its memory belongs to the arena.
 pub fn deinit(self: *ResolveResult, allocator: std.mem.Allocator) void {
     allocator.free(self.reference.registry);
     allocator.free(self.reference.repository);
@@ -168,7 +168,7 @@ fn slicePointsInto(inner: []const u8, outer: []const u8) bool {
     return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 
 test "ResolveResult.clone: deep copy produces independent memory" {
     // Arrange: build a result backed by a short-lived arena.

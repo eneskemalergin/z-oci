@@ -135,7 +135,7 @@ fn featuresEql(a: ?[]const []const u8, b: ?[]const []const u8) bool {
     return true;
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 //
 // match -----------------------------------------------------------------------
 
@@ -355,4 +355,136 @@ test "match: very long variant string still matches exactly" {
     const candidate = Platform{ .os = "linux", .architecture = "arm64", .variant = long_variant };
     const filter = Platform{ .os = "linux", .architecture = "arm64", .variant = long_variant };
     try std.testing.expect(match(candidate, filter));
+}
+
+test "eql: features different lengths return false" {
+    const fa = [_][]const u8{"seccomp"};
+    const fb = [_][]const u8{ "seccomp", "apparmor" };
+    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fa };
+    const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
+    try std.testing.expect(!eql(a, b));
+}
+
+// jsonParse / jsonStringify ---------------------------------------------------
+
+test "Platform jsonParse: minimal fields parse correctly" {
+    const json_bytes = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
+    const parsed = try std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
+    try std.testing.expectEqualSlices(u8, "amd64", parsed.value.architecture);
+}
+
+test "Platform jsonParse: parses all optional fields" {
+    const json_bytes =
+        \\{
+        \\  "os": "windows",
+        \\  "architecture": "amd64",
+        \\  "variant": "v1",
+        \\  "os.version": "10.0.17763",
+        \\  "os.features": ["win32k", "hyperv"]
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(u8, "windows", parsed.value.os);
+    try std.testing.expectEqualSlices(u8, "v1", parsed.value.variant.?);
+    try std.testing.expectEqualSlices(u8, "10.0.17763", parsed.value.os_version.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.os_features.?.len);
+}
+
+test "Platform jsonParse: missing os field returns MissingField" {
+    const json_bytes = "{\"architecture\": \"amd64\"}";
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true }));
+}
+
+test "Platform jsonParse: missing architecture field returns MissingField" {
+    const json_bytes = "{\"os\": \"linux\"}";
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true }));
+}
+
+test "Platform jsonParse: unknown fields cause error when ignore_unknown_fields=false" {
+    const json_bytes = "{\"os\": \"linux\", \"architecture\": \"amd64\", \"customField\": \"value\"}";
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = false }));
+}
+
+test "Platform jsonParse: allocation failures do not leak" {
+    const json_bytes = "{\"os\": \"linux\", \"architecture\": \"amd64\", \"variant\": \"v8\", \"os.version\": \"10.0\"}";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const parsed = try std.json.parseFromSlice(Platform, allocator, json_bytes, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
+        }
+    }.run, .{});
+}
+
+test "Platform jsonStringify: produces valid JSON with all fields" {
+    const features = [_][]const u8{"seccomp"};
+    const p = Platform{
+        .os = "linux",
+        .architecture = "arm64",
+        .variant = "v8",
+        .os_version = "10.0",
+        .os_features = &features,
+    };
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(p);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"os\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"architecture\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"variant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"os.version\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"os.features\"") != null);
+}
+
+test "Platform jsonStringify: round-trip preserves all fields" {
+    const features = [_][]const u8{ "seccomp", "apparmor" };
+    const original = Platform{
+        .os = "windows",
+        .architecture = "amd64",
+        .variant = "v1",
+        .os_version = "10.0.17763",
+        .os_features = &features,
+    };
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(original);
+    const reparsed = try std.json.parseFromSlice(Platform, std.testing.allocator, aw.written(), .{ .ignore_unknown_fields = true });
+    defer reparsed.deinit();
+    try std.testing.expectEqualSlices(u8, original.os, reparsed.value.os);
+    try std.testing.expectEqualSlices(u8, original.architecture, reparsed.value.architecture);
+    try std.testing.expectEqualSlices(u8, original.variant.?, reparsed.value.variant.?);
+    try std.testing.expectEqualSlices(u8, original.os_version.?, reparsed.value.os_version.?);
+    try std.testing.expectEqual(@as(usize, 2), reparsed.value.os_features.?.len);
+}
+
+test "Platform: repeated jsonParse rounds leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    for (0..16) |_| {
+        const parsed = try std.json.parseFromSlice(Platform, allocator, "{\"os\": \"linux\", \"architecture\": \"amd64\"}", .{ .ignore_unknown_fields = true });
+        parsed.deinit();
+    }
+}
+
+test "match: 1000 random platform pairs never panic" {
+    var seed: u64 = 0;
+    const oses = [_][]const u8{ "linux", "windows", "darwin", "freebsd", "" };
+    const arches = [_][]const u8{ "amd64", "arm64", "arm", "386", "s390x", "" };
+    for (0..1000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const os_idx = @as(usize, @truncate(seed)) % oses.len;
+        seed = seed *% 6364136223846793005 +% 1;
+        const arch_idx = @as(usize, @truncate(seed)) % arches.len;
+        const candidate = Platform{ .os = oses[os_idx], .architecture = arches[arch_idx] };
+        const filter = Platform{ .os = oses[arch_idx], .architecture = arches[os_idx] };
+        _ = match(candidate, filter);
+        _ = eql(candidate, filter);
+    }
 }

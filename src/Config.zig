@@ -69,7 +69,7 @@ pub const Config = struct {
     rate_limit_enabled: bool = true,
 };
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 
 test "Config: bare Config{} compiles with all defaults" {
     // A caller using Config{} for anonymous access must not need to set anything.
@@ -163,4 +163,31 @@ test "Config: max_retries zero disables retries" {
     // A caller that wants no retries must be able to set max_retries to 0.
     const c = Config{ .max_retries = 0 };
     try std.testing.expectEqual(@as(u8, 0), c.max_retries);
+}
+
+test "Config: connect_timeout_ms zero means no timeout" {
+    const c = Config{ .connect_timeout_ms = 0 };
+    try std.testing.expectEqual(@as(u32, 0), c.connect_timeout_ms);
+}
+
+test "Config: read_timeout_ms zero means no timeout" {
+    const c = Config{ .read_timeout_ms = 0 };
+    try std.testing.expectEqual(@as(u32, 0), c.read_timeout_ms);
+}
+
+test "Config: credential handle release with null release_fn is a no-op" {
+    const handle = CredentialHandle{
+        .credential = .{ .username = "u", .secret = "s" },
+    };
+    handle.release(); // must not crash or leak (covers default-null and explicit-null)
+}
+
+test "Config: max_retries at u8 maximum is valid" {
+    const c = Config{ .max_retries = 255 };
+    try std.testing.expectEqual(@as(u8, 255), c.max_retries);
+}
+
+test "Config: credential_provider null returns null for all registries" {
+    const c = Config{};
+    try std.testing.expect(c.credential_provider == null);
 }

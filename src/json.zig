@@ -21,12 +21,22 @@ pub fn parse(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) 
     });
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+/// Test helper: stringify any json-serializable value into an owned buffer.
+/// The caller owns the returned Allocating writer and must call .deinit().
+pub fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    errdefer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(value);
+    return aw;
+}
+
+// Tests
 
 const Manifest = @import("Manifest.zig");
 const Descriptor = @import("Descriptor.zig");
 
-// Lifecycle test: Parsed(T).deinit frees all memory --------------------------
+// Lifecycle: Parsed(T).deinit frees all memory
 
 test "json: Parsed lifecycle with testing allocator" {
     // Arrange: use testing.allocator to detect leaks.
@@ -48,7 +58,7 @@ test "json: Parsed lifecycle with testing allocator" {
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
 }
 
-// Unknown fields are ignored (spec extensions) --------------------------------
+// Unknown fields are ignored (spec extensions allowed by OCI)
 
 test "json: unknown fields in JSON are silently ignored" {
     // Arrange: the OCI spec allows vendor extension fields.
@@ -67,7 +77,7 @@ test "json: unknown fields in JSON are silently ignored" {
     try std.testing.expectEqual(@as(u64, 99), parsed.value.size);
 }
 
-// Parsed(T) is self-contained: input bytes can be freed after parse() ---------
+// Parsed(T) does not borrow from input bytes
 
 test "json: Parsed(T) does not borrow from input bytes" {
     // Arrange: allocate json_bytes on the heap then free before using parsed value.
@@ -82,7 +92,7 @@ test "json: Parsed(T) does not borrow from input bytes" {
     // Free the input before reading the parsed value.
     std.testing.allocator.free(json_bytes);
     defer parsed.deinit();
-    // Assert: values are readable — they live in the arena, not in json_bytes.
+    // Assert: values are readable (they live in the arena, not in json_bytes).
     try std.testing.expectEqual(@as(u64, 77), parsed.value.size);
     try std.testing.expectEqualSlices(u8, "e" ** 64, parsed.value.digest.hex);
 }
@@ -172,7 +182,7 @@ test "json: repeated success and parse failures leave no residual allocations un
     }
 }
 
-// Error paths — missing required fields ---------------------------------------
+// Error paths: missing required fields
 
 test "json: Descriptor missing required field returns error" {
     // Missing "size" is a required field.
@@ -187,7 +197,7 @@ test "json: Descriptor missing required field returns error" {
 }
 
 test "json: Manifest missing required config field returns error" {
-    // Missing "config" — layers alone is not enough.
+    // Missing "config": layers alone is not enough.
     const json_bytes =
         \\{
         \\  "schemaVersion": 2,
@@ -199,10 +209,10 @@ test "json: Manifest missing required config field returns error" {
     try std.testing.expectError(error.MissingField, result);
 }
 
-// Error paths — malformed values ----------------------------------------------
+// Error paths: malformed values
 
 test "json: invalid digest string returns error" {
-    // The digest has 63 hex chars — one short of the required 64.
+    // The digest has 63 hex chars: one short of the required 64.
     const json_bytes =
         \\{
         \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -243,7 +253,7 @@ test "json: wrong JSON type for size returns error" {
     } else |_| true);
 }
 
-// Platform round-trip with os.version and os.features ------------------------
+// Platform round-trip with os.version and os.features
 
 test "json: Platform round-trip with os.version and os.features" {
     // Arrange: a Windows platform entry with os.version and os.features.

@@ -91,10 +91,6 @@ const ParsedDockerCredentialHelperResponse = struct {
 const DockerCredentialHelperLookup = struct {
     server_url: []const u8,
     helper_suffix: []const u8,
-
-    fn commandAlloc(self: DockerCredentialHelperLookup, allocator: std.mem.Allocator) AuthError![]u8 {
-        return dockerCredentialHelperCommandAlloc(allocator, self.helper_suffix);
-    }
 };
 
 const DockerCredentialSource = union(enum) {
@@ -1131,8 +1127,7 @@ fn dockerConfigRegistryKeyMatches(config_key: []const u8, registry: []const u8) 
 
     return std.ascii.eqlIgnoreCase(config_key, docker_hub_auth_key) or
         std.ascii.eqlIgnoreCase(config_key, "https://index.docker.io/v1") or
-        std.ascii.eqlIgnoreCase(config_key, "index.docker.io") or
-        std.ascii.eqlIgnoreCase(config_key, "docker.io");
+        isDockerHubRegistryAlias(config_key);
 }
 
 fn registryHostMatches(configured_host: []const u8, registry: []const u8) bool {
@@ -1482,7 +1477,7 @@ fn isAuthWhitespace(char: u8) bool {
     return char == ' ' or char == '\t';
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 
 test "auth scaffolding: types compile with representative values" {
     const bearer = BearerChallenge{
@@ -3698,4 +3693,154 @@ test "AuthenticateRequest: carries parsed challenge data for token exchange" {
     try std.testing.expectEqualStrings("https://auth.example.test/token", request.challenge.realm);
     try std.testing.expectEqualStrings("registry.example.test", request.service().?);
     try std.testing.expectEqualStrings("repository:library/ubuntu:pull", request.scope().?);
+}
+
+// Fuzz tests for the WWW-Authenticate parser ----------------------------------
+
+test "parseAuthenticateHeader: 10000 pseudo-random headers never panic" {
+    var seed: u64 = 0xde_ad_be_ef;
+    var buf: [256]u8 = undefined;
+
+    for (0..10_000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const result = parseAuthenticateHeader(buf[0..len]);
+        _ = result catch {};
+    }
+}
+
+test "parseAuthenticateHeaders: 10000 pseudo-random multi-header inputs never panic" {
+    var seed: u64 = 0xc0_ff_ee_01;
+    var buf: [128]u8 = undefined;
+
+    for (0..10_000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const headers = [_][]const u8{buf[0..len]};
+        const result = parseAuthenticateHeaders(&headers);
+        _ = result catch {};
+    }
+}
+
+test "parseChallengeChunk: 10000 pseudo-random challenge chunks never panic" {
+    var seed: u64 = 0xca_fe_ba_be;
+    var buf: [128]u8 = undefined;
+
+    for (0..10_000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const result = parseChallengeChunk(buf[0..len]);
+        _ = result catch {};
+    }
+}
+
+test "probe/authenticate: repeated success and failure runs leave no residual allocations under DebugAllocator" {
+    const State = struct {
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(allocator);
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "debug-check-token",
+            \\  "expires_in": 90
+            \\}
+            };
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    for (0..8) |_| {
+        var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, State.exchange);
+        defer engine.deinit();
+        var client: std.http.Client = undefined;
+        const request = try AuthenticateRequest.init(
+            "registry.example.test",
+            .{
+                .realm = "https://auth.example.test/token",
+                .service = "registry.example.test",
+                .scope = "repository:owner/image:pull",
+            },
+        );
+
+        var response = (try engine.authenticate(&client, request)).?;
+        defer response.deinit(allocator);
+        try std.testing.expectEqualStrings("debug-check-token", response.access_token.value);
+    }
+}
+
+test "tokenCacheKeysEqual: nil service vs non-nil service returns false" {
+    const a = TokenCacheKey{ .realm = "https://example.test/token" };
+    const b = TokenCacheKey{ .realm = "https://example.test/token", .service = "svc" };
+    try std.testing.expect(!tokenCacheKeysEqual(a, b));
+}
+
+test "tokenCacheKeysEqual: nil scope vs non-nil scope returns false" {
+    const a = TokenCacheKey{ .realm = "https://example.test/token" };
+    const b = TokenCacheKey{ .realm = "https://example.test/token", .scope = "repository:image:pull" };
+    try std.testing.expect(!tokenCacheKeysEqual(a, b));
+}
+
+test "tokenCacheKeysEqual: both nil service and scope returns true" {
+    const a = TokenCacheKey{ .realm = "https://example.test/token" };
+    const b = TokenCacheKey{ .realm = "https://example.test/token" };
+    try std.testing.expect(tokenCacheKeysEqual(a, b));
+}
+
+test "parseAuthenticateHeader: bare challenge without scheme is UnsupportedAuthenticateScheme" {
+    try std.testing.expectError(
+        error.UnsupportedAuthenticateScheme,
+        parseAuthenticateHeader("realm=\"https://example.test/token\""),
+    );
+}
+
+test "parseAuthenticateHeader: multiple Bearer challenges selects first valid one" {
+    const challenge = try parseAuthenticateHeader(
+        "Bearer realm=\"https://first.test/token\", Bearer realm=\"https://second.test/token\"",
+    );
+    try std.testing.expect(challenge == .bearer);
+    try std.testing.expectEqualStrings("https://first.test/token", challenge.bearer.realm);
+}
+
+test "buildTokenHttpRequest: empty scope request builds url without query when no service or scope" {
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{ .realm = "https://auth.example.test/token" },
+    );
+
+    var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
+    defer http_request.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("https://auth.example.test/token", http_request.url);
+    try std.testing.expect(http_request.body == null);
+}
+
+test "classifyProbeResponse: unsupported status code returns error" {
+    try std.testing.expectError(
+        error.UnsupportedProbeStatus,
+        classifyProbeResponse(.internal_server_error, &.{}),
+    );
+    try std.testing.expectError(
+        error.UnsupportedProbeStatus,
+        classifyProbeResponse(.bad_request, &.{}),
+    );
 }
