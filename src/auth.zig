@@ -61,6 +61,10 @@ pub const TokenHttpExchanger = *const fn (
     request: TokenHttpRequest,
 ) AuthError!TokenExchangeResponse;
 
+pub const env_registry_host_var = "Z_OCI_REGISTRY_HOST";
+pub const env_registry_user_var = "Z_OCI_REGISTRY_USER";
+pub const env_registry_token_var = "Z_OCI_REGISTRY_TOKEN";
+
 /// Borrowed Bearer challenge data parsed from the authenticate header.
 ///
 /// These slices borrow from the header input passed to the parser.
@@ -193,6 +197,9 @@ pub const Phase2ConfigView = struct {
     connect_timeout_ms: u32,
     read_timeout_ms: u32,
     ca_bundle_path: ?[]const u8,
+    env_registry_host_var: []const u8 = env_registry_host_var,
+    env_registry_user_var: []const u8 = env_registry_user_var,
+    env_registry_token_var: []const u8 = env_registry_token_var,
 };
 
 /// Borrowed view of the normalized reference data auth consumes.
@@ -260,6 +267,7 @@ pub const AuthEngine = struct {
     config: Config,
     helper_process_context: ?HelperProcessContext = null,
     token_http_exchanger: ?TokenHttpExchanger = null,
+    environ_map: ?*const std.process.Environ.Map = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
         return .{
@@ -289,6 +297,18 @@ pub const AuthEngine = struct {
             .allocator = allocator,
             .config = config,
             .token_http_exchanger = token_http_exchanger,
+        };
+    }
+
+    pub fn initWithEnvironmentMap(
+        allocator: std.mem.Allocator,
+        config: Config,
+        environ_map: *const std.process.Environ.Map,
+    ) AuthEngine {
+        return .{
+            .allocator = allocator,
+            .config = config,
+            .environ_map = environ_map,
         };
     }
 
@@ -335,8 +355,15 @@ pub const AuthEngine = struct {
     }
 
     pub fn credentialForRegistry(self: AuthEngine, registry: []const u8) ?CredentialHandle {
-        const provider = self.config.credential_provider orelse return null;
-        return provider.getCredential(registry);
+        if (self.config.credential_provider) |provider| {
+            if (provider.getCredential(registry)) |handle| return handle;
+        }
+
+        if (self.environ_map) |environ_map| {
+            if (envCredentialForRegistry(environ_map, registry)) |handle| return handle;
+        }
+
+        return null;
     }
 };
 
@@ -347,6 +374,20 @@ pub fn phase2ConfigView(config: Config) Phase2ConfigView {
         .read_timeout_ms = config.read_timeout_ms,
         .ca_bundle_path = config.ca_bundle_path,
     };
+}
+
+pub fn envCredentialForRegistry(environ_map: *const std.process.Environ.Map, registry: []const u8) ?CredentialHandle {
+    const host = environ_map.get(env_registry_host_var) orelse return null;
+    if (!std.mem.eql(u8, host, registry)) return null;
+
+    const username = environ_map.get(env_registry_user_var) orelse return null;
+    const token = environ_map.get(env_registry_token_var) orelse return null;
+    if (username.len == 0 or token.len == 0) return null;
+
+    return .{ .credential = .{
+        .username = username,
+        .secret = token,
+    } };
 }
 
 pub fn referenceView(ref: Reference) AuthReferenceView {
@@ -766,6 +807,77 @@ test "auth scaffolding: engine can request credential handle" {
 
     try std.testing.expectEqualStrings("user", handle.credential.username);
     try std.testing.expectEqualStrings("token", handle.credential.secret);
+}
+
+test "auth scaffolding: phase2 config view records env credential variable names" {
+    const view = phase2ConfigView(Config{});
+
+    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_HOST", view.env_registry_host_var);
+    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_USER", view.env_registry_user_var);
+    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_TOKEN", view.env_registry_token_var);
+}
+
+test "AuthEngine.credentialForRegistry: explicit config provider wins before env" {
+    const State = struct {
+        fn get(registry: []const u8) ?CredentialHandle {
+            if (!std.mem.eql(u8, registry, "ghcr.io")) return null;
+            return .{ .credential = .{ .username = "config-user", .secret = "config-token" } };
+        }
+    };
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(env_registry_host_var, "ghcr.io");
+    try environ_map.put(env_registry_user_var, "env-user");
+    try environ_map.put(env_registry_token_var, "env-token");
+
+    const provider = CredentialProvider{ .getCredentialFn = State.get };
+    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
+    const handle = engine.credentialForRegistry("ghcr.io").?;
+
+    try std.testing.expectEqualStrings("config-user", handle.credential.username);
+    try std.testing.expectEqualStrings("config-token", handle.credential.secret);
+}
+
+test "AuthEngine.credentialForRegistry: env provider supplies fallback credentials" {
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(env_registry_host_var, "ghcr.io");
+    try environ_map.put(env_registry_user_var, "env-user");
+    try environ_map.put(env_registry_token_var, "env-token");
+
+    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    const handle = engine.credentialForRegistry("ghcr.io").?;
+
+    try std.testing.expectEqualStrings("env-user", handle.credential.username);
+    try std.testing.expectEqualStrings("env-token", handle.credential.secret);
+}
+
+test "AuthEngine.credentialForRegistry: env provider ignores registry mismatch and partial env" {
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(env_registry_host_var, "ghcr.io");
+    try environ_map.put(env_registry_user_var, "env-user");
+
+    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    try std.testing.expect(engine.credentialForRegistry("registry-1.docker.io") == null);
+    try std.testing.expect(engine.credentialForRegistry("ghcr.io") == null);
+}
+
+test "AuthEngine.credentialForRegistry: anonymous fallback is explicit when no provider matches" {
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const provider = CredentialProvider{
+        .getCredentialFn = struct {
+            fn get(_: []const u8) ?CredentialHandle {
+                return null;
+            }
+        }.get,
+    };
+    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
+
+    try std.testing.expect(engine.credentialForRegistry("registry-1.docker.io") == null);
 }
 
 test "buildTokenHttpRequest: get request includes query parameters" {
