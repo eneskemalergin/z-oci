@@ -65,7 +65,26 @@ pub const TokenHttpExchanger = *const fn (
 pub const env_registry_host_var = "Z_OCI_REGISTRY_HOST";
 pub const env_registry_user_var = "Z_OCI_REGISTRY_USER";
 pub const env_registry_token_var = "Z_OCI_REGISTRY_TOKEN";
+pub const docker_config_dir_var = "DOCKER_CONFIG";
+pub const home_dir_var = "HOME";
+pub const userprofile_dir_var = "USERPROFILE";
 pub const docker_hub_auth_key = "https://index.docker.io/v1/";
+
+const docker_config_file_size_limit = 1024 * 1024;
+
+const DockerCredentialHelperLookup = struct {
+    server_url: []const u8,
+    helper_suffix: []const u8,
+
+    fn commandAlloc(self: DockerCredentialHelperLookup, allocator: std.mem.Allocator) AuthError![]u8 {
+        return dockerCredentialHelperCommandAlloc(allocator, self.helper_suffix);
+    }
+};
+
+const DockerCredentialSource = union(enum) {
+    auth: ConfigModule.Credential,
+    helper: DockerCredentialHelperLookup,
+};
 
 const DockerConfigAuthEntry = struct {
     registry_key: []const u8,
@@ -106,12 +125,53 @@ const DockerConfig = struct {
     }
 
     fn credentialForRegistry(self: DockerConfig, registry: []const u8) ?CredentialHandle {
+        const credential = self.authCredentialForRegistry(registry) orelse return null;
+        return .{ .credential = credential };
+    }
+
+    fn authCredentialForRegistry(self: DockerConfig, registry: []const u8) ?ConfigModule.Credential {
         for (self.auths) |entry| {
             if (dockerConfigRegistryKeyMatches(entry.registry_key, registry)) {
-                return .{ .credential = entry.credential };
+                return entry.credential;
             }
         }
         return null;
+    }
+
+    fn credentialSourceForRegistry(self: DockerConfig, registry: []const u8) ?DockerCredentialSource {
+        if (self.registrySpecificHelperLookupForRegistry(registry)) |helper_lookup| {
+            return .{ .helper = helper_lookup };
+        }
+
+        if (self.authCredentialForRegistry(registry)) |credential| {
+            return .{ .auth = credential };
+        }
+
+        if (self.globalHelperLookupForRegistry(registry)) |helper_lookup| {
+            return .{ .helper = helper_lookup };
+        }
+
+        return null;
+    }
+
+    fn registrySpecificHelperLookupForRegistry(self: DockerConfig, registry: []const u8) ?DockerCredentialHelperLookup {
+        for (self.cred_helpers) |entry| {
+            if (dockerConfigRegistryKeyMatches(entry.registry_key, registry)) {
+                return .{
+                    .server_url = dockerCredentialHelperServer(registry),
+                    .helper_suffix = entry.helper_suffix,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn globalHelperLookupForRegistry(self: DockerConfig, registry: []const u8) ?DockerCredentialHelperLookup {
+        const helper_suffix = self.creds_store orelse return null;
+        return .{
+            .server_url = dockerCredentialHelperServer(registry),
+            .helper_suffix = helper_suffix,
+        };
     }
 };
 
@@ -381,8 +441,32 @@ pub const AuthEngine = struct {
     }
 
     pub fn setDockerConfigBytes(self: *AuthEngine, docker_config_json: []const u8) AuthError!void {
+        const parsed = try parseDockerConfig(self.allocator, docker_config_json);
         if (self.docker_config) |*docker_config| docker_config.deinit(self.allocator);
-        self.docker_config = try parseDockerConfig(self.allocator, docker_config_json);
+        self.docker_config = parsed;
+    }
+
+    pub fn loadDockerConfigFromEnvironment(self: *AuthEngine, io: std.Io) AuthError!bool {
+        const environ_map = self.environ_map orelse return false;
+        const config_path = try dockerConfigPathFromEnvironmentAlloc(self.allocator, environ_map) orelse return false;
+        defer self.allocator.free(config_path);
+
+        const docker_config_json = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            config_path,
+            self.allocator,
+            .limited(docker_config_file_size_limit),
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+        defer {
+            std.crypto.secureZero(u8, docker_config_json);
+            self.allocator.free(docker_config_json);
+        }
+
+        try self.setDockerConfigBytes(docker_config_json);
+        return true;
     }
 
     pub fn helperProcessContext(self: AuthEngine) ?HelperProcessContext {
@@ -566,6 +650,54 @@ fn initDockerConfigAuthEntry(
             .secret = secret,
         },
     };
+}
+
+fn dockerConfigPathFromEnvironmentAlloc(
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+) AuthError!?[]u8 {
+    if (environ_map.get(docker_config_dir_var)) |docker_config_dir| {
+        if (docker_config_dir.len != 0) {
+            return try std.fs.path.join(allocator, &.{ docker_config_dir, "config.json" });
+        }
+    }
+
+    if (environ_map.get(home_dir_var)) |home_dir| {
+        if (home_dir.len != 0) {
+            return try std.fs.path.join(allocator, &.{ home_dir, ".docker", "config.json" });
+        }
+    }
+
+    if (environ_map.get(userprofile_dir_var)) |userprofile_dir| {
+        if (userprofile_dir.len != 0) {
+            return try std.fs.path.join(allocator, &.{ userprofile_dir, ".docker", "config.json" });
+        }
+    }
+
+    return null;
+}
+
+fn dockerCredentialHelperServer(registry: []const u8) []const u8 {
+    if (std.mem.eql(u8, registry, "registry-1.docker.io")) return docker_hub_auth_key;
+    return registry;
+}
+
+fn dockerCredentialHelperCommandAlloc(
+    allocator: std.mem.Allocator,
+    helper_suffix: []const u8,
+) AuthError![]u8 {
+    if (!isValidDockerHelperSuffix(helper_suffix)) return error.InvalidDockerConfig;
+    return std.fmt.allocPrint(allocator, "docker-credential-{s}", .{helper_suffix});
+}
+
+fn isValidDockerHelperSuffix(helper_suffix: []const u8) bool {
+    if (helper_suffix.len == 0) return false;
+
+    for (helper_suffix) |byte| {
+        if (std.ascii.isWhitespace(byte) or byte == '/' or byte == '\\') return false;
+    }
+
+    return true;
 }
 
 fn dockerConfigRegistryKeyMatches(config_key: []const u8, registry: []const u8) bool {
@@ -1187,6 +1319,205 @@ test "AuthEngine.credentialForRegistry: env remains ahead of docker config" {
 
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
     try std.testing.expectEqualStrings("env-token", handle.credential.secret);
+}
+
+test "DockerConfig.credentialSourceForRegistry: registry helper beats auth and global store" {
+    var docker_config = try parseDockerConfig(std.testing.allocator,
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    },
+        \\    "registry.example.com": {
+        \\      "auth": "aW50ZXJuYWwtdXNlcjp0b2tlbg=="
+        \\    }
+        \\  },
+        \\  "credHelpers": {
+        \\    "ghcr.io": "secretservice"
+        \\  },
+        \\  "credsStore": "pass"
+        \\}
+    );
+    defer docker_config.deinit(std.testing.allocator);
+
+    const ghcr_source = docker_config.credentialSourceForRegistry("ghcr.io").?;
+    switch (ghcr_source) {
+        .helper => |helper| {
+            try std.testing.expectEqualStrings("ghcr.io", helper.server_url);
+            try std.testing.expectEqualStrings("secretservice", helper.helper_suffix);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const self_hosted_source = docker_config.credentialSourceForRegistry("registry.example.com").?;
+    switch (self_hosted_source) {
+        .auth => |credential| {
+            try std.testing.expectEqualStrings("internal-user", credential.username);
+            try std.testing.expectEqualStrings("token", credential.secret);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const quay_source = docker_config.credentialSourceForRegistry("quay.io").?;
+    switch (quay_source) {
+        .helper => |helper| {
+            try std.testing.expectEqualStrings("quay.io", helper.server_url);
+            try std.testing.expectEqualStrings("pass", helper.helper_suffix);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "DockerConfig.credentialSourceForRegistry: Docker Hub helper uses historical server key" {
+    var docker_config = try parseDockerConfig(std.testing.allocator,
+        \\{
+        \\  "credHelpers": {
+        \\    "docker.io": "secretservice"
+        \\  }
+        \\}
+    );
+    defer docker_config.deinit(std.testing.allocator);
+
+    const source = docker_config.credentialSourceForRegistry("registry-1.docker.io").?;
+    switch (source) {
+        .helper => |helper| {
+            try std.testing.expectEqualStrings(docker_hub_auth_key, helper.server_url);
+            try std.testing.expectEqualStrings("secretservice", helper.helper_suffix);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "dockerCredentialHelperCommandAlloc: expands helper binary names and rejects invalid suffixes" {
+    const command = try dockerCredentialHelperCommandAlloc(std.testing.allocator, "ecr-login");
+    defer std.testing.allocator.free(command);
+
+    try std.testing.expectEqualStrings("docker-credential-ecr-login", command);
+    try std.testing.expectError(error.InvalidDockerConfig, dockerCredentialHelperCommandAlloc(std.testing.allocator, ""));
+    try std.testing.expectError(error.InvalidDockerConfig, dockerCredentialHelperCommandAlloc(std.testing.allocator, "bad helper"));
+    try std.testing.expectError(error.InvalidDockerConfig, dockerCredentialHelperCommandAlloc(std.testing.allocator, "../pass"));
+}
+
+test "AuthEngine.loadDockerConfigFromEnvironment: loads HOME docker config" {
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var docker_dir = try tmp_dir.dir.createDirPathOpen(io, ".docker", .{});
+    defer docker_dir.close(io);
+
+    const file = try docker_dir.createFile(io, "config.json", .{ .read = true });
+    defer file.close(io);
+
+    var file_buffer: [256]u8 = undefined;
+    var file_writer = file.writer(io, &file_buffer);
+    try file_writer.interface.writeAll(
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  }
+        \\}
+    );
+    try file_writer.interface.flush();
+
+    const home_dir = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp_dir.sub_path[0..] });
+    defer std.testing.allocator.free(home_dir);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(home_dir_var, home_dir);
+
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    defer engine.deinit();
+
+    try std.testing.expect(try engine.loadDockerConfigFromEnvironment(io));
+
+    const handle = engine.credentialForRegistry("ghcr.io").?;
+    try std.testing.expectEqualStrings("octocat", handle.credential.username);
+    try std.testing.expectEqualStrings("ghp_example", handle.credential.secret);
+}
+
+test "AuthEngine.loadDockerConfigFromEnvironment: DOCKER_CONFIG overrides HOME" {
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var home_docker_dir = try tmp_dir.dir.createDirPathOpen(io, ".docker", .{});
+    defer home_docker_dir.close(io);
+    const home_file = try home_docker_dir.createFile(io, "config.json", .{ .read = true });
+    defer home_file.close(io);
+    var home_buffer: [256]u8 = undefined;
+    var home_writer = home_file.writer(io, &home_buffer);
+    try home_writer.interface.writeAll(
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "aG9tZS11c2VyOmhvbWUtdG9rZW4="
+        \\    }
+        \\  }
+        \\}
+    );
+    try home_writer.interface.flush();
+
+    var docker_config_dir = try tmp_dir.dir.createDirPathOpen(io, "docker-config", .{});
+    defer docker_config_dir.close(io);
+    const docker_config_file = try docker_config_dir.createFile(io, "config.json", .{ .read = true });
+    defer docker_config_file.close(io);
+    var docker_config_buffer: [256]u8 = undefined;
+    var docker_config_writer = docker_config_file.writer(io, &docker_config_buffer);
+    try docker_config_writer.interface.writeAll(
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "ZG9ja2VyLXVzZXI6ZG9ja2VyLXRva2Vu"
+        \\    }
+        \\  }
+        \\}
+    );
+    try docker_config_writer.interface.flush();
+
+    const home_dir = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp_dir.sub_path[0..] });
+    defer std.testing.allocator.free(home_dir);
+    const docker_config_path = try std.fs.path.join(std.testing.allocator, &.{ home_dir, "docker-config" });
+    defer std.testing.allocator.free(docker_config_path);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(home_dir_var, home_dir);
+    try environ_map.put(docker_config_dir_var, docker_config_path);
+
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    defer engine.deinit();
+
+    try std.testing.expect(try engine.loadDockerConfigFromEnvironment(io));
+
+    const handle = engine.credentialForRegistry("ghcr.io").?;
+    try std.testing.expectEqualStrings("docker-user", handle.credential.username);
+    try std.testing.expectEqualStrings("docker-token", handle.credential.secret);
+}
+
+test "AuthEngine.loadDockerConfigFromEnvironment: missing file is a clean miss" {
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const home_dir = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp_dir.sub_path[0..] });
+    defer std.testing.allocator.free(home_dir);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(home_dir_var, home_dir);
+
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    defer engine.deinit();
+
+    try std.testing.expect(!(try engine.loadDockerConfigFromEnvironment(io)));
+    try std.testing.expect(engine.credentialForRegistry("ghcr.io") == null);
 }
 
 test "buildTokenHttpRequest: get request includes query parameters" {
