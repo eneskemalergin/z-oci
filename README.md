@@ -59,8 +59,17 @@ The auth subsystem is now a real Phase 2 slice rather than a placeholder. Curren
 - Docker config discovery through `DOCKER_CONFIG`, `HOME`, and `USERPROFILE`
 - Docker `auths`, `credHelpers`, and `credsStore` support with registry helper -> inline auth -> global store precedence
 - helper-backed credential lookup through `std.process.spawn`, including timeout handling and repeated-run safety coverage
+- engine-owned token cache storage keyed by `realm + service + scope`
+- TTL-aware token reuse with refresh-window expiry handling and exact-key cache invalidation helpers for the future upstream-`401` retry path
 
-Token caching and live registry manifest fetch remain future Phase 2 and Phase 3 work.
+Live registry manifest fetch and the final auth hardening/release-prep pass remain future Phase 2 and Phase 3 work.
+
+**Next active auth milestone (`v0.1.7`):**
+
+- registry-specific auth hardening for Docker Hub, GHCR, Quay, and any other explicitly supported registries
+- final code-quality and ownership review across the Phase 2 auth surface
+- Phase 3 handoff definition for how manifest resolution consumes the auth engine
+- final docs and release gate checks before merging the Phase 2 branch back to `main`
 
 ## Requirements
 
@@ -152,10 +161,10 @@ The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, a
     - v0.1.3: token exchange with GET-first and POST fallback
     - v0.1.4: basic credential chain with config, env, and anonymous lookup
     - v0.1.5: Docker config parsing, helper-backed credentials, timeout handling, and Docker-source auth-chain integration
+    - v0.1.6: token caching keyed by `realm + service + scope`, expiry-aware reuse, exact-key invalidation, and cache hardening coverage
 
 Next up:
 
-- token cache and auth retry policy (v0.1.6)
 - auth hardening, docs, and release gate (v0.1.7 / v0.2.0)
 - Manifest resolution: HEAD/GET, multi-arch, nested index (v0.3.0)
 - Rate limiting: backoff, batch API, session cache (v0.4.0)

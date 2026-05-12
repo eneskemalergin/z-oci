@@ -7,11 +7,38 @@ Versions listed here are not yet tagged in git. Tags will follow once the librar
 
 ## [Unreleased]
 
-Nothing yet.
+### Planned
+
+- `v0.1.7` will focus on registry-specific auth hardening, Phase 3 handoff cleanup, and the final release-prep/docs gate before the Phase 2 branch is ready to merge.
 
 ---
 
-## [0.1.5] - 2026-05-12
+## [0.1.6] - 2026-05-11
+
+### Added
+
+- `AuthEngine` now owns token-cache storage built on `TokenCacheKey` and `CachedToken`, with explicit cached-entry teardown during engine deinitialization.
+- Token cache keys now preserve the full auth identity as `realm + service + scope`, including nil-vs-explicit field separation where appropriate.
+- Auth tests now cover cache-hit reuse, expiry refresh, exact-key invalidation retry, multi-scope coexistence, repeated mixed success/failure runs, and allocation-failure cleanup around cache insertion.
+
+### Changed
+
+- `AuthEngine.authenticate(...)` now checks the token cache before issuing token exchange and returns an owned response clone when a cached token is still valid.
+- Successful token exchange now stores expiry-aware cached tokens using the fixed refresh-window policy already defined in the auth layer.
+- The auth engine now exposes a narrow cached-token invalidation retry helper for the future upstream-`401` path without widening the public resolver surface prematurely.
+
+### Fixed
+
+- Cached token teardown now zeroes and frees owned token bytes correctly on engine shutdown, entry replacement, and explicit invalidation paths.
+- Cache replacement and repeated-run flows no longer collapse different scopes into one slot or leave stale cached entries behind.
+
+### Verified
+
+- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 231 tests.
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 278 tests.
+- `zig build test --summary all` passes with 282/282 tests.
+
+## [0.1.5] - 2026-05-11
 
 ### Added
 
