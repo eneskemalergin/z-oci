@@ -1802,6 +1802,78 @@ test "runDockerCredentialHelperCommand: timeout kills hung helper" {
     ));
 }
 
+test "runDockerCredentialHelperCommand: timeout does not poison the next helper run" {
+    if (builtin.os.tag == .windows) return;
+
+    try std.testing.expectError(error.HelperTimedOut, runDockerCredentialHelperCommand(
+        std.testing.allocator,
+        std.testing.io,
+        &.{
+            "/bin/sh",
+            "-c",
+            "IFS= read -r _ || exit 7\nsleep 1\nprintf '{\"Username\":\"late\",\"Secret\":\"late\"}'\n",
+            "docker-credential-secretservice",
+            "get",
+        },
+        "ghcr.io",
+        .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(10), .clock = .awake } },
+    ));
+
+    const handle = try runDockerCredentialHelperCommand(
+        std.testing.allocator,
+        std.testing.io,
+        &.{
+            "/bin/sh",
+            "-c",
+            "IFS= read -r server || exit 7\n[ \"$1\" = get ] || exit 9\n[ \"$server\" = \"ghcr.io\" ] || exit 8\nprintf '{\"Username\":\"recovered\",\"Secret\":\"secret\"}'\n",
+            "docker-credential-secretservice",
+            "get",
+        },
+        "ghcr.io",
+        .none,
+    );
+    defer handle.release();
+
+    try std.testing.expectEqualStrings("recovered", handle.credential.username);
+    try std.testing.expectEqualStrings("secret", handle.credential.secret);
+}
+
+test "runDockerCredentialHelperCommand: failed helper does not poison the next helper run" {
+    if (builtin.os.tag == .windows) return;
+
+    try std.testing.expectError(error.HelperFailed, runDockerCredentialHelperCommand(
+        std.testing.allocator,
+        std.testing.io,
+        &.{
+            "/bin/sh",
+            "-c",
+            "echo helper failed >&2\nexit 3\n",
+            "docker-credential-secretservice",
+            "get",
+        },
+        "ghcr.io",
+        .none,
+    ));
+
+    const handle = try runDockerCredentialHelperCommand(
+        std.testing.allocator,
+        std.testing.io,
+        &.{
+            "/bin/sh",
+            "-c",
+            "IFS= read -r server || exit 7\n[ \"$1\" = get ] || exit 9\n[ \"$server\" = \"ghcr.io\" ] || exit 8\nprintf '{\"Username\":\"recovered\",\"Secret\":\"secret\"}'\n",
+            "docker-credential-secretservice",
+            "get",
+        },
+        "ghcr.io",
+        .none,
+    );
+    defer handle.release();
+
+    try std.testing.expectEqualStrings("recovered", handle.credential.username);
+    try std.testing.expectEqualStrings("secret", handle.credential.secret);
+}
+
 test "AuthEngine.dockerCredentialForRegistry: helper path beats inline auth when helper context exists" {
     const State = struct {
         var calls: usize = 0;
