@@ -81,7 +81,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn nanoTime() i128 {
     var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => {},
+        else => return 0,
+    }
     return @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
 }
 

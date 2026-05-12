@@ -57,6 +57,12 @@ pub const TokenExchangeResponse = struct {
     body: []const u8,
 };
 
+/// Exchanges a `TokenHttpRequest` for a token response.
+///
+/// Ownership: the exchanger takes ownership of `request` and must call
+/// `request.deinit(allocator)` before or after producing the response.
+/// The caller (engine) relies on this contract — there is no fallback
+/// deinit in `exchangeTokenResponse`.
 pub const TokenHttpExchanger = *const fn (
     allocator: std.mem.Allocator,
     client: *std.http.Client,
