@@ -2,7 +2,7 @@
 
 JSON files in this directory are zebrac output snapshots from milestone releases. Each file captures wall-clock time, peak RSS, and CPU performance counter statistics for every benchmark operation.
 
-## Current Baseline: v0.1.9
+## Current Baseline: v0.2.0
 
 | Operation | Mean wall time | Mean RSS | Samples |
 |---|---|---|---|
@@ -30,7 +30,7 @@ Per-operation internal timing (from `z-oci-bench --counting`):
 
 ```sh
 zig build -Doptimize=ReleaseFast
-./tools/zebrac -d 5000 --json benchmarks/baselines/v0.X.Y.json \
+./tools/zebrac -d 4000 -w 1 --json benchmarks/baselines/v0.2.0.json \
   './zig-out/bin/z-oci-bench reference-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench digest-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench manifest-parse --iterations 10000' \

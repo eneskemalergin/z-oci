@@ -7,34 +7,32 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
-## [0.1.9] - 2026-05-12
+## [0.2.0] - 2026-05-12
 
 ### Added
 
-- `benchmarks/` directory: benchmark CLI (`z-oci-bench`), baselines directory, and build system wiring (`zig build bench`).
-- `CountingAllocator` allocator wrapper tracking bytes allocated/freed, peak concurrent bytes, and allocation count.
-- Seven benchmark subcommands: `reference-parse`, `digest-parse`, `manifest-parse`, `challenge-parse`, `platform-match`, `authenticate-miss`, `authenticate-hit`.
-- `zebrac`-based statistical sampling: `./tools/zebrac zig-out/bin/z-oci-bench <op>` collects wall-clock, RSS, and CPU perf counter metrics.
-- v0.1.9 baseline committed to `benchmarks/baselines/v0.1.9.json` (7 operations).
-- Memory stress tests: 7 new DebugAllocator tests at 1000x iterations each (auth engine 3 variants, Reference.parse 2 variants, all JSON types, parseDockerConfig). 358 total tests, up from 348.
-- CI workflow updated with `zig build bench`, `zebrac` informational baseline step, and `zig fmt --check benchmarks/`.
+- Phase 2 auth engine: `/v2/` probe, Bearer challenge parsing, token exchange (GET + POST fallback), credential-provider chain (config → env → Docker config → anonymous), per-scope token cache with TTL expiry, 401 invalidation retry. Full mock-transport test suite with 299 auth tests covering Docker Hub, GHCR, Quay, and generic self-hosted registries.
+- `benchmarks/` directory with `z-oci-bench` CLI (7 subcommands: `reference-parse`, `digest-parse`, `manifest-parse`, `challenge-parse`, `platform-match`, `authenticate-miss`, `authenticate-hit`), `CountingAllocator`, and `tools/zebrac` integration for statistical sampling.
+- Memory stress tests: 7 DebugAllocator tests at 1000x iterations each (auth engine 3 variants, Reference.parse 2 variants, all JSON types, parseDockerConfig). 358 total tests.
 - Token cache sizing documented in `AuthEngine` doc comment (unbounded by design for CLI use).
 - Arena lifecycle conventions documented in `root.zig` module docs.
-- `authenticate-miss` bench: unique scope per call, ~145μs/iter, ~13 allocs/call.
-- `authenticate-hit` bench: same cached scope, ~31μs/iter, 4 allocs/call (cache clone only).
+- CI workflow with zig build test, zig fmt --check, cached Zig 0.16 installation.
+- v0.2.0 baseline at `benchmarks/baselines/v0.2.0.json`.
+- `authenticate-miss` bench: ~145μs/iter, ~13 allocs/call.
+- `authenticate-hit` bench: ~31μs/iter, 4 allocs/call.
 
 ### Changed
 
-- `build.zig` now builds and installs the `z-oci-bench` binary.
-- Counting allocator uses saturating subtract to survive cross-allocator frees in complex paths.
+- Auth engine is now the Phase 2 deliverable, ready for Phase 3 resolver integration.
+- `build.zig` builds and installs `z-oci-bench`.
+- `build.zig.zon` version bumped to `0.2.0`.
 
 ### Verified
 
 - `zig build test --summary all` passes (358/358 tests, examples-smoke, workflow-smoke).
 - `zig build -Doptimize=ReleaseSmall` passes.
 - `zig fmt --check src/ examples/ build.zig benchmarks/` passes.
-- `zig build bench` compiles and runs all 7 benchmark operations.
-- `./tools/zebrac` generates the updated baseline JSON.
+- `zig build bench` compiles and runs all 7 operations.
 - Zero-allocation confirmed: `Digest.parse`, `Platform.match`, `parseAuthenticateHeader`, `classifyProbeResponse`, `tokenCacheKeysEqual`, `referenceView`.
 
 ## [0.1.8] - 2026-05-12
