@@ -23,8 +23,18 @@ pub const OciImageIndex = Index.OciImageIndex;
 pub const DockerManifestList = Index.DockerManifestList;
 pub const MultiArchManifest = Index.MultiArchManifest;
 pub const Reference = @import("Reference.zig");
+pub const auth = @import("auth.zig");
 
 pub const json = @import("json.zig");
+pub const AuthEngine = auth.AuthEngine;
+pub const AuthError = auth.AuthError;
+pub const AuthChallenge = auth.AuthChallenge;
+pub const BearerChallenge = auth.BearerChallenge;
+pub const ProbeResult = auth.ProbeResult;
+pub const Token = auth.Token;
+pub const TokenResponse = auth.TokenResponse;
+pub const TokenCacheKey = auth.TokenCacheKey;
+pub const CachedToken = auth.CachedToken;
 pub const ResolveError = @import("ResolveError.zig").ResolveError;
 pub const ResolveResult = @import("ResolveResult.zig");
 pub const Config = @import("Config.zig").Config;
@@ -110,6 +120,7 @@ test {
     _ = @import("Descriptor.zig");
     _ = @import("Manifest.zig");
     _ = @import("Index.zig");
+    _ = @import("auth.zig");
     _ = @import("json.zig");
     _ = @import("ResolveError.zig");
     _ = @import("ResolveResult.zig");
