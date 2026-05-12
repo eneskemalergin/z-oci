@@ -1,11 +1,12 @@
 .{
     .name = .z_oci,
-    .version = "0.1.0",
-    .fingerprint = 0xdf1b7d028191db04, // Changing this has security and trust implications.
+    .version = "0.2.0",
+    .fingerprint = 0xdf1b7d025f2687bf,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
         "assets",
+        "benchmarks",
         "build.zig",
         "build.zig.zon",
         "CHANGELOG.md",

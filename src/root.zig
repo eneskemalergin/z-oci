@@ -3,11 +3,22 @@
 //! Current scope:
 //! - offline OCI/Docker reference parsing and normalization
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
-//! - public resolver-surface stubs and ownership contracts ahead of Phase 2 HTTP work
+//! - auth engine: /v2/ probe, challenge parsing, token exchange, credential providers
+//! - public resolver-surface stubs and ownership contracts ahead of Phase 3 HTTP work
+//!
+//! Ownership conventions:
+//! - Functions taking an allocator produce owned storage that the caller must
+//!   free (pattern B): `Reference.parse(gpa, "img")` → caller calls `ref.deinit(gpa)`.
+//! - Functions returning `std.json.Parsed(T)` own an arena (pattern A): the caller
+//!   calls `parsed.deinit()` to free everything.
+//! - `AuthEngine` wraps persistent cache storage with its own `deinit()`.
+//!   Engine-created tokens (`TokenResponse`) are caller-owned → `.deinit(allocator)`.
+//! - Types that never allocate: `Digest` (borrowed view), `MediaType` (enum),
+//!   `Platform` (struct of slices), `AuthChallenge`/`BearerChallenge` (borrowed views).
+//!   These need no deinit.
 //!
 //! Not yet implemented:
-//! - registry HTTP transport
-//! - auth flows and token exchange
+//! - manifest fetch (HEAD/GET) and digest verification
 //! - real `resolve`, `validate`, and `getManifest` behavior
 
 const std = @import("std");
@@ -23,14 +34,30 @@ pub const OciImageIndex = Index.OciImageIndex;
 pub const DockerManifestList = Index.DockerManifestList;
 pub const MultiArchManifest = Index.MultiArchManifest;
 pub const Reference = @import("Reference.zig");
+pub const auth = @import("auth.zig");
 
 pub const json = @import("json.zig");
+pub const AuthEngine = auth.AuthEngine;
+pub const AuthError = auth.AuthError;
+pub const AuthChallenge = auth.AuthChallenge;
+pub const AuthReferenceView = auth.AuthReferenceView;
+pub const BearerChallenge = auth.BearerChallenge;
+pub const AuthenticateRequest = auth.AuthenticateRequest;
+pub const ProbeResult = auth.ProbeResult;
+pub const ProbeHttpResponse = auth.ProbeHttpResponse;
+pub const referenceView = auth.referenceView;
+pub const Token = auth.Token;
+pub const TokenResponse = auth.TokenResponse;
+pub const TokenCacheKey = auth.TokenCacheKey;
+pub const CachedToken = auth.CachedToken;
 pub const ResolveError = @import("ResolveError.zig").ResolveError;
 pub const ResolveResult = @import("ResolveResult.zig");
 pub const Config = @import("Config.zig").Config;
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
+pub const CredentialHandle = @import("Config.zig").CredentialHandle;
 
+/// Placeholder error returned by stub APIs until the network transport layer lands in Phase 3.
 pub const ImplementationError = error{NotYetImplemented};
 
 /// Resolve an image reference to a pinned manifest digest.
@@ -43,6 +70,16 @@ pub const ImplementationError = error{NotYetImplemented};
 ///   you need, then tear the arena down.
 /// - For batch operations that keep results longer, clone the ResolveResult into caller-owned
 ///   memory before freeing the per-call arena.
+///
+/// Phase 3 auth handoff contract:
+/// - derive `AuthReferenceView` from the normalized `Reference` with `referenceView(ref)`
+/// - probe `view.probeUriAlloc(...)` first; only enter auth when `ProbeHttpResponse.classify()`
+///   returns `.auth_required`
+/// - turn that bearer challenge into `AuthenticateRequest.init(view.registry, challenge)` and call
+///   `AuthEngine.authenticate(...)`
+/// - attach the returned bearer token to the retried HEAD/GET request; if that retry comes back
+///   `401`, call `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)` once for the same
+///   request and surface failure after that single retry
 pub fn resolve(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -64,6 +101,10 @@ pub fn resolve(
 /// - No owned data is returned from this API.
 /// - The caller still owns `allocator`; later implementations may use it for transient parsing and
 ///   response handling even though this stub returns immediately.
+///
+/// Phase 3 auth handoff contract:
+/// - validation follows the same probe -> classify -> authenticate -> retry-once flow as `resolve`
+/// - validation must treat `.not_found` as terminal and must not attempt auth in that case
 pub fn validate(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -83,6 +124,11 @@ pub fn validate(
 /// - The returned std.json.Parsed(Manifest) owns an arena.
 /// - Call parsed.deinit() when finished.
 /// - Do not free the allocator backing that arena while the parsed value is still in use.
+///
+/// Phase 3 auth handoff contract:
+/// - manifest GET uses the same `AuthReferenceView` and `AuthenticateRequest` boundary as `resolve`
+/// - auth owns token exchange and cache invalidation; manifest fetch owns Accept negotiation,
+///   response status handling, and JSON parsing
 pub fn getManifest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -110,6 +156,7 @@ test {
     _ = @import("Descriptor.zig");
     _ = @import("Manifest.zig");
     _ = @import("Index.zig");
+    _ = @import("auth.zig");
     _ = @import("json.zig");
     _ = @import("ResolveError.zig");
     _ = @import("ResolveResult.zig");

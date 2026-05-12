@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main, phase2-auth]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Zig 0.16
+        id: cache-zig
+        uses: actions/cache@v4
+        with:
+          path: zig-0.16.0
+          key: zig-0.16.0
+
+      - name: Install Zig 0.16
+        if: steps.cache-zig.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://ziglang.org/builds/zig-linux-x86_64-0.16.0.tar.xz
+          tar xf zig-linux-x86_64-0.16.0.tar.xz
+
+      - name: zig build test
+        run: ./zig-0.16.0/zig build test --summary all
+
+      - name: zig fmt check
+        run: ./zig-0.16.0/zig fmt --check src/ examples/ build.zig benchmarks/

@@ -114,6 +114,23 @@ pub fn build(b: *std.Build) void {
     run_select_platform_step.dependOn(&run_select_platform.step);
     if (b.args) |args| run_select_platform.addArgs(args);
 
+    // Benchmark CLI
+    const bench = b.addExecutable(.{
+        .name = "z-oci-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "z_oci", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(bench);
+
+    const bench_step = b.step("bench", "Build the benchmark CLI");
+    bench_step.dependOn(&bench.step);
+
     const smoke_examples_step = b.step("examples-smoke", "Run a minimal smoke pass over the offline examples");
 
     const smoke_normalize_reference = b.addRunArtifact(normalize_reference_example);

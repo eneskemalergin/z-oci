@@ -6,12 +6,12 @@
 <h1 align="center">z-oci</h1>
 
 <p align="center">
-    Pure Zig OCI/Docker Registry API v2 toolkit. Offline reference parsing, OCI JSON handling, and resolver API contracts. Zero dependencies, Zig 0.16 std only.
+        Pure Zig OCI/Docker Registry API v2 toolkit. Reference parsing, OCI types, auth engine. Zero external dependencies.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.0-8B5CF6?style=flat-square" alt="v0.1.0">
-  <img src="https://img.shields.io/badge/status-public%20offline%20release-2D7D46?style=flat-square" alt="Status: public offline release">
+    <img src="https://img.shields.io/badge/version-v0.2.0-8B5CF6?style=flat-square" alt="v0.2.0">
+    <img src="https://img.shields.io/badge/status-pre--networking-2D7D46?style=flat-square" alt="Status: pre-networking">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -19,36 +19,54 @@
 
 ---
 
-**What ships in v0.1.0:**
+## What z-oci does
 
-- `Digest`, `MediaType`, and `Platform`: leaf types with parser, matching, and formatting behavior
-- `Reference`: full Docker/OCI reference parser with owned-lifetime semantics
-- `Descriptor`, `Manifest`, `OciImageIndex`, and `DockerManifestList`: OCI/Docker data model types
-- `MultiArchManifest`: platform selection over multi-arch indices and manifest lists
-- `json.parse(T, allocator, bytes)`: OCI-friendly JSON wrapper over `std.json.Parsed(T)`
-- `ResolveError`, `ResolveResult`, and `Config`: public contract types for the future resolver surface
-- `resolve`, `validate`, and `getManifest`: public API stubs with documented ownership contracts
-- real offline OCI/Docker fixture set with provenance in `fixtures/SOURCES.md`
-- three offline example programs plus `examples-smoke` build coverage
-- explicit offline workflow smoke matrix via `zig build workflow-smoke`
+z-oci is a read-only OCI registry client. It parses image references, handles the types needed for manifest resolution, and authenticates against registries. Everything is built on Zig 0.16 std -- no external dependencies.
 
-## Supported Offline Workflows
+### Capabilities
 
-v0.1.0 is an offline toolkit. Not a partial network client. It handles:
+- **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
+- **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, `MultiArchManifest` -- all with JSON round-trip support.
+- **Auth engine** (v0.2.0): Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens (GET with POST fallback), resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry (in-memory, per-scope). 299 tests. The auth engine is transport-agnostic logic -- it produces token headers but does not perform live HTTP. Callers provide a `*std.http.Client` and an allocator; the library handles everything else.
+- **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
-- reference normalization and decomposition through `Reference.parse`, `repositoryPath()`, and `refString()`
-- digest parsing and syntactic validation through `Digest.parse` and digest-pinned references
-- offline manifest and index inspection from checked-in OCI/Docker JSON fixtures
-- platform selection from parsed multi-arch indices and manifest lists
-- clone `ResolveResult` values out of a short-lived arena
+### Not yet implemented
 
-## Requirements
+The `resolve()`, `validate()`, and `getManifest()` APIs return `error.NotYetImplemented`. Live manifest fetch, digest verification, and rate limiting are the next work areas.
 
-Zig **0.16.0** or later.
+### Registry support
 
-## Example use today
+| Registries             | Status                                    |
+| ---------------------- | ----------------------------------------- |
+| Docker Hub, GHCR, Quay | Tested with auth engine                   |
+| GitLab, Harbor         | Covered by generic bearer mock tests      |
+| ECR, GCR, ACR          | Deferred; use the credential helper chain |
 
-In `build.zig`, import the package into your executable module:
+### Performance
+
+| Operation                 | Time    | Allocations |
+| ------------------------- | ------- | ----------- |
+| `Reference.parse`         | 33 μs   | 4           |
+| `Digest.parse`            | 0.4 μs  | 0           |
+| `json.parse(Manifest)`    | 46 μs   | ~3          |
+| `parseAuthenticateHeader` | 5.6 μs  | 0           |
+| `Platform.match`          | 0.15 μs | 0           |
+| `authenticate` (miss)     | 145 μs  | ~13         |
+| `authenticate` (hit)      | 31 μs   | 4           |
+
+Full zebrac baseline at `benchmarks/baselines/`. CHANGELOG at [CHANGELOG.md](CHANGELOG.md).
+
+## Getting started
+
+**Requirements:** Zig **0.16.0** or later.
+
+### Add as a dependency
+
+```sh
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.2.0
+```
+
+Then in `build.zig`, import the package:
 
 ```zig
 const z_oci = b.dependency("z_oci", .{
@@ -104,18 +122,16 @@ pub fn main() !void {
 
 ## Build steps
 
-| Command | What it does |
-| ------- | ------------ |
-| `zig build` | Build and install the current stub CLI plus the package module |
-| `zig build test` | Run all unit tests |
-| `zig build examples` | Build all offline example programs |
-| `zig build examples-smoke` | Run a small smoke pass over the offline example programs |
-| `zig build workflow-smoke` | Run the offline workflow smoke-test matrix |
-| `zig build run` | Run the CLI (once implemented) |
+- `zig build`: build and install the stub CLI plus the package module
+- `zig build test`: run all unit tests and smoke checks
+- `zig build examples`: build the offline example programs
+- `zig build examples-smoke`: run a small smoke pass over the example programs
+- `zig build workflow-smoke`: run the offline workflow smoke-test matrix
+- `zig build bench`: build the benchmark CLI (`z-oci-bench`)
 
-Fixtures under `fixtures/` are checked-in snapshots, not live fetches. `zig build test` validates them in CI. To refresh, recapture from the URLs and `Accept` headers in `fixtures/SOURCES.md`.
+Fixtures under `fixtures/` are checked-in snapshots, not live fetches. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
 
-The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, and build files. Documented examples and tests work from a dependency fetch.
+The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
 
 ## Offline examples
 
@@ -123,20 +139,14 @@ The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, a
 - `zig build example-inspect-manifest`
 - `zig build example-select-platform`
 
-## Roadmap
+See [examples](examples) for the source of the packaged examples.
 
-Done: v0.0.1 -> v0.1.0 (offline toolkit).
+## What is next
 
-- Auth engine: Bearer token flow, credential helpers (v0.2.0)
-- Manifest resolution: HEAD/GET, multi-arch, nested index (v0.3.0)
-- Rate limiting: backoff, batch API, session cache (v0.4.0)
-- Testing: mock server, local registry, CI (v0.5.0)
-- CLI: `z-oci resolve`, `validate`, `inspect` (v0.6.0)
-- Zencelot (v0.7.0)
-- Zencelot Integration (v0.8.0)
-- Stabilization (v0.9.0)
-- Package release: Zig package index, API docs (v1.0.0)
-- Registry HTTP transport, auth flows, and real resolver behavior (Phase 2)
+- Live manifest resolution (HEAD/GET, digest verification, multi-arch selection)
+- Rate limiting and retry logic
+- CLI for resolve, validate, and inspect
+- More registry compatibility testing
 
 ## References
 

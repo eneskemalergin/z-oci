@@ -148,7 +148,7 @@ pub const ResolveError = union(enum) {
     }
 };
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 
 test "ResolveError.format: AuthFailed with HTTP status" {
     // Arrange
@@ -287,4 +287,35 @@ test "ResolveError.format: registry and reference appear in output" {
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "gcr.io") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "project/image") != null);
+}
+
+test "ResolveError.format: very long registry and reference are not truncated" {
+    const long_reg = "a" ** 200;
+    const long_ref = "b" ** 200;
+    const err = ResolveError{ .rate_limited = .{
+        .registry = long_reg,
+        .reference = long_ref,
+        .http_status = 429,
+    } };
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try err.format(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, long_reg) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, long_ref) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "429") != null);
+}
+
+test "ResolveError.format: typical error output length is bounded" {
+    const err = ResolveError{ .auth_failed = .{
+        .registry = "registry-1.docker.io",
+        .reference = "library/ubuntu:22.04",
+        .http_status = 401,
+    } };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try err.format(&w);
+    const out = w.buffered();
+    try std.testing.expect(out.len < 150);
+    try std.testing.expect(out.len > 20);
 }

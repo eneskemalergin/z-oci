@@ -51,24 +51,12 @@ pub const MediaType = enum {
     }
 
     /// Returns the canonical MIME string for this media type.
+    /// Derived from mime_table so both directions share one string per type.
     pub fn toString(self: MediaType) []const u8 {
-        return switch (self) {
-            .oci_manifest_v1 => "application/vnd.oci.image.manifest.v1+json",
-            .oci_index_v1 => "application/vnd.oci.image.index.v1+json",
-            .oci_config_v1 => "application/vnd.oci.image.config.v1+json",
-            .oci_empty_v1 => "application/vnd.oci.empty.v1+json",
-            .oci_layer_v1_tar => "application/vnd.oci.image.layer.v1.tar",
-            .oci_layer_v1_tar_gzip => "application/vnd.oci.image.layer.v1.tar+gzip",
-            .oci_layer_v1_tar_zstd => "application/vnd.oci.image.layer.v1.tar+zstd",
-            .oci_layer_nondistributable_v1_tar => "application/vnd.oci.image.layer.nondistributable.v1.tar",
-            .oci_layer_nondistributable_v1_tar_gzip => "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
-            .docker_manifest_v2 => "application/vnd.docker.distribution.manifest.v2+json",
-            .docker_manifest_list_v2 => "application/vnd.docker.distribution.manifest.list.v2+json",
-            .docker_container_image_v1 => "application/vnd.docker.container.image.v1+json",
-            .docker_layer_gzip => "application/vnd.docker.image.rootfs.diff.tar.gzip",
-            .docker_layer_foreign_gzip => "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
-            .docker_manifest_v1_signed => "application/vnd.docker.distribution.manifest.v1+prettyjws",
-        };
+        for (mime_table) |entry| {
+            if (entry[1] == self) return entry[0];
+        }
+        unreachable;
     }
 
     /// True for index and manifest list types. Both carry a list of platform descriptors.
@@ -104,9 +92,9 @@ pub const MediaType = enum {
     }
 };
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// Tests
 //
-// fromString ------------------------------------------------------------------
+// fromString
 
 test "fromString: all known types parse from their canonical MIME string" {
     // Each type must round-trip through toString → fromString.
@@ -211,4 +199,87 @@ test "isLegacy: docker_manifest_v2 returns false" {
 
 test "isLegacy: docker_manifest_list_v2 returns false" {
     try std.testing.expect(!MediaType.docker_manifest_list_v2.isLegacy());
+}
+
+// jsonParse / jsonStringify ---------------------------------------------------
+
+test "MediaType jsonParse: parses canonical MIME string" {
+    const json_bytes = "\"application/vnd.oci.image.manifest.v1+json\"";
+    const parsed = try std.json.parseFromSlice(MediaType, std.testing.allocator, json_bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value);
+}
+
+test "MediaType jsonParse: non-string token returns UnexpectedToken" {
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(MediaType, std.testing.allocator, "123", .{}));
+}
+
+test "MediaType jsonParse: unknown MIME returns UnexpectedToken" {
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(MediaType, std.testing.allocator, "\"application/x-unknown\"", .{}));
+}
+
+test "MediaType jsonParse: allocation failures do not leak" {
+    const json_bytes = "\"application/vnd.oci.image.index.v1+json\"";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const parsed = try std.json.parseFromSlice(MediaType, allocator, json_bytes, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value);
+        }
+    }.run, .{});
+}
+
+test "MediaType jsonStringify: produces canonical MIME string" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(MediaType.oci_manifest_v1);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "application/vnd.oci.image.manifest.v1+json") != null);
+}
+
+test "MediaType jsonStringify: round-trip preserves all types" {
+    const all_types = [_]MediaType{
+        .oci_manifest_v1,                        .oci_index_v1,              .oci_config_v1,             .oci_empty_v1,
+        .oci_layer_v1_tar,                       .oci_layer_v1_tar_gzip,     .oci_layer_v1_tar_zstd,     .oci_layer_nondistributable_v1_tar,
+        .oci_layer_nondistributable_v1_tar_gzip, .docker_manifest_v2,        .docker_manifest_list_v2,   .docker_container_image_v1,
+        .docker_layer_gzip,                      .docker_layer_foreign_gzip, .docker_manifest_v1_signed,
+    };
+    for (all_types) |mt| {
+        var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var ws: std.json.Stringify = .{ .writer = &aw.writer };
+        try ws.write(mt);
+        const reparsed = try std.json.parseFromSlice(MediaType, std.testing.allocator, aw.written(), .{});
+        defer reparsed.deinit();
+        try std.testing.expectEqual(mt, reparsed.value);
+    }
+}
+
+test "fromString: null bytes in input do not match" {
+    // Construct a string with embedded NUL at runtime (Zig 0.16 string literals disallow \0).
+    var buf: [128]u8 = undefined;
+    const base = "application/vnd.oci.image.manifest.v1+json";
+    @memcpy(buf[0..base.len], base);
+    buf[base.len] = 0;
+    const input = buf[0 .. base.len + 1];
+    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(input));
+}
+
+test "fromString: very long unknown string returns null" {
+    var buf: [1024]u8 = undefined;
+    @memset(&buf, 'x');
+    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(&buf));
+}
+
+// DebugAllocator: repeated parse rounds leave no leaks -------------------------
+
+test "MediaType: repeated jsonParse rounds leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    for (0..16) |_| {
+        const parsed = try std.json.parseFromSlice(MediaType, allocator, "\"application/vnd.oci.image.manifest.v1+json\"", .{});
+        parsed.deinit();
+    }
 }
