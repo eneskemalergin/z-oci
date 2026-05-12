@@ -11,6 +11,52 @@ Nothing yet.
 
 ---
 
+## [0.1.2] - 2026-05-11
+
+### Added
+
+- `auth.zig` now models repeated `WWW-Authenticate` header values explicitly through `ProbeHttpResponse.www_authenticate_headers` and `parseAuthenticateHeaders(...)`, so Bearer selection works across both comma-separated challenge lists and repeated header fields.
+- `AuthenticateRequest` now carries the parsed Bearer challenge context needed for real token exchange instead of relying on a lossy registry-plus-scope stub shape.
+- Additional parser and probe tests now cover repeated-header selection, insecure Bearer realms, escaped quoted values, and empty optional Bearer parameter rejection.
+
+### Changed
+
+- The auth probe/parser layer now consumes the canonical `Reference` outputs directly for `/v2/` probing and challenge handling, keeping Docker Hub normalization and repository-path ownership in Phase 1.
+- `WWW-Authenticate` parsing now handles mixed-case schemes, spacing normalization, unknown parameters, duplicate parameters, malformed quoting, and escaped quoted content deterministically.
+- The credential-provider seam now returns a `CredentialHandle` with an optional release hook, so provider-owned secrets can be torn down deliberately after auth uses them.
+
+### Fixed
+
+- Bearer challenge parsing now rejects insecure non-HTTPS realm URLs instead of accepting them for later token exchange.
+- Parser bug-hunt regressions were fixed around escaped quotes inside quoted parameter values and ambiguous empty `service` / `scope` values.
+- Probe classification no longer assumes only a single `WWW-Authenticate` value exists on `401` responses.
+
+### Verified
+
+- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 92 tests.
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 228 tests.
+- `zig build test --summary all` passes with 232/232 tests.
+
+## [0.1.1] - 2026-05-11
+
+### Added
+
+- `src/auth.zig`: initial Phase 2 auth scaffolding with `AuthError`, `AuthChallenge`, `BearerChallenge`, `ProbeResult`, `Token`, `TokenResponse`, `TokenCacheKey`, `CachedToken`, `HelperProcessContext`, and `AuthEngine`.
+- `Phase2ConfigView` and `AuthReferenceView` to make the Phase 1/Phase 2 boundary explicit in code.
+- Root exports for the new auth surface in `src/root.zig`.
+- Initial auth-focused tests covering type compilation, helper-process context wiring, provider borrow semantics, cache/key ownership, config review, and normalized `Reference` consumption.
+
+### Changed
+
+- The auth subsystem now keeps auth-specific errors internal to Phase 2 instead of extending the public `ResolveError` surface prematurely.
+- Ownership rules for transient tokens versus owned cached tokens are now encoded directly in code and doc comments.
+- The Zig 0.16 helper/process boundary is now explicit: HTTP continues through `std.http.Client`, while helper execution is modeled through a dedicated `std.Io`-backed process context.
+
+### Verified
+
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 215 tests.
+- `zig build test --summary all` passes with 219/219 tests.
+
 ## [0.1.0] - 2026-05-05 - [Tagged]
 
 ### Changed
