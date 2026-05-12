@@ -6,12 +6,12 @@
 <h1 align="center">z-oci</h1>
 
 <p align="center">
-    Pure Zig OCI/Docker Registry API v2 toolkit. Offline reference parsing, OCI JSON handling, and resolver API contracts. Zero dependencies, Zig 0.16 std only.
+        Pure Zig OCI/Docker Registry API v2 toolkit. Reference parsing, OCI JSON handling, and a Phase 2 auth engine on top of Zig 0.16 std only.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.0-8B5CF6?style=flat-square" alt="v0.1.0">
-  <img src="https://img.shields.io/badge/status-public%20offline%20release-2D7D46?style=flat-square" alt="Status: public offline release">
+    <img src="https://img.shields.io/badge/version-phase2--auth-8B5CF6?style=flat-square" alt="phase2-auth branch">
+    <img src="https://img.shields.io/badge/status-phase%202%20auth%20in%20progress-2D7D46?style=flat-square" alt="Status: Phase 2 auth in progress">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -19,7 +19,7 @@
 
 ---
 
-**What ships in v0.1.0:**
+**Current scope on `phase2-auth`:**
 
 - `Digest`, `MediaType`, and `Platform`: leaf types with parser, matching, and formatting behavior
 - `Reference`: full Docker/OCI reference parser with owned-lifetime semantics
@@ -27,20 +27,37 @@
 - `MultiArchManifest`: platform selection over multi-arch indices and manifest lists
 - `json.parse(T, allocator, bytes)`: OCI-friendly JSON wrapper over `std.json.Parsed(T)`
 - `ResolveError`, `ResolveResult`, and `Config`: public contract types for the future resolver surface
-- `resolve`, `validate`, and `getManifest`: public API stubs with documented ownership contracts
+- Phase 2 auth engine exports: `/v2/` probe classification, `WWW-Authenticate` parsing, token-request construction, token-response parsing, and credential-provider plumbing
+- `resolve`, `validate`, and `getManifest`: public API stubs with documented ownership contracts; real manifest HTTP fetch is still not implemented
 - real offline OCI/Docker fixture set with provenance in `fixtures/SOURCES.md`
 - three offline example programs plus `examples-smoke` build coverage
 - explicit offline workflow smoke matrix via `zig build workflow-smoke`
 
-## Supported Offline Workflows
+## Current Supported Workflows
 
-v0.1.0 is an offline toolkit. Not a partial network client. It handles:
+The current codebase handles:
 
 - reference normalization and decomposition through `Reference.parse`, `repositoryPath()`, and `refString()`
 - digest parsing and syntactic validation through `Digest.parse` and digest-pinned references
 - offline manifest and index inspection from checked-in OCI/Docker JSON fixtures
 - platform selection from parsed multi-arch indices and manifest lists
 - clone `ResolveResult` values out of a short-lived arena
+- auth-only Phase 2 flows: `/v2/` probe classification, Bearer challenge parsing, GET plus POST-fallback token exchange, and deterministic credential lookup ordering
+
+It does not yet implement live manifest fetch, digest verification over registry responses, or real `resolve`, `validate`, and `getManifest` behavior.
+
+## Auth Engine Status
+
+The auth subsystem is now a real Phase 2 slice rather than a placeholder. Current auth coverage includes:
+
+- `/v2/` probe response classification and repeated `WWW-Authenticate` header handling
+- Bearer challenge parsing with HTTPS realm validation
+- token request building from parsed challenge data, including GET-first and POST fallback shapes
+- optional Basic auth header construction for credentialed token exchange
+- deterministic credential lookup: explicit config provider -> injected environment map -> anonymous fallback
+- fixed environment variable names for the env-backed path: `Z_OCI_REGISTRY_HOST`, `Z_OCI_REGISTRY_USER`, and `Z_OCI_REGISTRY_TOKEN`
+
+Docker config parsing, credential helpers, token caching, and live registry manifest fetch remain future Phase 2 and Phase 3 work.
 
 ## Requirements
 
@@ -125,9 +142,18 @@ The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, a
 
 ## Roadmap
 
-Done: v0.0.1 -> v0.1.0 (offline toolkit).
+- Done on `main`: v0.0.1 -> v0.1.0: offline toolkit baseline
+- Done on `phase2-auth` so far:
+    - v0.1.1: auth surface and type scaffolding
+    - v0.1.2: `/v2/` probe and Bearer challenge parsing
+    - v0.1.3: token exchange with GET-first and POST fallback
+    - v0.1.4: basic credential chain with config, env, and anonymous lookup
 
-- Auth engine: Bearer token flow, credential helpers (v0.2.0)
+Next up:
+
+- Docker credential sources and helper integration (v0.1.5)
+- token cache and auth retry policy (v0.1.6)
+- auth hardening, docs, and release gate (v0.1.7 / v0.2.0)
 - Manifest resolution: HEAD/GET, multi-arch, nested index (v0.3.0)
 - Rate limiting: backoff, batch API, session cache (v0.4.0)
 - Testing: mock server, local registry, CI (v0.5.0)

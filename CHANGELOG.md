@@ -11,6 +11,51 @@ Nothing yet.
 
 ---
 
+## [0.1.4] - 2026-05-12
+
+### Added
+
+- The auth credential chain now supports an environment-backed provider through an injected `std.process.Environ.Map`, keeping env-based auth std-only and testable.
+- Phase 2 environment variable names are now fixed in code as `Z_OCI_REGISTRY_HOST`, `Z_OCI_REGISTRY_USER`, and `Z_OCI_REGISTRY_TOKEN`.
+- Additional zero-network auth tests now cover explicit-config precedence, env fallback, registry mismatch, partial env state, and anonymous behavior.
+
+### Changed
+
+- `AuthEngine.credentialForRegistry(...)` now resolves credentials in deterministic order: explicit config provider -> environment map -> anonymous fallback.
+- Provider composition remains local to the auth layer, so later Docker config and helper-backed credential sources can extend the chain without reinterpreting precedence.
+- Anonymous registry access is now an explicit credential-chain outcome instead of an implicit null-path side effect.
+
+### Verified
+
+- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 196 tests.
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 243 tests.
+- `zig build test --summary all` passes with 247/247 tests.
+
+## [0.1.3] - 2026-05-11
+
+### Added
+
+- Token exchange now builds authenticated Bearer-token requests from `AuthenticateRequest`, including `GET` query construction and `POST` body construction from parsed challenge fields.
+- Optional Basic auth header construction landed for credentialed token requests using provider-supplied credentials.
+- `TokenResponse` now returns owned token data with explicit teardown, preserving `refresh_token` as parsed-but-deferred data for later phases.
+
+### Changed
+
+- The auth engine now performs GET-first token exchange with POST fallback through an injected token HTTP exchanger, keeping the transport seam mockable before live HTTP wiring lands.
+- Token-response parsing now prefers `access_token`, falls back to `token`, and defaults missing expiry to a short-lived CLI-friendly value.
+- HTTPS realm validation now gates token exchange before credentials are sent to the challenge realm.
+
+### Fixed
+
+- Malformed token payloads, zero or invalid expiry values, and non-JSON token responses are now rejected deterministically as auth-layer failures.
+- Repeated auth success and failure runs now tear down owned token bytes correctly without leaking on retry and fallback paths.
+
+### Verified
+
+- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 191 tests.
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 238 tests.
+- `zig build test --summary all` passes with 242/242 tests.
+
 ## [0.1.2] - 2026-05-11
 
 ### Added
