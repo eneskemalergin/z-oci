@@ -7,6 +7,28 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-05-12
+
+### Added
+
+- `benchmarks/` directory: benchmark CLI (`z-oci-bench`), baselines directory, and build system wiring (`zig build bench`).
+- `CountingAllocator` allocator wrapper that tracks bytes allocated/freed, peak concurrent bytes, and allocation count.
+- Five benchmark subcommands: `reference-parse`, `digest-parse`, `manifest-parse`, `challenge-parse`, `platform-match`.
+- `zebrac`-based statistical sampling integrated: `./tools/zebrac zig-out/bin/z-oci-bench <op>` collects wall-clock, RSS, and CPU perf counter metrics.
+- v0.1.9 baseline committed to `benchmarks/baselines/v0.1.9.json` (5 operations, 4 seconds each).
+
+### Changed
+
+- `build.zig` now builds and installs the `z-oci-bench` binary.
+
+### Verified
+
+- `zig build test --summary all` passes (348/348 tests, examples-smoke, workflow-smoke).
+- `zig build ---Doptimize=ReleaseSmall` passes.
+- `zig fmt --check src/ examples/ build.zig benchmarks/` passes.
+- `zig build bench` compiles and runs all 5 benchmark operations.
+- `./tools/zebrac` generates the baseline JSON correctly.
+
 ## [0.1.8] - 2026-05-12
 
 ### Added

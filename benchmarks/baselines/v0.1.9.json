@@ -1,0 +1,474 @@
+{
+  "results": [
+    {
+      "command": "./zig-out/bin/z-oci-bench reference-parse --iterations 10000",
+      "sample_count": 12,
+      "argv": [
+        "./zig-out/bin/z-oci-bench",
+        "reference-parse",
+        "--iterations",
+        "10000"
+      ],
+      "wall_time": {
+        "mean": 343121151.5,
+        "std_dev": 6194836.518068774,
+        "min": 332953330,
+        "max": 355002464,
+        "median": 343985453,
+        "q1": 340420686,
+        "q3": 346239853,
+        "outlier_count": 1,
+        "sample_count": 12,
+        "unit": "nanoseconds"
+      },
+      "peak_rss": {
+        "mean": 4694698.666666667,
+        "std_dev": 2364.826702600707,
+        "min": 4694016,
+        "max": 4702208,
+        "median": 4694016,
+        "q1": 4694016,
+        "q3": 4694016,
+        "outlier_count": 1,
+        "sample_count": 12,
+        "unit": "bytes"
+      },
+      "cpu_cycles": {
+        "mean": 171064336,
+        "std_dev": 2926237.763705441,
+        "min": 168292317,
+        "max": 178838035,
+        "median": 170589045,
+        "q1": 169277610,
+        "q3": 171778491,
+        "outlier_count": 1,
+        "sample_count": 12,
+        "unit": "count"
+      },
+      "instructions": {
+        "mean": 189476350.91666666,
+        "std_dev": 45.00395605506321,
+        "min": 189476245,
+        "max": 189476398,
+        "median": 189476365,
+        "q1": 189476358,
+        "q3": 189476377,
+        "outlier_count": 2,
+        "sample_count": 12,
+        "unit": "count"
+      },
+      "cache_references": {
+        "mean": 17418675,
+        "std_dev": 321697.50702993135,
+        "min": 17156210,
+        "max": 18265898,
+        "median": 17343328,
+        "q1": 17228713,
+        "q3": 17540783,
+        "outlier_count": 1,
+        "sample_count": 12,
+        "unit": "count"
+      },
+      "cache_misses": {
+        "mean": 495737.5,
+        "std_dev": 207522.7877101693,
+        "min": 348418,
+        "max": 1095634,
+        "median": 425865,
+        "q1": 387800,
+        "q3": 573204,
+        "outlier_count": 1,
+        "sample_count": 12,
+        "unit": "count"
+      },
+      "branch_misses": {
+        "mean": 845810.5,
+        "std_dev": 6873.922057642599,
+        "min": 837802,
+        "max": 863144,
+        "median": 845221,
+        "q1": 841837,
+        "q3": 849534,
+        "outlier_count": 1,
+        "sample_count": 12,
+        "unit": "count"
+      }
+    },
+    {
+      "command": "./zig-out/bin/z-oci-bench digest-parse --iterations 10000",
+      "sample_count": 352,
+      "argv": [
+        "./zig-out/bin/z-oci-bench",
+        "digest-parse",
+        "--iterations",
+        "10000"
+      ],
+      "wall_time": {
+        "mean": 11323874.383522727,
+        "std_dev": 269173.1795781244,
+        "min": 11005122,
+        "max": 12973650,
+        "median": 11252163,
+        "q1": 11145342,
+        "q3": 11410374,
+        "outlier_count": 14,
+        "sample_count": 352,
+        "unit": "nanoseconds"
+      },
+      "peak_rss": {
+        "mean": 4698112,
+        "std_dev": 36586.1258737536,
+        "min": 4337664,
+        "max": 4702208,
+        "median": 4702208,
+        "q1": 4702208,
+        "q3": 4702208,
+        "outlier_count": 12,
+        "sample_count": 352,
+        "unit": "bytes"
+      },
+      "cpu_cycles": {
+        "mean": 34590007.11079545,
+        "std_dev": 620878.3495721278,
+        "min": 34074096,
+        "max": 39947509,
+        "median": 34423381,
+        "q1": 34311090,
+        "q3": 34620351,
+        "outlier_count": 38,
+        "sample_count": 352,
+        "unit": "count"
+      },
+      "instructions": {
+        "mean": 62193528.12215909,
+        "std_dev": 26.036121476438776,
+        "min": 62193423,
+        "max": 62193600,
+        "median": 62193531,
+        "q1": 62193530,
+        "q3": 62193533,
+        "outlier_count": 68,
+        "sample_count": 352,
+        "unit": "count"
+      },
+      "cache_references": {
+        "mean": 366690.17613636365,
+        "std_dev": 19776.00226821582,
+        "min": 347392,
+        "max": 538719,
+        "median": 362238,
+        "q1": 357150,
+        "q3": 369297,
+        "outlier_count": 24,
+        "sample_count": 352,
+        "unit": "count"
+      },
+      "cache_misses": {
+        "mean": 26884.238636363636,
+        "std_dev": 3081.3448926481515,
+        "min": 23011,
+        "max": 47958,
+        "median": 26187,
+        "q1": 24998,
+        "q3": 27714,
+        "outlier_count": 19,
+        "sample_count": 352,
+        "unit": "count"
+      },
+      "branch_misses": {
+        "mean": 29861.460227272728,
+        "std_dev": 566.2600135732947,
+        "min": 28795,
+        "max": 31889,
+        "median": 29742,
+        "q1": 29427,
+        "q3": 30145,
+        "outlier_count": 10,
+        "sample_count": 352,
+        "unit": "count"
+      }
+    },
+    {
+      "command": "./zig-out/bin/z-oci-bench manifest-parse --iterations 10000",
+      "sample_count": 9,
+      "argv": [
+        "./zig-out/bin/z-oci-bench",
+        "manifest-parse",
+        "--iterations",
+        "10000"
+      ],
+      "wall_time": {
+        "mean": 479842728.8888889,
+        "std_dev": 6287079.329974063,
+        "min": 468829577,
+        "max": 490061227,
+        "median": 478948995,
+        "q1": 478156131,
+        "q3": 487468944,
+        "outlier_count": 0,
+        "sample_count": 9,
+        "unit": "nanoseconds"
+      },
+      "peak_rss": {
+        "mean": 5148216.888888889,
+        "std_dev": 87381.33333333334,
+        "min": 4915200,
+        "max": 5177344,
+        "median": 5177344,
+        "q1": 5177344,
+        "q3": 5177344,
+        "outlier_count": 1,
+        "sample_count": 9,
+        "unit": "bytes"
+      },
+      "cpu_cycles": {
+        "mean": 884287127.4444444,
+        "std_dev": 10007901.044568762,
+        "min": 870789494,
+        "max": 904445333,
+        "median": 882144870,
+        "q1": 881145897,
+        "q3": 891666526,
+        "outlier_count": 0,
+        "sample_count": 9,
+        "unit": "count"
+      },
+      "instructions": {
+        "mean": 1213504569.2222223,
+        "std_dev": 24.35558343469613,
+        "min": 1213504537,
+        "max": 1213504611,
+        "median": 1213504559,
+        "q1": 1213504555,
+        "q3": 1213504597,
+        "outlier_count": 0,
+        "sample_count": 9,
+        "unit": "count"
+      },
+      "cache_references": {
+        "mean": 83656163.66666667,
+        "std_dev": 868141.973938019,
+        "min": 82542607,
+        "max": 85058627,
+        "median": 83527465,
+        "q1": 83011387,
+        "q3": 84743312,
+        "outlier_count": 0,
+        "sample_count": 9,
+        "unit": "count"
+      },
+      "cache_misses": {
+        "mean": 6560288.222222222,
+        "std_dev": 878102.5890593276,
+        "min": 5270386,
+        "max": 8170864,
+        "median": 6457224,
+        "q1": 5970955,
+        "q3": 7599517,
+        "outlier_count": 0,
+        "sample_count": 9,
+        "unit": "count"
+      },
+      "branch_misses": {
+        "mean": 2573171.5555555555,
+        "std_dev": 34968.011217794156,
+        "min": 2525357,
+        "max": 2634075,
+        "median": 2582162,
+        "q1": 2539005,
+        "q3": 2604943,
+        "outlier_count": 0,
+        "sample_count": 9,
+        "unit": "count"
+      }
+    },
+    {
+      "command": "./zig-out/bin/z-oci-bench challenge-parse --iterations 10000",
+      "sample_count": 65,
+      "argv": [
+        "./zig-out/bin/z-oci-bench",
+        "challenge-parse",
+        "--iterations",
+        "10000"
+      ],
+      "wall_time": {
+        "mean": 62045650.16923077,
+        "std_dev": 1794781.3800818783,
+        "min": 60585114,
+        "max": 70497800,
+        "median": 61426788,
+        "q1": 61057736,
+        "q3": 62352983,
+        "outlier_count": 5,
+        "sample_count": 65,
+        "unit": "nanoseconds"
+      },
+      "peak_rss": {
+        "mean": 4702081.969230769,
+        "std_dev": 1016.0925457547955,
+        "min": 4694016,
+        "max": 4702208,
+        "median": 4702208,
+        "q1": 4702208,
+        "q3": 4702208,
+        "outlier_count": 1,
+        "sample_count": 65,
+        "unit": "bytes"
+      },
+      "cpu_cycles": {
+        "mean": 220514821.92307693,
+        "std_dev": 6217680.358747116,
+        "min": 215948145,
+        "max": 250020057,
+        "median": 218515268,
+        "q1": 217196257,
+        "q3": 221132997,
+        "outlier_count": 6,
+        "sample_count": 65,
+        "unit": "count"
+      },
+      "instructions": {
+        "mean": 438851874.1076923,
+        "std_dev": 26.75708029949917,
+        "min": 438851770,
+        "max": 438851934,
+        "median": 438851878,
+        "q1": 438851876,
+        "q3": 438851881,
+        "outlier_count": 7,
+        "sample_count": 65,
+        "unit": "count"
+      },
+      "cache_references": {
+        "mean": 1893631.1538461538,
+        "std_dev": 255147.2026845625,
+        "min": 1644529,
+        "max": 2949460,
+        "median": 1812400,
+        "q1": 1741431,
+        "q3": 1916921,
+        "outlier_count": 8,
+        "sample_count": 65,
+        "unit": "count"
+      },
+      "cache_misses": {
+        "mean": 38753.446153846155,
+        "std_dev": 15615.176293864297,
+        "min": 25703,
+        "max": 93191,
+        "median": 34108,
+        "q1": 28128,
+        "q3": 39848,
+        "outlier_count": 9,
+        "sample_count": 65,
+        "unit": "count"
+      },
+      "branch_misses": {
+        "mean": 262369.46153846156,
+        "std_dev": 3281.3776645494263,
+        "min": 254722,
+        "max": 268449,
+        "median": 262174,
+        "q1": 260393,
+        "q3": 264752,
+        "outlier_count": 0,
+        "sample_count": 65,
+        "unit": "count"
+      }
+    },
+    {
+      "command": "./zig-out/bin/z-oci-bench platform-match --iterations 10000",
+      "sample_count": 450,
+      "argv": [
+        "./zig-out/bin/z-oci-bench",
+        "platform-match",
+        "--iterations",
+        "10000"
+      ],
+      "wall_time": {
+        "mean": 8842358.477777777,
+        "std_dev": 306878.14921387215,
+        "min": 8529300,
+        "max": 11493864,
+        "median": 8750011,
+        "q1": 8674951,
+        "q3": 8895732,
+        "outlier_count": 32,
+        "sample_count": 450,
+        "unit": "nanoseconds"
+      },
+      "peak_rss": {
+        "mean": 4699641.173333333,
+        "std_dev": 29828.27569148328,
+        "min": 4337664,
+        "max": 4702208,
+        "median": 4702208,
+        "q1": 4702208,
+        "q3": 4702208,
+        "outlier_count": 4,
+        "sample_count": 450,
+        "unit": "bytes"
+      },
+      "cpu_cycles": {
+        "mean": 25545911.6,
+        "std_dev": 793454.7074902209,
+        "min": 24926145,
+        "max": 33057165,
+        "median": 25341217,
+        "q1": 25234020,
+        "q3": 25561015,
+        "outlier_count": 37,
+        "sample_count": 450,
+        "unit": "count"
+      },
+      "instructions": {
+        "mean": 39801998.33555555,
+        "std_dev": 28.04055014373402,
+        "min": 39801896,
+        "max": 39802074,
+        "median": 39802004,
+        "q1": 39802003,
+        "q3": 39802005,
+        "outlier_count": 56,
+        "sample_count": 450,
+        "unit": "count"
+      },
+      "cache_references": {
+        "mean": 367658.44444444444,
+        "std_dev": 25017.120174122432,
+        "min": 344807,
+        "max": 587536,
+        "median": 361149,
+        "q1": 356347,
+        "q3": 369232,
+        "outlier_count": 41,
+        "sample_count": 450,
+        "unit": "count"
+      },
+      "cache_misses": {
+        "mean": 26311.96,
+        "std_dev": 5050.451986053312,
+        "min": 20818,
+        "max": 82157,
+        "median": 25034,
+        "q1": 24211,
+        "q3": 26492,
+        "outlier_count": 40,
+        "sample_count": 450,
+        "unit": "count"
+      },
+      "branch_misses": {
+        "mean": 9877.682222222222,
+        "std_dev": 654.429817889539,
+        "min": 8911,
+        "max": 12573,
+        "median": 9720,
+        "q1": 9390,
+        "q3": 10232,
+        "outlier_count": 13,
+        "sample_count": 450,
+        "unit": "count"
+      }
+    }
+  ]
+}
