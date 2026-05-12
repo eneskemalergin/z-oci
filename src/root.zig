@@ -3,11 +3,11 @@
 //! Current scope:
 //! - offline OCI/Docker reference parsing and normalization
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
-//! - public resolver-surface stubs and ownership contracts ahead of Phase 2 HTTP work
+//! - auth engine: /v2/ probe, challenge parsing, token exchange, credential providers
+//! - public resolver-surface stubs and ownership contracts ahead of Phase 3 HTTP work
 //!
 //! Not yet implemented:
-//! - registry HTTP transport
-//! - auth flows and token exchange
+//! - manifest fetch (HEAD/GET) and digest verification
 //! - real `resolve`, `validate`, and `getManifest` behavior
 
 const std = @import("std");

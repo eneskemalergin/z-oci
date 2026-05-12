@@ -1,8 +1,9 @@
-//! Phase 2 auth scaffolding.
+//! Phase 2 auth engine.
 //!
-//! This file provides the minimal compileable auth surface for `v0.1.1`:
-//! provisional data types, a small `AuthEngine` shell, and tests that lock the
-//! initial ownership story without freezing the full Phase 2 implementation.
+//! /v2/ probe flow, Bearer challenge parsing, token exchange (GET + POST
+//! fallback), credential-provider chain, and per-scope token caching.
+//! AuthError stays separate from ResolveError until Phase 3 wires auth
+//! through the public resolver surface.
 
 const std = @import("std");
 const ConfigModule = @import("Config.zig");
@@ -14,9 +15,8 @@ const json = @import("json.zig");
 
 /// Internal Phase 2 auth-only error set.
 ///
-/// This intentionally stays separate from `ResolveError` during `v0.1.1`.
-/// `ResolveError` remains the public resolver-facing error surface until Phase
-/// 3 threads auth failures through real resolve/validate/getManifest behavior.
+/// Stays separate from `ResolveError` until Phase 3 threads auth failures
+/// through real resolve/validate/getManifest behavior.
 pub const AuthError = error{
     NotYetImplemented,
     OutOfMemory,
@@ -63,9 +63,9 @@ pub const TokenHttpExchanger = *const fn (
 
 /// Borrowed Bearer challenge data parsed from the authenticate header.
 ///
-/// In `v0.1.1`, these slices borrow from the header input passed to the parser.
-/// Later request-building code may choose to duplicate selected fields, but the
-/// parser itself performs no ownership transfer.
+/// These slices borrow from the header input passed to the parser.
+/// Request-building code duplicates selected fields before freeing the
+/// original header bytes.
 pub const BearerChallenge = struct {
     realm: []const u8,
     service: ?[]const u8 = null,
@@ -186,9 +186,8 @@ pub const CachedToken = struct {
 
 /// Narrow Phase 2 view of `Config`.
 ///
-/// This makes the `v0.1.1` config review explicit in code:
-/// - relevant now: credentials, connect/read timeouts, CA bundle path
-/// - deferred: `max_retries`, `rate_limit_enabled`
+/// Relevant now: credentials, connect/read timeouts, CA bundle path
+/// Deferred: `max_retries`, `rate_limit_enabled`
 pub const Phase2ConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,
@@ -252,11 +251,10 @@ pub const HelperProcessContext = struct {
     io: std.Io,
 };
 
-/// Provisional Phase 2 auth engine shell.
+/// Phase 2 auth engine.
 ///
-/// The exact process/`std.Io` boundary remains intentionally unfrozen in
-/// `v0.1.1`. HTTP requests already carry `io` through `std.http.Client`, while
-/// helper execution likely needs an explicit `io` boundary later.
+/// HTTP requests carry `io` through `std.http.Client`. Helper execution
+/// passes an explicit `std.Io` boundary through `HelperProcessContext`.
 pub const AuthEngine = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -654,6 +652,8 @@ fn isChallengeStart(raw: []const u8) bool {
 fn isAuthWhitespace(char: u8) bool {
     return char == ' ' or char == '\t';
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 test "auth scaffolding: types compile with representative values" {
     const bearer = BearerChallenge{
