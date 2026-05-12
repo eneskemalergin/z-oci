@@ -20,6 +20,7 @@ const json = @import("json.zig");
 pub const AuthError = error{
     NotYetImplemented,
     OutOfMemory,
+    InvalidDockerConfig,
     MissingAuthenticateHeader,
     UnsupportedAuthenticateScheme,
     InvalidAuthenticateHeader,
@@ -64,6 +65,55 @@ pub const TokenHttpExchanger = *const fn (
 pub const env_registry_host_var = "Z_OCI_REGISTRY_HOST";
 pub const env_registry_user_var = "Z_OCI_REGISTRY_USER";
 pub const env_registry_token_var = "Z_OCI_REGISTRY_TOKEN";
+pub const docker_hub_auth_key = "https://index.docker.io/v1/";
+
+const DockerConfigAuthEntry = struct {
+    registry_key: []const u8,
+    credential: ConfigModule.Credential,
+
+    fn deinit(self: *DockerConfigAuthEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.registry_key);
+        allocator.free(self.credential.username);
+        std.crypto.secureZero(u8, @constCast(self.credential.secret));
+        allocator.free(self.credential.secret);
+    }
+};
+
+const DockerConfigHelperEntry = struct {
+    registry_key: []const u8,
+    helper_suffix: []const u8,
+
+    fn deinit(self: *DockerConfigHelperEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.registry_key);
+        allocator.free(self.helper_suffix);
+    }
+};
+
+const DockerConfig = struct {
+    auths: []DockerConfigAuthEntry = &.{},
+    cred_helpers: []DockerConfigHelperEntry = &.{},
+    creds_store: ?[]const u8 = null,
+
+    fn deinit(self: *DockerConfig, allocator: std.mem.Allocator) void {
+        for (self.auths) |*entry| entry.deinit(allocator);
+        allocator.free(self.auths);
+
+        for (self.cred_helpers) |*entry| entry.deinit(allocator);
+        allocator.free(self.cred_helpers);
+
+        if (self.creds_store) |creds_store| allocator.free(creds_store);
+        self.* = .{};
+    }
+
+    fn credentialForRegistry(self: DockerConfig, registry: []const u8) ?CredentialHandle {
+        for (self.auths) |entry| {
+            if (dockerConfigRegistryKeyMatches(entry.registry_key, registry)) {
+                return .{ .credential = entry.credential };
+            }
+        }
+        return null;
+    }
+};
 
 /// Borrowed Bearer challenge data parsed from the authenticate header.
 ///
@@ -268,6 +318,7 @@ pub const AuthEngine = struct {
     helper_process_context: ?HelperProcessContext = null,
     token_http_exchanger: ?TokenHttpExchanger = null,
     environ_map: ?*const std.process.Environ.Map = null,
+    docker_config: ?DockerConfig = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
         return .{
@@ -310,6 +361,28 @@ pub const AuthEngine = struct {
             .config = config,
             .environ_map = environ_map,
         };
+    }
+
+    pub fn initWithDockerConfigBytes(
+        allocator: std.mem.Allocator,
+        config: Config,
+        docker_config_json: []const u8,
+    ) AuthError!AuthEngine {
+        var engine = init(allocator, config);
+        try engine.setDockerConfigBytes(docker_config_json);
+        return engine;
+    }
+
+    pub fn deinit(self: *AuthEngine) void {
+        if (self.docker_config) |*docker_config| {
+            docker_config.deinit(self.allocator);
+            self.docker_config = null;
+        }
+    }
+
+    pub fn setDockerConfigBytes(self: *AuthEngine, docker_config_json: []const u8) AuthError!void {
+        if (self.docker_config) |*docker_config| docker_config.deinit(self.allocator);
+        self.docker_config = try parseDockerConfig(self.allocator, docker_config_json);
     }
 
     pub fn helperProcessContext(self: AuthEngine) ?HelperProcessContext {
@@ -363,6 +436,10 @@ pub const AuthEngine = struct {
             if (envCredentialForRegistry(environ_map, registry)) |handle| return handle;
         }
 
+        if (self.docker_config) |docker_config| {
+            if (docker_config.credentialForRegistry(registry)) |handle| return handle;
+        }
+
         return null;
     }
 };
@@ -388,6 +465,117 @@ pub fn envCredentialForRegistry(environ_map: *const std.process.Environ.Map, reg
         .username = username,
         .secret = token,
     } };
+}
+
+fn parseDockerConfig(allocator: std.mem.Allocator, docker_config_json: []const u8) AuthError!DockerConfig {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, docker_config_json, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidDockerConfig;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidDockerConfig,
+    };
+
+    var auth_entries: std.ArrayList(DockerConfigAuthEntry) = .empty;
+    defer auth_entries.deinit(allocator);
+
+    if (root.get("auths")) |auths_value| {
+        const auths_object = switch (auths_value) {
+            .object => |object| object,
+            else => return error.InvalidDockerConfig,
+        };
+        var auths_iter = auths_object.iterator();
+        while (auths_iter.next()) |entry| {
+            const entry_object = switch (entry.value_ptr.*) {
+                .object => |object| object,
+                else => return error.InvalidDockerConfig,
+            };
+            const encoded_auth = switch (entry_object.get("auth") orelse continue) {
+                .string => |value| value,
+                else => return error.InvalidDockerConfig,
+            };
+            try auth_entries.append(allocator, try initDockerConfigAuthEntry(allocator, entry.key_ptr.*, encoded_auth));
+        }
+    }
+
+    var helper_entries: std.ArrayList(DockerConfigHelperEntry) = .empty;
+    defer helper_entries.deinit(allocator);
+
+    if (root.get("credHelpers")) |helpers_value| {
+        const helpers_object = switch (helpers_value) {
+            .object => |object| object,
+            else => return error.InvalidDockerConfig,
+        };
+        var helpers_iter = helpers_object.iterator();
+        while (helpers_iter.next()) |entry| {
+            const helper_suffix = switch (entry.value_ptr.*) {
+                .string => |value| value,
+                else => return error.InvalidDockerConfig,
+            };
+            try helper_entries.append(allocator, .{
+                .registry_key = try allocator.dupe(u8, entry.key_ptr.*),
+                .helper_suffix = try allocator.dupe(u8, helper_suffix),
+            });
+        }
+    }
+
+    const creds_store = if (root.get("credsStore")) |creds_store_value|
+        switch (creds_store_value) {
+            .string => |value| try allocator.dupe(u8, value),
+            else => return error.InvalidDockerConfig,
+        }
+    else
+        null;
+
+    return .{
+        .auths = try auth_entries.toOwnedSlice(allocator),
+        .cred_helpers = try helper_entries.toOwnedSlice(allocator),
+        .creds_store = creds_store,
+    };
+}
+
+fn initDockerConfigAuthEntry(
+    allocator: std.mem.Allocator,
+    registry_key: []const u8,
+    encoded_auth: []const u8,
+) AuthError!DockerConfigAuthEntry {
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(encoded_auth) catch return error.InvalidDockerConfig;
+    const decoded_auth = try allocator.alloc(u8, decoded_len);
+    defer {
+        std.crypto.secureZero(u8, decoded_auth);
+        allocator.free(decoded_auth);
+    }
+
+    decoder.decode(decoded_auth, encoded_auth) catch return error.InvalidDockerConfig;
+    const decoded = decoded_auth;
+    const separator_index = std.mem.indexOfScalar(u8, decoded, ':') orelse return error.InvalidDockerConfig;
+    if (separator_index == 0 or separator_index + 1 >= decoded.len) return error.InvalidDockerConfig;
+
+    const username = try allocator.dupe(u8, decoded[0..separator_index]);
+    errdefer allocator.free(username);
+    const secret = try allocator.dupe(u8, decoded[separator_index + 1 ..]);
+
+    return .{
+        .registry_key = try allocator.dupe(u8, registry_key),
+        .credential = .{
+            .username = username,
+            .secret = secret,
+        },
+    };
+}
+
+fn dockerConfigRegistryKeyMatches(config_key: []const u8, registry: []const u8) bool {
+    if (std.mem.eql(u8, config_key, registry)) return true;
+    if (!std.mem.eql(u8, registry, "registry-1.docker.io")) return false;
+
+    return std.mem.eql(u8, config_key, docker_hub_auth_key) or
+        std.mem.eql(u8, config_key, "https://index.docker.io/v1") or
+        std.mem.eql(u8, config_key, "index.docker.io") or
+        std.mem.eql(u8, config_key, "docker.io");
 }
 
 pub fn referenceView(ref: Reference) AuthReferenceView {
@@ -878,6 +1066,127 @@ test "AuthEngine.credentialForRegistry: anonymous fallback is explicit when no p
     const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
 
     try std.testing.expect(engine.credentialForRegistry("registry-1.docker.io") == null);
+}
+
+test "parseDockerConfig: decodes auths and records helper metadata" {
+    var docker_config = try parseDockerConfig(std.testing.allocator,
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    },
+        \\    "https://index.docker.io/v1/": {
+        \\      "auth": "ZG9ja2VydXNlcjpzZWNyZXQ="
+        \\    }
+        \\  },
+        \\  "credHelpers": {
+        \\    "ghcr.io": "secretservice"
+        \\  },
+        \\  "credsStore": "pass"
+        \\}
+    );
+    defer docker_config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), docker_config.auths.len);
+    try std.testing.expectEqual(@as(usize, 1), docker_config.cred_helpers.len);
+    try std.testing.expectEqualStrings("pass", docker_config.creds_store.?);
+    try std.testing.expectEqualStrings("ghcr.io", docker_config.auths[0].registry_key);
+    try std.testing.expectEqualStrings("octocat", docker_config.auths[0].credential.username);
+    try std.testing.expectEqualStrings("ghp_example", docker_config.auths[0].credential.secret);
+    try std.testing.expectEqualStrings(docker_hub_auth_key, docker_config.auths[1].registry_key);
+    try std.testing.expectEqualStrings("dockeruser", docker_config.auths[1].credential.username);
+    try std.testing.expectEqualStrings("secret", docker_config.auths[1].credential.secret);
+    try std.testing.expectEqualStrings("ghcr.io", docker_config.cred_helpers[0].registry_key);
+    try std.testing.expectEqualStrings("secretservice", docker_config.cred_helpers[0].helper_suffix);
+}
+
+test "parseDockerConfig: rejects malformed auth entries" {
+    try std.testing.expectError(error.InvalidDockerConfig, parseDockerConfig(std.testing.allocator,
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "not-base64"
+        \\    }
+        \\  }
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidDockerConfig, parseDockerConfig(std.testing.allocator,
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "bm9fY29sb24="
+        \\    }
+        \\  }
+        \\}
+    ));
+}
+
+test "dockerConfigRegistryKeyMatches: recognizes Docker Hub historical key" {
+    try std.testing.expect(dockerConfigRegistryKeyMatches(docker_hub_auth_key, "registry-1.docker.io"));
+    try std.testing.expect(dockerConfigRegistryKeyMatches("docker.io", "registry-1.docker.io"));
+    try std.testing.expect(!dockerConfigRegistryKeyMatches("https://index.docker.io/v1/", "ghcr.io"));
+}
+
+test "AuthEngine.credentialForRegistry: docker config auth supplies fallback credentials" {
+    var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  }
+        \\}
+    );
+    defer engine.deinit();
+
+    const handle = engine.credentialForRegistry("ghcr.io").?;
+
+    try std.testing.expectEqualStrings("octocat", handle.credential.username);
+    try std.testing.expectEqualStrings("ghp_example", handle.credential.secret);
+}
+
+test "AuthEngine.credentialForRegistry: Docker Hub lookup normalizes to historical config key" {
+    var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
+        \\{
+        \\  "auths": {
+        \\    "https://index.docker.io/v1/": {
+        \\      "auth": "ZG9ja2VydXNlcjpzZWNyZXQ="
+        \\    }
+        \\  }
+        \\}
+    );
+    defer engine.deinit();
+
+    const handle = engine.credentialForRegistry("registry-1.docker.io").?;
+
+    try std.testing.expectEqualStrings("dockeruser", handle.credential.username);
+    try std.testing.expectEqualStrings("secret", handle.credential.secret);
+}
+
+test "AuthEngine.credentialForRegistry: env remains ahead of docker config" {
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(env_registry_host_var, "ghcr.io");
+    try environ_map.put(env_registry_user_var, "env-user");
+    try environ_map.put(env_registry_token_var, "env-token");
+
+    var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  }
+        \\}
+    );
+    defer engine.deinit();
+    engine.environ_map = &environ_map;
+
+    const handle = engine.credentialForRegistry("ghcr.io").?;
+
+    try std.testing.expectEqualStrings("env-user", handle.credential.username);
+    try std.testing.expectEqualStrings("env-token", handle.credential.secret);
 }
 
 test "buildTokenHttpRequest: get request includes query parameters" {
