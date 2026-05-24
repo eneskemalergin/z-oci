@@ -28,7 +28,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ### Fixed
 
-- Live manifest requests now follow a bounded redirect chain and rely on privileged headers so cross-domain redirects strip bearer authorization instead of failing the public resolver path outright.
+- Live manifest requests now follow a bounded redirect chain while preserving bearer authorization on the authenticated retry and stripping it when the redirect crosses origin, fixing the Docker Hub live auth path without reopening cross-domain header leakage.
 - Recursive multi-arch child fetches now reuse the same auth, media validation, and digest-verification path as single-arch resolution instead of diverging on the child-manifest path.
 - Resolver transport teardown now clones returned metadata, zeroes authorization buffers before free, and rejects mismatched manifest headers earlier.
 - Resolver GET classification now releases verified digest buffers and parsed-document allocations correctly on non-error failure outcomes, eliminating leak paths exposed by malformed non-empty fixture bodies.

@@ -338,64 +338,181 @@ pub fn liveManifestHttpExchanger(
     request: ManifestHttpRequest,
 ) ManifestExchangeError!ManifestHttpResponse {
     defer request.deinit(allocator);
-
-    const uri = std.Uri.parse(request.url) catch return error.TransportFailed;
     const accept_headers = try buildAcceptHeadersAlloc(allocator, request.accept);
     defer allocator.free(accept_headers);
 
-    var privileged_headers_storage: [1]std.http.Header = undefined;
-    const privileged_headers: []const std.http.Header = if (request.authorization) |authorization| blk: {
-        privileged_headers_storage[0] = .{
-            .name = "authorization",
-            .value = authorization,
-        };
-        break :blk privileged_headers_storage[0..1];
-    } else &.{};
+    const redirect_hop_limit: u8 = 2;
+    var current_url = request.url;
+    var current_authorization = request.authorization;
+    var owned_redirect_url: ?[]u8 = null;
+    defer if (owned_redirect_url) |url| allocator.free(url);
 
-    var http_request = client.request(
-        switch (request.method) {
-            .head => .HEAD,
-            .get => .GET,
-        },
-        uri,
-        .{
-            .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(2),
-            .extra_headers = accept_headers,
-            .privileged_headers = privileged_headers,
-        },
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.TransportFailed,
-    };
-    defer http_request.deinit();
+    var redirect_hops_remaining: u8 = redirect_hop_limit;
+    while (true) {
+        const uri = std.Uri.parse(current_url) catch return error.TransportFailed;
 
-    http_request.sendBodiless() catch |err| switch (err) {
-        else => return error.TransportFailed,
-    };
-
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = http_request.receiveHead(&redirect_buffer) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.TransportFailed,
-    };
-
-    var owned_metadata = try ownedManifestResponseMetadataFromHead(allocator, response.head);
-    errdefer owned_metadata.deinit(allocator);
-
-    const body = if (request.method == .get)
-        response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+        var http_request = client.request(
+            switch (request.method) {
+                .head => .HEAD,
+                .get => .GET,
+            },
+            uri,
+            .{
+                .redirect_behavior = .unhandled,
+                .headers = .{
+                    .authorization = if (current_authorization) |authorization|
+                        .{ .override = authorization }
+                    else
+                        .default,
+                },
+                .extra_headers = accept_headers,
+            },
+        ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.TransportFailed,
+        };
+        defer http_request.deinit();
+
+        http_request.sendBodiless() catch return error.TransportFailed;
+
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+        var response = http_request.receiveHead(&redirect_buffer) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.TransportFailed,
+        };
+
+        if (isRedirectStatus(response.head.status) and response.head.location != null and redirect_hops_remaining > 0) {
+            redirect_hops_remaining -= 1;
+
+            const next_url = try resolveRedirectUrlAlloc(allocator, current_url, uri, response.head.location.?);
+            errdefer allocator.free(next_url);
+
+            const keep_authorization = shouldKeepAuthorizationOnRedirect(uri, next_url) catch false;
+            if (owned_redirect_url) |url| allocator.free(url);
+            owned_redirect_url = next_url;
+            current_url = next_url;
+            current_authorization = if (keep_authorization) request.authorization else null;
+
+            continue;
         }
+
+        var owned_metadata = try ownedManifestResponseMetadataFromHead(allocator, response.head);
+        errdefer owned_metadata.deinit(allocator);
+
+        const body = if (request.method == .get)
+            response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            }
+        else
+            null;
+        errdefer if (body) |bytes| allocator.free(bytes);
+
+        return .{
+            .metadata = owned_metadata.view(response.head.status),
+            .owned_metadata = owned_metadata,
+            .body = body,
+        };
+    }
+}
+
+fn resolveRedirectUrlAlloc(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    base_uri: std.Uri,
+    location: []const u8,
+) ManifestExchangeError![]u8 {
+    var buffer = try allocator.alloc(u8, base_url.len + location.len + 16);
+    defer allocator.free(buffer);
+
+    @memcpy(buffer[0..location.len], location);
+    var aux_buf = buffer;
+    const resolved = std.Uri.resolveInPlace(base_uri, location.len, &aux_buf) catch |err| switch (err) {
+        error.NoSpaceLeft => return error.OutOfMemory,
+        else => return error.TransportFailed,
+    };
+    return std.fmt.allocPrint(allocator, "{f}", .{std.Uri.fmt(&resolved, .all)}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+fn shouldKeepAuthorizationOnRedirect(base_uri: std.Uri, next_url: []const u8) !bool {
+    const next_uri = std.Uri.parse(next_url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(base_uri.scheme, next_uri.scheme)) return false;
+
+    var base_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const base_host = try base_uri.getHost(&base_host_buffer);
+
+    var next_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const next_host = try next_uri.getHost(&next_host_buffer);
+
+    return base_host.eql(next_host) and effectiveUriPort(base_uri) == effectiveUriPort(next_uri);
+}
+
+fn effectiveUriPort(uri: std.Uri) ?u16 {
+    return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+        443
+    else if (std.ascii.eqlIgnoreCase(uri.scheme, "http"))
+        80
     else
         null;
-    errdefer if (body) |bytes| allocator.free(bytes);
+}
 
-    return .{
-        .metadata = owned_metadata.view(response.head.status),
-        .owned_metadata = owned_metadata,
-        .body = body,
-    };
+test "resolveRedirectUrlAlloc resolves relative redirect against manifest URL" {
+    const base_url = "https://registry.example.test/v2/library/ubuntu/manifests/latest";
+    const base_uri = try std.Uri.parse(base_url);
+
+    const resolved = try resolveRedirectUrlAlloc(
+        std.testing.allocator,
+        base_url,
+        base_uri,
+        "../blobs/sha256:abc123",
+    );
+    defer std.testing.allocator.free(resolved);
+
+    try std.testing.expectEqualStrings(
+        "https://registry.example.test/v2/library/ubuntu/blobs/sha256:abc123",
+        resolved,
+    );
+}
+
+test "shouldKeepAuthorizationOnRedirect only keeps same-origin authorization" {
+    const base_uri = try std.Uri.parse("https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04");
+
+    try std.testing.expect(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04",
+    ));
+    try std.testing.expect(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://registry-1.docker.io:443/v2/library/ubuntu/manifests/22.04",
+    ));
+    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/abc/data",
+    )));
+    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "http://registry-1.docker.io/v2/library/ubuntu/manifests/22.04",
+    )));
+}
+
+test "shouldKeepAuthorizationOnRedirect rejects subdomain redirects" {
+    const base_uri = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
+
+    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://cdn.registry.example.test/v2/owner/repo/manifests/latest",
+    )));
+}
+
+test "shouldKeepAuthorizationOnRedirect rejects port changes" {
+    const base_uri = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
+
+    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://registry.example.test:8443/v2/owner/repo/manifests/latest",
+    )));
 }
 
 fn buildAcceptHeadersAlloc(
