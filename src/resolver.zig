@@ -107,7 +107,10 @@ pub const ManifestHttpRequest = struct {
 
     pub fn deinit(self: ManifestHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
-        if (self.authorization) |authorization| allocator.free(authorization);
+        if (self.authorization) |authorization| {
+            std.crypto.secureZero(u8, authorization);
+            allocator.free(authorization);
+        }
     }
 };
 
@@ -117,10 +120,33 @@ pub const ManifestHttpRequest = struct {
 /// `deinit()` after parsing or classification is complete.
 pub const ManifestHttpResponse = struct {
     metadata: ManifestResponseMetadata,
+    owned_metadata: ?OwnedManifestResponseMetadata = null,
     body: ?[]u8 = null,
 
     pub fn deinit(self: ManifestHttpResponse, allocator: std.mem.Allocator) void {
+        if (self.owned_metadata) |owned_metadata| owned_metadata.deinit(allocator);
         if (self.body) |body| allocator.free(body);
+    }
+
+    pub fn initOwnedAlloc(
+        allocator: std.mem.Allocator,
+        metadata: ManifestResponseMetadata,
+        body: ?[]const u8,
+    ) !ManifestHttpResponse {
+        const owned_metadata = try OwnedManifestResponseMetadata.initAlloc(allocator, metadata);
+        errdefer owned_metadata.deinit(allocator);
+
+        const owned_body = if (body) |bytes|
+            try allocator.dupe(u8, bytes)
+        else
+            null;
+        errdefer if (owned_body) |bytes| allocator.free(bytes);
+
+        return .{
+            .metadata = owned_metadata.view(metadata.status),
+            .owned_metadata = owned_metadata,
+            .body = owned_body,
+        };
     }
 };
 
@@ -156,6 +182,74 @@ pub const ManifestResponseMetadata = struct {
             .www_authenticate_headers = self.www_authenticate_headers,
         };
         return response.classify();
+    }
+
+    pub fn cloneAlloc(self: ManifestResponseMetadata, allocator: std.mem.Allocator) !ManifestResponseMetadata {
+        return .{
+            .status = self.status,
+            .content_type = if (self.content_type) |content_type|
+                try allocator.dupe(u8, content_type)
+            else
+                null,
+            .docker_content_digest = if (self.docker_content_digest) |digest|
+                try allocator.dupe(u8, digest)
+            else
+                null,
+            .location = if (self.location) |location|
+                try allocator.dupe(u8, location)
+            else
+                null,
+            .www_authenticate_headers = try duplicateHeaderSlicesAlloc(allocator, self.www_authenticate_headers),
+        };
+    }
+
+    pub fn deinitOwned(self: ManifestResponseMetadata, allocator: std.mem.Allocator) void {
+        if (self.content_type) |content_type| allocator.free(content_type);
+        if (self.docker_content_digest) |digest| allocator.free(digest);
+        if (self.location) |location| allocator.free(location);
+        freeHeaderSlices(allocator, self.www_authenticate_headers);
+    }
+};
+
+pub const OwnedManifestResponseMetadata = struct {
+    content_type: ?[]u8 = null,
+    docker_content_digest: ?[]u8 = null,
+    location: ?[]u8 = null,
+    www_authenticate_headers: []const []const u8 = &.{},
+
+    pub fn initAlloc(allocator: std.mem.Allocator, metadata: ManifestResponseMetadata) !OwnedManifestResponseMetadata {
+        return .{
+            .content_type = if (metadata.content_type) |content_type|
+                try allocator.dupe(u8, content_type)
+            else
+                null,
+            .docker_content_digest = if (metadata.docker_content_digest) |digest|
+                try allocator.dupe(u8, digest)
+            else
+                null,
+            .location = if (metadata.location) |location|
+                try allocator.dupe(u8, location)
+            else
+                null,
+            .www_authenticate_headers = try duplicateHeaderSlicesAlloc(allocator, metadata.www_authenticate_headers),
+        };
+    }
+
+    pub fn deinit(self: OwnedManifestResponseMetadata, allocator: std.mem.Allocator) void {
+        if (self.content_type) |content_type| allocator.free(content_type);
+        if (self.docker_content_digest) |digest| allocator.free(digest);
+        if (self.location) |location| allocator.free(location);
+        freeHeaderSlices(allocator, self.www_authenticate_headers);
+    }
+
+    pub fn view(self: OwnedManifestResponseMetadata, status: std.http.Status) ManifestResponseMetadata {
+        return .{
+            .status = status,
+            .content_type = self.content_type,
+            .docker_content_digest = self.docker_content_digest,
+            .location = self.location,
+            .www_authenticate_headers = self.www_authenticate_headers,
+        };
     }
 };
 
@@ -199,7 +293,8 @@ pub const ManifestGetSuccess = struct {
     metadata: ManifestResponseMetadata,
     document: ParsedManifestDocument,
 
-    pub fn deinit(self: *ManifestGetSuccess) void {
+    pub fn deinit(self: *ManifestGetSuccess, allocator: std.mem.Allocator) void {
+        self.metadata.deinitOwned(allocator);
         self.document.deinit();
     }
 };
@@ -211,9 +306,10 @@ pub const GetRequestOutcome = union(enum) {
     redirect: ManifestResponseMetadata,
     failure: ResolveError,
 
-    pub fn deinit(self: *GetRequestOutcome) void {
+    pub fn deinit(self: *GetRequestOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .success => |*success| success.deinit(),
+            .success => |*success| success.deinit(allocator),
+            .redirect => |metadata| metadata.deinitOwned(allocator),
             else => {},
         }
     }
@@ -226,6 +322,15 @@ pub const HeadRequestOutcome = union(enum) {
     not_found,
     redirect: ManifestResponseMetadata,
     failure: ResolveError,
+
+    pub fn deinit(self: *HeadRequestOutcome, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .success => |metadata| metadata.deinitOwned(allocator),
+            .use_get_fallback => |metadata| metadata.deinitOwned(allocator),
+            .redirect => |metadata| metadata.deinitOwned(allocator),
+            else => {},
+        }
+    }
 };
 
 pub fn phase3ConfigView(config: Config) Phase3ConfigView {
@@ -392,7 +497,7 @@ fn classifyHeadResponse(
     allow_auth: bool,
 ) error{OutOfMemory}!HeadRequestOutcome {
     if (isRedirectStatus(metadata.status)) {
-        if (metadata.location != null) return .{ .redirect = metadata };
+        if (metadata.location != null) return .{ .redirect = try metadata.cloneAlloc(ctx.allocator) };
         return transportFailureOutcome(ctx, metadata.httpStatus());
     }
 
@@ -405,7 +510,7 @@ fn classifyHeadResponse(
     };
 
     return switch (classification) {
-        .ok => classifyUsableHeadMetadata(ctx, metadata),
+        .ok => classifyUsableHeadMetadata(ctx, request, metadata),
         .not_found => .not_found,
         .auth_required => |challenge| if (allow_auth)
             authenticateHeadRequest(ctx, engine, exchanger, request, challenge)
@@ -421,57 +526,18 @@ fn authenticateHeadRequest(
     request: ManifestRequest,
     challenge: auth.AuthChallenge,
 ) error{OutOfMemory}!HeadRequestOutcome {
-    const bearer_challenge = switch (challenge) {
-        .bearer => |bearer| bearer,
-        else => return authFailureOutcome(ctx, @intFromEnum(std.http.Status.unauthorized)),
-    };
-
-    const auth_request = auth.AuthenticateRequest.init(ctx.reference.registry, bearer_challenge) catch |err| {
-        return mapAuthFailureOutcome(ctx, err, @intFromEnum(std.http.Status.unauthorized));
-    };
-
-    var token_response = (engine.authenticate(ctx.client, auth_request) catch |err| {
-        return mapAuthFailureOutcome(ctx, err, @intFromEnum(std.http.Status.unauthorized));
-    }) orelse {
-        return authFailureOutcome(ctx, @intFromEnum(std.http.Status.unauthorized));
-    };
-    defer token_response.deinit(ctx.allocator);
-
-    const retry_response = exchangeManifestRequest(ctx, exchanger, request, token_response.access_token.value) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.TransportFailed => return transportFailureOutcome(ctx, null),
-    };
-    defer retry_response.deinit(ctx.allocator);
-    const retry_metadata = retry_response.metadata;
-
-    if (retry_metadata.status != .unauthorized) {
-        return classifyHeadResponse(ctx, engine, exchanger, request, retry_metadata, false);
-    }
-
-    if (!request.allow_cached_auth_retry) return authFailureOutcome(ctx, retry_metadata.httpStatus());
-
-    var refreshed_token_response = (engine.retryAuthenticateAfterCachedUnauthorized(ctx.client, auth_request) catch |err| {
-        return mapAuthFailureOutcome(ctx, err, retry_metadata.httpStatus());
-    }) orelse {
-        return authFailureOutcome(ctx, retry_metadata.httpStatus());
-    };
-    defer refreshed_token_response.deinit(ctx.allocator);
-
-    var retried_request = request;
-    retried_request.allow_cached_auth_retry = false;
-
-    const refreshed_response = exchangeManifestRequest(ctx, exchanger, retried_request, refreshed_token_response.access_token.value) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.TransportFailed => return transportFailureOutcome(ctx, null),
-    };
-    defer refreshed_response.deinit(ctx.allocator);
-    const refreshed_metadata = refreshed_response.metadata;
-
-    if (refreshed_metadata.status == .unauthorized) {
-        return authFailureOutcome(ctx, refreshed_metadata.httpStatus());
-    }
-
-    return classifyHeadResponse(ctx, engine, exchanger, retried_request, refreshed_metadata, false);
+    return authenticateManifestRequest(
+        HeadRequestOutcome,
+        ctx,
+        engine,
+        exchanger,
+        request,
+        challenge,
+        authFailureOutcome,
+        mapAuthFailureOutcome,
+        transportFailureOutcome,
+        classifyAuthenticatedHeadResponse,
+    );
 }
 
 fn classifyGetResponse(
@@ -486,7 +552,7 @@ fn classifyGetResponse(
     const metadata = response.metadata;
 
     if (isRedirectStatus(metadata.status)) {
-        if (metadata.location != null) return .{ .redirect = metadata };
+        if (metadata.location != null) return .{ .redirect = try metadata.cloneAlloc(ctx.allocator) };
         return transportFailureGetOutcome(ctx, metadata.httpStatus());
     }
 
@@ -515,39 +581,66 @@ fn authenticateGetRequest(
     request: ManifestRequest,
     challenge: auth.AuthChallenge,
 ) error{OutOfMemory}!GetRequestOutcome {
+    return authenticateManifestRequest(
+        GetRequestOutcome,
+        ctx,
+        engine,
+        exchanger,
+        request,
+        challenge,
+        authFailureGetOutcome,
+        mapAuthFailureGetOutcome,
+        transportFailureGetOutcome,
+        classifyAuthenticatedGetResponse,
+    );
+}
+
+fn authenticateManifestRequest(
+    comptime Outcome: type,
+    ctx: ResolverContext,
+    engine: *auth.AuthEngine,
+    exchanger: ManifestHttpExchanger,
+    request: ManifestRequest,
+    challenge: auth.AuthChallenge,
+    comptime auth_failure_fn: fn (ResolverContext, ?u16) error{OutOfMemory}!Outcome,
+    comptime map_auth_failure_fn: fn (ResolverContext, auth.AuthError, ?u16) error{OutOfMemory}!Outcome,
+    comptime transport_failure_fn: fn (ResolverContext, ?u16) error{OutOfMemory}!Outcome,
+    comptime classify_authenticated_response_fn: fn (ResolverContext, *auth.AuthEngine, ManifestHttpExchanger, ManifestRequest, ManifestHttpResponse) error{OutOfMemory}!Outcome,
+) error{OutOfMemory}!Outcome {
+    const unauthorized_status = @intFromEnum(std.http.Status.unauthorized);
     const bearer_challenge = switch (challenge) {
         .bearer => |bearer| bearer,
-        else => return authFailureGetOutcome(ctx, @intFromEnum(std.http.Status.unauthorized)),
+        else => return auth_failure_fn(ctx, unauthorized_status),
     };
 
     const auth_request = auth.AuthenticateRequest.init(ctx.reference.registry, bearer_challenge) catch |err| {
-        return mapAuthFailureGetOutcome(ctx, err, @intFromEnum(std.http.Status.unauthorized));
+        return map_auth_failure_fn(ctx, err, unauthorized_status);
     };
 
     var token_response = (engine.authenticate(ctx.client, auth_request) catch |err| {
-        return mapAuthFailureGetOutcome(ctx, err, @intFromEnum(std.http.Status.unauthorized));
+        return map_auth_failure_fn(ctx, err, unauthorized_status);
     }) orelse {
-        return authFailureGetOutcome(ctx, @intFromEnum(std.http.Status.unauthorized));
+        return auth_failure_fn(ctx, unauthorized_status);
     };
     defer token_response.deinit(ctx.allocator);
 
     const retry_response = exchangeManifestRequest(ctx, exchanger, request, token_response.access_token.value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TransportFailed => return transportFailureGetOutcome(ctx, null),
+        error.TransportFailed => return transport_failure_fn(ctx, null),
     };
 
     if (retry_response.metadata.status != .unauthorized) {
-        return classifyGetResponse(ctx, engine, exchanger, request, retry_response, false);
+        return classify_authenticated_response_fn(ctx, engine, exchanger, request, retry_response);
     }
 
     retry_response.deinit(ctx.allocator);
 
-    if (!request.allow_cached_auth_retry) return authFailureGetOutcome(ctx, @intFromEnum(std.http.Status.unauthorized));
+    if (!request.allow_cached_auth_retry) return auth_failure_fn(ctx, unauthorized_status);
 
     var refreshed_token_response = (engine.retryAuthenticateAfterCachedUnauthorized(ctx.client, auth_request) catch |err| {
-        return mapAuthFailureGetOutcome(ctx, err, @intFromEnum(std.http.Status.unauthorized));
+        return map_auth_failure_fn(ctx, err, unauthorized_status);
     }) orelse {
-        return authFailureGetOutcome(ctx, @intFromEnum(std.http.Status.unauthorized));
+        return auth_failure_fn(ctx, unauthorized_status);
     };
     defer refreshed_token_response.deinit(ctx.allocator);
 
@@ -556,28 +649,57 @@ fn authenticateGetRequest(
 
     const refreshed_response = exchangeManifestRequest(ctx, exchanger, retried_request, refreshed_token_response.access_token.value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TransportFailed => return transportFailureGetOutcome(ctx, null),
+        error.TransportFailed => return transport_failure_fn(ctx, null),
     };
 
     if (refreshed_response.metadata.status == .unauthorized) {
         refreshed_response.deinit(ctx.allocator);
-        return authFailureGetOutcome(ctx, @intFromEnum(std.http.Status.unauthorized));
+        return auth_failure_fn(ctx, unauthorized_status);
     }
 
-    return classifyGetResponse(ctx, engine, exchanger, retried_request, refreshed_response, false);
+    return classify_authenticated_response_fn(ctx, engine, exchanger, retried_request, refreshed_response);
 }
 
-fn classifyUsableHeadMetadata(ctx: ResolverContext, metadata: ManifestResponseMetadata) error{OutOfMemory}!HeadRequestOutcome {
-    if (metadata.docker_content_digest == null) return .{ .use_get_fallback = metadata };
-    if (Digest.parse(metadata.docker_content_digest.?)) |_| {} else |_| return .{ .use_get_fallback = metadata };
+fn classifyAuthenticatedHeadResponse(
+    ctx: ResolverContext,
+    engine: *auth.AuthEngine,
+    exchanger: ManifestHttpExchanger,
+    request: ManifestRequest,
+    response: ManifestHttpResponse,
+) error{OutOfMemory}!HeadRequestOutcome {
+    defer response.deinit(ctx.allocator);
+    return classifyHeadResponse(ctx, engine, exchanger, request, response.metadata, false);
+}
 
-    const content_type = metadata.content_type orelse return .{ .use_get_fallback = metadata };
+fn classifyAuthenticatedGetResponse(
+    ctx: ResolverContext,
+    engine: *auth.AuthEngine,
+    exchanger: ManifestHttpExchanger,
+    request: ManifestRequest,
+    response: ManifestHttpResponse,
+) error{OutOfMemory}!GetRequestOutcome {
+    return classifyGetResponse(ctx, engine, exchanger, request, response, false);
+}
+
+fn classifyUsableHeadMetadata(
+    ctx: ResolverContext,
+    request: ManifestRequest,
+    metadata: ManifestResponseMetadata,
+) error{OutOfMemory}!HeadRequestOutcome {
+    if (metadata.docker_content_digest == null) return .{ .use_get_fallback = try metadata.cloneAlloc(ctx.allocator) };
+    if (Digest.parse(metadata.docker_content_digest.?)) |_| {} else |_| {
+        return .{ .use_get_fallback = try metadata.cloneAlloc(ctx.allocator) };
+    }
+
+    const content_type = metadata.content_type orelse return .{ .use_get_fallback = try metadata.cloneAlloc(ctx.allocator) };
     const media_type = manifestDocumentMediaType(content_type) orelse {
         return unsupportedContentTypeOutcome(ctx, metadata.httpStatus());
     };
-    _ = media_type;
+    if (!acceptsManifestMediaType(request.accept, media_type)) {
+        return unsupportedContentTypeOutcome(ctx, metadata.httpStatus());
+    }
 
-    return .{ .success = metadata };
+    return .{ .success = try metadata.cloneAlloc(ctx.allocator) };
 }
 
 fn classifyUsableGetResponse(
@@ -592,17 +714,25 @@ fn classifyUsableGetResponse(
     const media_type = manifestDocumentMediaType(content_type) orelse {
         return unsupportedContentTypeGetOutcome(ctx, metadata.httpStatus());
     };
+    if (!acceptsManifestMediaType(request.accept, media_type)) {
+        return unsupportedContentTypeGetOutcome(ctx, metadata.httpStatus());
+    }
     const response_body = body orelse return parseFailureGetOutcome(ctx, metadata.httpStatus());
     if (response_body.len == 0) return parseFailureGetOutcome(ctx, metadata.httpStatus());
 
-    const document = parseManifestDocument(ctx.allocator, media_type, response_body) catch |err| switch (err) {
+    var document = parseManifestDocument(ctx.allocator, media_type, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return parseFailureGetOutcome(ctx, metadata.httpStatus()),
     };
+    errdefer document.deinit();
+
+    if (document.mediaType() != media_type) {
+        return unsupportedContentTypeGetOutcome(ctx, metadata.httpStatus());
+    }
 
     return .{ .success = .{
         .request = request,
-        .metadata = metadata,
+        .metadata = try metadata.cloneAlloc(ctx.allocator),
         .document = document,
     } };
 }
@@ -623,6 +753,20 @@ fn manifestDocumentMediaType(content_type: []const u8) ?MediaType {
 fn normalizeContentType(content_type: []const u8) []const u8 {
     const without_parameters = content_type[0..(std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len)];
     return std.mem.trim(u8, without_parameters, " \t\r\n");
+}
+
+fn acceptsManifestMediaType(accept: []const []const u8, media_type: MediaType) bool {
+    if (accept.len == 0) return true;
+
+    for (accept) |entry| {
+        const normalized = normalizeContentType(entry);
+        if (std.mem.eql(u8, normalized, "*/*")) return true;
+
+        const accepted_media_type = MediaType.fromString(normalized) orelse continue;
+        if (accepted_media_type == media_type) return true;
+    }
+
+    return false;
 }
 
 fn parseManifestDocument(
@@ -710,6 +854,28 @@ fn fixtureBodyAlloc(allocator: std.mem.Allocator, path: []const u8, comptime max
         else => return error.TransportFailed,
     };
     return allocator.dupe(u8, bytes);
+}
+
+fn duplicateHeaderSlicesAlloc(allocator: std.mem.Allocator, headers: []const []const u8) ![]const []const u8 {
+    const owned_headers = try allocator.alloc([]const u8, headers.len);
+    errdefer allocator.free(owned_headers);
+
+    var initialized: usize = 0;
+    errdefer {
+        for (owned_headers[0..initialized]) |header| allocator.free(header);
+    }
+
+    for (headers, 0..) |header, index| {
+        owned_headers[index] = try allocator.dupe(u8, header);
+        initialized += 1;
+    }
+
+    return owned_headers;
+}
+
+fn freeHeaderSlices(allocator: std.mem.Allocator, headers: []const []const u8) void {
+    for (headers) |header| allocator.free(header);
+    allocator.free(headers);
 }
 
 test "phase3ConfigView keeps resolver-relevant config fields" {
@@ -870,6 +1036,12 @@ test "manifestDocumentMediaType normalizes parameters and rejects non-manifest t
     try std.testing.expectEqual(@as(?MediaType, null), manifestDocumentMediaType("application/vnd.docker.distribution.manifest.v1+prettyjws"));
 }
 
+test "acceptsManifestMediaType matches normalized exact entries and wildcard" {
+    try std.testing.expect(acceptsManifestMediaType(&.{" application/vnd.oci.image.manifest.v1+json; q=1.0 "}, .oci_manifest_v1));
+    try std.testing.expect(acceptsManifestMediaType(&.{"*/*"}, .docker_manifest_list_v2));
+    try std.testing.expect(!acceptsManifestMediaType(&.{"application/vnd.oci.image.index.v1+json"}, .docker_manifest_v2));
+}
+
 test "performManifestHead returns success for anonymous usable HEAD metadata" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -880,11 +1052,11 @@ test "performManifestHead returns success for anonymous usable HEAD metadata" {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
             defer request.deinit(allocator);
             if (request.authorization != null) return error.TransportFailed;
-            return .{ .metadata = .{
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
                 .status = .ok,
                 .content_type = "application/vnd.oci.image.manifest.v1+json",
                 .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-            } };
+            }, null);
         }
     };
 
@@ -900,9 +1072,11 @@ test "performManifestHead returns success for anonymous usable HEAD metadata" {
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .success => |metadata| {
+            try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", metadata.content_type.?);
             try std.testing.expectEqualStrings(
                 "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
                 metadata.docker_content_digest.?,
@@ -940,7 +1114,8 @@ test "performManifestHead falls back to GET when usable HEAD metadata is incompl
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .use_get_fallback => {},
         else => return error.TestUnexpectedResult,
@@ -975,7 +1150,8 @@ test "performManifestHead returns redirect outcome for redirect metadata with lo
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .redirect => |metadata| try std.testing.expectEqualStrings("https://cdn.example.test/manifest", metadata.location.?),
         else => return error.TestUnexpectedResult,
@@ -1007,7 +1183,8 @@ test "performManifestHead returns not_found for missing manifest" {
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .not_found => {},
         else => return error.TestUnexpectedResult,
@@ -1060,7 +1237,8 @@ test "performManifestHead authenticates on challenge and retries HEAD with beare
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .success => {},
         else => return error.TestUnexpectedResult,
@@ -1131,7 +1309,8 @@ test "performManifestHead retries once after cached unauthorized response" {
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .success => {},
         else => return error.TestUnexpectedResult,
@@ -1169,7 +1348,8 @@ test "performManifestHead maps transport failures into resolver failures" {
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(arena.allocator());
     switch (outcome) {
         .failure => |err| try std.testing.expectEqualStrings("network_error", @tagName(err)),
         else => return error.TestUnexpectedResult,
@@ -1208,7 +1388,8 @@ test "performManifestHead rejects unsupported content type on HEAD success" {
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(arena.allocator());
     switch (outcome) {
         .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
         else => return error.TestUnexpectedResult,
@@ -1247,7 +1428,48 @@ test "performManifestHead rejects known non-manifest content type on HEAD succes
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(arena.allocator());
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestHead rejects recognized media type outside Accept list" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{
+                .status = .ok,
+                .content_type = "application/vnd.docker.distribution.manifest.v2+json",
+                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+            } };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
     switch (outcome) {
         .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
         else => return error.TestUnexpectedResult,
@@ -1297,7 +1519,7 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
             "application/vnd.docker.distribution.manifest.v2+json",
         },
     );
-    defer outcome.deinit();
+    defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
         .success => |success| {
@@ -1347,7 +1569,7 @@ test "performManifestGet parses Docker manifest fixture" {
     );
 
     var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.docker.distribution.manifest.v2+json"});
-    defer outcome.deinit();
+    defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
         .success => |success| switch (success.document) {
@@ -1393,7 +1615,7 @@ test "performManifestGet parses OCI index fixture" {
     );
 
     var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.index.v1+json"});
-    defer outcome.deinit();
+    defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
         .success => |success| switch (success.document) {
@@ -1439,7 +1661,7 @@ test "performManifestGet parses Docker manifest list fixture" {
     );
 
     var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.docker.distribution.manifest.list.v2+json"});
-    defer outcome.deinit();
+    defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
         .success => |success| switch (success.document) {
@@ -1488,7 +1710,7 @@ test "performManifestGet maps unsupported content type into resolver failure" {
     );
 
     var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit();
+    defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
         .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
@@ -1496,7 +1718,7 @@ test "performManifestGet maps unsupported content type into resolver failure" {
     }
 }
 
-test "performManifestGet maps body and media-type mismatch into parse failure" {
+test "performManifestGet rejects body whose declared mediaType disagrees with Content-Type" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
             request.deinit(std.testing.allocator);
@@ -1510,7 +1732,7 @@ test "performManifestGet maps body and media-type mismatch into parse failure" {
                     .status = .ok,
                     .content_type = "application/vnd.oci.image.manifest.v1+json",
                 },
-                .body = try fixtureBodyAlloc(allocator, "fixtures/indexes/oci-image-index-spec-example.json", 16 * 1024),
+                .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json", 32 * 1024),
             };
         }
     };
@@ -1531,10 +1753,53 @@ test "performManifestGet maps body and media-type mismatch into parse failure" {
     );
 
     var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit();
+    defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("manifest_parse_error", @tagName(err)),
+        .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet rejects recognized media type outside Accept list" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{
+                .metadata = .{
+                    .status = .ok,
+                    .content_type = "application/vnd.docker.distribution.manifest.v2+json",
+                },
+                .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json", 32 * 1024),
+            };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
+
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1588,7 +1853,7 @@ test "performManifestGet authenticates on challenge and retries GET with bearer 
     );
 
     var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit();
+    defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
         .success => |success| try std.testing.expectEqual(MediaType.oci_manifest_v1, success.document.mediaType()),

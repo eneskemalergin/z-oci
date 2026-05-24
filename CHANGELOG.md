@@ -18,6 +18,8 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - `src/root.zig` now builds a resolver context at the public API boundary before returning `error.NotYetImplemented`, which locks the Phase 2 to Phase 3 handoff into code without changing public behavior yet.
 - The Phase 3 resolver layer now performs real internal HEAD request control flow, including bearer-token retry and cached-unauthorized retry, while public resolver APIs remain intentionally stubbed.
 - Resolver media-type validation now accepts only actual manifest document types on the internal HEAD and GET paths, so config, layer, and legacy manifest content types fail before parse instead of slipping through as usable metadata.
+- Resolver hardening now clones returned response metadata, zeroes authorization buffers on request teardown, and rejects header/body or `Accept` mismatches earlier.
+- HEAD and GET auth-on-demand retry now share one internal resolver helper instead of maintaining two separate retry state machines.
 
 ### Verified
 

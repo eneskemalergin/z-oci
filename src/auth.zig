@@ -47,7 +47,10 @@ pub const TokenHttpRequest = struct {
 
     pub fn deinit(self: TokenHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
-        if (self.authorization) |authorization| allocator.free(authorization);
+        if (self.authorization) |authorization| {
+            std.crypto.secureZero(u8, authorization);
+            allocator.free(authorization);
+        }
         if (self.body) |body| allocator.free(body);
     }
 };
