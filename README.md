@@ -21,14 +21,24 @@
 
 ## What z-oci does
 
-z-oci is a read-only OCI registry client. It parses image references, authenticates against registries, resolves manifests, verifies digests, and follows supported multi-arch indices. Everything is built on Zig 0.16 std -- no external dependencies.
+z-oci is a read-only OCI registry client for Zig. Give it an image reference, and it can normalize the name, authenticate with the registry, fetch the manifest, verify the digest, and pick the right child manifest for a platform when the image is multi-arch. Everything is built on Zig 0.16 std with no external dependencies.
+
+## What you can do today
+
+- Parse and normalize Docker and OCI image references, including tags, digests, Docker Hub defaults, and host-plus-port registries.
+- Resolve a tag to a pinned digest with `resolve`.
+- Check whether a manifest exists with `validate`.
+- Fetch and parse a manifest with `getManifest`.
+- Follow OCI indexes and Docker manifest lists when you provide a target platform.
+- Run packaged examples for offline parsing and live resolution.
+- Measure parser, auth, and resolver costs with `z-oci-bench`.
 
 ### Capabilities
 
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
-- **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, `MultiArchManifest` -- all with JSON round-trip support.
-- **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens (GET with POST fallback), resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry (in-memory, per-scope). 299 tests. The auth engine is transport-agnostic logic -- it produces token headers but does not perform live HTTP. Callers provide a `*std.http.Client` and an allocator; the library handles everything else.
-- **Public resolver path**: `resolve`, `validate`, and `getManifest` now perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the shipped auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
+- **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, and `MultiArchManifest`, all with JSON round-trip support.
+- **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. It probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens, resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry.
+- **Public resolver path**: `resolve`, `validate`, and `getManifest` perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
 ### Current limitations
@@ -37,27 +47,30 @@ z-oci is a read-only OCI registry client. It parses image references, authentica
 - Retry and rate-limit policy beyond the current correctness-first fetch path remains deferred to Phase 4. `Config.max_retries` only governs the cached-401 auth retry path today, while live HTTP timeout and custom CA bundle wiring remain deferred because callers own `std.http.Client`.
 - User-facing CLI commands built on top of the live resolver surface are still future work.
 
-### Registry support
+### Registry coverage
 
-| Registries             | Status                                    |
-| ---------------------- | ----------------------------------------- |
-| Docker Hub, GHCR, Quay | Tested with auth engine                   |
-| GitLab, Harbor         | Covered by generic bearer mock tests      |
-| ECR, GCR, ACR          | Deferred; use the credential helper chain |
+Docker Hub, Quay, and GHCR are the main named targets in the current code and tests.
+
+- Docker Hub: covered in auth tests and exercised on the live resolver path.
+- Quay: covered in auth tests and fixture-backed resolver coverage.
+- GHCR: covered in auth and challenge-flow tests.
+- GitLab and Harbor: covered through generic bearer-registry mock tests.
+- ECR, GCR, and ACR: not first-class targets yet. Use the credential helper chain where it fits your setup.
 
 ### Performance
 
-| Operation                 | Time    | Allocations |
-| ------------------------- | ------- | ----------- |
-| `Reference.parse`         | 33 μs   | 4           |
-| `Digest.parse`            | 0.4 μs  | 0           |
-| `json.parse(Manifest)`    | 46 μs   | ~3          |
-| `parseAuthenticateHeader` | 5.6 μs  | 0           |
-| `Platform.match`          | 0.15 μs | 0           |
-| `authenticate` (miss)     | 145 μs  | ~13         |
-| `authenticate` (hit)      | 31 μs   | 4           |
+Representative ReleaseFast counting snapshot for v0.3.0:
 
-Full zebrac baseline at `benchmarks/baselines/`. CHANGELOG at [CHANGELOG.md](CHANGELOG.md).
+| Operation             | Mean per iteration | Allocs per call |
+| --------------------- | ------------------ | --------------- |
+| `resolve-single`      | 95 μs              | 13              |
+| `resolve-multi`       | 284 μs             | 28              |
+| `validate-single`     | 24 μs              | 3               |
+| `get-manifest`        | 74 μs              | 10              |
+| `authenticate` (miss) | 145 μs             | 13              |
+| `authenticate` (hit)  | 31 μs              | 4               |
+
+Full zebrac baselines, parser microbenchmarks, and wall-time summaries live in `benchmarks/baselines/`. Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Getting started
 
@@ -78,6 +91,16 @@ const z_oci = b.dependency("z_oci", .{
 });
 exe.root_module.addImport("z_oci", z_oci.module("z_oci"));
 ```
+
+### Live resolver entry points
+
+```zig
+const outcome = try z_oci.resolve(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+const validity = try z_oci.validate(allocator, &client, config, ref, null);
+const manifest = try z_oci.getManifest(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+```
+
+`resolve`, `validate`, and `getManifest` all use a caller-owned `std.http.Client` and the same auth-backed resolver flow.
 
 ### Normalize an image reference
 
@@ -153,7 +176,7 @@ Offline examples:
 
 See [examples](examples) for the source of the packaged examples.
 
-## What is next
+## Next
 
 - Rate limiting and retry logic
 - CLI for resolve, validate, and inspect

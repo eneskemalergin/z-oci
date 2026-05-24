@@ -7,7 +7,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-05-24
+## [0.3.0] - 2026-05-24 - [Tagged]
 
 ### Added
 
@@ -78,7 +78,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - `MediaType.toString()` now derives from `mime_table` instead of duplicating every MIME string in a second switch. Adding a new media type now requires touching exactly one table.
 - `stringifyForTest` extracted from 3 files to `json.zig` as a shared test helper.
 - `dockerConfigRegistryKeyMatches` now reuses the shared `isDockerHubRegistryAlias` helper instead of duplicating the alias list inline.
-- Doc comments stripped of em-dashes throughout (`Reference.zig`, `ResolveResult.zig`, `Config.zig`, `Index.zig`, `json.zig`).
+- Doc comment wording and section-header style were normalized across `Reference.zig`, `ResolveResult.zig`, `Config.zig`, `Index.zig`, and `json.zig`.
 - Section headers normalized from `// ----` box-drawing characters to plain `//` comments across all source files.
 - `zig fmt` formatting pass applied across `src/`, `examples/`, and `build.zig`.
 - `build.zig.zon` version bumped to `0.1.8`.

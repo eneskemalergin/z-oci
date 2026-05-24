@@ -5,7 +5,7 @@ JSON files in this directory are zebrac output snapshots from milestone releases
 ## Available Baselines
 
 - `v0.2.0.json` is the tagged Phase 2 auth-engine release baseline.
-- `v0.3.0.json` is the Phase 3 resolver branch baseline generated after the public resolver and packaged benchmark CLI gained deterministic resolver operations.
+- `v0.3.0.json` is the Phase 3 resolver baseline generated after the public resolver and packaged benchmark CLI gained deterministic resolver operations.
 
 | Operation                    | Mean wall time | Mean RSS | Samples |
 | ---------------------------- | -------------- | -------- | ------- |
@@ -38,7 +38,7 @@ Per-operation internal timing (from `z-oci-bench --counting`):
 | authenticate-miss | 145 us             | 13              |
 | authenticate-hit  | 31 us              | 4               |
 
-Resolver-surface counting snapshot from the current `v0.3.0` branch baseline pass after the repeated-allocation audit:
+Resolver-surface counting snapshot from the current `v0.3.0` baseline pass after the repeated-allocation audit:
 
 | Operation       | Mean per iteration | Allocs per call |
 | --------------- | ------------------ | --------------- |

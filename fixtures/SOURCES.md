@@ -9,9 +9,7 @@ All fixtures are intentionally small, human-reviewable, and covered by tests.
 
 ## Synthetic Negative Fixtures
 
-These fixtures are intentionally malformed and are checked in to keep
-negative-path parser and resolver behavior deterministic without inline payload
-literals spread across test files.
+These fixtures are intentionally malformed and are checked in to keep negative-path parser and resolver behavior deterministic without inline payload literals spread across test files.
 
 - `fixtures/manifests/invalid-empty-manifest.json`
     - Source: repository-authored synthetic fixture
