@@ -19,6 +19,7 @@
 //!
 const std = @import("std");
 const resolver = @import("resolver.zig");
+const failure_matrix = @import("resolve_failure_matrix_support.zig");
 
 pub const Digest = @import("Digest.zig");
 pub const MediaType = @import("MediaType.zig").MediaType;
@@ -709,6 +710,23 @@ fn deinitOwnedResolveError(failure: ResolveError, allocator: std.mem.Allocator) 
     failure.deinitOwned(allocator);
 }
 
+fn expectResolveFailure(
+    failure: ResolveError,
+    expected_tag_name: []const u8,
+    expected_registry: []const u8,
+    expected_reference: []const u8,
+    expected_http_status: ?u16,
+) !void {
+    try std.testing.expectEqualStrings(expected_tag_name, @tagName(std.meta.activeTag(failure)));
+    switch (failure) {
+        inline else => |value| {
+            try std.testing.expectEqualSlices(u8, expected_registry, value.registry);
+            try std.testing.expectEqualSlices(u8, expected_reference, value.reference);
+            try std.testing.expectEqual(expected_http_status, value.http_status);
+        },
+    }
+}
+
 fn readFixtureAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -930,6 +948,85 @@ test "validateWithExchangers returns not_found for missing manifest" {
     );
 
     try std.testing.expectEqual(ValidateOutcome.not_found, outcome);
+}
+
+test "resolveWithExchangers propagates resolver failure matrix with full context" {
+    const State = struct {
+        var scenario: failure_matrix.Scenario = .network_error;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const plan = failure_matrix.responsePlan(scenario);
+            const headers: []const []const u8 = if (plan.malformed_auth_header)
+                &.{"Bearer realm=\"https://auth.example.test/token"}
+            else
+                &.{};
+
+            const metadata = resolver.ManifestResponseMetadata{
+                .status = plan.status,
+                .content_type = plan.content_type,
+                .docker_content_digest = plan.docker_content_digest,
+                .www_authenticate_headers = headers,
+            };
+
+            return switch (plan.body_kind) {
+                .none => resolver.ManifestHttpResponse.initOwnedAlloc(allocator, metadata, null),
+                .empty_manifest => resolver.ManifestHttpResponse.initOwnedAlloc(allocator, metadata, ""),
+                .manifest_fixture => blk: {
+                    const body = readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.TransportFailed,
+                    };
+                    defer allocator.free(body);
+
+                    break :blk resolver.ManifestHttpResponse.initOwnedAlloc(allocator, metadata, body);
+                },
+            };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    for (failure_matrix.public_resolve_failure_scenarios) |scenario| {
+        State.scenario = scenario;
+
+        const outcome = try resolveWithExchangers(
+            std.testing.allocator,
+            &client,
+            Config{},
+            ref,
+            null,
+            State.tokenExchange,
+            State.manifestExchange,
+        );
+        defer switch (outcome) {
+            .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+            else => {},
+        };
+
+        switch (outcome) {
+            .success => return error.TestUnexpectedResult,
+            .failure => |failure| try expectResolveFailure(
+                failure,
+                failure_matrix.expectedTagName(scenario),
+                "registry-1.docker.io",
+                "registry-1.docker.io/library/busybox:latest",
+                failure_matrix.expectedHttpStatus(scenario),
+            ),
+        }
+    }
 }
 
 test "resolveWithExchangers returns platform_required when multi-arch request omits platform" {

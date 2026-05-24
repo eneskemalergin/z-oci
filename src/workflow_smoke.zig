@@ -9,6 +9,38 @@
 const std = @import("std");
 const z_oci = @import("z_oci");
 
+const WorkflowFailureScenario = enum {
+    network_error,
+    auth_failed,
+    content_type_mismatch,
+    manifest_parse_error,
+    digest_mismatch,
+    unsupported_algorithm,
+};
+
+const WorkflowResponseBodyKind = enum {
+    none,
+    empty_manifest,
+    manifest_fixture,
+};
+
+const WorkflowResponsePlan = struct {
+    status: std.http.Status,
+    content_type: ?[]const u8 = null,
+    docker_content_digest: ?[]const u8 = null,
+    body_kind: WorkflowResponseBodyKind = .none,
+    malformed_auth_header: bool = false,
+};
+
+const workflow_public_resolve_failure_scenarios = [_]WorkflowFailureScenario{
+    .network_error,
+    .auth_failed,
+    .content_type_mismatch,
+    .manifest_parse_error,
+    .digest_mismatch,
+    .unsupported_algorithm,
+};
+
 test "workflow smoke: parse manifest fixture and stringify summary fields" {
     const parsed = try parseWorkflowFixture(
         z_oci.Manifest,
@@ -348,6 +380,101 @@ test "workflow smoke: public getManifest reports platform_required for multi-arc
     }
 }
 
+test "workflow smoke: public resolve failure matrix preserves full error context" {
+    const State = struct {
+        var scenario: WorkflowFailureScenario = .network_error;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const plan = workflowResponsePlan(scenario);
+            const headers: []const []const u8 = if (plan.malformed_auth_header)
+                &.{"Bearer realm=\"https://auth.example.test/token"}
+            else
+                &.{};
+
+            return switch (plan.body_kind) {
+                .none => z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = plan.status,
+                    .content_type = plan.content_type,
+                    .docker_content_digest = plan.docker_content_digest,
+                    .www_authenticate_headers = headers,
+                }, null),
+                .empty_manifest => z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = plan.status,
+                    .content_type = plan.content_type,
+                    .docker_content_digest = plan.docker_content_digest,
+                    .www_authenticate_headers = headers,
+                }, ""),
+                .manifest_fixture => blk: {
+                    const body = readWorkflowFixtureAlloc(
+                        allocator,
+                        "fixtures/manifests/oci-image-manifest-spec-example.json",
+                        16 * 1024,
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.TransportFailed,
+                    };
+                    defer allocator.free(body);
+
+                    break :blk z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = plan.status,
+                        .content_type = plan.content_type,
+                        .docker_content_digest = plan.docker_content_digest,
+                        .www_authenticate_headers = headers,
+                    }, body);
+                },
+            };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    for (workflow_public_resolve_failure_scenarios) |scenario| {
+        State.scenario = scenario;
+
+        const outcome = try z_oci.testing.resolveWithExchangers(
+            std.testing.allocator,
+            &client,
+            z_oci.Config{},
+            ref,
+            null,
+            State.tokenExchange,
+            State.manifestExchange,
+        );
+        defer switch (outcome) {
+            .failure => |failure| z_oci.testing.deinitResolveError(failure, std.testing.allocator),
+            else => {},
+        };
+
+        switch (outcome) {
+            .success => return error.TestUnexpectedResult,
+            .failure => |failure| try expectWorkflowResolveFailure(
+                failure,
+                workflowExpectedTagName(scenario),
+                "registry-1.docker.io",
+                "registry-1.docker.io/library/busybox:latest",
+                workflowExpectedHttpStatus(scenario),
+            ),
+        }
+    }
+}
+
 // Kept local on purpose: workflow_smoke builds as its own root module under
 // `zig build test`, so importing test_support.zig here would make that file
 // belong to two modules at once.
@@ -368,6 +495,65 @@ fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8
     std.crypto.hash.sha2.Sha256.hash(body, &digest_bytes, .{});
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
+}
+
+fn workflowResponsePlan(scenario: WorkflowFailureScenario) WorkflowResponsePlan {
+    return switch (scenario) {
+        .network_error => .{
+            .status = .temporary_redirect,
+        },
+        .auth_failed => .{
+            .status = .unauthorized,
+            .malformed_auth_header = true,
+        },
+        .content_type_mismatch => .{
+            .status = .ok,
+            .content_type = "application/vnd.oci.image.config.v1+json",
+            .body_kind = .manifest_fixture,
+        },
+        .manifest_parse_error => .{
+            .status = .ok,
+            .content_type = "application/vnd.oci.image.manifest.v1+json",
+            .body_kind = .empty_manifest,
+        },
+        .digest_mismatch => .{
+            .status = .ok,
+            .content_type = "application/vnd.oci.image.manifest.v1+json",
+            .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .body_kind = .manifest_fixture,
+        },
+        .unsupported_algorithm => .{
+            .status = .ok,
+            .content_type = "application/vnd.oci.image.manifest.v1+json",
+            .docker_content_digest = "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .body_kind = .manifest_fixture,
+        },
+    };
+}
+
+fn workflowExpectedTagName(scenario: WorkflowFailureScenario) []const u8 {
+    return @tagName(scenario);
+}
+
+fn workflowExpectedHttpStatus(scenario: WorkflowFailureScenario) ?u16 {
+    return @intCast(@intFromEnum(workflowResponsePlan(scenario).status));
+}
+
+fn expectWorkflowResolveFailure(
+    failure: z_oci.ResolveError,
+    expected_tag_name: []const u8,
+    expected_registry: []const u8,
+    expected_reference: []const u8,
+    expected_http_status: ?u16,
+) !void {
+    try std.testing.expectEqualStrings(expected_tag_name, @tagName(std.meta.activeTag(failure)));
+    switch (failure) {
+        inline else => |value| {
+            try std.testing.expectEqualSlices(u8, expected_registry, value.registry);
+            try std.testing.expectEqualSlices(u8, expected_reference, value.reference);
+            try std.testing.expectEqual(expected_http_status, value.http_status);
+        },
+    }
 }
 
 fn buildIndexBodyAlloc(

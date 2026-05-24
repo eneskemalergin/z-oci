@@ -12,12 +12,15 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - Live manifest resolution for `resolve`, `validate`, and `getManifest`, including HEAD and GET fetch paths, manifest media routing, digest verification, and structured public outcomes.
 - Platform-aware multi-arch resolution for OCI indexes and Docker manifest lists, including recursive child selection, auxiliary-descriptor skipping, and explicit depth-limit failures.
 - A live `resolve-reference` packaged example alongside expanded workflow smoke coverage for the public resolver surface.
+- Public error-propagation matrix coverage at both `root` and `workflow-smoke` layers for `network_error`, `auth_failed`, `content_type_mismatch`, `manifest_parse_error`, `digest_mismatch`, and `unsupported_algorithm`.
 
 ### Changed
 
 - No-platform multi-arch calls now fail with the structured `platform_required` resolver error instead of surfacing `error.NotYetImplemented`.
 - Public resolver ownership contracts are now explicit: public failures support owned teardown, and `ResolveResult.deinit()` is valid for live resolver results as well as cloned results.
 - Packaged example builds are now distinct from the offline `examples-smoke` step, so the repo can ship a live resolver example without making the smoke gate network-dependent.
+- Public resolve negative-path tests were consolidated from repeated per-variant cases into matrix-style checks, reducing overlap while preserving behavior coverage.
+- Public failure assertions now validate full error context (`tag`, `registry`, canonical `reference`, and `http_status`) instead of checking only the variant tag.
 
 ### Fixed
 

@@ -1102,6 +1102,28 @@ test "ManifestResponseMetadata probeClassification reuses auth probe rules" {
     }
 }
 
+test "ManifestResponseMetadata probeClassification selects bearer from repeated headers" {
+    const metadata = ManifestResponseMetadata{
+        .status = .unauthorized,
+        .www_authenticate_headers = &.{
+            "Basic realm=\"example\"",
+            "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
+        },
+    };
+
+    const result = try metadata.probeClassification();
+    switch (result) {
+        .auth_required => |challenge| switch (challenge) {
+            .bearer => |bearer| {
+                try std.testing.expectEqualStrings("https://auth.example.test/token", bearer.realm);
+                try std.testing.expectEqualStrings("registry.example.test", bearer.service.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible variants" {
     try std.testing.expectError(
         error.OutOfMemory,
@@ -1281,6 +1303,42 @@ test "performManifestHead returns redirect outcome for redirect metadata with lo
     }
 }
 
+test "performManifestHead maps redirect without location into network error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{ .status = .found } };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(arena.allocator());
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("network_error", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "performManifestHead returns not_found for missing manifest" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1368,6 +1426,45 @@ test "performManifestHead authenticates on challenge and retries HEAD with beare
     }
 
     try std.testing.expectEqual(@as(usize, 2), State.manifest_call_count);
+}
+
+test "performManifestHead maps malformed authenticate header into auth failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{
+                .status = .unauthorized,
+                .www_authenticate_headers = &.{"Bearer realm=\"https://auth.example.test/token"},
+            } };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "registry.example.test", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(arena.allocator());
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("auth_failed", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "performManifestHead retries once after cached unauthorized response" {
@@ -1799,6 +1896,158 @@ test "performManifestGet parses Docker manifest list fixture" {
     }
 }
 
+test "performManifestGet returns redirect outcome for redirect metadata with location" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{
+                .status = .temporary_redirect,
+                .location = "https://cdn.example.test/manifest",
+            } };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(std.testing.allocator);
+    switch (outcome) {
+        .redirect => |metadata| try std.testing.expectEqualStrings("https://cdn.example.test/manifest", metadata.location.?),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet maps redirect without location into network error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{ .status = .temporary_redirect } };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(arena.allocator());
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("network_error", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet maps missing body into manifest parse error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+            } };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
+
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("manifest_parse_error", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet maps empty body into manifest parse error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+            }, "");
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
+
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("manifest_parse_error", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "performManifestGet maps unsupported content type into resolver failure" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1984,6 +2233,120 @@ test "performManifestGet authenticates on challenge and retries GET with bearer 
     }
 
     try std.testing.expectEqual(@as(usize, 2), State.manifest_call_count);
+}
+
+test "performManifestGet maps malformed authenticate header into auth failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{
+                .status = .unauthorized,
+                .www_authenticate_headers = &.{"Bearer realm=\"https://auth.example.test/token"},
+            } };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "registry.example.test", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{});
+    defer outcome.deinit(arena.allocator());
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("auth_failed", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet retries once after cached unauthorized response" {
+    const State = struct {
+        var manifest_call_count: usize = 0;
+        var token_call_count: usize = 0;
+        const stale_token_body = "{\"access_token\":\"stale-token\",\"expires_in\":3600}";
+        const fresh_token_body = "{\"access_token\":\"fresh-token\",\"expires_in\":3600}";
+
+        fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            defer request.deinit(allocator);
+            token_call_count += 1;
+            return switch (token_call_count) {
+                1 => .{ .status = .ok, .body = stale_token_body },
+                2 => .{ .status = .ok, .body = fresh_token_body },
+                else => error.TokenExchangeFailed,
+            };
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            manifest_call_count += 1;
+
+            return switch (manifest_call_count) {
+                1 => .{ .metadata = .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{"Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\",scope=\"repository:owner/repo:pull\""},
+                } },
+                2 => blk: {
+                    if (request.authorization == null) return error.TransportFailed;
+                    if (!std.mem.eql(u8, request.authorization.?, "Bearer stale-token")) return error.TransportFailed;
+                    break :blk .{ .metadata = .{ .status = .unauthorized } };
+                },
+                3 => blk: {
+                    if (request.authorization == null) return error.TransportFailed;
+                    if (!std.mem.eql(u8, request.authorization.?, "Bearer fresh-token")) return error.TransportFailed;
+                    const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+                    defer allocator.free(body);
+                    break :blk try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = .ok,
+                        .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    }, body);
+                },
+                else => error.TransportFailed,
+            };
+        }
+    };
+
+    defer {
+        State.manifest_call_count = 0;
+        State.token_call_count = 0;
+    }
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        Config{},
+        .{ .registry = "registry.example.test", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
+
+    switch (outcome) {
+        .success => |success| try std.testing.expectEqual(MediaType.oci_manifest_v1, success.document.mediaType()),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), State.manifest_call_count);
+    try std.testing.expectEqual(@as(usize, 2), State.token_call_count);
 }
 
 test "performManifestGet verifies matching pinned digest reference" {
