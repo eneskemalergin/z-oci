@@ -151,6 +151,13 @@ pub const ManifestOutcome = union(enum) {
 
 const max_child_manifest_depth: usize = 4;
 
+const manifest_accept_values = [_][]const u8{
+    MediaType.oci_manifest_v1.toString(),
+    MediaType.docker_manifest_v2.toString(),
+    MediaType.oci_index_v1.toString(),
+    MediaType.docker_manifest_list_v2.toString(),
+};
+
 const ResolvedManifestSuccess = struct {
     resolved_digest: Digest,
     resolved_digest_raw: []u8,
@@ -158,7 +165,7 @@ const ResolvedManifestSuccess = struct {
     platform: ?Platform,
 
     fn deinit(self: *ResolvedManifestSuccess, allocator: std.mem.Allocator) void {
-        allocator.free(self.resolved_digest_raw);
+        if (self.resolved_digest_raw.len != 0) allocator.free(self.resolved_digest_raw);
         self.document.deinit();
         if (self.platform) |platform| deinitOwnedPlatform(platform, allocator);
     }
@@ -299,11 +306,13 @@ fn resolveWithExchangers(
             };
             const selected_platform = success.platform;
             success.platform = null;
+            const resolved_digest_raw = success.resolved_digest_raw;
+            success.resolved_digest_raw = "";
 
             return .{ .success = try buildResolveResultAlloc(
                 allocator,
                 ref,
-                success.resolved_digest_raw,
+                resolved_digest_raw,
                 manifest.media_type,
                 selected_platform,
             ) };
@@ -562,18 +571,12 @@ fn recurseIntoMultiArchDocument(
         return .{ .failure = try platformNotFoundErrorAlloc(allocator, ref_view) };
     };
 
-    const selected_platform = if (child_descriptor.platform) |child_platform|
-        try clonePlatformAlloc(allocator, child_platform)
-    else
-        null;
-    errdefer if (selected_platform) |owned_platform| deinitOwnedPlatform(owned_platform, allocator);
-
-    const child_ref_string = try std.fmt.allocPrint(
-        allocator,
+    var child_ref_string_buffer: [128]u8 = undefined;
+    const child_ref_string = std.fmt.bufPrint(
+        &child_ref_string_buffer,
         "{s}:{s}",
         .{ @tagName(child_descriptor.digest.algorithm), child_descriptor.digest.hex },
-    );
-    defer allocator.free(child_ref_string);
+    ) catch unreachable;
 
     var child_outcome = try fetchResolvedManifestWithExchangers(
         allocator,
@@ -595,32 +598,25 @@ fn recurseIntoMultiArchDocument(
     switch (child_outcome) {
         .success => |*child_success| {
             if (child_success.platform == null) {
-                child_success.platform = selected_platform;
-            } else if (selected_platform) |owned_platform| {
-                deinitOwnedPlatform(owned_platform, allocator);
+                if (child_descriptor.platform) |child_platform| {
+                    child_success.platform = try clonePlatformAlloc(allocator, child_platform);
+                }
             }
         },
-        .failure => {
-            if (selected_platform) |owned_platform| deinitOwnedPlatform(owned_platform, allocator);
-        },
+        .failure => {},
     }
 
     return child_outcome;
 }
 
 fn manifestAcceptValues() []const []const u8 {
-    return &.{
-        MediaType.oci_manifest_v1.toString(),
-        MediaType.docker_manifest_v2.toString(),
-        MediaType.oci_index_v1.toString(),
-        MediaType.docker_manifest_list_v2.toString(),
-    };
+    return &manifest_accept_values;
 }
 
 fn buildResolveResultAlloc(
     allocator: std.mem.Allocator,
     ref: Reference,
-    resolved_digest_raw: []const u8,
+    resolved_digest_raw: []u8,
     media_type: MediaType,
     platform: ?Platform,
 ) error{OutOfMemory}!ResolveResult {
@@ -638,7 +634,7 @@ fn buildResolveResultAlloc(
 fn buildResolvedReferenceAlloc(
     allocator: std.mem.Allocator,
     ref: Reference,
-    resolved_digest_raw: []const u8,
+    resolved_digest_raw: []u8,
 ) error{OutOfMemory}!Reference {
     const registry = try allocator.dupe(u8, ref.registry);
     errdefer allocator.free(registry);
@@ -652,16 +648,15 @@ fn buildResolvedReferenceAlloc(
         null;
     errdefer if (tag) |value| allocator.free(value);
 
-    const digest_raw = try allocator.dupe(u8, resolved_digest_raw);
-    errdefer allocator.free(digest_raw);
+    errdefer allocator.free(resolved_digest_raw);
 
-    const digest = Digest.parse(digest_raw) catch unreachable;
+    const digest = Digest.parse(resolved_digest_raw) catch unreachable;
     return .{
         .registry = registry,
         .repository = repository,
         .tag = tag,
         .digest = digest,
-        .digest_raw = digest_raw,
+        .digest_raw = resolved_digest_raw,
     };
 }
 
@@ -912,6 +907,65 @@ test "resolveWithExchangers returns pinned single-arch result for tag reference"
             try std.testing.expectEqualSlices(u8, result.reference.digest_raw.?[("sha256:").len..], result.digest.hex);
         },
         .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "resolveWithExchangers repeated single-arch runs leave no residual allocations under DebugAllocator" {
+    const State = struct {
+        var body: []u8 = undefined;
+        var digest: []u8 = undefined;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    State.body = try readFixtureAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
+    defer std.testing.allocator.free(State.body);
+
+    State.digest = try sha256DigestStringAlloc(std.testing.allocator, State.body);
+    defer std.testing.allocator.free(State.digest);
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    for (0..32) |_| {
+        const outcome = try resolveWithExchangers(
+            allocator,
+            &client,
+            Config{},
+            ref,
+            null,
+            State.tokenExchange,
+            State.manifestExchange,
+        );
+
+        switch (outcome) {
+            .success => |result| {
+                var owned = result;
+                owned.deinit(allocator);
+            },
+            .failure => return error.TestUnexpectedResult,
+        }
     }
 }
 
@@ -1646,6 +1700,106 @@ test "resolveWithExchangers resolves multi-arch index to selected child manifest
             try std.testing.expectEqualSlices(u8, State.child_digest[("sha256:").len..], result.digest.hex);
         },
         .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "resolveWithExchangers repeated multi-arch runs leave no residual allocations under DebugAllocator" {
+    const State = struct {
+        var index_body: []u8 = undefined;
+        var index_digest: []u8 = undefined;
+        var child_body: []u8 = undefined;
+        var child_digest: []u8 = undefined;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = index_digest,
+                }, index_body);
+            }
+
+            if (std.mem.endsWith(u8, request.url, child_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_manifest_v1.toString(),
+                    .docker_content_digest = child_digest,
+                }, child_body);
+            }
+
+            return error.TransportFailed;
+        }
+    };
+
+    State.child_body = try std.testing.allocator.dupe(
+        u8,
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 123
+        \\  },
+        \\  "layers": []
+        \\}
+        ,
+    );
+    defer std.testing.allocator.free(State.child_body);
+
+    State.child_digest = try sha256DigestStringAlloc(std.testing.allocator, State.child_body);
+    defer std.testing.allocator.free(State.child_digest);
+
+    State.index_body = try buildIndexBodyAlloc(
+        std.testing.allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        State.child_digest,
+        "linux",
+        "arm64",
+    );
+    defer std.testing.allocator.free(State.index_body);
+
+    State.index_digest = try sha256DigestStringAlloc(std.testing.allocator, State.index_body);
+    defer std.testing.allocator.free(State.index_digest);
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    for (0..32) |_| {
+        const outcome = try resolveWithExchangers(
+            allocator,
+            &client,
+            Config{},
+            ref,
+            .{ .os = "linux", .architecture = "arm64" },
+            State.tokenExchange,
+            State.manifestExchange,
+        );
+
+        switch (outcome) {
+            .success => |result| {
+                var owned = result;
+                owned.deinit(allocator);
+            },
+            .failure => return error.TestUnexpectedResult,
+        }
     }
 }
 

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.2.0-8B5CF6?style=flat-square" alt="v0.2.0">
+    <img src="https://img.shields.io/badge/version-v0.3.0-8B5CF6?style=flat-square" alt="v0.3.0">
         <img src="https://img.shields.io/badge/status-phase--3%20resolver-2D7D46?style=flat-square" alt="Status: Phase 3 resolver">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
@@ -27,8 +27,8 @@ z-oci is a read-only OCI registry client. It parses image references, authentica
 
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
 - **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, `MultiArchManifest` -- all with JSON round-trip support.
-- **Auth engine** (v0.2.0): Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens (GET with POST fallback), resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry (in-memory, per-scope). 299 tests. The auth engine is transport-agnostic logic -- it produces token headers but does not perform live HTTP. Callers provide a `*std.http.Client` and an allocator; the library handles everything else.
-- **Public resolver path** (v0.2.7): `resolve`, `validate`, and `getManifest` now perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the shipped auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
+- **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens (GET with POST fallback), resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry (in-memory, per-scope). 299 tests. The auth engine is transport-agnostic logic -- it produces token headers but does not perform live HTTP. Callers provide a `*std.http.Client` and an allocator; the library handles everything else.
+- **Public resolver path**: `resolve`, `validate`, and `getManifest` now perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the shipped auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
 ### Current limitations
@@ -66,7 +66,7 @@ Full zebrac baseline at `benchmarks/baselines/`. CHANGELOG at [CHANGELOG.md](CHA
 ### Add as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.2.0
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.3.0
 ```
 
 Then in `build.zig`, import the package:
