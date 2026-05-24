@@ -11,11 +11,13 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 - Phase 3 resolver scaffolding in `src/resolver.zig`: resolver context, Phase 3 config view, manifest request and response metadata types, canonical reference helpers, and initial resolver-side error mapping.
 - Internal resolver HEAD flow in `src/resolver.zig`: manifest transport request type, mockable manifest HTTP exchanger seam, HEAD outcome classification, header-based GET fallback rules, redirect handling, and auth-on-demand retry coverage.
+- Internal resolver GET flow in `src/resolver.zig`: owned manifest response bodies, normalized content-type routing, parser integration for OCI and Docker single-arch and multi-arch documents, and focused transport-plus-parser coverage.
 
 ### Changed
 
 - `src/root.zig` now builds a resolver context at the public API boundary before returning `error.NotYetImplemented`, which locks the Phase 2 to Phase 3 handoff into code without changing public behavior yet.
 - The Phase 3 resolver layer now performs real internal HEAD request control flow, including bearer-token retry and cached-unauthorized retry, while public resolver APIs remain intentionally stubbed.
+- Resolver media-type validation now accepts only actual manifest document types on the internal HEAD and GET paths, so config, layer, and legacy manifest content types fail before parse instead of slipping through as usable metadata.
 
 ### Verified
 
@@ -23,6 +25,8 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
 - `zig fmt --check src/root.zig src/resolver.zig` passes.
 - `zig build example-select-platform -- fixtures/indexes/busybox-latest-live-oci-index.json linux arm64 v8` passes.
+- `zig build example-inspect-manifest -- fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json` passes.
+- `zig build example-select-platform -- fixtures/indexes/quay-prometheus-busybox-latest-live-docker-manifest-list.json linux arm64` passes.
 - `zig build test --summary all` passes.
 
 ## [0.2.0] - 2026-05-12 - [Tagged]
