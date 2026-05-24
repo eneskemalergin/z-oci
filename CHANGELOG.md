@@ -10,15 +10,18 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 ### Added
 
 - Phase 3 resolver scaffolding in `src/resolver.zig`: resolver context, Phase 3 config view, manifest request and response metadata types, canonical reference helpers, and initial resolver-side error mapping.
+- Internal resolver HEAD flow in `src/resolver.zig`: manifest transport request type, mockable manifest HTTP exchanger seam, HEAD outcome classification, header-based GET fallback rules, redirect handling, and auth-on-demand retry coverage.
 
 ### Changed
 
 - `src/root.zig` now builds a resolver context at the public API boundary before returning `error.NotYetImplemented`, which locks the Phase 2 to Phase 3 handoff into code without changing public behavior yet.
+- The Phase 3 resolver layer now performs real internal HEAD request control flow, including bearer-token retry and cached-unauthorized retry, while public resolver APIs remain intentionally stubbed.
 
 ### Verified
 
 - `zig test src/resolver.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
 - `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
+- `zig fmt --check src/root.zig src/resolver.zig` passes.
 - `zig build example-select-platform -- fixtures/indexes/busybox-latest-live-oci-index.json linux arm64 v8` passes.
 - `zig build test --summary all` passes.
 
