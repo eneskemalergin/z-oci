@@ -343,6 +343,15 @@ pub fn liveManifestHttpExchanger(
     const accept_headers = try buildAcceptHeadersAlloc(allocator, request.accept);
     defer allocator.free(accept_headers);
 
+    var privileged_headers_storage: [1]std.http.Header = undefined;
+    const privileged_headers: []const std.http.Header = if (request.authorization) |authorization| blk: {
+        privileged_headers_storage[0] = .{
+            .name = "authorization",
+            .value = authorization,
+        };
+        break :blk privileged_headers_storage[0..1];
+    } else &.{};
+
     var http_request = client.request(
         switch (request.method) {
             .head => .HEAD,
@@ -350,14 +359,9 @@ pub fn liveManifestHttpExchanger(
         },
         uri,
         .{
-            .redirect_behavior = .unhandled,
-            .headers = .{
-                .authorization = if (request.authorization) |authorization|
-                    .{ .override = authorization }
-                else
-                    .default,
-            },
+            .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(2),
             .extra_headers = accept_headers,
+            .privileged_headers = privileged_headers,
         },
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

@@ -20,12 +20,15 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 - No-platform multi-arch calls now fail with the structured `platform_required` resolver error instead of surfacing `error.NotYetImplemented` or guessing a default child manifest.
 - `validate` now accepts an optional platform and follows the selected child manifest on supported multi-arch inputs, matching `resolve` and `getManifest` semantics.
+- `validate` now uses the internal HEAD path first for top-level existence checks, returning early for single-arch manifests and no-platform multi-arch failures before falling back to GET only when child selection still requires parsing.
 - Public resolver ownership contracts are now explicit: public failures support owned teardown, and `ResolveResult.deinit()` is valid for live resolver results as well as cloned results.
 - Packaged example builds are now distinct from the offline `examples-smoke` step, allowing a live resolver example without making the smoke gate network-dependent.
 - Public negative-path coverage was tightened around full error context (`tag`, `registry`, canonical `reference`, and `http_status`) and fixture-backed malformed payloads rather than repeated inline body literals.
+- The public config contract is now explicit about what the caller-owned client path really supports today: cached-401 auth retry is live, Docker credential helper timeout uses `read_timeout_ms`, and wider HTTP timeout, custom CA bundle, and rate-limit controls remain deferred instead of being described as already wired.
 
 ### Fixed
 
+- Live manifest requests now follow a bounded redirect chain and rely on privileged headers so cross-domain redirects strip bearer authorization instead of failing the public resolver path outright.
 - Recursive multi-arch child fetches now reuse the same auth, media validation, and digest-verification path as single-arch resolution instead of diverging on the child-manifest path.
 - Resolver transport teardown now clones returned metadata, zeroes authorization buffers before free, and rejects mismatched manifest headers earlier.
 - Resolver GET classification now releases verified digest buffers and parsed-document allocations correctly on non-error failure outcomes, eliminating leak paths exposed by malformed non-empty fixture bodies.

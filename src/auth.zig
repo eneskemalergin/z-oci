@@ -354,8 +354,9 @@ const NowUnixSecondsFn = *const fn (client: *std.http.Client) u64;
 
 /// Narrow Phase 2 view of `Config`.
 ///
-/// Relevant now: credentials, connect/read timeouts, CA bundle path
-/// Deferred: `max_retries`, `rate_limit_enabled`
+/// Relevant now: credentials, helper timeout, cached-401 auth retry policy.
+/// Deferred on the live HTTP path: connect timeout, custom CA bundle wiring,
+/// and rate-limit policy.
 pub const Phase2ConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,

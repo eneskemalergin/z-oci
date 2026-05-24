@@ -34,7 +34,7 @@ z-oci is a read-only OCI registry client. It parses image references, authentica
 ### Current limitations
 
 - Multi-arch public calls without an explicit platform now fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
-- Retry and rate-limit policy beyond the current correctness-first fetch path remains deferred to Phase 4.
+- Retry and rate-limit policy beyond the current correctness-first fetch path remains deferred to Phase 4. `Config.max_retries` only governs the cached-401 auth retry path today, while live HTTP timeout and custom CA bundle wiring remain deferred because callers own `std.http.Client`.
 - User-facing CLI commands built on top of the live resolver surface are still future work.
 
 ### Registry support

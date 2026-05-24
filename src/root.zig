@@ -326,19 +326,54 @@ fn validateWithExchangers(
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
     defer engine.deinit();
 
+    const ref_view = referenceView(ref);
+    const ctx = resolver.ResolverContext.init(
+        allocator,
+        client,
+        config,
+        ref_view,
+        platform,
+        .validate,
+    );
+
+    const head_outcome = try resolver.performManifestHead(ctx, &engine, manifest_exchanger, manifestAcceptValues());
+    switch (head_outcome) {
+        .success => |metadata| {
+            defer metadata.deinitOwned(allocator);
+
+            if (try validateOutcomeFromHeadMetadata(allocator, ref_view, platform, metadata)) |outcome| {
+                return outcome;
+            }
+        },
+        .use_get_fallback => |metadata| metadata.deinitOwned(allocator),
+        .not_found => return .not_found,
+        .redirect => |metadata| {
+            defer metadata.deinitOwned(allocator);
+            return .{ .failure = try networkErrorAlloc(allocator, ref_view, metadata.httpStatus()) };
+        },
+        .failure => |failure| return .{ .failure = failure },
+    }
+
     var outcome = try fetchResolvedManifestWithExchangers(
         allocator,
         client,
         config,
         &engine,
-        referenceView(ref),
+        ref_view,
         platform,
         token_exchanger,
         manifest_exchanger,
         .validate,
         0,
     );
-    switch (outcome) {
+    return validateOutcomeFromResolvedManifestOutcome(allocator, &outcome);
+}
+
+fn validateOutcomeFromResolvedManifestOutcome(
+    allocator: std.mem.Allocator,
+    outcome: *ResolvedManifestOutcome,
+) ValidateOutcome {
+    switch (outcome.*) {
         .success => |*success| {
             defer success.deinit(allocator);
             return switch (success.document) {
@@ -354,6 +389,28 @@ fn validateWithExchangers(
             else => .{ .failure = failure },
         },
     }
+}
+
+fn validateOutcomeFromHeadMetadata(
+    allocator: std.mem.Allocator,
+    ref_view: AuthReferenceView,
+    platform: ?Platform,
+    metadata: resolver.ManifestResponseMetadata,
+) error{OutOfMemory}!?ValidateOutcome {
+    const content_type = metadata.content_type orelse return null;
+    const media_type = manifestResponseMediaType(content_type) orelse return null;
+
+    if (!media_type.isMultiArch()) return .valid;
+    if (platform == null) {
+        return .{ .failure = try platformRequiredErrorAlloc(allocator, ref_view) };
+    }
+
+    return null;
+}
+
+fn manifestResponseMediaType(content_type: []const u8) ?MediaType {
+    const without_parameters = content_type[0..(std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len)];
+    return MediaType.fromString(std.mem.trim(u8, without_parameters, " \t\r\n"));
 }
 
 fn getManifestWithExchangers(
@@ -947,6 +1004,105 @@ test "validateWithExchangers returns not_found for missing manifest" {
     );
 
     try std.testing.expectEqual(ValidateOutcome.not_found, outcome);
+}
+
+test "validateWithExchangers returns valid from HEAD for single-arch manifest" {
+    const State = struct {
+        var saw_head = false;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (request.method != .head) return error.TransportFailed;
+            saw_head = true;
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }, null);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/alpine",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try validateWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+
+    try std.testing.expect(State.saw_head);
+    try std.testing.expectEqual(ValidateOutcome.valid, outcome);
+}
+
+test "validateWithExchangers returns platform_required from HEAD for multi-arch request without platform" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            calls += 1;
+            if (request.method != .head) return error.TransportFailed;
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_index_v1.toString(),
+                .docker_content_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            }, null);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try validateWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    switch (outcome) {
+        .failure => |failure| switch (failure) {
+            .platform_required => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "resolveWithExchangers propagates resolver failure matrix with full context" {
