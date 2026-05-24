@@ -3,8 +3,10 @@
 //! Each variant carries context: the registry hostname and the full reference
 //! string. http_status is set when the server returned an HTTP response code.
 //!
-//! Context slices borrow from the per-call arena. They are valid for the
-//! lifetime of that arena. No allocation is performed here.
+//! Values returned from the public resolver APIs own their `reference` string
+//! through the caller-provided allocator. Call `deinitOwned()` on those public
+//! failures when using a non-arena allocator. If the surrounding allocator is
+//! an arena, tearing the arena down is also sufficient.
 //!
 //! Callers switch on variants for structured error handling. The format method
 //! produces a human-readable string for logging or display.
@@ -41,6 +43,13 @@ pub const DigestMismatch = struct {
 
 /// No manifest in the index matched the requested platform.
 pub const PlatformNotFound = struct {
+    registry: []const u8,
+    reference: []const u8,
+    http_status: ?u16 = null,
+};
+
+/// The manifest is multi-arch and the caller must provide a platform.
+pub const PlatformRequired = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
@@ -90,13 +99,14 @@ pub const DepthLimitExceeded = struct {
 };
 
 /// Tagged union over all possible OCI resolve failure modes.
-/// Each variant carries context fields that borrow from the per-call arena.
+/// Public resolver failures own their `reference` string through the caller allocator.
 pub const ResolveError = union(enum) {
     auth_failed: AuthFailed,
     not_found: NotFound,
     rate_limited: RateLimited,
     digest_mismatch: DigestMismatch,
     platform_not_found: PlatformNotFound,
+    platform_required: PlatformRequired,
     manifest_parse_error: ManifestParseError,
     network_error: NetworkError,
     unsupported_algorithm: UnsupportedAlgorithm,
@@ -112,6 +122,17 @@ pub const ResolveError = union(enum) {
         try w.print("{s}: registry {s} for {s}", .{ name, ctx.registry, ctx.reference });
         if (ctx.http_status) |status| {
             try w.print(" (HTTP {d})", .{status});
+        }
+    }
+
+    /// Release the owned `reference` string carried by public resolver failures.
+    ///
+    /// Call this only for errors returned from the public resolver APIs, or for
+    /// other ResolveError values whose `reference` string was allocated from the
+    /// same allocator.
+    pub fn deinitOwned(self: ResolveError, allocator: std.mem.Allocator) void {
+        switch (self) {
+            inline else => |value| allocator.free(value.reference),
         }
     }
 
@@ -138,6 +159,7 @@ pub const ResolveError = union(enum) {
             .rate_limited => "RateLimited",
             .digest_mismatch => "DigestMismatch",
             .platform_not_found => "PlatformNotFound",
+            .platform_required => "PlatformRequired",
             .manifest_parse_error => "ManifestParseError",
             .network_error => "NetworkError",
             .unsupported_algorithm => "UnsupportedAlgorithm",
@@ -191,6 +213,7 @@ test "ResolveError.format: all variants produce non-empty output" {
         .{ .rate_limited = .{ .registry = "r", .reference = "ref", .http_status = 429 } },
         .{ .digest_mismatch = .{ .registry = "r", .reference = "ref" } },
         .{ .platform_not_found = .{ .registry = "r", .reference = "ref" } },
+        .{ .platform_required = .{ .registry = "r", .reference = "ref" } },
         .{ .manifest_parse_error = .{ .registry = "r", .reference = "ref" } },
         .{ .network_error = .{ .registry = "r", .reference = "ref" } },
         .{ .unsupported_algorithm = .{ .registry = "r", .reference = "ref" } },
@@ -236,6 +259,7 @@ test "ResolveError.format: all variants include their exact name" {
         .{ .err = .{ .rate_limited = .{ .registry = "r", .reference = "ref" } }, .name = "RateLimited" },
         .{ .err = .{ .digest_mismatch = .{ .registry = "r", .reference = "ref" } }, .name = "DigestMismatch" },
         .{ .err = .{ .platform_not_found = .{ .registry = "r", .reference = "ref" } }, .name = "PlatformNotFound" },
+        .{ .err = .{ .platform_required = .{ .registry = "r", .reference = "ref" } }, .name = "PlatformRequired" },
         .{ .err = .{ .manifest_parse_error = .{ .registry = "r", .reference = "ref" } }, .name = "ManifestParseError" },
         .{ .err = .{ .network_error = .{ .registry = "r", .reference = "ref" } }, .name = "NetworkError" },
         .{ .err = .{ .unsupported_algorithm = .{ .registry = "r", .reference = "ref" } }, .name = "UnsupportedAlgorithm" },
@@ -287,6 +311,20 @@ test "ResolveError.format: registry and reference appear in output" {
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "gcr.io") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "project/image") != null);
+}
+
+test "ResolveError.deinitOwned: frees owned public-style reference context" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const owned_reference = try alloc.dupe(u8, "library/busybox:latest");
+    const err = ResolveError{ .platform_required = .{
+        .registry = "registry-1.docker.io",
+        .reference = owned_reference,
+    } };
+
+    err.deinitOwned(alloc);
 }
 
 test "ResolveError.format: very long registry and reference are not truncated" {

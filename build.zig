@@ -94,10 +94,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const examples_step = b.step("examples", "Build all offline example programs");
+    const resolve_reference_example = b.addExecutable(.{
+        .name = "resolve-reference",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/resolve-reference.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "z_oci", .module = mod },
+            },
+        }),
+    });
+
+    const examples_step = b.step("examples", "Build all packaged example programs");
     examples_step.dependOn(&normalize_reference_example.step);
     examples_step.dependOn(&inspect_manifest_example.step);
     examples_step.dependOn(&select_platform_example.step);
+    examples_step.dependOn(&resolve_reference_example.step);
 
     const run_normalize_reference_step = b.step("example-normalize-reference", "Run the normalize-reference example");
     const run_normalize_reference = b.addRunArtifact(normalize_reference_example);
@@ -113,6 +126,11 @@ pub fn build(b: *std.Build) void {
     const run_select_platform = b.addRunArtifact(select_platform_example);
     run_select_platform_step.dependOn(&run_select_platform.step);
     if (b.args) |args| run_select_platform.addArgs(args);
+
+    const run_resolve_reference_step = b.step("example-resolve-reference", "Run the live resolve-reference example");
+    const run_resolve_reference = b.addRunArtifact(resolve_reference_example);
+    run_resolve_reference_step.dependOn(&run_resolve_reference.step);
+    if (b.args) |args| run_resolve_reference.addArgs(args);
 
     // Benchmark CLI
     const bench = b.addExecutable(.{

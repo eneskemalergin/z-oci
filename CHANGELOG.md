@@ -9,35 +9,20 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ### Added
 
-- Phase 3 resolver scaffolding in `src/resolver.zig`: resolver context, Phase 3 config view, manifest request and response metadata types, canonical reference helpers, and initial resolver-side error mapping.
-- Internal resolver HEAD flow in `src/resolver.zig`: manifest transport request type, mockable manifest HTTP exchanger seam, HEAD outcome classification, header-based GET fallback rules, redirect handling, and auth-on-demand retry coverage.
-- Internal resolver GET flow in `src/resolver.zig`: owned manifest response bodies, normalized content-type routing, parser integration for OCI and Docker single-arch and multi-arch documents, and focused transport-plus-parser coverage.
-- Internal digest verification in `src/resolver.zig`: GET body hashing, pinned-reference and `Docker-Content-Digest` reconciliation, and focused integrity coverage for mismatch and unsupported-algorithm paths.
-- First public single-arch resolver path in `src/root.zig`: live `resolve`, `validate`, and `getManifest` wiring above the internal GET flow, explicit public outcome unions, and focused public-path tests for success, not-found, and multi-arch deferral.
-- Public multi-arch selection in `src/Index.zig` and `src/root.zig`: platform-based child descriptor selection, auxiliary-descriptor skipping, recursive child-manifest fetch, selected-platform preservation in `ResolveResult`, and explicit recursion-limit failures.
+- Live manifest resolution for `resolve`, `validate`, and `getManifest`, including HEAD and GET fetch paths, manifest media routing, digest verification, and structured public outcomes.
+- Platform-aware multi-arch resolution for OCI indexes and Docker manifest lists, including recursive child selection, auxiliary-descriptor skipping, and explicit depth-limit failures.
+- A live `resolve-reference` packaged example alongside expanded workflow smoke coverage for the public resolver surface.
 
 ### Changed
 
-- `src/root.zig` no longer defers all public multi-arch behavior. `resolve` and `getManifest` now follow OCI indexes and Docker manifest lists to a selected child manifest when the caller provides a platform, while no-platform multi-arch flows remain explicitly unsupported.
-- The Phase 3 resolver layer now performs real internal HEAD request control flow, including bearer-token retry and cached-unauthorized retry, while public resolver APIs remain intentionally stubbed.
-- Resolver media-type validation now accepts only actual manifest document types on the internal HEAD and GET paths, so config, layer, and legacy manifest content types fail before parse instead of slipping through as usable metadata.
-- Resolver hardening now clones returned response metadata, zeroes authorization buffers on request teardown, and rejects header/body or `Accept` mismatches earlier.
-- HEAD and GET auth-on-demand retry now share one internal resolver helper instead of maintaining two separate retry state machines.
-- The auth engine now has a live `std.http.Client` token exchanger for public resolver use, and token exchange responses now track owned response bodies so live auth teardown stays correct under both network and mock transports.
-- Public multi-arch selection now reuses the existing resolver digest-verification and auth flow across child fetches instead of inventing a separate follow-up transport path.
+- No-platform multi-arch calls now fail with the structured `platform_required` resolver error instead of surfacing `error.NotYetImplemented`.
+- Public resolver ownership contracts are now explicit: public failures support owned teardown, and `ResolveResult.deinit()` is valid for live resolver results as well as cloned results.
+- Packaged example builds are now distinct from the offline `examples-smoke` step, so the repo can ship a live resolver example without making the smoke gate network-dependent.
 
-### Verified
+### Fixed
 
-- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
-- `zig test src/resolver.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
-- `zig test src/Index.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
-- `zig fmt --check src/root.zig src/resolver.zig src/auth.zig` passes.
-- `zig fmt --check src/root.zig src/auth.zig src/Index.zig` passes.
-- `zig build example-select-platform -- fixtures/indexes/busybox-latest-live-oci-index.json linux arm64 v8` passes.
-- `zig build example-inspect-manifest -- fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json` passes.
-- `zig build example-select-platform -- fixtures/indexes/quay-prometheus-busybox-latest-live-docker-manifest-list.json linux arm64` passes.
-- `zig build test --summary all` passes.
+- Recursive multi-arch child fetches now reuse the same auth, media validation, and digest-verification path as single-arch resolution.
+- Resolver transport teardown now clones returned metadata, zeroes authorization buffers before free, and rejects mismatched manifest headers earlier.
 
 ## [0.2.0] - 2026-05-12 - [Tagged]
 

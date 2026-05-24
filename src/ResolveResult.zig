@@ -1,16 +1,16 @@
 //! Result of a successful OCI registry resolve operation.
 //!
-//! All slice fields in the original borrow from the per-call arena.
-//! Call clone() to produce an independent copy that outlives that arena.
-//! Call deinit() on the clone when it is no longer needed.
+//! Values returned from the public `resolve` API are owned by the caller's
+//! allocator and may be released with `deinit()`.
 //!
-//! The original ResolveResult (not a clone) does not need deinit. The
-//! caller's arena teardown handles all cleanup.
+//! `clone()` remains useful when you want to copy a result into a different
+//! allocator or keep it alive after tearing a source arena down.
 //!
 //! Ownership:
-//! - values returned from future resolve calls borrow from the per-call allocator
-//! - `clone()` produces a fully owned copy of every string slice
-//! - the cloned `reference.digest.hex` may be distinct from `digest.hex` and is freed accordingly
+//! - values returned from public resolve calls are owned by the caller allocator
+//! - `clone()` produces an independent owned copy in a target allocator
+//! - some owned layouts intentionally alias digest slices to avoid extra copies;
+//!   `deinit()` handles those aliases safely
 
 const std = @import("std");
 const Digest = @import("Digest.zig");
@@ -18,22 +18,22 @@ const MediaType = @import("MediaType.zig").MediaType;
 const Platform = @import("Platform.zig");
 const Reference = @import("Reference.zig");
 
-/// The pinned digest of the resolved manifest. Borrowed in originals, owned in clones.
+/// The pinned digest of the resolved manifest.
 digest: Digest,
 /// The manifest media type (OCI or Docker).
 media_type: MediaType,
 /// The platform if resolution targeted a specific platform. Null for
 /// single-arch manifests or when platform was not requested.
 platform: ?Platform,
-/// The parsed image reference. Borrowed in originals, deep-copied by clone().
+/// The parsed image reference.
 reference: Reference,
 
 const ResolveResult = @This();
 
 /// clone produces an independent deep copy of all slice fields.
 ///
-/// Use case: batch resolve that keeps results after per-image arena teardown.
-/// The caller owns the returned ResolveResult and must call deinit(allocator).
+/// Use case: move a ResolveResult into a different allocator or keep it after
+/// a source arena teardown.
 pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
     // Clone reference string fields.
     const registry = try allocator.dupe(u8, self.reference.registry);
@@ -131,8 +131,10 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
     };
 }
 
-/// deinit frees all slices allocated by clone().
-/// Do not call on the original ResolveResult. Its memory belongs to the arena.
+/// deinit frees all slices owned by this ResolveResult.
+///
+/// This is valid for values returned from the public `resolve` API and for
+/// values produced by `clone()`.
 pub fn deinit(self: *ResolveResult, allocator: std.mem.Allocator) void {
     allocator.free(self.reference.registry);
     allocator.free(self.reference.repository);
@@ -140,7 +142,7 @@ pub fn deinit(self: *ResolveResult, allocator: std.mem.Allocator) void {
     if (self.reference.digest) |d| {
         if (shouldFreeReferenceDigestHex(self.*, d.hex)) allocator.free(d.hex);
     }
-    allocator.free(self.digest.hex);
+    if (shouldFreeResolvedDigestHex(self.*)) allocator.free(self.digest.hex);
     if (self.reference.digest_raw) |dr| allocator.free(dr);
     if (self.platform) |p| {
         allocator.free(p.os);
@@ -158,6 +160,13 @@ fn shouldFreeReferenceDigestHex(self: ResolveResult, hex: []const u8) bool {
     if (hex.ptr == self.digest.hex.ptr) return false;
     if (self.reference.digest_raw) |raw| {
         if (slicePointsInto(hex, raw)) return false;
+    }
+    return true;
+}
+
+fn shouldFreeResolvedDigestHex(self: ResolveResult) bool {
+    if (self.reference.digest_raw) |raw| {
+        if (slicePointsInto(self.digest.hex, raw)) return false;
     }
     return true;
 }
@@ -490,6 +499,35 @@ test "ResolveResult.deinit: reference digest hex may borrow from digest_raw" {
     try std.testing.expect(owned.reference.digest != null);
     try std.testing.expect(owned.reference.digest_raw != null);
     try std.testing.expect(slicePointsInto(owned.reference.digest.?.hex, owned.reference.digest_raw.?));
+}
+
+test "ResolveResult.deinit: resolved digest hex may borrow from reference digest_raw" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const digest_raw = try alloc.dupe(u8, "sha256:" ++ "f" ** 64);
+
+    var owned = ResolveResult{
+        .digest = .{
+            .algorithm = .sha256,
+            .hex = digest_raw[digest_raw.len - 64 ..],
+        },
+        .media_type = .oci_manifest_v1,
+        .platform = null,
+        .reference = .{
+            .registry = try alloc.dupe(u8, "registry-1.docker.io"),
+            .repository = try alloc.dupe(u8, "library/busybox"),
+            .tag = try alloc.dupe(u8, "latest"),
+            .digest = .{
+                .algorithm = .sha256,
+                .hex = digest_raw[digest_raw.len - 64 ..],
+            },
+            .digest_raw = digest_raw,
+        },
+    };
+
+    owned.deinit(alloc);
 }
 
 test "ResolveResult.clone: source reference digest may borrow from digest_raw" {

@@ -28,13 +28,12 @@ z-oci is a read-only OCI registry client. It parses image references, handles th
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
 - **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, `MultiArchManifest` -- all with JSON round-trip support.
 - **Auth engine** (v0.2.0): Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens (GET with POST fallback), resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry (in-memory, per-scope). 299 tests. The auth engine is transport-agnostic logic -- it produces token headers but does not perform live HTTP. Callers provide a `*std.http.Client` and an allocator; the library handles everything else.
-- **Public resolver path** (v0.2.6): `resolve` and `getManifest` now perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the shipped auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
+- **Public resolver path** (v0.2.7): `resolve`, `validate`, and `getManifest` now perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the shipped auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
 ### Current limitations
 
-- Multi-arch public calls without an explicit platform still return `error.NotYetImplemented` instead of guessing a default child.
-- `validate` still has no platform-aware multi-arch path, so multi-arch validation remains explicitly unsupported at the public boundary.
+- Multi-arch public calls without an explicit platform now fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
 - Retry and rate-limit policy beyond the current correctness-first fetch path.
 - CLI commands built on top of the live resolver surface.
 
@@ -128,8 +127,8 @@ pub fn main() !void {
 
 - `zig build`: build and install the stub CLI plus the package module
 - `zig build test`: run all unit tests and smoke checks
-- `zig build examples`: build the offline example programs
-- `zig build examples-smoke`: run a small smoke pass over the example programs
+- `zig build examples`: build all packaged example programs
+- `zig build examples-smoke`: run a small smoke pass over the offline example programs
 - `zig build workflow-smoke`: run the offline workflow smoke-test matrix
 - `zig build bench`: build the benchmark CLI (`z-oci-bench`)
 
@@ -137,7 +136,16 @@ Fixtures under `fixtures/` are checked-in snapshots, not live fetches. Their pro
 
 The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
 
-## Offline examples
+## Examples
+
+Live example:
+
+- `zig build example-resolve-reference -- ubuntu:22.04`
+- `zig build example-resolve-reference -- ubuntu:22.04 linux/amd64`
+
+This example uses the live public `resolve` API and may make network requests or trigger registry auth.
+
+Offline examples:
 
 - `zig build example-normalize-reference -- ubuntu:22.04`
 - `zig build example-inspect-manifest`
@@ -147,7 +155,6 @@ See [examples](examples) for the source of the packaged examples.
 
 ## What is next
 
-- Public API semantic cleanup around multi-arch `validate` and the remaining explicit `NotYetImplemented` cases
 - Rate limiting and retry logic
 - CLI for resolve, validate, and inspect
 - More registry compatibility testing

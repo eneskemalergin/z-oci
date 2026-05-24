@@ -408,28 +408,18 @@ pub fn liveManifestHttpExchanger(
         },
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            _ = err;
-            return error.TransportFailed;
-        },
+        else => return error.TransportFailed,
     };
     defer http_request.deinit();
 
     http_request.sendBodiless() catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            _ = err;
-            return error.TransportFailed;
-        },
+        else => return error.TransportFailed,
     };
 
     var redirect_buffer: [8 * 1024]u8 = undefined;
     var response = http_request.receiveHead(&redirect_buffer) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            _ = err;
-            return error.TransportFailed;
-        },
+        else => return error.TransportFailed,
     };
 
     var owned_metadata = try ownedManifestResponseMetadataFromHead(allocator, response.head);
@@ -438,10 +428,7 @@ pub fn liveManifestHttpExchanger(
     const body = if (request.method == .get)
         response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                _ = err;
-                return error.TransportFailed;
-            },
+            else => return error.TransportFailed,
         }
     else
         null;
