@@ -28,11 +28,14 @@ z-oci is a read-only OCI registry client. It parses image references, handles th
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
 - **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, `MultiArchManifest` -- all with JSON round-trip support.
 - **Auth engine** (v0.2.0): Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens (GET with POST fallback), resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry (in-memory, per-scope). 299 tests. The auth engine is transport-agnostic logic -- it produces token headers but does not perform live HTTP. Callers provide a `*std.http.Client` and an allocator; the library handles everything else.
+- **Public single-arch resolver path** (v0.2.5): `resolve`, `validate`, and `getManifest` now perform live single-arch manifest fetches through Zig 0.16 `std.http.Client`, reuse the shipped auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, and return explicit public outcome unions. OCI indexes and Docker manifest lists still remain deferred to the next milestone.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
 ### Not yet implemented
 
-The `resolve()`, `validate()`, and `getManifest()` APIs return `error.NotYetImplemented`. Live manifest fetch, digest verification, and rate limiting are the next work areas.
+- Multi-arch public resolution and child-manifest selection.
+- Retry and rate-limit policy beyond the current correctness-first fetch path.
+- CLI commands built on top of the live resolver surface.
 
 ### Registry support
 

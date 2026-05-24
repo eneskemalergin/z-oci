@@ -291,10 +291,13 @@ pub const ParsedManifestDocument = union(enum) {
 pub const ManifestGetSuccess = struct {
     request: ManifestRequest,
     metadata: ManifestResponseMetadata,
+    resolved_digest: Digest,
+    resolved_digest_raw: []u8,
     document: ParsedManifestDocument,
 
     pub fn deinit(self: *ManifestGetSuccess, allocator: std.mem.Allocator) void {
         self.metadata.deinitOwned(allocator);
+        allocator.free(self.resolved_digest_raw);
         self.document.deinit();
     }
 };
@@ -372,6 +375,143 @@ pub fn buildManifestHttpRequestAlloc(
         .url = url,
         .authorization = authorization,
         .accept = request.accept,
+    };
+}
+
+/// Live HTTP exchanger for manifest HEAD and GET requests.
+pub fn liveManifestHttpExchanger(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    request: ManifestHttpRequest,
+) ManifestExchangeError!ManifestHttpResponse {
+    defer request.deinit(allocator);
+
+    const uri = std.Uri.parse(request.url) catch return error.TransportFailed;
+    const accept_headers = try buildAcceptHeadersAlloc(allocator, request.accept);
+    defer allocator.free(accept_headers);
+
+    var http_request = client.request(
+        switch (request.method) {
+            .head => .HEAD,
+            .get => .GET,
+        },
+        uri,
+        .{
+            .redirect_behavior = .unhandled,
+            .headers = .{
+                .authorization = if (request.authorization) |authorization|
+                    .{ .override = authorization }
+                else
+                    .default,
+            },
+            .extra_headers = accept_headers,
+        },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            _ = err;
+            return error.TransportFailed;
+        },
+    };
+    defer http_request.deinit();
+
+    http_request.sendBodiless() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            _ = err;
+            return error.TransportFailed;
+        },
+    };
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = http_request.receiveHead(&redirect_buffer) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            _ = err;
+            return error.TransportFailed;
+        },
+    };
+
+    var owned_metadata = try ownedManifestResponseMetadataFromHead(allocator, response.head);
+    errdefer owned_metadata.deinit(allocator);
+
+    const body = if (request.method == .get)
+        response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                _ = err;
+                return error.TransportFailed;
+            },
+        }
+    else
+        null;
+    errdefer if (body) |bytes| allocator.free(bytes);
+
+    return .{
+        .metadata = owned_metadata.view(response.head.status),
+        .owned_metadata = owned_metadata,
+        .body = body,
+    };
+}
+
+fn buildAcceptHeadersAlloc(
+    allocator: std.mem.Allocator,
+    accept: []const []const u8,
+) error{OutOfMemory}![]std.http.Header {
+    const headers = try allocator.alloc(std.http.Header, accept.len);
+    for (accept, 0..) |value, index| {
+        headers[index] = .{
+            .name = "accept",
+            .value = value,
+        };
+    }
+    return headers;
+}
+
+fn ownedManifestResponseMetadataFromHead(
+    allocator: std.mem.Allocator,
+    head: std.http.Client.Response.Head,
+) error{OutOfMemory}!OwnedManifestResponseMetadata {
+    var www_authenticate_headers = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (www_authenticate_headers.items) |header| allocator.free(header);
+        www_authenticate_headers.deinit(allocator);
+    }
+
+    const content_type = if (head.content_type) |content_type|
+        try allocator.dupe(u8, content_type)
+    else
+        null;
+    errdefer if (content_type) |value| allocator.free(value);
+
+    const location = if (head.location) |location|
+        try allocator.dupe(u8, location)
+    else
+        null;
+    errdefer if (location) |value| allocator.free(value);
+
+    var docker_content_digest: ?[]u8 = null;
+    errdefer if (docker_content_digest) |value| allocator.free(value);
+
+    var header_it = head.iterateHeaders();
+    while (header_it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "docker-content-digest")) {
+            if (docker_content_digest == null) {
+                docker_content_digest = try allocator.dupe(u8, header.value);
+            }
+            continue;
+        }
+
+        if (std.ascii.eqlIgnoreCase(header.name, "www-authenticate")) {
+            try www_authenticate_headers.append(allocator, try allocator.dupe(u8, header.value));
+        }
+    }
+
+    return .{
+        .content_type = content_type,
+        .docker_content_digest = docker_content_digest,
+        .location = location,
+        .www_authenticate_headers = try www_authenticate_headers.toOwnedSlice(allocator),
     };
 }
 
@@ -736,11 +876,12 @@ fn classifyUsableGetResponse(
     const response_body = body orelse return parseFailureGetOutcome(ctx, metadata.httpStatus());
     if (response_body.len == 0) return parseFailureGetOutcome(ctx, metadata.httpStatus());
 
-    verifyManifestBodyIntegrity(ctx, metadata, response_body) catch |err| switch (err) {
+    const resolved_digest = verifyManifestBodyIntegrityAlloc(ctx, metadata, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DigestMismatch => return digestMismatchGetOutcome(ctx, metadata.httpStatus()),
         error.UnsupportedAlgorithm => return unsupportedAlgorithmGetOutcome(ctx, metadata.httpStatus()),
     };
+    errdefer ctx.allocator.free(resolved_digest.raw);
 
     var document = parseManifestDocument(ctx.allocator, media_type, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -755,6 +896,8 @@ fn classifyUsableGetResponse(
     return .{ .success = .{
         .request = request,
         .metadata = try metadata.cloneAlloc(ctx.allocator),
+        .resolved_digest = resolved_digest.digest,
+        .resolved_digest_raw = resolved_digest.raw,
         .document = document,
     } };
 }
@@ -810,15 +953,25 @@ const ManifestIntegrityError = error{
     UnsupportedAlgorithm,
 };
 
-fn verifyManifestBodyIntegrity(
+const VerifiedManifestDigest = struct {
+    digest: Digest,
+    raw: []u8,
+};
+
+fn verifyManifestBodyIntegrityAlloc(
     ctx: ResolverContext,
     metadata: ManifestResponseMetadata,
     body: []const u8,
-) ManifestIntegrityError!void {
-    const body_digest_hex = bodySha256DigestHex(body);
+) ManifestIntegrityError!VerifiedManifestDigest {
+    const body_digest_raw = try sha256DigestStringAlloc(ctx.allocator, body);
+    errdefer ctx.allocator.free(body_digest_raw);
+    const body_digest = Digest{
+        .algorithm = .sha256,
+        .hex = body_digest_raw["sha256:".len..],
+    };
 
     if (try expectedReferenceDigest(ctx.reference.ref_string)) |expected_digest| {
-        if (!digestMatchesSha256Hex(expected_digest, body_digest_hex[0..])) return error.DigestMismatch;
+        if (!digestMatchesSha256Hex(expected_digest, body_digest.hex)) return error.DigestMismatch;
     }
 
     if (metadata.docker_content_digest) |header_digest_text| {
@@ -827,8 +980,13 @@ fn verifyManifestBodyIntegrity(
             else => return error.DigestMismatch,
         };
 
-        if (!digestMatchesSha256Hex(header_digest, body_digest_hex[0..])) return error.DigestMismatch;
+        if (!digestMatchesSha256Hex(header_digest, body_digest.hex)) return error.DigestMismatch;
     }
+
+    return .{
+        .digest = body_digest,
+        .raw = body_digest_raw,
+    };
 }
 
 fn expectedReferenceDigest(ref_string: []const u8) ManifestIntegrityError!?Digest {

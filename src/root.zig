@@ -4,7 +4,7 @@
 //! - offline OCI/Docker reference parsing and normalization
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
 //! - auth engine: /v2/ probe, challenge parsing, token exchange, credential providers
-//! - internal resolver scaffolding and public API stubs ahead of live Phase 3 fetch work
+//! - single-arch public manifest resolution on top of the internal Phase 3 GET path
 //!
 //! Ownership conventions:
 //! - Functions taking an allocator produce owned storage that the caller must
@@ -18,8 +18,8 @@
 //!   These need no deinit.
 //!
 //! Not yet implemented:
-//! - manifest fetch (HEAD/GET) and digest verification
-//! - real `resolve`, `validate`, and `getManifest` behavior
+//! - multi-arch public resolution and child-manifest selection
+//! - final public API semantic cleanup across every Phase 3-supported path
 
 const std = @import("std");
 const resolver = @import("resolver.zig");
@@ -60,6 +60,23 @@ pub const CredentialHandle = @import("Config.zig").CredentialHandle;
 
 /// Placeholder error returned by stub APIs until the network transport layer lands in Phase 3.
 pub const ImplementationError = error{NotYetImplemented};
+pub const PublicApiError = error{ OutOfMemory, NotYetImplemented };
+
+pub const ResolveOutcome = union(enum) {
+    success: ResolveResult,
+    failure: ResolveError,
+};
+
+pub const ValidateOutcome = union(enum) {
+    valid,
+    not_found,
+    failure: ResolveError,
+};
+
+pub const ManifestOutcome = union(enum) {
+    success: std.json.Parsed(Manifest),
+    failure: ResolveError,
+};
 
 /// Resolve an image reference to a pinned manifest digest.
 ///
@@ -87,17 +104,16 @@ pub fn resolve(
     config: Config,
     ref: Reference,
     platform: ?Platform,
-) ImplementationError!ResolveResult {
-    const ctx = resolver.ResolverContext.init(
+) PublicApiError!ResolveOutcome {
+    return resolveWithExchangers(
         allocator,
         client,
         config,
-        referenceView(ref),
+        ref,
         platform,
-        .resolve,
+        auth.liveTokenHttpExchanger,
+        resolver.liveManifestHttpExchanger,
     );
-    _ = ctx;
-    return error.NotYetImplemented;
 }
 
 /// Validate that a manifest reference still exists and is fetchable.
@@ -115,17 +131,15 @@ pub fn validate(
     client: *std.http.Client,
     config: Config,
     ref: Reference,
-) ImplementationError!bool {
-    const ctx = resolver.ResolverContext.init(
+) PublicApiError!ValidateOutcome {
+    return validateWithExchangers(
         allocator,
         client,
         config,
-        referenceView(ref),
-        null,
-        .validate,
+        ref,
+        auth.liveTokenHttpExchanger,
+        resolver.liveManifestHttpExchanger,
     );
-    _ = ctx;
-    return error.NotYetImplemented;
 }
 
 /// Fetch and parse a manifest payload.
@@ -145,7 +159,118 @@ pub fn getManifest(
     config: Config,
     ref: Reference,
     platform: ?Platform,
-) ImplementationError!std.json.Parsed(Manifest) {
+) PublicApiError!ManifestOutcome {
+    return getManifestWithExchangers(
+        allocator,
+        client,
+        config,
+        ref,
+        platform,
+        auth.liveTokenHttpExchanger,
+        resolver.liveManifestHttpExchanger,
+    );
+}
+
+fn resolveWithExchangers(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+    token_exchanger: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+) PublicApiError!ResolveOutcome {
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
+    defer engine.deinit();
+
+    const ctx = resolver.ResolverContext.init(
+        allocator,
+        client,
+        config,
+        referenceView(ref),
+        platform,
+        .resolve,
+    );
+
+    var outcome = try resolver.performManifestGet(ctx, &engine, manifest_exchanger, manifestAcceptValues());
+    switch (outcome) {
+        .success => |*success| {
+            defer success.deinit(allocator);
+            const manifest = switch (success.document) {
+                .manifest => |parsed| parsed.value,
+                else => return error.NotYetImplemented,
+            };
+
+            return .{ .success = try buildResolveResultAlloc(
+                allocator,
+                ref,
+                success.resolved_digest_raw,
+                manifest.media_type,
+            ) };
+        },
+        .not_found => {
+            return .{ .failure = try notFoundErrorAlloc(allocator, referenceView(ref)) };
+        },
+        .redirect => |metadata| {
+            defer metadata.deinitOwned(allocator);
+            return .{ .failure = try transportFailureAlloc(allocator, referenceView(ref), metadata.httpStatus()) };
+        },
+        .failure => |failure| {
+            return .{ .failure = failure };
+        },
+    }
+}
+
+fn validateWithExchangers(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    token_exchanger: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+) PublicApiError!ValidateOutcome {
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
+    defer engine.deinit();
+
+    const ctx = resolver.ResolverContext.init(
+        allocator,
+        client,
+        config,
+        referenceView(ref),
+        null,
+        .validate,
+    );
+
+    var outcome = try resolver.performManifestGet(ctx, &engine, manifest_exchanger, manifestAcceptValues());
+    switch (outcome) {
+        .success => |*success| {
+            defer success.deinit(allocator);
+            return switch (success.document) {
+                .manifest => .valid,
+                else => error.NotYetImplemented,
+            };
+        },
+        .not_found => return .not_found,
+        .redirect => |metadata| {
+            defer metadata.deinitOwned(allocator);
+            return .{ .failure = try transportFailureAlloc(allocator, referenceView(ref), metadata.httpStatus()) };
+        },
+        .failure => |failure| return .{ .failure = failure },
+    }
+}
+
+fn getManifestWithExchangers(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+    token_exchanger: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+) PublicApiError!ManifestOutcome {
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
+    defer engine.deinit();
+
     const ctx = resolver.ResolverContext.init(
         allocator,
         client,
@@ -154,8 +279,116 @@ pub fn getManifest(
         platform,
         .get_manifest,
     );
-    _ = ctx;
-    return error.NotYetImplemented;
+
+    var outcome = try resolver.performManifestGet(ctx, &engine, manifest_exchanger, manifestAcceptValues());
+    switch (outcome) {
+        .success => |*success| {
+            const parsed_manifest = switch (success.document) {
+                .manifest => |parsed| parsed,
+                else => {
+                    success.deinit(allocator);
+                    return error.NotYetImplemented;
+                },
+            };
+
+            success.metadata.deinitOwned(allocator);
+            allocator.free(success.resolved_digest_raw);
+            return .{ .success = parsed_manifest };
+        },
+        .not_found => {
+            return .{ .failure = try notFoundErrorAlloc(allocator, referenceView(ref)) };
+        },
+        .redirect => |metadata| {
+            defer metadata.deinitOwned(allocator);
+            return .{ .failure = try transportFailureAlloc(allocator, referenceView(ref), metadata.httpStatus()) };
+        },
+        .failure => |failure| return .{ .failure = failure },
+    }
+}
+
+fn manifestAcceptValues() []const []const u8 {
+    return &.{
+        MediaType.oci_manifest_v1.toString(),
+        MediaType.docker_manifest_v2.toString(),
+        MediaType.oci_index_v1.toString(),
+        MediaType.docker_manifest_list_v2.toString(),
+    };
+}
+
+fn buildResolveResultAlloc(
+    allocator: std.mem.Allocator,
+    ref: Reference,
+    resolved_digest_raw: []const u8,
+    media_type: MediaType,
+) error{OutOfMemory}!ResolveResult {
+    var resolved_reference = try buildResolvedReferenceAlloc(allocator, ref, resolved_digest_raw);
+    errdefer resolved_reference.deinit(allocator);
+
+    return .{
+        .digest = resolved_reference.digest.?,
+        .media_type = media_type,
+        .platform = null,
+        .reference = resolved_reference,
+    };
+}
+
+fn buildResolvedReferenceAlloc(
+    allocator: std.mem.Allocator,
+    ref: Reference,
+    resolved_digest_raw: []const u8,
+) error{OutOfMemory}!Reference {
+    const registry = try allocator.dupe(u8, ref.registry);
+    errdefer allocator.free(registry);
+
+    const repository = try allocator.dupe(u8, ref.repository);
+    errdefer allocator.free(repository);
+
+    const tag = if (ref.tag) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (tag) |value| allocator.free(value);
+
+    const digest_raw = try allocator.dupe(u8, resolved_digest_raw);
+    errdefer allocator.free(digest_raw);
+
+    const digest = Digest.parse(digest_raw) catch unreachable;
+    return .{
+        .registry = registry,
+        .repository = repository,
+        .tag = tag,
+        .digest = digest,
+        .digest_raw = digest_raw,
+    };
+}
+
+fn notFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
+    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
+    return .{ .not_found = .{
+        .registry = ref.registry,
+        .reference = reference,
+    } };
+}
+
+fn transportFailureAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView, http_status: ?u16) !ResolveError {
+    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
+    return resolver.transportFailure(ref.registry, reference, http_status);
+}
+
+fn readFixtureAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        allocator,
+        .limited(max_bytes),
+    );
+}
+
+fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var digest_bytes: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest_bytes, .{});
+    const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
 }
 
 // Pulling every sub-module into the test build.
@@ -179,7 +412,140 @@ test {
     _ = @import("test_support.zig");
 }
 
-test "public API stubs return NotYetImplemented" {
+test "resolveWithExchangers returns pinned single-arch result for tag reference" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
+
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try resolveWithExchangers(
+        arena_allocator,
+        &client,
+        Config{},
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+
+    switch (outcome) {
+        .success => |result| {
+            try std.testing.expectEqual(MediaType.oci_manifest_v1, result.media_type);
+            try std.testing.expect(result.platform == null);
+            try std.testing.expectEqualSlices(u8, "registry-1.docker.io", result.reference.registry);
+            try std.testing.expectEqualSlices(u8, "library/busybox", result.reference.repository);
+            try std.testing.expectEqualSlices(u8, "latest", result.reference.tag.?);
+            try std.testing.expect(result.reference.digest != null);
+            try std.testing.expect(result.reference.digest_raw != null);
+            try std.testing.expectEqualSlices(u8, result.digest.hex, result.reference.digest.?.hex);
+            try std.testing.expectEqualSlices(u8, result.reference.digest_raw.?[("sha256:").len..], result.digest.hex);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "getManifestWithExchangers returns parsed single-arch manifest" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
+
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try getManifestWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+
+    switch (outcome) {
+        .success => |parsed| {
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u32, 2), parsed.value.schema_version);
+            try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "validateWithExchangers returns not_found for missing manifest" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .not_found,
+            }, null);
+        }
+    };
+
     var client: std.http.Client = undefined;
     const ref = Reference{
         .registry = "registry-1.docker.io",
@@ -189,7 +555,63 @@ test "public API stubs return NotYetImplemented" {
         .digest_raw = null,
     };
 
-    try std.testing.expectError(error.NotYetImplemented, resolve(std.testing.allocator, &client, Config{}, ref, null));
-    try std.testing.expectError(error.NotYetImplemented, validate(std.testing.allocator, &client, Config{}, ref));
-    try std.testing.expectError(error.NotYetImplemented, getManifest(std.testing.allocator, &client, Config{}, ref, null));
+    const outcome = try validateWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+
+    try std.testing.expectEqual(ValidateOutcome.not_found, outcome);
+}
+
+test "resolveWithExchangers keeps multi-arch responses out of scope" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const body = readFixtureAlloc(allocator, "fixtures/indexes/busybox-latest-live-oci-index.json", 32 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
+
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.index.v1+json",
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    try std.testing.expectError(
+        error.NotYetImplemented,
+        resolveWithExchangers(
+            std.testing.allocator,
+            &client,
+            Config{},
+            ref,
+            null,
+            State.tokenExchange,
+            State.manifestExchange,
+        ),
+    );
 }

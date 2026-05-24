@@ -13,17 +13,20 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - Internal resolver HEAD flow in `src/resolver.zig`: manifest transport request type, mockable manifest HTTP exchanger seam, HEAD outcome classification, header-based GET fallback rules, redirect handling, and auth-on-demand retry coverage.
 - Internal resolver GET flow in `src/resolver.zig`: owned manifest response bodies, normalized content-type routing, parser integration for OCI and Docker single-arch and multi-arch documents, and focused transport-plus-parser coverage.
 - Internal digest verification in `src/resolver.zig`: GET body hashing, pinned-reference and `Docker-Content-Digest` reconciliation, and focused integrity coverage for mismatch and unsupported-algorithm paths.
+- First public single-arch resolver path in `src/root.zig`: live `resolve`, `validate`, and `getManifest` wiring above the internal GET flow, explicit public outcome unions, and focused public-path tests for success, not-found, and multi-arch deferral.
 
 ### Changed
 
-- `src/root.zig` now builds a resolver context at the public API boundary before returning `error.NotYetImplemented`, which locks the Phase 2 to Phase 3 handoff into code without changing public behavior yet.
+- `src/root.zig` no longer stops at public stubs for the supported single-arch path. Successful single-arch manifests now resolve through the live resolver, while multi-arch public behavior still remains deferred with `error.NotYetImplemented`.
 - The Phase 3 resolver layer now performs real internal HEAD request control flow, including bearer-token retry and cached-unauthorized retry, while public resolver APIs remain intentionally stubbed.
 - Resolver media-type validation now accepts only actual manifest document types on the internal HEAD and GET paths, so config, layer, and legacy manifest content types fail before parse instead of slipping through as usable metadata.
 - Resolver hardening now clones returned response metadata, zeroes authorization buffers on request teardown, and rejects header/body or `Accept` mismatches earlier.
 - HEAD and GET auth-on-demand retry now share one internal resolver helper instead of maintaining two separate retry state machines.
+- The auth engine now has a live `std.http.Client` token exchanger for public resolver use, and token exchange responses now track owned response bodies so live auth teardown stays correct under both network and mock transports.
 
 ### Verified
 
+- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
 - `zig test src/resolver.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
 - `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
 - `zig fmt --check src/root.zig src/resolver.zig src/auth.zig` passes.
