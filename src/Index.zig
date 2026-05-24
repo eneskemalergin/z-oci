@@ -175,7 +175,29 @@ pub const MultiArchManifest = union(enum) {
         }
         return null;
     }
+
+    /// Returns the first platform-matching descriptor that points to another
+    /// manifest document the resolver can fetch.
+    pub fn selectChildDescriptorByPlatform(self: MultiArchManifest, filter: Platform) ?Descriptor {
+        for (self.descriptors()) |desc| {
+            const plat = desc.platform orelse continue;
+            if (!Platform.match(plat, filter)) continue;
+            if (isResolvableChildMediaType(desc.media_type)) return desc;
+        }
+        return null;
+    }
 };
+
+fn isResolvableChildMediaType(media_type: MediaType) bool {
+    return switch (media_type) {
+        .oci_manifest_v1,
+        .docker_manifest_v2,
+        .oci_index_v1,
+        .docker_manifest_list_v2,
+        => true,
+        else => false,
+    };
+}
 
 // Tests
 
@@ -238,6 +260,76 @@ test "descriptors: DockerManifestList returns all entries" {
         .manifests = &manifests,
     } };
     try std.testing.expectEqual(@as(usize, 1), m.descriptors().len);
+}
+
+test "selectChildDescriptorByPlatform: skips auxiliary descriptor and returns manifest child" {
+    const aux = try makeDescriptor('d', "linux", "arm64");
+    defer aux.deinit(std.testing.allocator);
+    const child = try makeDescriptor('e', "linux", "arm64");
+    defer child.deinit(std.testing.allocator);
+
+    const manifests = [_]Descriptor{
+        Descriptor{
+            .media_type = .oci_config_v1,
+            .digest = aux.descriptor.digest,
+            .size = aux.descriptor.size,
+            .platform = aux.descriptor.platform,
+        },
+        child.descriptor,
+    };
+
+    const multi = MultiArchManifest{ .oci = .{
+        .schema_version = 2,
+        .media_type = .oci_index_v1,
+        .manifests = &manifests,
+    } };
+
+    const selected = multi.selectChildDescriptorByPlatform(.{ .os = "linux", .architecture = "arm64" });
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, selected.?.media_type);
+    try std.testing.expectEqualSlices(u8, child.descriptor.digest.hex, selected.?.digest.hex);
+}
+
+test "selectChildDescriptorByPlatform: accepts nested index descriptor" {
+    const nested = try makeDescriptor('f', "linux", "arm64");
+    defer nested.deinit(std.testing.allocator);
+
+    const manifests = [_]Descriptor{Descriptor{
+        .media_type = .oci_index_v1,
+        .digest = nested.descriptor.digest,
+        .size = nested.descriptor.size,
+        .platform = nested.descriptor.platform,
+    }};
+
+    const multi = MultiArchManifest{ .docker = .{
+        .schema_version = 2,
+        .media_type = .docker_manifest_list_v2,
+        .manifests = &manifests,
+    } };
+
+    const selected = multi.selectChildDescriptorByPlatform(.{ .os = "linux", .architecture = "arm64" });
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqual(MediaType.oci_index_v1, selected.?.media_type);
+}
+
+test "selectChildDescriptorByPlatform: returns null when only auxiliary descriptor matches" {
+    const aux = try makeDescriptor('1', "linux", "arm64");
+    defer aux.deinit(std.testing.allocator);
+
+    const manifests = [_]Descriptor{Descriptor{
+        .media_type = .oci_config_v1,
+        .digest = aux.descriptor.digest,
+        .size = aux.descriptor.size,
+        .platform = aux.descriptor.platform,
+    }};
+
+    const multi = MultiArchManifest{ .oci = .{
+        .schema_version = 2,
+        .media_type = .oci_index_v1,
+        .manifests = &manifests,
+    } };
+
+    try std.testing.expect(multi.selectChildDescriptorByPlatform(.{ .os = "linux", .architecture = "arm64" }) == null);
 }
 
 test "descriptors: empty manifest list returns empty slice" {

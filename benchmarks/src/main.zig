@@ -13,6 +13,10 @@ const usage =
     \\  platform-match    Platform.match throughput
     \\  authenticate-miss AuthEngine.authenticate (cache miss per iteration)
     \\  authenticate-hit  AuthEngine.authenticate (cached token, second call)
+    \\  resolve-single    public resolve() single-arch path via injected transports
+    \\  resolve-multi     public resolve() multi-arch child-selection path via injected transports
+    \\  validate-single   public validate() single-arch path via injected transports
+    \\  get-manifest      public getManifest() single-arch path via injected transports
     \\  all               run every operation sequentially
     \\
     \\Options:
@@ -56,6 +60,10 @@ pub fn main(init: std.process.Init) !void {
         try benchPlatformMatch(io, iterations, counting);
         try benchAuthenticateMiss(io, iterations, counting);
         try benchAuthenticateHit(io, iterations, counting);
+        try benchResolveSingle(io, iterations, counting);
+        try benchResolveMulti(io, iterations, counting);
+        try benchValidateSingle(io, iterations, counting);
+        try benchGetManifest(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "reference-parse")) {
         try benchReferenceParse(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "digest-parse")) {
@@ -70,6 +78,14 @@ pub fn main(init: std.process.Init) !void {
         try benchAuthenticateMiss(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "authenticate-hit")) {
         try benchAuthenticateHit(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "resolve-single")) {
+        try benchResolveSingle(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "resolve-multi")) {
+        try benchResolveMulti(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "validate-single")) {
+        try benchValidateSingle(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "get-manifest")) {
+        try benchGetManifest(io, iterations, counting);
     } else {
         var ebuf: [1024]u8 = undefined;
         var ew = Io.File.stderr().writer(io, &ebuf);
@@ -194,6 +210,11 @@ const CountingAllocator = struct {
         self.current_bytes -|= buf.len;
     }
 };
+
+const oci_manifest_media_type = "application/vnd.oci.image.manifest.v1+json";
+const oci_index_media_type = "application/vnd.oci.image.index.v1+json";
+const busybox_manifest_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65";
+const busybox_index_digest = "sha256:924ad1d57c2cb496c959c157fd3562d2abb87e98efd9f62912fb8ff975bbafc3";
 
 fn benchReferenceParse(io: Io, iterations: usize, counting: bool) !void {
     var ca = CountingAllocator{ .inner = std.heap.page_allocator };
@@ -380,4 +401,339 @@ fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
     const elapsed = nanoTime() - start;
 
     printReport("authenticate-hit", "same scope, cached", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+const ResolverBenchFixture = struct {
+    index_body: []u8,
+    index_digest: []u8,
+    child_body: []u8,
+    child_digest: []u8,
+
+    fn init(allocator: std.mem.Allocator, io: Io) !ResolverBenchFixture {
+        const index_body = try readFixtureAlloc(allocator, io, "fixtures/indexes/busybox-latest-live-oci-index.json", 32 * 1024);
+        errdefer allocator.free(index_body);
+
+        const index_digest = try allocator.dupe(u8, busybox_index_digest);
+        errdefer allocator.free(index_digest);
+
+        const child_body = try readFixtureAlloc(allocator, io, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 32 * 1024);
+        errdefer allocator.free(child_body);
+
+        const child_digest = try allocator.dupe(u8, busybox_manifest_digest);
+        errdefer allocator.free(child_digest);
+
+        return .{
+            .index_body = index_body,
+            .index_digest = index_digest,
+            .child_body = child_body,
+            .child_digest = child_digest,
+        };
+    }
+
+    fn deinit(self: *ResolverBenchFixture, allocator: std.mem.Allocator) void {
+        allocator.free(self.index_body);
+        allocator.free(self.index_digest);
+        allocator.free(self.child_body);
+        allocator.free(self.child_digest);
+    }
+};
+
+const SingleManifestBenchState = struct {
+    var body: []const u8 = undefined;
+
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+        request.deinit(allocator);
+        return error.TokenExchangeFailed;
+    }
+
+    fn manifestExchange(
+        allocator: std.mem.Allocator,
+        _: *std.http.Client,
+        request: z_oci.testing.ManifestHttpRequest,
+    ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+        defer request.deinit(allocator);
+        return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+            .status = .ok,
+            .content_type = oci_manifest_media_type,
+            .docker_content_digest = busybox_manifest_digest,
+        }, body);
+    }
+};
+
+const MultiManifestBenchState = struct {
+    var fixture_ref: *const ResolverBenchFixture = undefined;
+
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+        request.deinit(allocator);
+        return error.TokenExchangeFailed;
+    }
+
+    fn manifestExchange(
+        allocator: std.mem.Allocator,
+        _: *std.http.Client,
+        request: z_oci.testing.ManifestHttpRequest,
+    ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+        defer request.deinit(allocator);
+
+        if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = oci_index_media_type,
+                .docker_content_digest = fixture_ref.index_digest,
+            }, fixture_ref.index_body);
+        }
+
+        return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+            .status = .ok,
+            .content_type = oci_manifest_media_type,
+            .docker_content_digest = fixture_ref.child_digest,
+        }, fixture_ref.child_body);
+    }
+};
+
+const ValidateBenchState = struct {
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+        request.deinit(allocator);
+        return error.TokenExchangeFailed;
+    }
+
+    fn manifestExchange(
+        allocator: std.mem.Allocator,
+        _: *std.http.Client,
+        request: z_oci.testing.ManifestHttpRequest,
+    ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+        defer request.deinit(allocator);
+        return .{ .metadata = .{
+            .status = .ok,
+            .content_type = oci_manifest_media_type,
+            .docker_content_digest = busybox_manifest_digest,
+        } };
+    }
+};
+
+fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const manifest_body = try readFixtureAlloc(alloc, io, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 32 * 1024);
+    defer alloc.free(manifest_body);
+
+    SingleManifestBenchState.body = manifest_body;
+
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
+        alloc,
+        &client,
+        z_oci.Config{},
+        ref,
+        null,
+        SingleManifestBenchState.tokenExchange,
+        SingleManifestBenchState.manifestExchange,
+    ), alloc);
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
+            alloc,
+            &client,
+            z_oci.Config{},
+            ref,
+            null,
+            SingleManifestBenchState.tokenExchange,
+            SingleManifestBenchState.manifestExchange,
+        ), alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("resolve-single", "single-arch resolve via injected manifest fixture", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn benchResolveMulti(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    var fixture = try ResolverBenchFixture.init(alloc, io);
+    defer fixture.deinit(alloc);
+
+    MultiManifestBenchState.fixture_ref = &fixture;
+
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+    const platform = z_oci.Platform{ .os = "linux", .architecture = "amd64" };
+
+    try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
+        alloc,
+        &client,
+        z_oci.Config{},
+        ref,
+        platform,
+        MultiManifestBenchState.tokenExchange,
+        MultiManifestBenchState.manifestExchange,
+    ), alloc);
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
+            alloc,
+            &client,
+            z_oci.Config{},
+            ref,
+            platform,
+            MultiManifestBenchState.tokenExchange,
+            MultiManifestBenchState.manifestExchange,
+        ), alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("resolve-multi", "multi-arch resolve with child selection via injected fixtures", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn benchValidateSingle(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    try expectValidOutcome(try z_oci.testing.validateWithExchangers(
+        alloc,
+        &client,
+        z_oci.Config{},
+        ref,
+        null,
+        ValidateBenchState.tokenExchange,
+        ValidateBenchState.manifestExchange,
+    ), alloc);
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        try expectValidOutcome(try z_oci.testing.validateWithExchangers(
+            alloc,
+            &client,
+            z_oci.Config{},
+            ref,
+            null,
+            ValidateBenchState.tokenExchange,
+            ValidateBenchState.manifestExchange,
+        ), alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("validate-single", "single-arch validate HEAD path via injected metadata", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn benchGetManifest(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const manifest_body = try readFixtureAlloc(alloc, io, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 32 * 1024);
+    defer alloc.free(manifest_body);
+
+    SingleManifestBenchState.body = manifest_body;
+
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    try deinitManifestSuccess(try z_oci.testing.getManifestWithExchangers(
+        alloc,
+        &client,
+        z_oci.Config{},
+        ref,
+        null,
+        SingleManifestBenchState.tokenExchange,
+        SingleManifestBenchState.manifestExchange,
+    ), alloc);
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        try deinitManifestSuccess(try z_oci.testing.getManifestWithExchangers(
+            alloc,
+            &client,
+            z_oci.Config{},
+            ref,
+            null,
+            SingleManifestBenchState.tokenExchange,
+            SingleManifestBenchState.manifestExchange,
+        ), alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("get-manifest", "single-arch getManifest via injected manifest fixture", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn deinitResolveSuccess(outcome: z_oci.ResolveOutcome, allocator: std.mem.Allocator) !void {
+    switch (outcome) {
+        .success => |result| {
+            var owned = result;
+            owned.deinit(allocator);
+        },
+        .failure => |failure| {
+            var owned = failure;
+            std.debug.print("resolve benchmark failure: {f}\n", .{owned});
+            owned.deinitOwned(allocator);
+            return error.UnexpectedBenchmarkFailure;
+        },
+    }
+}
+
+fn expectValidOutcome(outcome: z_oci.ValidateOutcome, allocator: std.mem.Allocator) !void {
+    switch (outcome) {
+        .valid => {},
+        .not_found => return error.UnexpectedBenchmarkFailure,
+        .failure => |failure| {
+            var owned = failure;
+            std.debug.print("validate benchmark failure: {f}\n", .{owned});
+            owned.deinitOwned(allocator);
+            return error.UnexpectedBenchmarkFailure;
+        },
+    }
+}
+
+fn deinitManifestSuccess(outcome: z_oci.ManifestOutcome, allocator: std.mem.Allocator) !void {
+    switch (outcome) {
+        .success => |parsed| {
+            var owned = parsed;
+            owned.deinit();
+        },
+        .failure => |failure| {
+            var owned = failure;
+            std.debug.print("getManifest benchmark failure: {f}\n", .{owned});
+            owned.deinitOwned(allocator);
+            return error.UnexpectedBenchmarkFailure;
+        },
+    }
+}
+
+fn readFixtureAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8, max_bytes: usize) ![]u8 {
+    return try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
 }

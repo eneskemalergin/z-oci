@@ -7,7 +7,36 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-05-12
+## [0.3.0] - 2026-05-24 - [Tagged]
+
+### Added
+
+- Live manifest resolution for `resolve`, `validate`, and `getManifest`, including HEAD and GET fetch paths, manifest media routing, digest verification, and allocator-owned public results built on the shipped auth engine.
+- Platform-aware multi-arch resolution for OCI indexes and Docker manifest lists, including recursive child selection, auxiliary-descriptor skipping, selected-platform preservation in `ResolveResult`, and explicit depth-limit failures.
+- A live `resolve-reference` packaged example for end-to-end resolver usage, while the existing offline examples remain fixture-backed.
+- Synthetic malformed manifest fixtures with explicit provenance (`invalid-empty-manifest.json`, `invalid-truncated-oci-manifest.json`) for deterministic malformed-body coverage in parser and resolver tests.
+- Resolver benchmark coverage now exists in `z-oci-bench` through deterministic `resolve-single`, `resolve-multi`, `validate-single`, and `get-manifest` operations, and the repo now carries a `benchmarks/baselines/v0.3.0.json` Phase 3 baseline alongside the older auth-only snapshot.
+
+### Changed
+
+- No-platform multi-arch calls now fail with the structured `platform_required` resolver error instead of surfacing `error.NotYetImplemented` or guessing a default child manifest.
+- `validate` now accepts an optional platform and follows the selected child manifest on supported multi-arch inputs, matching `resolve` and `getManifest` semantics.
+- `validate` now uses the internal HEAD path first for top-level existence checks, returning early for single-arch manifests and no-platform multi-arch failures before falling back to GET only when child selection still requires parsing.
+- Public resolver ownership contracts are now explicit: public failures support owned teardown, and `ResolveResult.deinit()` is valid for live resolver results as well as cloned results.
+- Resolver result shaping now reuses owned verified digest strings, and multi-arch child selection formats digest references on the stack instead of allocating them per child fetch, trimming the current ReleaseFast counting snapshot to roughly `95us / 13 allocs` for `resolve-single` and `284us / 28 allocs` for `resolve-multi`.
+- Packaged example builds are now distinct from the offline `examples-smoke` step, allowing a live resolver example without making the smoke gate network-dependent.
+- Public negative-path coverage was tightened around full error context (`tag`, `registry`, canonical `reference`, and `http_status`) and fixture-backed malformed payloads rather than repeated inline body literals.
+- The public config contract is now explicit about what the caller-owned client path really supports today: cached-401 auth retry is live, Docker credential helper timeout uses `read_timeout_ms`, and wider HTTP timeout, custom CA bundle, and rate-limit controls remain deferred instead of being described as already wired.
+
+### Fixed
+
+- Live manifest requests now follow a bounded redirect chain while preserving bearer authorization on the authenticated retry and stripping it when the redirect crosses origin, fixing the Docker Hub live auth path without reopening cross-domain header leakage.
+- Recursive multi-arch child fetches now reuse the same auth, media validation, and digest-verification path as single-arch resolution instead of diverging on the child-manifest path.
+- Resolver transport teardown now clones returned metadata, zeroes authorization buffers before free, and rejects mismatched manifest headers earlier.
+- Resolver GET classification now releases verified digest buffers and parsed-document allocations correctly on non-error failure outcomes, eliminating leak paths exposed by malformed non-empty fixture bodies.
+- The public resolver Accept list now lives in stable top-level storage instead of an anonymous temporary slice, fixing a ReleaseFast-only regression where optimized `resolve` and `getManifest` paths could misclassify valid manifest responses as `content_type_mismatch`.
+
+## [0.2.0] - 2026-05-12 - [Tagged]
 
 ### Added
 
@@ -49,7 +78,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - `MediaType.toString()` now derives from `mime_table` instead of duplicating every MIME string in a second switch. Adding a new media type now requires touching exactly one table.
 - `stringifyForTest` extracted from 3 files to `json.zig` as a shared test helper.
 - `dockerConfigRegistryKeyMatches` now reuses the shared `isDockerHubRegistryAlias` helper instead of duplicating the alias list inline.
-- Doc comments stripped of em-dashes throughout (`Reference.zig`, `ResolveResult.zig`, `Config.zig`, `Index.zig`, `json.zig`).
+- Doc comment wording and section-header style were normalized across `Reference.zig`, `ResolveResult.zig`, `Config.zig`, `Index.zig`, and `json.zig`.
 - Section headers normalized from `// ----` box-drawing characters to plain `//` comments across all source files.
 - `zig fmt` formatting pass applied across `src/`, `examples/`, and `build.zig`.
 - `build.zig.zon` version bumped to `0.1.8`.
@@ -397,3 +426,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - `MediaType.zig`: OCI/Docker MIME type enum with `fromString`, `toString`, `isMultiArch`, `isLegacy`.
 - `Platform.zig`: os/arch/variant struct with `match` (partial, case-insensitive) and `eql` (strict).
 - `root.zig`: public API entry point re-exporting all leaf types.
+
+[0.1.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.1.0
+[0.2.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.2.0
+[0.3.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.3.0

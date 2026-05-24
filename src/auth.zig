@@ -47,7 +47,10 @@ pub const TokenHttpRequest = struct {
 
     pub fn deinit(self: TokenHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
-        if (self.authorization) |authorization| allocator.free(authorization);
+        if (self.authorization) |authorization| {
+            std.crypto.secureZero(u8, authorization);
+            allocator.free(authorization);
+        }
         if (self.body) |body| allocator.free(body);
     }
 };
@@ -55,6 +58,13 @@ pub const TokenHttpRequest = struct {
 pub const TokenExchangeResponse = struct {
     status: std.http.Status,
     body: []const u8,
+    owned_body: ?[]u8 = null,
+
+    pub fn deinit(self: TokenExchangeResponse, allocator: std.mem.Allocator) void {
+        const owned_body = self.owned_body orelse return;
+        std.crypto.secureZero(u8, owned_body);
+        allocator.free(owned_body);
+    }
 };
 
 /// Exchanges a `TokenHttpRequest` for a token response.
@@ -344,8 +354,9 @@ const NowUnixSecondsFn = *const fn (client: *std.http.Client) u64;
 
 /// Narrow Phase 2 view of `Config`.
 ///
-/// Relevant now: credentials, connect/read timeouts, CA bundle path
-/// Deferred: `max_retries`, `rate_limit_enabled`
+/// Relevant now: credentials, helper timeout, cached-401 auth retry policy.
+/// Deferred on the live HTTP path: connect timeout, custom CA bundle wiring,
+/// and rate-limit policy.
 pub const Phase2ConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,
@@ -655,6 +666,7 @@ pub const AuthEngine = struct {
             credential,
         );
         const get_response = try exchanger(self.allocator, client, get_request);
+        defer get_response.deinit(self.allocator);
         if (get_response.status == .ok) {
             return try parseTokenResponse(self.allocator, get_response.body);
         }
@@ -666,6 +678,7 @@ pub const AuthEngine = struct {
             credential,
         );
         const post_response = try exchanger(self.allocator, client, post_request);
+        defer post_response.deinit(self.allocator);
         if (post_response.status != .ok) return error.TokenExchangeFailed;
 
         return try parseTokenResponse(self.allocator, post_response.body);
@@ -1234,6 +1247,49 @@ pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: Co
     @memcpy(buffer[0.."Basic ".len], "Basic ");
     _ = encoder.encode(buffer["Basic ".len..], joined);
     return buffer;
+}
+
+/// Live HTTP exchanger for token requests using Zig 0.16 `std.http.Client`.
+pub fn liveTokenHttpExchanger(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    request: TokenHttpRequest,
+) AuthError!TokenExchangeResponse {
+    defer request.deinit(allocator);
+
+    const uri = std.Uri.parse(request.url) catch return error.TokenExchangeFailed;
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    errdefer response_body.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .uri = uri },
+        .method = switch (request.method) {
+            .get => .GET,
+            .post => .POST,
+        },
+        .payload = request.body,
+        .headers = .{
+            .authorization = if (request.authorization) |authorization|
+                .{ .override = authorization }
+            else
+                .default,
+            .content_type = if (request.content_type) |content_type|
+                .{ .override = content_type }
+            else
+                .default,
+        },
+        .response_writer = &response_body.writer,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TokenExchangeFailed,
+    };
+
+    const owned_body = try response_body.toOwnedSlice();
+    return .{
+        .status = result.status,
+        .body = owned_body,
+        .owned_body = owned_body,
+    };
 }
 
 pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) AuthError!TokenResponse {

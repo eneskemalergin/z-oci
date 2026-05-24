@@ -6,12 +6,12 @@
 <h1 align="center">z-oci</h1>
 
 <p align="center">
-        Pure Zig OCI/Docker Registry API v2 toolkit. Reference parsing, OCI types, auth engine. Zero external dependencies.
+    Pure Zig OCI/Docker Registry API v2 toolkit. Reference parsing, live manifest resolution, auth engine. Zero external dependencies.
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.2.0-8B5CF6?style=flat-square" alt="v0.2.0">
-    <img src="https://img.shields.io/badge/status-pre--networking-2D7D46?style=flat-square" alt="Status: pre-networking">
+    <img src="https://img.shields.io/badge/version-v0.3.0-8B5CF6?style=flat-square" alt="v0.3.0">
+        <img src="https://img.shields.io/badge/status-phase--3%20resolver-2D7D46?style=flat-square" alt="Status: Phase 3 resolver">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -21,40 +21,56 @@
 
 ## What z-oci does
 
-z-oci is a read-only OCI registry client. It parses image references, handles the types needed for manifest resolution, and authenticates against registries. Everything is built on Zig 0.16 std -- no external dependencies.
+z-oci is a read-only OCI registry client for Zig. Give it an image reference, and it can normalize the name, authenticate with the registry, fetch the manifest, verify the digest, and pick the right child manifest for a platform when the image is multi-arch. Everything is built on Zig 0.16 std with no external dependencies.
+
+## What you can do today
+
+- Parse and normalize Docker and OCI image references, including tags, digests, Docker Hub defaults, and host-plus-port registries.
+- Resolve a tag to a pinned digest with `resolve`.
+- Check whether a manifest exists with `validate`.
+- Fetch and parse a manifest with `getManifest`.
+- Follow OCI indexes and Docker manifest lists when you provide a target platform.
+- Run packaged examples for offline parsing and live resolution.
+- Measure parser, auth, and resolver costs with `z-oci-bench`.
 
 ### Capabilities
 
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
-- **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, `MultiArchManifest` -- all with JSON round-trip support.
-- **Auth engine** (v0.2.0): Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens (GET with POST fallback), resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry (in-memory, per-scope). 299 tests. The auth engine is transport-agnostic logic -- it produces token headers but does not perform live HTTP. Callers provide a `*std.http.Client` and an allocator; the library handles everything else.
+- **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, and `MultiArchManifest`, all with JSON round-trip support.
+- **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. It probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens, resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry.
+- **Public resolver path**: `resolve`, `validate`, and `getManifest` perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
-### Not yet implemented
+### Current limitations
 
-The `resolve()`, `validate()`, and `getManifest()` APIs return `error.NotYetImplemented`. Live manifest fetch, digest verification, and rate limiting are the next work areas.
+- Multi-arch public calls without an explicit platform now fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
+- Retry and rate-limit policy beyond the current correctness-first fetch path remains deferred to Phase 4. `Config.max_retries` only governs the cached-401 auth retry path today, while live HTTP timeout and custom CA bundle wiring remain deferred because callers own `std.http.Client`.
+- User-facing CLI commands built on top of the live resolver surface are still future work.
 
-### Registry support
+### Registry coverage
 
-| Registries             | Status                                    |
-| ---------------------- | ----------------------------------------- |
-| Docker Hub, GHCR, Quay | Tested with auth engine                   |
-| GitLab, Harbor         | Covered by generic bearer mock tests      |
-| ECR, GCR, ACR          | Deferred; use the credential helper chain |
+Docker Hub, Quay, and GHCR are the main named targets in the current code and tests.
+
+- Docker Hub: covered in auth tests and exercised on the live resolver path.
+- Quay: covered in auth tests and fixture-backed resolver coverage.
+- GHCR: covered in auth and challenge-flow tests.
+- GitLab and Harbor: covered through generic bearer-registry mock tests.
+- ECR, GCR, and ACR: not first-class targets yet. Use the credential helper chain where it fits your setup.
 
 ### Performance
 
-| Operation                 | Time    | Allocations |
-| ------------------------- | ------- | ----------- |
-| `Reference.parse`         | 33 μs   | 4           |
-| `Digest.parse`            | 0.4 μs  | 0           |
-| `json.parse(Manifest)`    | 46 μs   | ~3          |
-| `parseAuthenticateHeader` | 5.6 μs  | 0           |
-| `Platform.match`          | 0.15 μs | 0           |
-| `authenticate` (miss)     | 145 μs  | ~13         |
-| `authenticate` (hit)      | 31 μs   | 4           |
+Representative ReleaseFast counting snapshot for v0.3.0:
 
-Full zebrac baseline at `benchmarks/baselines/`. CHANGELOG at [CHANGELOG.md](CHANGELOG.md).
+| Operation             | Mean per iteration | Allocs per call |
+| --------------------- | ------------------ | --------------- |
+| `resolve-single`      | 95 μs              | 13              |
+| `resolve-multi`       | 284 μs             | 28              |
+| `validate-single`     | 24 μs              | 3               |
+| `get-manifest`        | 74 μs              | 10              |
+| `authenticate` (miss) | 145 μs             | 13              |
+| `authenticate` (hit)  | 31 μs              | 4               |
+
+Full zebrac baselines, parser microbenchmarks, and wall-time summaries live in `benchmarks/baselines/`. Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Getting started
 
@@ -63,7 +79,7 @@ Full zebrac baseline at `benchmarks/baselines/`. CHANGELOG at [CHANGELOG.md](CHA
 ### Add as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.2.0
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.3.0
 ```
 
 Then in `build.zig`, import the package:
@@ -75,6 +91,16 @@ const z_oci = b.dependency("z_oci", .{
 });
 exe.root_module.addImport("z_oci", z_oci.module("z_oci"));
 ```
+
+### Live resolver entry points
+
+```zig
+const outcome = try z_oci.resolve(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+const validity = try z_oci.validate(allocator, &client, config, ref, null);
+const manifest = try z_oci.getManifest(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+```
+
+`resolve`, `validate`, and `getManifest` all use a caller-owned `std.http.Client` and the same auth-backed resolver flow.
 
 ### Normalize an image reference
 
@@ -122,18 +148,27 @@ pub fn main() !void {
 
 ## Build steps
 
-- `zig build`: build and install the stub CLI plus the package module
+- `zig build`: build and install the current `z-oci` CLI scaffold and `z-oci-bench` executable
 - `zig build test`: run all unit tests and smoke checks
-- `zig build examples`: build the offline example programs
-- `zig build examples-smoke`: run a small smoke pass over the example programs
+- `zig build examples`: build all packaged example programs
+- `zig build examples-smoke`: run a small smoke pass over the offline example programs
 - `zig build workflow-smoke`: run the offline workflow smoke-test matrix
 - `zig build bench`: build the benchmark CLI (`z-oci-bench`)
 
-Fixtures under `fixtures/` are checked-in snapshots, not live fetches. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
+Fixtures under `fixtures/` include checked-in live registry snapshots plus synthetic malformed payloads for deterministic negative-path tests. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
 
-The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
+The Zig package contents in this repository bundle `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
 
-## Offline examples
+## Examples
+
+Live example:
+
+- `zig build example-resolve-reference -- ubuntu:22.04`
+- `zig build example-resolve-reference -- ubuntu:22.04 linux/amd64`
+
+This example uses the live public `resolve` API and may make network requests or trigger registry auth.
+
+Offline examples:
 
 - `zig build example-normalize-reference -- ubuntu:22.04`
 - `zig build example-inspect-manifest`
@@ -141,9 +176,8 @@ The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, `
 
 See [examples](examples) for the source of the packaged examples.
 
-## What is next
+## Next
 
-- Live manifest resolution (HEAD/GET, digest verification, multi-arch selection)
 - Rate limiting and retry logic
 - CLI for resolve, validate, and inspect
 - More registry compatibility testing

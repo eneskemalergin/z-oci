@@ -3,8 +3,10 @@
 //! Each variant carries context: the registry hostname and the full reference
 //! string. http_status is set when the server returned an HTTP response code.
 //!
-//! Context slices borrow from the per-call arena. They are valid for the
-//! lifetime of that arena. No allocation is performed here.
+//! Values returned from the public resolver APIs own their `reference` string
+//! through the caller-provided allocator. Call `deinitOwned()` on those public
+//! failures when using a non-arena allocator. If the surrounding allocator is
+//! an arena, tearing the arena down is also sufficient.
 //!
 //! Callers switch on variants for structured error handling. The format method
 //! produces a human-readable string for logging or display.
@@ -41,6 +43,13 @@ pub const DigestMismatch = struct {
 
 /// No manifest in the index matched the requested platform.
 pub const PlatformNotFound = struct {
+    registry: []const u8,
+    reference: []const u8,
+    http_status: ?u16 = null,
+};
+
+/// The manifest is multi-arch and the caller must provide a platform.
+pub const PlatformRequired = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
@@ -90,13 +99,14 @@ pub const DepthLimitExceeded = struct {
 };
 
 /// Tagged union over all possible OCI resolve failure modes.
-/// Each variant carries context fields that borrow from the per-call arena.
+/// Public resolver failures own their `reference` string through the caller allocator.
 pub const ResolveError = union(enum) {
     auth_failed: AuthFailed,
     not_found: NotFound,
     rate_limited: RateLimited,
     digest_mismatch: DigestMismatch,
     platform_not_found: PlatformNotFound,
+    platform_required: PlatformRequired,
     manifest_parse_error: ManifestParseError,
     network_error: NetworkError,
     unsupported_algorithm: UnsupportedAlgorithm,
@@ -105,13 +115,23 @@ pub const ResolveError = union(enum) {
     depth_limit_exceeded: DepthLimitExceeded,
 
     /// Write a human-readable error description.
-    /// Format: "VariantName: registry <reg> for <ref> [status <N>]"
+    /// Format: "summary: registry <reg> for <ref> [status <N>]"
     pub fn format(self: ResolveError, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const ctx = self.context();
-        const name = self.variantName();
-        try w.print("{s}: registry {s} for {s}", .{ name, ctx.registry, ctx.reference });
+        try w.print("{s}: registry {s} for {s}", .{ self.summary(), ctx.registry, ctx.reference });
         if (ctx.http_status) |status| {
             try w.print(" (HTTP {d})", .{status});
+        }
+    }
+
+    /// Release the owned `reference` string carried by public resolver failures.
+    ///
+    /// Call this only for errors returned from the public resolver APIs, or for
+    /// other ResolveError values whose `reference` string was allocated from the
+    /// same allocator.
+    pub fn deinitOwned(self: ResolveError, allocator: std.mem.Allocator) void {
+        switch (self) {
+            inline else => |value| allocator.free(value.reference),
         }
     }
 
@@ -131,19 +151,20 @@ pub const ResolveError = union(enum) {
         };
     }
 
-    fn variantName(self: ResolveError) []const u8 {
+    fn summary(self: ResolveError) []const u8 {
         return switch (self) {
-            .auth_failed => "AuthFailed",
-            .not_found => "NotFound",
-            .rate_limited => "RateLimited",
-            .digest_mismatch => "DigestMismatch",
-            .platform_not_found => "PlatformNotFound",
-            .manifest_parse_error => "ManifestParseError",
-            .network_error => "NetworkError",
-            .unsupported_algorithm => "UnsupportedAlgorithm",
-            .content_type_mismatch => "ContentTypeMismatch",
-            .timeout => "Timeout",
-            .depth_limit_exceeded => "DepthLimitExceeded",
+            .auth_failed => "authentication failed",
+            .not_found => "manifest not found",
+            .rate_limited => "rate limited",
+            .digest_mismatch => "digest mismatch",
+            .platform_not_found => "platform not found",
+            .platform_required => "platform required",
+            .manifest_parse_error => "manifest parse error",
+            .network_error => "network error",
+            .unsupported_algorithm => "unsupported digest algorithm",
+            .content_type_mismatch => "content type mismatch",
+            .timeout => "timeout",
+            .depth_limit_exceeded => "depth limit exceeded",
         };
     }
 };
@@ -163,7 +184,7 @@ test "ResolveError.format: AuthFailed with HTTP status" {
     try err.format(&w);
     const out = w.buffered();
     // Assert
-    try std.testing.expect(std.mem.indexOf(u8, out, "AuthFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "authentication failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ghcr.io") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "401") != null);
 }
@@ -180,7 +201,7 @@ test "ResolveError.format: NotFound without HTTP status" {
     try err.format(&w);
     const out = w.buffered();
     // Assert: status is absent when not set
-    try std.testing.expect(std.mem.indexOf(u8, out, "NotFound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "manifest not found") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ubuntu") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "HTTP") == null);
 }
@@ -191,6 +212,7 @@ test "ResolveError.format: all variants produce non-empty output" {
         .{ .rate_limited = .{ .registry = "r", .reference = "ref", .http_status = 429 } },
         .{ .digest_mismatch = .{ .registry = "r", .reference = "ref" } },
         .{ .platform_not_found = .{ .registry = "r", .reference = "ref" } },
+        .{ .platform_required = .{ .registry = "r", .reference = "ref" } },
         .{ .manifest_parse_error = .{ .registry = "r", .reference = "ref" } },
         .{ .network_error = .{ .registry = "r", .reference = "ref" } },
         .{ .unsupported_algorithm = .{ .registry = "r", .reference = "ref" } },
@@ -202,7 +224,7 @@ test "ResolveError.format: all variants produce non-empty output" {
         var buf: [256]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         try err.format(&w);
-        // Each variant must produce at least the variant name and registry.
+        // Each variant must produce at least the summary text and registry.
         try std.testing.expect(w.buffered().len > 0);
     }
 }
@@ -228,27 +250,26 @@ test "ResolveError: http_status null when not set" {
     try std.testing.expectEqual(@as(?u16, null), err.context().http_status);
 }
 
-test "ResolveError.format: all variants include their exact name" {
-    // Each variant must include the exact name string in its output.
-    const cases = [_]struct { err: ResolveError, name: []const u8 }{
-        .{ .err = .{ .auth_failed = .{ .registry = "r", .reference = "ref" } }, .name = "AuthFailed" },
-        .{ .err = .{ .not_found = .{ .registry = "r", .reference = "ref" } }, .name = "NotFound" },
-        .{ .err = .{ .rate_limited = .{ .registry = "r", .reference = "ref" } }, .name = "RateLimited" },
-        .{ .err = .{ .digest_mismatch = .{ .registry = "r", .reference = "ref" } }, .name = "DigestMismatch" },
-        .{ .err = .{ .platform_not_found = .{ .registry = "r", .reference = "ref" } }, .name = "PlatformNotFound" },
-        .{ .err = .{ .manifest_parse_error = .{ .registry = "r", .reference = "ref" } }, .name = "ManifestParseError" },
-        .{ .err = .{ .network_error = .{ .registry = "r", .reference = "ref" } }, .name = "NetworkError" },
-        .{ .err = .{ .unsupported_algorithm = .{ .registry = "r", .reference = "ref" } }, .name = "UnsupportedAlgorithm" },
-        .{ .err = .{ .content_type_mismatch = .{ .registry = "r", .reference = "ref" } }, .name = "ContentTypeMismatch" },
-        .{ .err = .{ .timeout = .{ .registry = "r", .reference = "ref" } }, .name = "Timeout" },
-        .{ .err = .{ .depth_limit_exceeded = .{ .registry = "r", .reference = "ref" } }, .name = "DepthLimitExceeded" },
+test "ResolveError.format: all variants include a plain summary" {
+    const cases = [_]struct { err: ResolveError, summary: []const u8 }{
+        .{ .err = .{ .auth_failed = .{ .registry = "r", .reference = "ref" } }, .summary = "authentication failed" },
+        .{ .err = .{ .not_found = .{ .registry = "r", .reference = "ref" } }, .summary = "manifest not found" },
+        .{ .err = .{ .rate_limited = .{ .registry = "r", .reference = "ref" } }, .summary = "rate limited" },
+        .{ .err = .{ .digest_mismatch = .{ .registry = "r", .reference = "ref" } }, .summary = "digest mismatch" },
+        .{ .err = .{ .platform_not_found = .{ .registry = "r", .reference = "ref" } }, .summary = "platform not found" },
+        .{ .err = .{ .platform_required = .{ .registry = "r", .reference = "ref" } }, .summary = "platform required" },
+        .{ .err = .{ .manifest_parse_error = .{ .registry = "r", .reference = "ref" } }, .summary = "manifest parse error" },
+        .{ .err = .{ .network_error = .{ .registry = "r", .reference = "ref" } }, .summary = "network error" },
+        .{ .err = .{ .unsupported_algorithm = .{ .registry = "r", .reference = "ref" } }, .summary = "unsupported digest algorithm" },
+        .{ .err = .{ .content_type_mismatch = .{ .registry = "r", .reference = "ref" } }, .summary = "content type mismatch" },
+        .{ .err = .{ .timeout = .{ .registry = "r", .reference = "ref" } }, .summary = "timeout" },
+        .{ .err = .{ .depth_limit_exceeded = .{ .registry = "r", .reference = "ref" } }, .summary = "depth limit exceeded" },
     };
     for (cases) |tc| {
         var buf: [256]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         try tc.err.format(&w);
-        // The exact variant name must appear at the start of the output.
-        try std.testing.expect(std.mem.startsWith(u8, w.buffered(), tc.name));
+        try std.testing.expect(std.mem.startsWith(u8, w.buffered(), tc.summary));
     }
 }
 
@@ -287,6 +308,20 @@ test "ResolveError.format: registry and reference appear in output" {
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "gcr.io") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "project/image") != null);
+}
+
+test "ResolveError.deinitOwned: frees owned public-style reference context" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const owned_reference = try alloc.dupe(u8, "library/busybox:latest");
+    const err = ResolveError{ .platform_required = .{
+        .registry = "registry-1.docker.io",
+        .reference = owned_reference,
+    } };
+
+    err.deinitOwned(alloc);
 }
 
 test "ResolveError.format: very long registry and reference are not truncated" {

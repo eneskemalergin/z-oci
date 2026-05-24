@@ -1,8 +1,9 @@
-//! Resolver configuration skeleton.
+//! Resolver configuration.
 //!
-//! Config holds all settings the resolver needs: credentials, timeouts, and
-//! TLS options. All fields have defaults. A bare Config{} works for anonymous
-//! access to public registries.
+//! Config holds the caller-provided knobs the current resolver surface accepts.
+//! Not every field is wired into live manifest HTTP yet because callers still
+//! own `std.http.Client`. A bare Config{} works for anonymous access to public
+//! registries.
 //!
 //! CredentialProvider and Credential are defined here because they describe
 //! the interface slot, not the implementation. Phase 2 provides concrete
@@ -53,19 +54,30 @@ pub const Config = struct {
     /// Credential provider for authenticated registries. Null means anonymous.
     credential_provider: ?*const CredentialProvider = null,
 
-    /// TCP connection timeout in milliseconds. Applied per connection attempt.
+    /// Reserved for future live HTTP connect-timeout wiring.
+    ///
+    /// The current resolver path does not apply this to manifest or token HTTP
+    /// because callers own `std.http.Client` and Zig 0.16 does not expose a
+    /// clean per-request timeout hook through the current request path.
     connect_timeout_ms: u32 = 10_000,
 
-    /// Read timeout in milliseconds. Applied per HTTP response read.
+    /// Timeout in milliseconds for Docker credential helper subprocess I/O.
+    ///
+    /// Live manifest and token HTTP reads do not currently consume this field.
     read_timeout_ms: u32 = 30_000,
 
-    /// Maximum number of retries on transient errors (network, 5xx).
+    /// Maximum auth retry count for the cached-401 invalidation path.
+    ///
+    /// Wider transient-network retry policy remains deferred.
     max_retries: u8 = 1,
 
-    /// Path to a CA bundle file for TLS verification. Null uses the system bundle.
+    /// Reserved for future custom CA bundle integration.
+    ///
+    /// Today the live resolver uses the CA bundle already configured on the
+    /// caller-owned `std.http.Client`.
     ca_bundle_path: ?[]const u8 = null,
 
-    /// When true, the resolver tracks and honors Retry-After headers from the registry.
+    /// Reserved for the future resilience/rate-limit phase.
     rate_limit_enabled: bool = true,
 };
 
