@@ -4,7 +4,7 @@
 //! - offline OCI/Docker reference parsing and normalization
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
 //! - auth engine: /v2/ probe, challenge parsing, token exchange, credential providers
-//! - public resolver-surface stubs and ownership contracts ahead of Phase 3 HTTP work
+//! - internal resolver scaffolding and public API stubs ahead of live Phase 3 fetch work
 //!
 //! Ownership conventions:
 //! - Functions taking an allocator produce owned storage that the caller must
@@ -22,6 +22,7 @@
 //! - real `resolve`, `validate`, and `getManifest` behavior
 
 const std = @import("std");
+const resolver = @import("resolver.zig");
 
 pub const Digest = @import("Digest.zig");
 pub const MediaType = @import("MediaType.zig").MediaType;
@@ -87,11 +88,15 @@ pub fn resolve(
     ref: Reference,
     platform: ?Platform,
 ) ImplementationError!ResolveResult {
-    _ = allocator;
-    _ = client;
-    _ = config;
-    _ = ref;
-    _ = platform;
+    const ctx = resolver.ResolverContext.init(
+        allocator,
+        client,
+        config,
+        referenceView(ref),
+        platform,
+        .resolve,
+    );
+    _ = ctx;
     return error.NotYetImplemented;
 }
 
@@ -111,10 +116,15 @@ pub fn validate(
     config: Config,
     ref: Reference,
 ) ImplementationError!bool {
-    _ = allocator;
-    _ = client;
-    _ = config;
-    _ = ref;
+    const ctx = resolver.ResolverContext.init(
+        allocator,
+        client,
+        config,
+        referenceView(ref),
+        null,
+        .validate,
+    );
+    _ = ctx;
     return error.NotYetImplemented;
 }
 
@@ -136,11 +146,15 @@ pub fn getManifest(
     ref: Reference,
     platform: ?Platform,
 ) ImplementationError!std.json.Parsed(Manifest) {
-    _ = allocator;
-    _ = client;
-    _ = config;
-    _ = ref;
-    _ = platform;
+    const ctx = resolver.ResolverContext.init(
+        allocator,
+        client,
+        config,
+        referenceView(ref),
+        platform,
+        .get_manifest,
+    );
+    _ = ctx;
     return error.NotYetImplemented;
 }
 
@@ -161,6 +175,7 @@ test {
     _ = @import("ResolveError.zig");
     _ = @import("ResolveResult.zig");
     _ = @import("Config.zig");
+    _ = @import("resolver.zig");
     _ = @import("test_support.zig");
 }
 

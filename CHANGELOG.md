@@ -7,7 +7,22 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-05-12
+### Added
+
+- Phase 3 resolver scaffolding in `src/resolver.zig`: resolver context, Phase 3 config view, manifest request and response metadata types, canonical reference helpers, and initial resolver-side error mapping.
+
+### Changed
+
+- `src/root.zig` now builds a resolver context at the public API boundary before returning `error.NotYetImplemented`, which locks the Phase 2 to Phase 3 handoff into code without changing public behavior yet.
+
+### Verified
+
+- `zig test src/resolver.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
+- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
+- `zig build example-select-platform -- fixtures/indexes/busybox-latest-live-oci-index.json linux arm64 v8` passes.
+- `zig build test --summary all` passes.
+
+## [0.2.0] - 2026-05-12 - [Tagged]
 
 ### Added
 
@@ -397,3 +412,6 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - `MediaType.zig`: OCI/Docker MIME type enum with `fromString`, `toString`, `isMultiArch`, `isLegacy`.
 - `Platform.zig`: os/arch/variant struct with `match` (partial, case-insensitive) and `eql` (strict).
 - `root.zig`: public API entry point re-exporting all leaf types.
+
+[0.1.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.1.0
+[0.2.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.2.0
