@@ -1280,10 +1280,7 @@ pub fn liveTokenHttpExchanger(
         .response_writer = &response_body.writer,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            _ = err;
-            return error.TokenExchangeFailed;
-        },
+        else => return error.TokenExchangeFailed,
     };
 
     const owned_body = try response_body.toOwnedSlice();

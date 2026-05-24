@@ -78,6 +78,26 @@ pub const ManifestOutcome = union(enum) {
     failure: ResolveError,
 };
 
+const max_child_manifest_depth: usize = 4;
+
+const ResolvedManifestSuccess = struct {
+    resolved_digest: Digest,
+    resolved_digest_raw: []u8,
+    document: resolver.ParsedManifestDocument,
+    platform: ?Platform,
+
+    fn deinit(self: *ResolvedManifestSuccess, allocator: std.mem.Allocator) void {
+        allocator.free(self.resolved_digest_raw);
+        self.document.deinit();
+        if (self.platform) |platform| deinitOwnedPlatform(platform, allocator);
+    }
+};
+
+const ResolvedManifestOutcome = union(enum) {
+    success: ResolvedManifestSuccess,
+    failure: ResolveError,
+};
+
 /// Resolve an image reference to a pinned manifest digest.
 ///
 /// Ownership contract:
@@ -183,37 +203,35 @@ fn resolveWithExchangers(
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
     defer engine.deinit();
 
-    const ctx = resolver.ResolverContext.init(
+    var outcome = try fetchResolvedManifestWithExchangers(
         allocator,
         client,
         config,
+        &engine,
         referenceView(ref),
         platform,
+        token_exchanger,
+        manifest_exchanger,
         .resolve,
+        0,
     );
-
-    var outcome = try resolver.performManifestGet(ctx, &engine, manifest_exchanger, manifestAcceptValues());
     switch (outcome) {
         .success => |*success| {
             defer success.deinit(allocator);
             const manifest = switch (success.document) {
                 .manifest => |parsed| parsed.value,
-                else => return error.NotYetImplemented,
+                else => unreachable,
             };
+            const selected_platform = success.platform;
+            success.platform = null;
 
             return .{ .success = try buildResolveResultAlloc(
                 allocator,
                 ref,
                 success.resolved_digest_raw,
                 manifest.media_type,
+                selected_platform,
             ) };
-        },
-        .not_found => {
-            return .{ .failure = try notFoundErrorAlloc(allocator, referenceView(ref)) };
-        },
-        .redirect => |metadata| {
-            defer metadata.deinitOwned(allocator);
-            return .{ .failure = try transportFailureAlloc(allocator, referenceView(ref), metadata.httpStatus()) };
         },
         .failure => |failure| {
             return .{ .failure = failure };
@@ -232,30 +250,33 @@ fn validateWithExchangers(
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
     defer engine.deinit();
 
-    const ctx = resolver.ResolverContext.init(
+    var outcome = try fetchResolvedManifestWithExchangers(
         allocator,
         client,
         config,
+        &engine,
         referenceView(ref),
         null,
+        token_exchanger,
+        manifest_exchanger,
         .validate,
+        0,
     );
-
-    var outcome = try resolver.performManifestGet(ctx, &engine, manifest_exchanger, manifestAcceptValues());
     switch (outcome) {
         .success => |*success| {
             defer success.deinit(allocator);
             return switch (success.document) {
                 .manifest => .valid,
-                else => error.NotYetImplemented,
+                else => unreachable,
             };
         },
-        .not_found => return .not_found,
-        .redirect => |metadata| {
-            defer metadata.deinitOwned(allocator);
-            return .{ .failure = try transportFailureAlloc(allocator, referenceView(ref), metadata.httpStatus()) };
+        .failure => |failure| return switch (failure) {
+            .not_found => {
+                deinitOwnedResolveError(failure, allocator);
+                return .not_found;
+            },
+            else => .{ .failure = failure },
         },
-        .failure => |failure| return .{ .failure = failure },
     }
 }
 
@@ -271,39 +292,185 @@ fn getManifestWithExchangers(
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
     defer engine.deinit();
 
-    const ctx = resolver.ResolverContext.init(
+    var outcome = try fetchResolvedManifestWithExchangers(
         allocator,
         client,
         config,
+        &engine,
         referenceView(ref),
         platform,
+        token_exchanger,
+        manifest_exchanger,
         .get_manifest,
+        0,
     );
-
-    var outcome = try resolver.performManifestGet(ctx, &engine, manifest_exchanger, manifestAcceptValues());
     switch (outcome) {
         .success => |*success| {
             const parsed_manifest = switch (success.document) {
                 .manifest => |parsed| parsed,
-                else => {
-                    success.deinit(allocator);
-                    return error.NotYetImplemented;
-                },
+                else => unreachable,
             };
 
-            success.metadata.deinitOwned(allocator);
+            if (success.platform) |selected_platform| deinitOwnedPlatform(selected_platform, allocator);
             allocator.free(success.resolved_digest_raw);
             return .{ .success = parsed_manifest };
         },
-        .not_found => {
-            return .{ .failure = try notFoundErrorAlloc(allocator, referenceView(ref)) };
+        .failure => |failure| return .{ .failure = failure },
+    }
+}
+
+fn fetchResolvedManifestWithExchangers(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    ref_view: AuthReferenceView,
+    platform: ?Platform,
+    _: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    operation: resolver.ResolverOperation,
+    depth: usize,
+) PublicApiError!ResolvedManifestOutcome {
+    if (depth > max_child_manifest_depth) {
+        return .{ .failure = try depthLimitExceededErrorAlloc(allocator, ref_view) };
+    }
+
+    const ctx = resolver.ResolverContext.init(
+        allocator,
+        client,
+        config,
+        ref_view,
+        platform,
+        if (depth == 0) operation else .resolve_child_manifest,
+    );
+
+    var outcome = try resolver.performManifestGet(ctx, engine, manifest_exchanger, manifestAcceptValues());
+    switch (outcome) {
+        .success => |*success| {
+            success.metadata.deinitOwned(allocator);
+
+            const document = success.document;
+            const resolved_digest = success.resolved_digest;
+            const resolved_digest_raw = success.resolved_digest_raw;
+
+            switch (document) {
+                .manifest => {
+                    return .{ .success = .{
+                        .resolved_digest = resolved_digest,
+                        .resolved_digest_raw = resolved_digest_raw,
+                        .document = document,
+                        .platform = null,
+                    } };
+                },
+                .oci_index => |parsed| {
+                    return recurseIntoMultiArchDocument(
+                        allocator,
+                        client,
+                        config,
+                        engine,
+                        ref_view,
+                        platform,
+                        manifest_exchanger,
+                        depth,
+                        resolved_digest_raw,
+                        document,
+                        .{ .oci = parsed.value },
+                    );
+                },
+                .docker_manifest_list => |parsed| {
+                    return recurseIntoMultiArchDocument(
+                        allocator,
+                        client,
+                        config,
+                        engine,
+                        ref_view,
+                        platform,
+                        manifest_exchanger,
+                        depth,
+                        resolved_digest_raw,
+                        document,
+                        .{ .docker = parsed.value },
+                    );
+                },
+            }
         },
+        .not_found => return .{ .failure = try notFoundErrorAlloc(allocator, ref_view) },
         .redirect => |metadata| {
             defer metadata.deinitOwned(allocator);
-            return .{ .failure = try transportFailureAlloc(allocator, referenceView(ref), metadata.httpStatus()) };
+            return .{ .failure = try transportFailureAlloc(allocator, ref_view, metadata.httpStatus()) };
         },
         .failure => |failure| return .{ .failure = failure },
     }
+}
+
+fn recurseIntoMultiArchDocument(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    ref_view: AuthReferenceView,
+    platform: ?Platform,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    depth: usize,
+    parent_digest_raw: []u8,
+    parent_document: resolver.ParsedManifestDocument,
+    multi_arch: MultiArchManifest,
+) PublicApiError!ResolvedManifestOutcome {
+    defer allocator.free(parent_digest_raw);
+    defer {
+        var owned_document = parent_document;
+        owned_document.deinit();
+    }
+
+    const requested_platform = platform orelse return error.NotYetImplemented;
+    const child_descriptor = multi_arch.selectChildDescriptorByPlatform(requested_platform) orelse {
+        return .{ .failure = try platformNotFoundErrorAlloc(allocator, ref_view) };
+    };
+
+    const selected_platform = if (child_descriptor.platform) |child_platform|
+        try clonePlatformAlloc(allocator, child_platform)
+    else
+        null;
+    errdefer if (selected_platform) |owned_platform| deinitOwnedPlatform(owned_platform, allocator);
+
+    const child_ref_string = try std.fmt.allocPrint(
+        allocator,
+        "{s}:{s}",
+        .{ @tagName(child_descriptor.digest.algorithm), child_descriptor.digest.hex },
+    );
+    defer allocator.free(child_ref_string);
+
+    var child_outcome = try fetchResolvedManifestWithExchangers(
+        allocator,
+        client,
+        config,
+        engine,
+        .{
+            .registry = ref_view.registry,
+            .repository_path = ref_view.repository_path,
+            .ref_string = child_ref_string,
+        },
+        platform,
+        auth.liveTokenHttpExchanger,
+        manifest_exchanger,
+        .resolve_child_manifest,
+        depth + 1,
+    );
+
+    switch (child_outcome) {
+        .success => |*child_success| {
+            if (child_success.platform == null) {
+                child_success.platform = selected_platform;
+            } else if (selected_platform) |owned_platform| {
+                deinitOwnedPlatform(owned_platform, allocator);
+            }
+        },
+        .failure => {
+            if (selected_platform) |owned_platform| deinitOwnedPlatform(owned_platform, allocator);
+        },
+    }
+
+    return child_outcome;
 }
 
 fn manifestAcceptValues() []const []const u8 {
@@ -320,6 +487,7 @@ fn buildResolveResultAlloc(
     ref: Reference,
     resolved_digest_raw: []const u8,
     media_type: MediaType,
+    platform: ?Platform,
 ) error{OutOfMemory}!ResolveResult {
     var resolved_reference = try buildResolvedReferenceAlloc(allocator, ref, resolved_digest_raw);
     errdefer resolved_reference.deinit(allocator);
@@ -327,7 +495,7 @@ fn buildResolveResultAlloc(
     return .{
         .digest = resolved_reference.digest.?,
         .media_type = media_type,
-        .platform = null,
+        .platform = platform,
         .reference = resolved_reference,
     };
 }
@@ -375,6 +543,91 @@ fn transportFailureAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView, h
     return resolver.transportFailure(ref.registry, reference, http_status);
 }
 
+fn platformNotFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
+    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
+    return .{ .platform_not_found = .{
+        .registry = ref.registry,
+        .reference = reference,
+    } };
+}
+
+fn depthLimitExceededErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
+    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
+    return .{ .depth_limit_exceeded = .{
+        .registry = ref.registry,
+        .reference = reference,
+    } };
+}
+
+fn clonePlatformAlloc(allocator: std.mem.Allocator, platform: Platform) !Platform {
+    const os = try allocator.dupe(u8, platform.os);
+    errdefer allocator.free(os);
+
+    const architecture = try allocator.dupe(u8, platform.architecture);
+    errdefer allocator.free(architecture);
+
+    const variant = if (platform.variant) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (variant) |value| allocator.free(value);
+
+    const os_version = if (platform.os_version) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (os_version) |value| allocator.free(value);
+
+    const os_features = if (platform.os_features) |features|
+        try clonePlatformFeaturesAlloc(allocator, features)
+    else
+        null;
+    errdefer if (os_features) |features| freePlatformFeatures(features, allocator);
+
+    return .{
+        .os = os,
+        .architecture = architecture,
+        .variant = variant,
+        .os_version = os_version,
+        .os_features = os_features,
+    };
+}
+
+fn clonePlatformFeaturesAlloc(allocator: std.mem.Allocator, features: []const []const u8) ![]const []const u8 {
+    const owned = try allocator.alloc([]const u8, features.len);
+    errdefer allocator.free(owned);
+
+    var cloned_count: usize = 0;
+    errdefer {
+        for (owned[0..cloned_count]) |feature| allocator.free(feature);
+    }
+
+    for (features, 0..) |feature, index| {
+        owned[index] = try allocator.dupe(u8, feature);
+        cloned_count += 1;
+    }
+    return owned;
+}
+
+fn freePlatformFeatures(features: []const []const u8, allocator: std.mem.Allocator) void {
+    for (features) |feature| allocator.free(feature);
+    allocator.free(features);
+}
+
+fn deinitOwnedPlatform(platform: Platform, allocator: std.mem.Allocator) void {
+    allocator.free(platform.os);
+    allocator.free(platform.architecture);
+    if (platform.variant) |variant| allocator.free(variant);
+    if (platform.os_version) |os_version| allocator.free(os_version);
+    if (platform.os_features) |features| freePlatformFeatures(features, allocator);
+}
+
+fn deinitOwnedResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
+    switch (failure) {
+        inline else => |value| allocator.free(value.reference),
+    }
+}
+
 fn readFixtureAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -389,6 +642,36 @@ fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8
     std.crypto.hash.sha2.Sha256.hash(body, &digest_bytes, .{});
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
+}
+
+fn buildIndexBodyAlloc(
+    allocator: std.mem.Allocator,
+    index_media_type: []const u8,
+    child_media_type: []const u8,
+    child_digest: []const u8,
+    os: []const u8,
+    architecture: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "{s}",
+        \\  "manifests": [
+        \\    {{
+        \\      "mediaType": "{s}",
+        \\      "digest": "{s}",
+        \\      "size": 610,
+        \\      "platform": {{
+        \\        "os": "{s}",
+        \\        "architecture": "{s}"
+        \\      }}
+        \\    }}
+        \\  ]
+        \\}}
+    ,
+        .{ index_media_type, child_media_type, child_digest, os, architecture },
+    );
 }
 
 // Pulling every sub-module into the test build.
@@ -614,4 +897,373 @@ test "resolveWithExchangers keeps multi-arch responses out of scope" {
             State.manifestExchange,
         ),
     );
+}
+
+test "resolveWithExchangers resolves multi-arch index to selected child manifest" {
+    const State = struct {
+        var index_body: []u8 = undefined;
+        var index_digest: []u8 = undefined;
+        var child_body: []u8 = undefined;
+        var child_digest: []u8 = undefined;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = index_digest,
+                }, index_body);
+            }
+
+            if (std.mem.endsWith(u8, request.url, child_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_manifest_v1.toString(),
+                    .docker_content_digest = child_digest,
+                }, child_body);
+            }
+
+            return error.TransportFailed;
+        }
+    };
+
+    State.child_body = try std.testing.allocator.dupe(
+        u8,
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 123
+        \\  },
+        \\  "layers": []
+        \\}
+        ,
+    );
+    defer std.testing.allocator.free(State.child_body);
+
+    State.child_digest = try sha256DigestStringAlloc(std.testing.allocator, State.child_body);
+    defer std.testing.allocator.free(State.child_digest);
+
+    State.index_body = try buildIndexBodyAlloc(
+        std.testing.allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        State.child_digest,
+        "linux",
+        "arm64",
+    );
+    defer std.testing.allocator.free(State.index_body);
+
+    State.index_digest = try sha256DigestStringAlloc(std.testing.allocator, State.index_body);
+    defer std.testing.allocator.free(State.index_digest);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try resolveWithExchangers(
+        arena.allocator(),
+        &client,
+        Config{},
+        ref,
+        .{ .os = "linux", .architecture = "arm64" },
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+
+    switch (outcome) {
+        .success => |result| {
+            try std.testing.expectEqual(MediaType.oci_manifest_v1, result.media_type);
+            try std.testing.expect(result.platform != null);
+            try std.testing.expectEqualSlices(u8, "linux", result.platform.?.os);
+            try std.testing.expectEqualSlices(u8, "arm64", result.platform.?.architecture);
+            try std.testing.expectEqualSlices(u8, State.child_digest[("sha256:").len..], result.digest.hex);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "resolveWithExchangers returns platform_not_found when multi-arch platform is missing" {
+    const State = struct {
+        var index_body: []u8 = undefined;
+        var index_digest: []u8 = undefined;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            if (!std.mem.endsWith(u8, request.url, "/manifests/latest")) return error.TransportFailed;
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_index_v1.toString(),
+                .docker_content_digest = index_digest,
+            }, index_body);
+        }
+    };
+
+    const child_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    State.index_body = try buildIndexBodyAlloc(
+        std.testing.allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        child_digest,
+        "linux",
+        "arm64",
+    );
+    defer std.testing.allocator.free(State.index_body);
+
+    State.index_digest = try sha256DigestStringAlloc(std.testing.allocator, State.index_body);
+    defer std.testing.allocator.free(State.index_digest);
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        .{ .os = "windows", .architecture = "amd64" },
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .success => return error.TestUnexpectedResult,
+        .failure => |failure| try std.testing.expectEqualStrings("PlatformNotFound", switch (failure) {
+            .platform_not_found => "PlatformNotFound",
+            else => return error.TestUnexpectedResult,
+        }),
+    }
+}
+
+test "getManifestWithExchangers resolves nested index to leaf manifest" {
+    const State = struct {
+        var outer_body: []u8 = undefined;
+        var outer_digest: []u8 = undefined;
+        var inner_body: []u8 = undefined;
+        var inner_digest: []u8 = undefined;
+        var leaf_body: []u8 = undefined;
+        var leaf_digest: []u8 = undefined;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = outer_digest,
+                }, outer_body);
+            }
+            if (std.mem.endsWith(u8, request.url, inner_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = inner_digest,
+                }, inner_body);
+            }
+            if (std.mem.endsWith(u8, request.url, leaf_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_manifest_v1.toString(),
+                    .docker_content_digest = leaf_digest,
+                }, leaf_body);
+            }
+            return error.TransportFailed;
+        }
+    };
+
+    State.leaf_body = try std.testing.allocator.dupe(
+        u8,
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 456
+        \\  },
+        \\  "layers": []
+        \\}
+        ,
+    );
+    defer std.testing.allocator.free(State.leaf_body);
+
+    State.leaf_digest = try sha256DigestStringAlloc(std.testing.allocator, State.leaf_body);
+    defer std.testing.allocator.free(State.leaf_digest);
+
+    State.inner_body = try buildIndexBodyAlloc(
+        std.testing.allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        State.leaf_digest,
+        "linux",
+        "arm64",
+    );
+    defer std.testing.allocator.free(State.inner_body);
+
+    State.inner_digest = try sha256DigestStringAlloc(std.testing.allocator, State.inner_body);
+    defer std.testing.allocator.free(State.inner_digest);
+
+    State.outer_body = try buildIndexBodyAlloc(
+        std.testing.allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_index_v1.toString(),
+        State.inner_digest,
+        "linux",
+        "arm64",
+    );
+    defer std.testing.allocator.free(State.outer_body);
+
+    State.outer_digest = try sha256DigestStringAlloc(std.testing.allocator, State.outer_body);
+    defer std.testing.allocator.free(State.outer_digest);
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try getManifestWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        .{ .os = "linux", .architecture = "arm64" },
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+
+    switch (outcome) {
+        .success => |parsed| {
+            defer parsed.deinit();
+            try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+        },
+        .failure => |failure| {
+            deinitOwnedResolveError(failure, std.testing.allocator);
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "resolveWithExchangers returns depth_limit_exceeded for nested indexes beyond limit" {
+    const depth = max_child_manifest_depth + 1;
+    const State = struct {
+        var bodies: [depth][]u8 = undefined;
+        var digests: [depth][]u8 = undefined;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = digests[0],
+                }, bodies[0]);
+            }
+
+            for (1..depth) |index| {
+                if (std.mem.endsWith(u8, request.url, digests[index])) {
+                    return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = .ok,
+                        .content_type = MediaType.oci_index_v1.toString(),
+                        .docker_content_digest = digests[index],
+                    }, bodies[index]);
+                }
+            }
+
+            return error.TransportFailed;
+        }
+    };
+
+    var next_digest: []const u8 = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    var reverse_index: usize = depth;
+    while (reverse_index > 0) {
+        reverse_index -= 1;
+        State.bodies[reverse_index] = try buildIndexBodyAlloc(
+            std.testing.allocator,
+            MediaType.oci_index_v1.toString(),
+            MediaType.oci_index_v1.toString(),
+            next_digest,
+            "linux",
+            "arm64",
+        );
+        State.digests[reverse_index] = try sha256DigestStringAlloc(std.testing.allocator, State.bodies[reverse_index]);
+        next_digest = State.digests[reverse_index];
+    }
+    defer for (State.bodies) |body| std.testing.allocator.free(body);
+    defer for (State.digests) |digest| std.testing.allocator.free(digest);
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        .{ .os = "linux", .architecture = "arm64" },
+        State.tokenExchange,
+        State.manifestExchange,
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .success => return error.TestUnexpectedResult,
+        .failure => |failure| switch (failure) {
+            .depth_limit_exceeded => {},
+            else => return error.TestUnexpectedResult,
+        },
+    }
 }

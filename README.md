@@ -11,7 +11,7 @@
 
 <p align="center">
     <img src="https://img.shields.io/badge/version-v0.2.0-8B5CF6?style=flat-square" alt="v0.2.0">
-    <img src="https://img.shields.io/badge/status-pre--networking-2D7D46?style=flat-square" alt="Status: pre-networking">
+        <img src="https://img.shields.io/badge/status-phase--3%20resolver-2D7D46?style=flat-square" alt="Status: Phase 3 resolver">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -28,12 +28,13 @@ z-oci is a read-only OCI registry client. It parses image references, handles th
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
 - **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, `MultiArchManifest` -- all with JSON round-trip support.
 - **Auth engine** (v0.2.0): Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Probes `/v2/`, parses `WWW-Authenticate` challenges, exchanges tokens (GET with POST fallback), resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry (in-memory, per-scope). 299 tests. The auth engine is transport-agnostic logic -- it produces token headers but does not perform live HTTP. Callers provide a `*std.http.Client` and an allocator; the library handles everything else.
-- **Public single-arch resolver path** (v0.2.5): `resolve`, `validate`, and `getManifest` now perform live single-arch manifest fetches through Zig 0.16 `std.http.Client`, reuse the shipped auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, and return explicit public outcome unions. OCI indexes and Docker manifest lists still remain deferred to the next milestone.
+- **Public resolver path** (v0.2.6): `resolve` and `getManifest` now perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the shipped auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
-### Not yet implemented
+### Current limitations
 
-- Multi-arch public resolution and child-manifest selection.
+- Multi-arch public calls without an explicit platform still return `error.NotYetImplemented` instead of guessing a default child.
+- `validate` still has no platform-aware multi-arch path, so multi-arch validation remains explicitly unsupported at the public boundary.
 - Retry and rate-limit policy beyond the current correctness-first fetch path.
 - CLI commands built on top of the live resolver surface.
 
@@ -146,7 +147,7 @@ See [examples](examples) for the source of the packaged examples.
 
 ## What is next
 
-- Live manifest resolution (HEAD/GET, digest verification, multi-arch selection)
+- Public API semantic cleanup around multi-arch `validate` and the remaining explicit `NotYetImplemented` cases
 - Rate limiting and retry logic
 - CLI for resolve, validate, and inspect
 - More registry compatibility testing
