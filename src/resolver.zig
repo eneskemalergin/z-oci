@@ -425,6 +425,22 @@ pub fn unsupportedContentType(registry: []const u8, reference: []const u8, http_
     } };
 }
 
+pub fn digestMismatchFailure(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+    return .{ .digest_mismatch = .{
+        .registry = registry,
+        .reference = reference,
+        .http_status = http_status,
+    } };
+}
+
+pub fn unsupportedAlgorithmFailure(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+    return .{ .unsupported_algorithm = .{
+        .registry = registry,
+        .reference = reference,
+        .http_status = http_status,
+    } };
+}
+
 /// Execute the internal Phase 3 HEAD path through a mockable transport seam.
 ///
 /// The result stays internal for `v0.2.2`. Public resolver functions still
@@ -720,6 +736,12 @@ fn classifyUsableGetResponse(
     const response_body = body orelse return parseFailureGetOutcome(ctx, metadata.httpStatus());
     if (response_body.len == 0) return parseFailureGetOutcome(ctx, metadata.httpStatus());
 
+    verifyManifestBodyIntegrity(ctx, metadata, response_body) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DigestMismatch => return digestMismatchGetOutcome(ctx, metadata.httpStatus()),
+        error.UnsupportedAlgorithm => return unsupportedAlgorithmGetOutcome(ctx, metadata.httpStatus()),
+    };
+
     var document = parseManifestDocument(ctx.allocator, media_type, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return parseFailureGetOutcome(ctx, metadata.httpStatus()),
@@ -782,6 +804,60 @@ fn parseManifestDocument(
     };
 }
 
+const ManifestIntegrityError = error{
+    OutOfMemory,
+    DigestMismatch,
+    UnsupportedAlgorithm,
+};
+
+fn verifyManifestBodyIntegrity(
+    ctx: ResolverContext,
+    metadata: ManifestResponseMetadata,
+    body: []const u8,
+) ManifestIntegrityError!void {
+    const body_digest_hex = bodySha256DigestHex(body);
+
+    if (try expectedReferenceDigest(ctx.reference.ref_string)) |expected_digest| {
+        if (!digestMatchesSha256Hex(expected_digest, body_digest_hex[0..])) return error.DigestMismatch;
+    }
+
+    if (metadata.docker_content_digest) |header_digest_text| {
+        const header_digest = parseExpectedDigest(header_digest_text) catch |err| switch (err) {
+            error.UnsupportedAlgorithm => return error.UnsupportedAlgorithm,
+            else => return error.DigestMismatch,
+        };
+
+        if (!digestMatchesSha256Hex(header_digest, body_digest_hex[0..])) return error.DigestMismatch;
+    }
+}
+
+fn expectedReferenceDigest(ref_string: []const u8) ManifestIntegrityError!?Digest {
+    return Digest.parse(ref_string) catch |err| switch (err) {
+        error.MissingColon => null,
+        error.UnsupportedAlgorithm => error.UnsupportedAlgorithm,
+        else => error.DigestMismatch,
+    };
+}
+
+fn parseExpectedDigest(text: []const u8) Digest.ParseError!Digest {
+    return Digest.parse(text);
+}
+
+fn bodySha256DigestHex(body: []const u8) [Digest.Algorithm.sha256.hexLen()]u8 {
+    var digest_bytes: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest_bytes, .{});
+    return std.fmt.bytesToHex(digest_bytes, .lower);
+}
+
+fn digestMatchesSha256Hex(expected_digest: Digest, actual_hex: []const u8) bool {
+    return expected_digest.algorithm == .sha256 and std.ascii.eqlIgnoreCase(expected_digest.hex, actual_hex);
+}
+
+fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    const digest_hex = bodySha256DigestHex(body);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
+}
+
 fn transportFailureOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!HeadRequestOutcome {
     const reference = try ctx.errorReferenceAlloc();
     return .{ .failure = transportFailure(ctx.reference.registry, reference, http_status) };
@@ -818,6 +894,16 @@ fn transportFailureGetOutcome(ctx: ResolverContext, http_status: ?u16) error{Out
 fn unsupportedContentTypeGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
     const reference = try ctx.errorReferenceAlloc();
     return .{ .failure = unsupportedContentType(ctx.reference.registry, reference, http_status) };
+}
+
+fn digestMismatchGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
+    const reference = try ctx.errorReferenceAlloc();
+    return .{ .failure = digestMismatchFailure(ctx.reference.registry, reference, http_status) };
+}
+
+fn unsupportedAlgorithmGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
+    const reference = try ctx.errorReferenceAlloc();
+    return .{ .failure = unsupportedAlgorithmFailure(ctx.reference.registry, reference, http_status) };
 }
 
 fn parseFailureGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
@@ -1003,10 +1089,14 @@ test "resolver error helpers keep registry, reference, and status" {
     const parse_err = manifestParseFailure("ghcr.io", "ghcr.io/owner/repo:v1", 200);
     const transport_err = transportFailure("ghcr.io", "ghcr.io/owner/repo:v1", 503);
     const content_type_err = unsupportedContentType("ghcr.io", "ghcr.io/owner/repo:v1", 415);
+    const digest_mismatch_err = digestMismatchFailure("ghcr.io", "ghcr.io/owner/repo:v1", 412);
+    const unsupported_algorithm_err = unsupportedAlgorithmFailure("ghcr.io", "ghcr.io/owner/repo:v1", 400);
 
     try std.testing.expectEqualStrings("manifest_parse_error", @tagName(parse_err));
     try std.testing.expectEqualStrings("network_error", @tagName(transport_err));
     try std.testing.expectEqualStrings("content_type_mismatch", @tagName(content_type_err));
+    try std.testing.expectEqualStrings("digest_mismatch", @tagName(digest_mismatch_err));
+    try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(unsupported_algorithm_err));
 }
 
 test "buildManifestHttpRequestAlloc shapes HEAD request and optional bearer header" {
@@ -1487,14 +1577,15 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
             defer request.deinit(allocator);
             if (request.method != .get) return error.TransportFailed;
             if (request.accept.len != 2) return error.TransportFailed;
-            return .{
-                .metadata = .{
-                    .status = .ok,
-                    .content_type = " application/vnd.oci.image.manifest.v1+json; charset=utf-8 ",
-                    .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-                },
-                .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024),
-            };
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            defer allocator.free(body);
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = " application/vnd.oci.image.manifest.v1+json; charset=utf-8 ",
+                .docker_content_digest = digest,
+            }, body);
         }
     };
 
@@ -1828,13 +1919,12 @@ test "performManifestGet authenticates on challenge and retries GET with bearer 
 
             if (request.authorization == null) return error.TransportFailed;
             if (!std.mem.eql(u8, request.authorization.?, "Bearer get-token")) return error.TransportFailed;
-            return .{
-                .metadata = .{
-                    .status = .ok,
-                    .content_type = "application/vnd.oci.image.manifest.v1+json",
-                },
-                .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024),
-            };
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            defer allocator.free(body);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+            }, body);
         }
     };
 
@@ -1861,4 +1951,176 @@ test "performManifestGet authenticates on challenge and retries GET with bearer 
     }
 
     try std.testing.expectEqual(@as(usize, 2), State.manifest_call_count);
+}
+
+test "performManifestGet verifies matching pinned digest reference" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            defer allocator.free(body);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+            }, body);
+        }
+    };
+
+    const fixture_body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer std.testing.allocator.free(fixture_body);
+    const pinned_digest = try sha256DigestStringAlloc(std.testing.allocator, fixture_body);
+    defer std.testing.allocator.free(pinned_digest);
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        Config{},
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = pinned_digest },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
+
+    switch (outcome) {
+        .success => |success| try std.testing.expectEqual(MediaType.oci_manifest_v1, success.document.mediaType()),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet rejects mismatched response digest header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            defer allocator.free(body);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }, body);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
+
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("digest_mismatch", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet rejects mismatched pinned digest reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            defer allocator.free(body);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+            }, body);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
+
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("digest_mismatch", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet rejects unsupported digest algorithm in response header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            defer allocator.free(body);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }, body);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
+
+    switch (outcome) {
+        .failure => |err| try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
 }

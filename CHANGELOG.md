@@ -12,6 +12,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - Phase 3 resolver scaffolding in `src/resolver.zig`: resolver context, Phase 3 config view, manifest request and response metadata types, canonical reference helpers, and initial resolver-side error mapping.
 - Internal resolver HEAD flow in `src/resolver.zig`: manifest transport request type, mockable manifest HTTP exchanger seam, HEAD outcome classification, header-based GET fallback rules, redirect handling, and auth-on-demand retry coverage.
 - Internal resolver GET flow in `src/resolver.zig`: owned manifest response bodies, normalized content-type routing, parser integration for OCI and Docker single-arch and multi-arch documents, and focused transport-plus-parser coverage.
+- Internal digest verification in `src/resolver.zig`: GET body hashing, pinned-reference and `Docker-Content-Digest` reconciliation, and focused integrity coverage for mismatch and unsupported-algorithm paths.
 
 ### Changed
 
@@ -25,7 +26,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 - `zig test src/resolver.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
 - `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes.
-- `zig fmt --check src/root.zig src/resolver.zig` passes.
+- `zig fmt --check src/root.zig src/resolver.zig src/auth.zig` passes.
 - `zig build example-select-platform -- fixtures/indexes/busybox-latest-live-oci-index.json linux arm64 v8` passes.
 - `zig build example-inspect-manifest -- fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json` passes.
 - `zig build example-select-platform -- fixtures/indexes/quay-prometheus-busybox-latest-live-docker-manifest-list.json linux arm64` passes.
