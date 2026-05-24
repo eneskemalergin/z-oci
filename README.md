@@ -6,7 +6,7 @@
 <h1 align="center">z-oci</h1>
 
 <p align="center">
-        Pure Zig OCI/Docker Registry API v2 toolkit. Reference parsing, OCI types, auth engine. Zero external dependencies.
+    Pure Zig OCI/Docker Registry API v2 toolkit. Reference parsing, live manifest resolution, auth engine. Zero external dependencies.
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 
 ## What z-oci does
 
-z-oci is a read-only OCI registry client. It parses image references, handles the types needed for manifest resolution, and authenticates against registries. Everything is built on Zig 0.16 std -- no external dependencies.
+z-oci is a read-only OCI registry client. It parses image references, authenticates against registries, resolves manifests, verifies digests, and follows supported multi-arch indices. Everything is built on Zig 0.16 std -- no external dependencies.
 
 ### Capabilities
 
@@ -34,8 +34,8 @@ z-oci is a read-only OCI registry client. It parses image references, handles th
 ### Current limitations
 
 - Multi-arch public calls without an explicit platform now fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
-- Retry and rate-limit policy beyond the current correctness-first fetch path.
-- CLI commands built on top of the live resolver surface.
+- Retry and rate-limit policy beyond the current correctness-first fetch path remains deferred to Phase 4.
+- User-facing CLI commands built on top of the live resolver surface are still future work.
 
 ### Registry support
 
@@ -125,16 +125,16 @@ pub fn main() !void {
 
 ## Build steps
 
-- `zig build`: build and install the stub CLI plus the package module
+- `zig build`: build and install the current `z-oci` CLI scaffold and `z-oci-bench` executable
 - `zig build test`: run all unit tests and smoke checks
 - `zig build examples`: build all packaged example programs
 - `zig build examples-smoke`: run a small smoke pass over the offline example programs
 - `zig build workflow-smoke`: run the offline workflow smoke-test matrix
 - `zig build bench`: build the benchmark CLI (`z-oci-bench`)
 
-Fixtures under `fixtures/` are checked-in snapshots, not live fetches. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
+Fixtures under `fixtures/` include checked-in live registry snapshots plus synthetic malformed payloads for deterministic negative-path tests. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
 
-The published Zig package bundles `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
+The Zig package contents in this repository bundle `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
 
 ## Examples
 

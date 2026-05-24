@@ -7,25 +7,28 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-24
+
 ### Added
 
-- Live manifest resolution for `resolve`, `validate`, and `getManifest`, including HEAD and GET fetch paths, manifest media routing, digest verification, and structured public outcomes.
-- Platform-aware multi-arch resolution for OCI indexes and Docker manifest lists, including recursive child selection, auxiliary-descriptor skipping, and explicit depth-limit failures.
-- A live `resolve-reference` packaged example alongside expanded workflow smoke coverage for the public resolver surface.
-- Public error-propagation matrix coverage at both `root` and `workflow-smoke` layers for `network_error`, `auth_failed`, `content_type_mismatch`, `manifest_parse_error`, `digest_mismatch`, and `unsupported_algorithm`.
+- Live manifest resolution for `resolve`, `validate`, and `getManifest`, including HEAD and GET fetch paths, manifest media routing, digest verification, and allocator-owned public results built on the shipped auth engine.
+- Platform-aware multi-arch resolution for OCI indexes and Docker manifest lists, including recursive child selection, auxiliary-descriptor skipping, selected-platform preservation in `ResolveResult`, and explicit depth-limit failures.
+- A live `resolve-reference` packaged example for end-to-end resolver usage, while the existing offline examples remain fixture-backed.
+- Synthetic malformed manifest fixtures with explicit provenance (`invalid-empty-manifest.json`, `invalid-truncated-oci-manifest.json`) for deterministic malformed-body coverage in parser and resolver tests.
 
 ### Changed
 
-- No-platform multi-arch calls now fail with the structured `platform_required` resolver error instead of surfacing `error.NotYetImplemented`.
+- No-platform multi-arch calls now fail with the structured `platform_required` resolver error instead of surfacing `error.NotYetImplemented` or guessing a default child manifest.
+- `validate` now accepts an optional platform and follows the selected child manifest on supported multi-arch inputs, matching `resolve` and `getManifest` semantics.
 - Public resolver ownership contracts are now explicit: public failures support owned teardown, and `ResolveResult.deinit()` is valid for live resolver results as well as cloned results.
-- Packaged example builds are now distinct from the offline `examples-smoke` step, so the repo can ship a live resolver example without making the smoke gate network-dependent.
-- Public resolve negative-path tests were consolidated from repeated per-variant cases into matrix-style checks, reducing overlap while preserving behavior coverage.
-- Public failure assertions now validate full error context (`tag`, `registry`, canonical `reference`, and `http_status`) instead of checking only the variant tag.
+- Packaged example builds are now distinct from the offline `examples-smoke` step, allowing a live resolver example without making the smoke gate network-dependent.
+- Public negative-path coverage was tightened around full error context (`tag`, `registry`, canonical `reference`, and `http_status`) and fixture-backed malformed payloads rather than repeated inline body literals.
 
 ### Fixed
 
-- Recursive multi-arch child fetches now reuse the same auth, media validation, and digest-verification path as single-arch resolution.
+- Recursive multi-arch child fetches now reuse the same auth, media validation, and digest-verification path as single-arch resolution instead of diverging on the child-manifest path.
 - Resolver transport teardown now clones returned metadata, zeroes authorization buffers before free, and rejects mismatched manifest headers earlier.
+- Resolver GET classification now releases verified digest buffers and parsed-document allocations correctly on non-error failure outcomes, eliminating leak paths exposed by malformed non-empty fixture bodies.
 
 ## [0.2.0] - 2026-05-12 - [Tagged]
 
@@ -420,3 +423,4 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 [0.1.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.1.0
 [0.2.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.2.0
+[0.3.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.3.0

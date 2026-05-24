@@ -806,23 +806,29 @@ fn classifyUsableGetResponse(
         error.DigestMismatch => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), digestMismatchError),
         error.UnsupportedAlgorithm => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), unsupportedAlgorithmError),
     };
-    errdefer ctx.allocator.free(resolved_digest.raw);
+    var resolved_digest_raw: ?[]u8 = resolved_digest.raw;
+    defer if (resolved_digest_raw) |raw| ctx.allocator.free(raw);
 
     var document = parseManifestDocument(ctx.allocator, media_type, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError),
     };
-    errdefer document.deinit();
+    var keep_document = false;
+    defer if (!keep_document) document.deinit();
 
     if (document.mediaType() != media_type) {
         return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     }
 
+    keep_document = true;
+    const owned_digest_raw = resolved_digest_raw.?;
+    resolved_digest_raw = null;
+
     return .{ .success = .{
         .request = request,
         .metadata = try metadata.cloneAlloc(ctx.allocator),
         .resolved_digest = resolved_digest.digest,
-        .resolved_digest_raw = resolved_digest.raw,
+        .resolved_digest_raw = owned_digest_raw,
         .document = document,
     } };
 }
@@ -2020,10 +2026,12 @@ test "performManifestGet maps empty body into manifest parse error" {
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
             defer request.deinit(allocator);
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/invalid-empty-manifest.json", 1024);
+            defer allocator.free(body);
             return try ManifestHttpResponse.initOwnedAlloc(allocator, .{
                 .status = .ok,
                 .content_type = "application/vnd.oci.image.manifest.v1+json",
-            }, "");
+            }, body);
         }
     };
 

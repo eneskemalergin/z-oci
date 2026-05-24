@@ -7,6 +7,23 @@ This directory contains two kinds of fixtures:
 
 All fixtures are intentionally small, human-reviewable, and covered by tests.
 
+## Synthetic Negative Fixtures
+
+These fixtures are intentionally malformed and are checked in to keep
+negative-path parser and resolver behavior deterministic without inline payload
+literals spread across test files.
+
+- `fixtures/manifests/invalid-empty-manifest.json`
+    - Source: repository-authored synthetic fixture
+    - Created: 2026-05-24
+    - Shape: zero-byte body
+    - Purpose: assert manifest-parse failure on empty GET bodies
+- `fixtures/manifests/invalid-truncated-oci-manifest.json`
+    - Source: repository-authored synthetic fixture
+    - Created: 2026-05-24
+    - Shape: truncated OCI manifest JSON (missing closing delimiters)
+    - Purpose: assert manifest-parse failure on malformed-but-manifest-shaped payloads
+
 ## Spec-Derived Examples
 
 These were copied from upstream specifications on 2026-05-05. The JSON stays semantically faithful to the source examples, although formatting may differ.

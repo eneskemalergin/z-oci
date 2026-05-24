@@ -19,7 +19,6 @@
 //!
 const std = @import("std");
 const resolver = @import("resolver.zig");
-const failure_matrix = @import("resolve_failure_matrix_support.zig");
 
 pub const Digest = @import("Digest.zig");
 pub const MediaType = @import("MediaType.zig").MediaType;
@@ -951,8 +950,84 @@ test "validateWithExchangers returns not_found for missing manifest" {
 }
 
 test "resolveWithExchangers propagates resolver failure matrix with full context" {
+    const Matrix = struct {
+        const Scenario = enum {
+            network_error,
+            auth_failed,
+            content_type_mismatch,
+            manifest_parse_error,
+            digest_mismatch,
+            unsupported_algorithm,
+        };
+
+        const BodyKind = enum {
+            none,
+            malformed_manifest_fixture,
+            manifest_fixture,
+        };
+
+        const ResponsePlan = struct {
+            status: std.http.Status,
+            content_type: ?[]const u8 = null,
+            docker_content_digest: ?[]const u8 = null,
+            body_kind: BodyKind = .none,
+            malformed_auth_header: bool = false,
+        };
+
+        const scenarios = [_]Scenario{
+            .network_error,
+            .auth_failed,
+            .content_type_mismatch,
+            .manifest_parse_error,
+            .digest_mismatch,
+            .unsupported_algorithm,
+        };
+
+        fn responsePlan(scenario: Scenario) ResponsePlan {
+            return switch (scenario) {
+                .network_error => .{
+                    .status = .temporary_redirect,
+                },
+                .auth_failed => .{
+                    .status = .unauthorized,
+                    .malformed_auth_header = true,
+                },
+                .content_type_mismatch => .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.config.v1+json",
+                    .body_kind = .manifest_fixture,
+                },
+                .manifest_parse_error => .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    .body_kind = .malformed_manifest_fixture,
+                },
+                .digest_mismatch => .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    .body_kind = .manifest_fixture,
+                },
+                .unsupported_algorithm => .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    .docker_content_digest = "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    .body_kind = .manifest_fixture,
+                },
+            };
+        }
+
+        fn expectedTagName(scenario: Scenario) []const u8 {
+            return @tagName(scenario);
+        }
+
+        fn expectedHttpStatus(scenario: Scenario) ?u16 {
+            return @intCast(@intFromEnum(responsePlan(scenario).status));
+        }
+    };
+
     const State = struct {
-        var scenario: failure_matrix.Scenario = .network_error;
+        var scenario: Matrix.Scenario = .network_error;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
             return error.TokenExchangeFailed;
@@ -961,7 +1036,7 @@ test "resolveWithExchangers propagates resolver failure matrix with full context
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
 
-            const plan = failure_matrix.responsePlan(scenario);
+            const plan = Matrix.responsePlan(scenario);
             const headers: []const []const u8 = if (plan.malformed_auth_header)
                 &.{"Bearer realm=\"https://auth.example.test/token"}
             else
@@ -976,7 +1051,15 @@ test "resolveWithExchangers propagates resolver failure matrix with full context
 
             return switch (plan.body_kind) {
                 .none => resolver.ManifestHttpResponse.initOwnedAlloc(allocator, metadata, null),
-                .empty_manifest => resolver.ManifestHttpResponse.initOwnedAlloc(allocator, metadata, ""),
+                .malformed_manifest_fixture => blk: {
+                    const body = readFixtureAlloc(allocator, "fixtures/manifests/invalid-truncated-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.TransportFailed,
+                    };
+                    defer allocator.free(body);
+
+                    break :blk resolver.ManifestHttpResponse.initOwnedAlloc(allocator, metadata, body);
+                },
                 .manifest_fixture => blk: {
                     const body = readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -999,7 +1082,7 @@ test "resolveWithExchangers propagates resolver failure matrix with full context
         .digest_raw = null,
     };
 
-    for (failure_matrix.public_resolve_failure_scenarios) |scenario| {
+    for (Matrix.scenarios) |scenario| {
         State.scenario = scenario;
 
         const outcome = try resolveWithExchangers(
@@ -1020,10 +1103,10 @@ test "resolveWithExchangers propagates resolver failure matrix with full context
             .success => return error.TestUnexpectedResult,
             .failure => |failure| try expectResolveFailure(
                 failure,
-                failure_matrix.expectedTagName(scenario),
+                Matrix.expectedTagName(scenario),
                 "registry-1.docker.io",
                 "registry-1.docker.io/library/busybox:latest",
-                failure_matrix.expectedHttpStatus(scenario),
+                Matrix.expectedHttpStatus(scenario),
             ),
         }
     }

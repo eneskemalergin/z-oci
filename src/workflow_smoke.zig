@@ -20,7 +20,7 @@ const WorkflowFailureScenario = enum {
 
 const WorkflowResponseBodyKind = enum {
     none,
-    empty_manifest,
+    malformed_manifest_fixture,
     manifest_fixture,
 };
 
@@ -408,12 +408,24 @@ test "workflow smoke: public resolve failure matrix preserves full error context
                     .docker_content_digest = plan.docker_content_digest,
                     .www_authenticate_headers = headers,
                 }, null),
-                .empty_manifest => z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = plan.status,
-                    .content_type = plan.content_type,
-                    .docker_content_digest = plan.docker_content_digest,
-                    .www_authenticate_headers = headers,
-                }, ""),
+                .malformed_manifest_fixture => blk: {
+                    const body = readWorkflowFixtureAlloc(
+                        allocator,
+                        "fixtures/manifests/invalid-truncated-oci-manifest.json",
+                        16 * 1024,
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.TransportFailed,
+                    };
+                    defer allocator.free(body);
+
+                    break :blk z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = plan.status,
+                        .content_type = plan.content_type,
+                        .docker_content_digest = plan.docker_content_digest,
+                        .www_authenticate_headers = headers,
+                    }, body);
+                },
                 .manifest_fixture => blk: {
                     const body = readWorkflowFixtureAlloc(
                         allocator,
@@ -514,7 +526,7 @@ fn workflowResponsePlan(scenario: WorkflowFailureScenario) WorkflowResponsePlan 
         .manifest_parse_error => .{
             .status = .ok,
             .content_type = "application/vnd.oci.image.manifest.v1+json",
-            .body_kind = .empty_manifest,
+            .body_kind = .malformed_manifest_fixture,
         },
         .digest_mismatch => .{
             .status = .ok,

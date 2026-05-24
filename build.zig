@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // CLI executable (Phase 6)
+    // Current CLI scaffold. Real user-facing commands land in the later CLI phase.
     const exe = b.addExecutable(.{
         .name = "z-oci",
         .root_module = b.createModule(.{
