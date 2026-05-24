@@ -4,7 +4,7 @@
 //! - offline OCI/Docker reference parsing and normalization
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
 //! - auth engine: /v2/ probe, challenge parsing, token exchange, credential providers
-//! - public manifest resolution on top of the internal Phase 3 GET path
+//! - public manifest resolution for single-arch and supported multi-arch flows
 //!
 //! Ownership conventions:
 //! - Functions taking an allocator produce owned storage that the caller must
@@ -17,9 +17,6 @@
 //!   `Platform` (struct of slices), `AuthChallenge`/`BearerChallenge` (borrowed views).
 //!   These need no deinit.
 //!
-//! Remaining Phase 3 work:
-//! - final public API semantic cleanup across every Phase 3-supported path
-
 const std = @import("std");
 const resolver = @import("resolver.zig");
 
@@ -180,7 +177,7 @@ const ResolvedManifestOutcome = union(enum) {
 /// - If the allocator is an arena, tearing the arena down is also sufficient.
 /// - `ResolveResult.clone()` is only needed when moving the result into a different allocator.
 ///
-/// Phase 3 auth handoff contract:
+/// Auth handoff contract:
 /// - derive `AuthReferenceView` from the normalized `Reference` with `referenceView(ref)`
 /// - probe `view.probeUriAlloc(...)` first; only enter auth when `ProbeHttpResponse.classify()`
 ///   returns `.auth_required`
@@ -214,7 +211,7 @@ pub fn resolve(
 /// - The caller still owns `allocator`; the resolver uses it for transient request shaping,
 ///   parsing, and any structured failure context that must outlive internal temporaries.
 ///
-/// Phase 3 auth handoff contract:
+/// Auth handoff contract:
 /// - validation follows the same probe -> classify -> authenticate -> retry-once flow as `resolve`
 /// - validation must treat `.not_found` as terminal and must not attempt auth in that case
 /// - multi-arch validation follows the selected child manifest when `platform` is provided
@@ -245,7 +242,7 @@ pub fn validate(
 /// - Call parsed.deinit() when finished.
 /// - Do not free the allocator backing that arena while the parsed value is still in use.
 ///
-/// Phase 3 auth handoff contract:
+/// Auth handoff contract:
 /// - manifest GET uses the same `AuthReferenceView` and `AuthenticateRequest` boundary as `resolve`
 /// - auth owns token exchange and cache invalidation; manifest fetch owns Accept negotiation,
 ///   response status handling, and JSON parsing
@@ -476,7 +473,7 @@ fn fetchResolvedManifestWithExchangers(
         .not_found => return .{ .failure = try notFoundErrorAlloc(allocator, ref_view) },
         .redirect => |metadata| {
             defer metadata.deinitOwned(allocator);
-            return .{ .failure = try transportFailureAlloc(allocator, ref_view, metadata.httpStatus()) };
+            return .{ .failure = try networkErrorAlloc(allocator, ref_view, metadata.httpStatus()) };
         },
         .failure => |failure| return .{ .failure = failure },
     }
@@ -612,40 +609,37 @@ fn buildResolvedReferenceAlloc(
 }
 
 fn notFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
-    return .{ .not_found = .{
-        .registry = ref.registry,
-        .reference = reference,
-    } };
+    return allocatedResolveError(allocator, ref, .not_found, null);
 }
 
-fn transportFailureAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView, http_status: ?u16) !ResolveError {
-    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
-    return resolver.transportFailure(ref.registry, reference, http_status);
+fn networkErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView, http_status: ?u16) !ResolveError {
+    return allocatedResolveError(allocator, ref, .network_error, http_status);
 }
 
 fn platformNotFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
-    return .{ .platform_not_found = .{
-        .registry = ref.registry,
-        .reference = reference,
-    } };
+    return allocatedResolveError(allocator, ref, .platform_not_found, null);
 }
 
 fn platformRequiredErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
-    return .{ .platform_required = .{
-        .registry = ref.registry,
-        .reference = reference,
-    } };
+    return allocatedResolveError(allocator, ref, .platform_required, null);
 }
 
 fn depthLimitExceededErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
+    return allocatedResolveError(allocator, ref, .depth_limit_exceeded, null);
+}
+
+fn allocatedResolveError(
+    allocator: std.mem.Allocator,
+    ref: AuthReferenceView,
+    comptime tag: std.meta.Tag(ResolveError),
+    http_status: ?u16,
+) !ResolveError {
     const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
-    return .{ .depth_limit_exceeded = .{
+    return @unionInit(ResolveError, @tagName(tag), .{
         .registry = ref.registry,
         .reference = reference,
-    } };
+        .http_status = http_status,
+    });
 }
 
 fn clonePlatformAlloc(allocator: std.mem.Allocator, platform: Platform) !Platform {

@@ -1,9 +1,8 @@
-//! Phase 3 resolver scaffolding.
+//! Internal manifest resolver helpers.
 //!
-//! This module owns the first internal seam for live manifest resolution.
-//! It keeps request intent, transport metadata, config review, and
-//! error-mapping rules local to the resolver layer so auth and manifest
-//! fetch do not collapse into one large implementation.
+//! This module keeps request intent, transport metadata, and error-mapping
+//! rules local to the resolver layer so auth and manifest fetch
+//! do not collapse into one large implementation.
 
 const std = @import("std");
 const auth = @import("auth.zig");
@@ -29,27 +28,10 @@ pub const ResolverOperation = enum {
     resolve_child_manifest,
 };
 
-/// Narrow Phase 3 view of Config.
-///
-/// Resolver-relevant now: transport timeouts, retry budget, CA bundle, and
-/// whether later phases should honor rate-limit behavior.
-pub const Phase3ConfigView = struct {
-    connect_timeout_ms: u32,
-    read_timeout_ms: u32,
-    max_retries: u8,
-    ca_bundle_path: ?[]const u8,
-    rate_limit_enabled: bool,
-};
-
 /// Internal resolver context built once at the public API boundary.
-///
-/// The context borrows the normalized reference view and caller-owned client.
-/// Later resolver milestones can add fetch helpers here without changing the
-/// public `resolve`, `validate`, or `getManifest` signatures.
 pub const ResolverContext = struct {
     allocator: std.mem.Allocator,
     client: *std.http.Client,
-    config: Phase3ConfigView,
     reference: auth.AuthReferenceView,
     platform: ?Platform,
     operation: ResolverOperation,
@@ -57,7 +39,7 @@ pub const ResolverContext = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
-        config: Config,
+        _: Config,
         reference: auth.AuthReferenceView,
         platform: ?Platform,
         operation: ResolverOperation,
@@ -65,19 +47,14 @@ pub const ResolverContext = struct {
         return .{
             .allocator = allocator,
             .client = client,
-            .config = phase3ConfigView(config),
             .reference = reference,
             .platform = platform,
             .operation = operation,
         };
     }
-
-    pub fn errorReferenceAlloc(self: ResolverContext) ![]u8 {
-        return canonicalReferenceAlloc(self.allocator, self.reference);
-    }
 };
 
-/// Manifest request shape for the live resolver paths that arrive next.
+/// Manifest request shape for resolver transport operations.
 pub const ManifestRequest = struct {
     method: ManifestRequestMethod,
     operation: ResolverOperation,
@@ -96,9 +73,6 @@ pub const ManifestRequest = struct {
 };
 
 /// Concrete HTTP request shape for the resolver transport seam.
-///
-/// This keeps Phase 3 fetch tests transport-agnostic until the live std.http
-/// wiring arrives in later milestones.
 pub const ManifestHttpRequest = struct {
     method: ManifestRequestMethod,
     url: []u8,
@@ -253,17 +227,6 @@ pub const OwnedManifestResponseMetadata = struct {
     }
 };
 
-pub const ManifestFetchSuccess = struct {
-    request: ManifestRequest,
-    metadata: ManifestResponseMetadata,
-    body: ?[]const u8 = null,
-};
-
-pub const ManifestFetchOutcome = union(enum) {
-    success: ManifestFetchSuccess,
-    redirect: ManifestResponseMetadata,
-};
-
 /// Parsed manifest document owned by a JSON arena.
 pub const ParsedManifestDocument = union(enum) {
     manifest: std.json.Parsed(Manifest),
@@ -335,16 +298,6 @@ pub const HeadRequestOutcome = union(enum) {
         }
     }
 };
-
-pub fn phase3ConfigView(config: Config) Phase3ConfigView {
-    return .{
-        .connect_timeout_ms = config.connect_timeout_ms,
-        .read_timeout_ms = config.read_timeout_ms,
-        .max_retries = config.max_retries,
-        .ca_bundle_path = config.ca_bundle_path,
-        .rate_limit_enabled = config.rate_limit_enabled,
-    };
-}
 
 pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.AuthReferenceView) ![]u8 {
     const separator: []const u8 = if (Digest.parse(reference.ref_string)) |_| "@" else |_| ":";
@@ -502,7 +455,7 @@ fn ownedManifestResponseMetadataFromHead(
     };
 }
 
-pub fn mapAuthError(
+fn resolveErrorFromAuthError(
     err: auth.AuthError,
     registry: []const u8,
     reference: []const u8,
@@ -528,7 +481,7 @@ pub fn mapAuthError(
     };
 }
 
-pub fn manifestParseFailure(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+fn manifestParseError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .manifest_parse_error = .{
         .registry = registry,
         .reference = reference,
@@ -536,7 +489,7 @@ pub fn manifestParseFailure(registry: []const u8, reference: []const u8, http_st
     } };
 }
 
-pub fn transportFailure(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+fn networkError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .network_error = .{
         .registry = registry,
         .reference = reference,
@@ -544,7 +497,7 @@ pub fn transportFailure(registry: []const u8, reference: []const u8, http_status
     } };
 }
 
-pub fn unsupportedContentType(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+fn contentTypeMismatchError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .content_type_mismatch = .{
         .registry = registry,
         .reference = reference,
@@ -552,7 +505,7 @@ pub fn unsupportedContentType(registry: []const u8, reference: []const u8, http_
     } };
 }
 
-pub fn digestMismatchFailure(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+fn digestMismatchError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .digest_mismatch = .{
         .registry = registry,
         .reference = reference,
@@ -560,7 +513,7 @@ pub fn digestMismatchFailure(registry: []const u8, reference: []const u8, http_s
     } };
 }
 
-pub fn unsupportedAlgorithmFailure(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+fn unsupportedAlgorithmError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .unsupported_algorithm = .{
         .registry = registry,
         .reference = reference,
@@ -568,10 +521,7 @@ pub fn unsupportedAlgorithmFailure(registry: []const u8, reference: []const u8, 
     } };
 }
 
-/// Execute the internal Phase 3 HEAD path through a mockable transport seam.
-///
-/// The result stays internal for `v0.2.2`. Public resolver functions still
-/// return `error.NotYetImplemented` until later milestones wire this path in.
+/// Execute the internal HEAD path through a mockable transport seam.
 pub fn performManifestHead(
     ctx: ResolverContext,
     engine: *auth.AuthEngine,
@@ -588,17 +538,14 @@ pub fn performManifestHead(
 
     const response = exchangeManifestRequest(ctx, exchanger, request, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TransportFailed => return transportFailureOutcome(ctx, null),
+        error.TransportFailed => return mappedFailureOutcome(HeadRequestOutcome, ctx, null, networkError),
     };
     defer response.deinit(ctx.allocator);
 
     return classifyHeadResponse(ctx, engine, exchanger, request, response.metadata, true);
 }
 
-/// Execute the internal Phase 3 GET path through the resolver transport seam.
-///
-/// This stays internal for `v0.2.3`. Public resolver functions still return
-/// `error.NotYetImplemented` until later milestones wire the live path in.
+/// Execute the internal GET path through the resolver transport seam.
 pub fn performManifestGet(
     ctx: ResolverContext,
     engine: *auth.AuthEngine,
@@ -615,7 +562,7 @@ pub fn performManifestGet(
 
     const response = exchangeManifestRequest(ctx, exchanger, request, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TransportFailed => return transportFailureGetOutcome(ctx, null),
+        error.TransportFailed => return mappedFailureOutcome(GetRequestOutcome, ctx, null, networkError),
     };
 
     return classifyGetResponse(ctx, engine, exchanger, request, response, true);
@@ -641,15 +588,15 @@ fn classifyHeadResponse(
 ) error{OutOfMemory}!HeadRequestOutcome {
     if (isRedirectStatus(metadata.status)) {
         if (metadata.location != null) return .{ .redirect = try metadata.cloneAlloc(ctx.allocator) };
-        return transportFailureOutcome(ctx, metadata.httpStatus());
+        return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), networkError);
     }
 
     if (metadata.status == .unauthorized and !allow_auth) {
-        return authFailureOutcome(ctx, metadata.httpStatus());
+        return authFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus());
     }
 
     const classification = metadata.probeClassification() catch |err| {
-        return mapAuthFailureOutcome(ctx, err, metadata.httpStatus());
+        return mappedAuthFailureOutcome(HeadRequestOutcome, ctx, err, metadata.httpStatus());
     };
 
     return switch (classification) {
@@ -658,7 +605,7 @@ fn classifyHeadResponse(
         .auth_required => |challenge| if (allow_auth)
             authenticateHeadRequest(ctx, engine, exchanger, request, challenge)
         else
-            authFailureOutcome(ctx, metadata.httpStatus()),
+            authFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus()),
     };
 }
 
@@ -676,9 +623,6 @@ fn authenticateHeadRequest(
         exchanger,
         request,
         challenge,
-        authFailureOutcome,
-        mapAuthFailureOutcome,
-        transportFailureOutcome,
         classifyAuthenticatedHeadResponse,
     );
 }
@@ -696,15 +640,15 @@ fn classifyGetResponse(
 
     if (isRedirectStatus(metadata.status)) {
         if (metadata.location != null) return .{ .redirect = try metadata.cloneAlloc(ctx.allocator) };
-        return transportFailureGetOutcome(ctx, metadata.httpStatus());
+        return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), networkError);
     }
 
     if (metadata.status == .unauthorized and !allow_auth) {
-        return authFailureGetOutcome(ctx, metadata.httpStatus());
+        return authFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus());
     }
 
     const classification = metadata.probeClassification() catch |err| {
-        return mapAuthFailureGetOutcome(ctx, err, metadata.httpStatus());
+        return mappedAuthFailureOutcome(GetRequestOutcome, ctx, err, metadata.httpStatus());
     };
 
     return switch (classification) {
@@ -713,7 +657,7 @@ fn classifyGetResponse(
         .auth_required => |challenge| if (allow_auth)
             authenticateGetRequest(ctx, engine, exchanger, request, challenge)
         else
-            authFailureGetOutcome(ctx, metadata.httpStatus()),
+            authFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus()),
     };
 }
 
@@ -731,9 +675,6 @@ fn authenticateGetRequest(
         exchanger,
         request,
         challenge,
-        authFailureGetOutcome,
-        mapAuthFailureGetOutcome,
-        transportFailureGetOutcome,
         classifyAuthenticatedGetResponse,
     );
 }
@@ -745,31 +686,28 @@ fn authenticateManifestRequest(
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
     challenge: auth.AuthChallenge,
-    comptime auth_failure_fn: fn (ResolverContext, ?u16) error{OutOfMemory}!Outcome,
-    comptime map_auth_failure_fn: fn (ResolverContext, auth.AuthError, ?u16) error{OutOfMemory}!Outcome,
-    comptime transport_failure_fn: fn (ResolverContext, ?u16) error{OutOfMemory}!Outcome,
     comptime classify_authenticated_response_fn: fn (ResolverContext, *auth.AuthEngine, ManifestHttpExchanger, ManifestRequest, ManifestHttpResponse) error{OutOfMemory}!Outcome,
 ) error{OutOfMemory}!Outcome {
     const unauthorized_status = @intFromEnum(std.http.Status.unauthorized);
     const bearer_challenge = switch (challenge) {
         .bearer => |bearer| bearer,
-        else => return auth_failure_fn(ctx, unauthorized_status),
+        else => return authFailureOutcome(Outcome, ctx, unauthorized_status),
     };
 
     const auth_request = auth.AuthenticateRequest.init(ctx.reference.registry, bearer_challenge) catch |err| {
-        return map_auth_failure_fn(ctx, err, unauthorized_status);
+        return mappedAuthFailureOutcome(Outcome, ctx, err, unauthorized_status);
     };
 
     var token_response = (engine.authenticate(ctx.client, auth_request) catch |err| {
-        return map_auth_failure_fn(ctx, err, unauthorized_status);
+        return mappedAuthFailureOutcome(Outcome, ctx, err, unauthorized_status);
     }) orelse {
-        return auth_failure_fn(ctx, unauthorized_status);
+        return authFailureOutcome(Outcome, ctx, unauthorized_status);
     };
     defer token_response.deinit(ctx.allocator);
 
     const retry_response = exchangeManifestRequest(ctx, exchanger, request, token_response.access_token.value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TransportFailed => return transport_failure_fn(ctx, null),
+        error.TransportFailed => return mappedFailureOutcome(Outcome, ctx, null, networkError),
     };
 
     if (retry_response.metadata.status != .unauthorized) {
@@ -778,12 +716,12 @@ fn authenticateManifestRequest(
 
     retry_response.deinit(ctx.allocator);
 
-    if (!request.allow_cached_auth_retry) return auth_failure_fn(ctx, unauthorized_status);
+    if (!request.allow_cached_auth_retry) return authFailureOutcome(Outcome, ctx, unauthorized_status);
 
     var refreshed_token_response = (engine.retryAuthenticateAfterCachedUnauthorized(ctx.client, auth_request) catch |err| {
-        return map_auth_failure_fn(ctx, err, unauthorized_status);
+        return mappedAuthFailureOutcome(Outcome, ctx, err, unauthorized_status);
     }) orelse {
-        return auth_failure_fn(ctx, unauthorized_status);
+        return authFailureOutcome(Outcome, ctx, unauthorized_status);
     };
     defer refreshed_token_response.deinit(ctx.allocator);
 
@@ -792,12 +730,12 @@ fn authenticateManifestRequest(
 
     const refreshed_response = exchangeManifestRequest(ctx, exchanger, retried_request, refreshed_token_response.access_token.value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TransportFailed => return transport_failure_fn(ctx, null),
+        error.TransportFailed => return mappedFailureOutcome(Outcome, ctx, null, networkError),
     };
 
     if (refreshed_response.metadata.status == .unauthorized) {
         refreshed_response.deinit(ctx.allocator);
-        return auth_failure_fn(ctx, unauthorized_status);
+        return authFailureOutcome(Outcome, ctx, unauthorized_status);
     }
 
     return classify_authenticated_response_fn(ctx, engine, exchanger, retried_request, refreshed_response);
@@ -836,10 +774,10 @@ fn classifyUsableHeadMetadata(
 
     const content_type = metadata.content_type orelse return .{ .use_get_fallback = try metadata.cloneAlloc(ctx.allocator) };
     const media_type = manifestDocumentMediaType(content_type) orelse {
-        return unsupportedContentTypeOutcome(ctx, metadata.httpStatus());
+        return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     };
     if (!acceptsManifestMediaType(request.accept, media_type)) {
-        return unsupportedContentTypeOutcome(ctx, metadata.httpStatus());
+        return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     }
 
     return .{ .success = try metadata.cloneAlloc(ctx.allocator) };
@@ -852,32 +790,32 @@ fn classifyUsableGetResponse(
     body: ?[]u8,
 ) error{OutOfMemory}!GetRequestOutcome {
     const content_type = metadata.content_type orelse {
-        return unsupportedContentTypeGetOutcome(ctx, metadata.httpStatus());
+        return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     };
     const media_type = manifestDocumentMediaType(content_type) orelse {
-        return unsupportedContentTypeGetOutcome(ctx, metadata.httpStatus());
+        return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     };
     if (!acceptsManifestMediaType(request.accept, media_type)) {
-        return unsupportedContentTypeGetOutcome(ctx, metadata.httpStatus());
+        return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     }
-    const response_body = body orelse return parseFailureGetOutcome(ctx, metadata.httpStatus());
-    if (response_body.len == 0) return parseFailureGetOutcome(ctx, metadata.httpStatus());
+    const response_body = body orelse return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
+    if (response_body.len == 0) return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
 
     const resolved_digest = verifyManifestBodyIntegrityAlloc(ctx, metadata, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.DigestMismatch => return digestMismatchGetOutcome(ctx, metadata.httpStatus()),
-        error.UnsupportedAlgorithm => return unsupportedAlgorithmGetOutcome(ctx, metadata.httpStatus()),
+        error.DigestMismatch => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), digestMismatchError),
+        error.UnsupportedAlgorithm => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), unsupportedAlgorithmError),
     };
     errdefer ctx.allocator.free(resolved_digest.raw);
 
     var document = parseManifestDocument(ctx.allocator, media_type, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return parseFailureGetOutcome(ctx, metadata.httpStatus()),
+        else => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError),
     };
     errdefer document.deinit();
 
     if (document.mediaType() != media_type) {
-        return unsupportedContentTypeGetOutcome(ctx, metadata.httpStatus());
+        return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     }
 
     return .{ .success = .{
@@ -1003,75 +941,41 @@ fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
 }
 
-fn transportFailureOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!HeadRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = transportFailure(ctx.reference.registry, reference, http_status) };
+fn failureOutcome(comptime Outcome: type, failure: ResolveError) Outcome {
+    return .{ .failure = failure };
 }
 
-fn unsupportedContentTypeOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!HeadRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = unsupportedContentType(ctx.reference.registry, reference, http_status) };
+fn mappedFailureOutcome(
+    comptime Outcome: type,
+    ctx: ResolverContext,
+    http_status: ?u16,
+    comptime failure_factory: *const fn ([]const u8, []const u8, ?u16) ResolveError,
+) error{OutOfMemory}!Outcome {
+    const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
+    return failureOutcome(Outcome, failure_factory(ctx.reference.registry, reference, http_status));
 }
 
-fn authFailureOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!HeadRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = .{ .auth_failed = .{
+fn authFailureOutcome(
+    comptime Outcome: type,
+    ctx: ResolverContext,
+    http_status: ?u16,
+) error{OutOfMemory}!Outcome {
+    const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
+    return failureOutcome(Outcome, .{ .auth_failed = .{
         .registry = ctx.reference.registry,
         .reference = reference,
         .http_status = http_status,
-    } } };
+    } });
 }
 
-fn mapAuthFailureOutcome(
+fn mappedAuthFailureOutcome(
+    comptime Outcome: type,
     ctx: ResolverContext,
     err: auth.AuthError,
     http_status: ?u16,
-) error{OutOfMemory}!HeadRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = try mapAuthError(err, ctx.reference.registry, reference, http_status) };
-}
-
-fn transportFailureGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = transportFailure(ctx.reference.registry, reference, http_status) };
-}
-
-fn unsupportedContentTypeGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = unsupportedContentType(ctx.reference.registry, reference, http_status) };
-}
-
-fn digestMismatchGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = digestMismatchFailure(ctx.reference.registry, reference, http_status) };
-}
-
-fn unsupportedAlgorithmGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = unsupportedAlgorithmFailure(ctx.reference.registry, reference, http_status) };
-}
-
-fn parseFailureGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = manifestParseFailure(ctx.reference.registry, reference, http_status) };
-}
-
-fn authFailureGetOutcome(ctx: ResolverContext, http_status: ?u16) error{OutOfMemory}!GetRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = .{ .auth_failed = .{
-        .registry = ctx.reference.registry,
-        .reference = reference,
-        .http_status = http_status,
-    } } };
-}
-
-fn mapAuthFailureGetOutcome(
-    ctx: ResolverContext,
-    err: auth.AuthError,
-    http_status: ?u16,
-) error{OutOfMemory}!GetRequestOutcome {
-    const reference = try ctx.errorReferenceAlloc();
-    return .{ .failure = try mapAuthError(err, ctx.reference.registry, reference, http_status) };
+) error{OutOfMemory}!Outcome {
+    const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
+    return failureOutcome(Outcome, try resolveErrorFromAuthError(err, ctx.reference.registry, reference, http_status));
 }
 
 fn isRedirectStatus(status: std.http.Status) bool {
@@ -1107,22 +1011,6 @@ fn duplicateHeaderSlicesAlloc(allocator: std.mem.Allocator, headers: []const []c
 fn freeHeaderSlices(allocator: std.mem.Allocator, headers: []const []const u8) void {
     for (headers) |header| allocator.free(header);
     allocator.free(headers);
-}
-
-test "phase3ConfigView keeps resolver-relevant config fields" {
-    const view = phase3ConfigView(.{
-        .connect_timeout_ms = 1234,
-        .read_timeout_ms = 5678,
-        .max_retries = 2,
-        .ca_bundle_path = "/tmp/ca.pem",
-        .rate_limit_enabled = false,
-    });
-
-    try std.testing.expectEqual(@as(u32, 1234), view.connect_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 5678), view.read_timeout_ms);
-    try std.testing.expectEqual(@as(u8, 2), view.max_retries);
-    try std.testing.expectEqualSlices(u8, "/tmp/ca.pem", view.ca_bundle_path.?);
-    try std.testing.expect(!view.rate_limit_enabled);
 }
 
 test "ResolverContext init preserves normalized reference and operation" {
@@ -1214,31 +1102,31 @@ test "ManifestResponseMetadata probeClassification reuses auth probe rules" {
     }
 }
 
-test "mapAuthError preserves OutOfMemory and maps resolver-visible variants" {
+test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible variants" {
     try std.testing.expectError(
         error.OutOfMemory,
-        mapAuthError(error.OutOfMemory, "r", "ref", null),
+        resolveErrorFromAuthError(error.OutOfMemory, "r", "ref", null),
     );
 
-    const timed_out = try mapAuthError(error.HelperTimedOut, "r", "ref", 401);
+    const timed_out = try resolveErrorFromAuthError(error.HelperTimedOut, "r", "ref", 401);
     try std.testing.expectEqualStrings("timeout", @tagName(timed_out));
 
-    const auth_failed = try mapAuthError(error.TokenExchangeFailed, "r", "ref", 401);
+    const auth_failed = try resolveErrorFromAuthError(error.TokenExchangeFailed, "r", "ref", 401);
     try std.testing.expectEqualStrings("auth_failed", @tagName(auth_failed));
 
-    const network_error = try mapAuthError(error.UnsupportedProbeStatus, "r", "ref", 500);
+    const network_error = try resolveErrorFromAuthError(error.UnsupportedProbeStatus, "r", "ref", 500);
     try std.testing.expectEqualStrings("network_error", @tagName(network_error));
 }
 
 test "resolver error helpers keep registry, reference, and status" {
-    const parse_err = manifestParseFailure("ghcr.io", "ghcr.io/owner/repo:v1", 200);
-    const transport_err = transportFailure("ghcr.io", "ghcr.io/owner/repo:v1", 503);
-    const content_type_err = unsupportedContentType("ghcr.io", "ghcr.io/owner/repo:v1", 415);
-    const digest_mismatch_err = digestMismatchFailure("ghcr.io", "ghcr.io/owner/repo:v1", 412);
-    const unsupported_algorithm_err = unsupportedAlgorithmFailure("ghcr.io", "ghcr.io/owner/repo:v1", 400);
+    const parse_err = manifestParseError("ghcr.io", "ghcr.io/owner/repo:v1", 200);
+    const network_err = networkError("ghcr.io", "ghcr.io/owner/repo:v1", 503);
+    const content_type_err = contentTypeMismatchError("ghcr.io", "ghcr.io/owner/repo:v1", 415);
+    const digest_mismatch_err = digestMismatchError("ghcr.io", "ghcr.io/owner/repo:v1", 412);
+    const unsupported_algorithm_err = unsupportedAlgorithmError("ghcr.io", "ghcr.io/owner/repo:v1", 400);
 
     try std.testing.expectEqualStrings("manifest_parse_error", @tagName(parse_err));
-    try std.testing.expectEqualStrings("network_error", @tagName(transport_err));
+    try std.testing.expectEqualStrings("network_error", @tagName(network_err));
     try std.testing.expectEqualStrings("content_type_mismatch", @tagName(content_type_err));
     try std.testing.expectEqualStrings("digest_mismatch", @tagName(digest_mismatch_err));
     try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(unsupported_algorithm_err));
