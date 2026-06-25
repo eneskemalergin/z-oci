@@ -54,16 +54,16 @@ pub const Config = struct {
     /// Credential provider for authenticated registries. Null means anonymous.
     credential_provider: ?*const CredentialProvider = null,
 
-    /// Reserved for future live HTTP connect-timeout wiring.
+    /// Reserved for v0.3.5 manifest/token connect timeout wiring. `0` means unset.
     ///
-    /// The current resolver path does not apply this to manifest or token HTTP
-    /// because callers own `std.http.Client` and Zig 0.16 does not expose a
-    /// clean per-request timeout hook through the current request path.
-    connect_timeout_ms: u32 = 10_000,
+    /// Live manifest and token HTTP ignore this today because callers own
+    /// `std.http.Client` and Zig 0.16 lacks a clean per-request hook.
+    connect_timeout_ms: u32 = 0,
 
     /// Timeout in milliseconds for Docker credential helper subprocess I/O.
     ///
-    /// Live manifest and token HTTP reads do not currently consume this field.
+    /// Manifest and token HTTP reads do not consume this field. Auth applies it
+    /// when waiting on helper stdout/stderr.
     read_timeout_ms: u32 = 30_000,
 
     /// Maximum auth retry count for the cached-401 invalidation path.
@@ -73,22 +73,24 @@ pub const Config = struct {
     max_retries: u8 = 1,
 
     /// Maximum reactive retries for transient network failures on idempotent
-    /// `HEAD`/`GET` traffic. Not yet wired into live manifest or token HTTP.
+    /// manifest `HEAD`/`GET` and token HTTP traffic.
     max_network_retries: u8 = 1,
 
-    /// Maximum reactive retries for `429` / rate-limit responses. Not yet
-    /// wired into live manifest or token HTTP.
+    /// Maximum reactive retries for `429` / rate-limit responses on manifest
+    /// `HEAD`/`GET` and token HTTP traffic.
     max_rate_limit_retries: u8 = 1,
 
-    /// Reserved for future custom CA bundle integration.
+    /// Reserved for v0.3.6 custom CA bundle integration.
     ///
     /// Today the live resolver uses the CA bundle already configured on the
     /// caller-owned `std.http.Client`.
     ca_bundle_path: ?[]const u8 = null,
 
-    /// Gates pre-emptive throttling when rate-limit headers are trustworthy.
-    /// Not yet wired. Reactive `429` backoff is independent of this flag.
-    rate_limit_enabled: bool = true,
+    /// Reserved for v0.3.7 pre-emptive throttling when rate-limit headers look trustworthy.
+    ///
+    /// Defaults off because nothing reads it yet. Reactive `429` backoff stays on
+    /// regardless through the transport retry budgets above.
+    rate_limit_enabled: bool = false,
 };
 
 // Tests
@@ -97,12 +99,17 @@ test "Config: bare Config{} compiles with all defaults" {
     // A caller using Config{} for anonymous access must not need to set anything.
     const c = Config{};
     try std.testing.expect(c.credential_provider == null);
-    try std.testing.expectEqual(@as(u32, 10_000), c.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 0), c.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 30_000), c.read_timeout_ms);
     try std.testing.expectEqual(@as(u8, 1), c.max_retries);
     try std.testing.expectEqual(@as(u8, 1), c.max_network_retries);
     try std.testing.expectEqual(@as(u8, 1), c.max_rate_limit_retries);
     try std.testing.expect(c.ca_bundle_path == null);
+    try std.testing.expect(!c.rate_limit_enabled);
+}
+
+test "Config: rate_limit_enabled can be enabled for future pre-emptive throttling" {
+    const c = Config{ .rate_limit_enabled = true };
     try std.testing.expect(c.rate_limit_enabled);
 }
 
@@ -173,11 +180,6 @@ test "Config: timeout fields accept custom values" {
     try std.testing.expectEqual(@as(u32, 60_000), c.read_timeout_ms);
 }
 
-test "Config: rate_limit_enabled can be disabled" {
-    const c = Config{ .rate_limit_enabled = false };
-    try std.testing.expect(!c.rate_limit_enabled);
-}
-
 test "Config: ca_bundle_path stores and returns path" {
     const c = Config{ .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt" };
     try std.testing.expectEqualSlices(u8, "/etc/ssl/certs/ca-certificates.crt", c.ca_bundle_path.?);
@@ -198,7 +200,7 @@ test "Config: max_retries zero disables retries" {
     try std.testing.expectEqual(@as(u8, 0), c.max_retries);
 }
 
-test "Config: connect_timeout_ms zero means no timeout" {
+test "Config: connect_timeout_ms zero means unset until v0.3.5 wiring" {
     const c = Config{ .connect_timeout_ms = 0 };
     try std.testing.expectEqual(@as(u32, 0), c.connect_timeout_ms);
 }

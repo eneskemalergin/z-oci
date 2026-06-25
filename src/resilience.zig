@@ -6,13 +6,18 @@
 //! wrappers share.
 //!
 //! Bundled Zig 0.16.0 HTTP/TLS notes:
-//! - Manifest traffic uses `std.http.Client.request` with no timeout field on
-//!   `RequestOptions`.
-//! - Token traffic uses `client.fetch` with no timeout field on `FetchOptions`.
+//! - Manifest and token traffic use `std.http.Client.request`; `RequestOptions`
+//!   has no per-request read/connect timeout field today.
 //! - `ConnectTcpOptions.timeout` exists, but `connectTcpOptions` does not pass
 //!   it through to `host.connect` today (zig#31305).
 //! - Custom CA trust lives on `std.http.Client.ca_bundle`; `Config.ca_bundle_path`
-//!   still needs a caller-side apply helper.
+//!   still needs a caller-side apply helper (v0.3.6).
+//!
+//! Config field liveness:
+//! - Live on transport path: `max_network_retries`, `max_rate_limit_retries`.
+//! - Live on helper subprocess only: `read_timeout_ms` (via auth, not this module).
+//! - Reserved in `ResilienceConfigView` until later milestones: connect/read HTTP
+//!   timeouts on manifest/token traffic, `ca_bundle_path`, `rate_limit_enabled`.
 //!
 //! Retry budgets:
 //! - `Config.max_retries` stays auth-only (cached-401 invalidation).
@@ -66,18 +71,35 @@ pub const HttpHeader = struct {
     value: []const u8,
 };
 
-/// Narrow view of `Config` fields that drive transport resilience policy.
+/// Fields that actually drive `RetryBudget` on the live transport path.
 ///
-/// Auth cached-401 retry stays on `Config.max_retries` outside this view so
-/// transport policy does not collide with token invalidation.
-pub const ResilienceConfigView = struct {
-    connect_timeout_ms: u32,
-    read_timeout_ms: u32,
+/// Kept separate from `ResilienceConfigView` so reserved config slots do not
+/// look wired into retry policy before v0.3.5+ work lands.
+pub const RetryBudgetConfig = struct {
     max_network_retries: u8,
     max_rate_limit_retries: u8,
+};
+
+/// Narrow view of `Config` fields reserved for upcoming resilience milestones.
+///
+/// `resilienceConfigView` projects the full struct for callers that need one
+/// snapshot. Only `max_network_retries` and `max_rate_limit_retries` feed
+/// `RetryPolicy` today via `retryBudgetConfig`.
+pub const ResilienceConfigView = struct {
+    /// Reserved for v0.3.5 manifest/token connect timeout wiring.
+    connect_timeout_ms: u32,
+    /// Reserved for v0.3.5 manifest/token read timeout wiring.
+    ///
+    /// Docker credential helper subprocess I/O reads `Config.read_timeout_ms`
+    /// directly in auth instead of through this view.
+    read_timeout_ms: u32,
+    /// Live: reactive retry budget for transient `5xx` and socket errors.
+    max_network_retries: u8,
+    /// Live: reactive retry budget for `429` responses.
+    max_rate_limit_retries: u8,
+    /// Reserved for v0.3.6 custom CA bundle apply helper.
     ca_bundle_path: ?[]const u8,
-    /// Gates pre-emptive throttling only. Reactive `429` backoff is independent
-    /// of this flag once transport retries are wired.
+    /// Reserved for v0.3.7 pre-emptive throttling. Reactive `429` backoff ignores this.
     rate_limit_enabled: bool,
 };
 
@@ -88,10 +110,10 @@ pub const RetryBudget = struct {
     max_network_retries: u8,
     max_rate_limit_retries: u8,
 
-    pub fn init(view: ResilienceConfigView) RetryBudget {
+    pub fn init(config: RetryBudgetConfig) RetryBudget {
         return .{
-            .max_network_retries = view.max_network_retries,
-            .max_rate_limit_retries = view.max_rate_limit_retries,
+            .max_network_retries = config.max_network_retries,
+            .max_rate_limit_retries = config.max_rate_limit_retries,
         };
     }
 
@@ -148,12 +170,12 @@ pub const RetryPolicy = struct {
     clock: RetryClock,
 
     pub fn init(
-        view: ResilienceConfigView,
+        budget_config: RetryBudgetConfig,
         random_u64: RetryRandomSource,
         clock: RetryClock,
     ) RetryPolicy {
         return .{
-            .budget = RetryBudget.init(view),
+            .budget = RetryBudget.init(budget_config),
             .random_u64 = random_u64,
             .clock = clock,
         };
@@ -236,7 +258,7 @@ fn systemRetryRandomU64() u64 {
 pub const systemRetryClock: RetryClock = .{ .now_unix_seconds = systemNowUnixSeconds };
 
 pub fn retryPolicyFromConfig(config: Config, hooks: TransportHooks) RetryPolicy {
-    return RetryPolicy.init(resilienceConfigView(config), hooks.random_u64, hooks.clock);
+    return RetryPolicy.init(retryBudgetConfig(config), hooks.random_u64, hooks.clock);
 }
 
 pub fn sleepForTransportRetry(
@@ -347,6 +369,13 @@ fn exponentialBackoffDelayMs(
     const capped = @min(uncapped, config.max_delay_ms);
     if (capped == 0) return 0;
     return @intCast(random_u64 % (@as(u64, capped) + 1));
+}
+
+pub fn retryBudgetConfig(config: Config) RetryBudgetConfig {
+    return .{
+        .max_network_retries = config.max_network_retries,
+        .max_rate_limit_retries = config.max_rate_limit_retries,
+    };
 }
 
 pub fn resilienceConfigView(config: Config) ResilienceConfigView {
@@ -676,7 +705,24 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-test "resilienceConfigView projects transport retry fields and leaves auth max_retries separate" {
+test "retryBudgetConfig projects only transport retry limits" {
+    const config = Config{
+        .connect_timeout_ms = 5_000,
+        .read_timeout_ms = 60_000,
+        .max_retries = 9,
+        .max_network_retries = 2,
+        .max_rate_limit_retries = 3,
+        .ca_bundle_path = "/tmp/custom-ca.pem",
+        .rate_limit_enabled = true,
+    };
+
+    const budget_config = retryBudgetConfig(config);
+    try std.testing.expectEqual(@as(u8, 2), budget_config.max_network_retries);
+    try std.testing.expectEqual(@as(u8, 3), budget_config.max_rate_limit_retries);
+    try std.testing.expectEqual(@as(u8, 9), config.max_retries);
+}
+
+test "resilienceConfigView projects reserved fields without implying they drive RetryPolicy" {
     const config = Config{
         .connect_timeout_ms = 5_000,
         .read_timeout_ms = 60_000,
@@ -715,12 +761,11 @@ test "classifyNetworkTransportError maps transient socket failures to network" {
 }
 
 test "RetryBudget tracks separate network and rate-limit attempt limits" {
-    const view = resilienceConfigView(.{
+    const budget_config = retryBudgetConfig(.{
         .max_network_retries = 1,
         .max_rate_limit_retries = 2,
     });
-
-    var budget = RetryBudget.init(view);
+    var budget = RetryBudget.init(budget_config);
     try std.testing.expect(budget.canRetryNetwork());
     try std.testing.expect(budget.canRetryRateLimit());
 
@@ -942,15 +987,38 @@ fn testPolicyRandomU64() u64 {
     return test_policy_random_u64;
 }
 
-fn testRetryPolicy(view: ResilienceConfigView) RetryPolicy {
-    return RetryPolicy.init(view, testPolicyRandomU64, .{ .now_unix_seconds = testPolicyNowUnixSeconds });
+fn testRetryPolicy(budget_config: RetryBudgetConfig) RetryPolicy {
+    return RetryPolicy.init(budget_config, testPolicyRandomU64, .{ .now_unix_seconds = testPolicyNowUnixSeconds });
+}
+
+test "RetryPolicy ignores reserved config fields when budgets are built from Config" {
+    var tight = testRetryPolicy(retryBudgetConfig(.{
+        .max_network_retries = 0,
+        .max_rate_limit_retries = 0,
+        .rate_limit_enabled = true,
+        .connect_timeout_ms = 60_000,
+    }));
+    var loose = testRetryPolicy(retryBudgetConfig(.{
+        .max_network_retries = 2,
+        .max_rate_limit_retries = 2,
+        .rate_limit_enabled = false,
+        .connect_timeout_ms = 0,
+    }));
+
+    const tight_decision = tight.decideHttpRetry(.service_unavailable, null);
+    try std.testing.expectEqual(RetryDecision.Action.give_up, tight_decision.action);
+
+    const loose_decision = loose.decideHttpRetry(.service_unavailable, null);
+    try std.testing.expectEqual(RetryDecision.Action.retry, loose_decision.action);
+    _ = loose.decideHttpRetry(.too_many_requests, null);
+    try std.testing.expectEqual(@as(u8, 1), loose.budget.rate_limit_attempts_used);
 }
 
 test "RetryPolicy retries 429 using Retry-After delay and separate rate-limit budget" {
     test_policy_now_unix_seconds = 1_700_000_000;
     test_policy_random_u64 = 0;
 
-    var policy = testRetryPolicy(resilienceConfigView(.{
+    var policy = testRetryPolicy(retryBudgetConfig(.{
         .max_network_retries = 1,
         .max_rate_limit_retries = 2,
     }));
@@ -974,7 +1042,7 @@ test "RetryPolicy retries 429 using Retry-After delay and separate rate-limit bu
 test "RetryPolicy retries transient 5xx and transport errors on the network budget" {
     test_policy_random_u64 = 4;
 
-    var policy = testRetryPolicy(resilienceConfigView(.{
+    var policy = testRetryPolicy(retryBudgetConfig(.{
         .max_network_retries = 2,
         .max_rate_limit_retries = 0,
     }));
@@ -994,7 +1062,7 @@ test "RetryPolicy retries transient 5xx and transport errors on the network budg
 }
 
 test "RetryPolicy gives up on non-retryable HTTP statuses" {
-    var policy = testRetryPolicy(resilienceConfigView(.{
+    var policy = testRetryPolicy(retryBudgetConfig(.{
         .max_network_retries = 3,
         .max_rate_limit_retries = 3,
     }));
