@@ -26,6 +26,18 @@
 //!   the registry/API rate-limit parsers. Headers are captured on responses but
 //!   rate-limit snapshots do not affect retry policy yet.
 //!
+//! Policy liveness (v0.3.3):
+//! - Pure policy core: `RetryPolicy`, `decideHttpRetry`, `decideTransportRetry`,
+//!   `RetryBackoffConfig` defaults, injected `RetryClock` / `RetryRandomSource`.
+//! - Live via transport wrappers (v0.3.4): `retryPolicyFromConfig` on manifest
+//!   HEAD/GET and token HTTP paths. Wrappers sleep on `RetryDecision.delay_ms`
+//!   and re-invoke the inner exchanger.
+//! - `TransportHooks` sleep wiring is a transport concern, not part of the pure
+//!   policy decision. `retryPolicyFromConfig` only borrows clock/RNG hooks.
+//! - `classifyNetworkTransportError` only retries errors the exchanger surfaces.
+//!   Opaque `TransportFailed` / `TokenExchangeFailed` stay non-retryable at the
+//!   policy layer even when the underlying fault was transient.
+//!
 //! Retry budgets:
 //! - `Config.max_retries` stays auth-only (cached-401 invalidation).
 //! - `Config.max_network_retries` and `Config.max_rate_limit_retries` own
@@ -144,6 +156,9 @@ pub const RetryBudget = struct {
 };
 
 /// Exponential backoff parameters for reactive transport retries.
+///
+/// Fixed defaults today. `Config` does not tune these yet; callers cannot mistake
+/// config fields for backoff control until a future milestone adds them.
 pub const RetryBackoffConfig = struct {
     base_delay_ms: u32 = 1_000,
     max_delay_ms: u32 = 30_000,
@@ -171,7 +186,8 @@ pub const RetryDecision = struct {
 
 /// Pure reactive retry policy shared by manifest and token transport wrappers.
 ///
-/// Auth cached-401 retry stays on `Config.max_retries` outside this type.
+/// Evaluates one retry decision at a time. Transport wrappers own the sleep/retry
+/// loop; auth cached-401 retry stays on `Config.max_retries` outside this type.
 pub const RetryPolicy = struct {
     backoff: RetryBackoffConfig = .{},
     budget: RetryBudget,
@@ -179,12 +195,13 @@ pub const RetryPolicy = struct {
     clock: RetryClock,
 
     pub fn init(
-        budget_config: RetryBudgetConfig,
+        policy_config: RetryPolicyConfig,
         random_u64: RetryRandomSource,
         clock: RetryClock,
     ) RetryPolicy {
         return .{
-            .budget = RetryBudget.init(budget_config),
+            .backoff = policy_config.backoff,
+            .budget = RetryBudget.init(policy_config.budget),
             .random_u64 = random_u64,
             .clock = clock,
         };
@@ -229,6 +246,15 @@ pub const RetryPolicy = struct {
     }
 };
 
+/// Inputs that actually drive `RetryPolicy` today.
+///
+/// `Config` only supplies the budget half via `retryPolicyConfig`. Backoff stays
+/// on fixed defaults until a future milestone exposes tuning fields.
+pub const RetryPolicyConfig = struct {
+    budget: RetryBudgetConfig,
+    backoff: RetryBackoffConfig = .{},
+};
+
 /// Injectable sleep hook so unit tests avoid real delays.
 pub const TransportSleeper = *const fn (delay_ms: u32) void;
 
@@ -266,8 +292,12 @@ fn systemRetryRandomU64() u64 {
 
 pub const systemRetryClock: RetryClock = .{ .now_unix_seconds = systemNowUnixSeconds };
 
+pub fn retryPolicyConfig(config: Config) RetryPolicyConfig {
+    return .{ .budget = retryBudgetConfig(config) };
+}
+
 pub fn retryPolicyFromConfig(config: Config, hooks: TransportHooks) RetryPolicy {
-    return RetryPolicy.init(retryBudgetConfig(config), hooks.random_u64, hooks.clock);
+    return RetryPolicy.init(retryPolicyConfig(config), hooks.random_u64, hooks.clock);
 }
 
 pub fn sleepForTransportRetry(
@@ -425,7 +455,9 @@ pub fn isRetryableHttpStatus(status: std.http.Status) bool {
 
 /// Classify transient transport failures that may succeed on idempotent retry.
 ///
-/// Hard auth, parse, and digest failures stay outside this helper.
+/// Hard auth, parse, and digest failures stay outside this helper. Opaque wrapper
+/// errors such as `error.TransportFailed` map to `.none` so policy does not retry
+/// faults the exchanger collapsed.
 pub fn classifyNetworkTransportError(err: anyerror) RetryKind {
     return switch (err) {
         error.ConnectionResetByPeer,
@@ -794,6 +826,12 @@ test "classifyNetworkTransportError maps transient socket failures to network" {
     try std.testing.expectEqual(RetryKind.none, classifyNetworkTransportError(error.OutOfMemory));
 }
 
+test "classifyNetworkTransportError ignores opaque collapsed transport errors" {
+    // Manifest/token wrappers often collapse socket failures to a single opaque
+    // error before policy sees them. Those stay non-retryable here by design.
+    try std.testing.expectEqual(RetryKind.none, classifyNetworkTransportError(error.UnexpectedEndOfInput));
+}
+
 test "RetryBudget tracks separate network and rate-limit attempt limits" {
     const budget_config = retryBudgetConfig(.{
         .max_network_retries = 1,
@@ -1109,7 +1147,90 @@ fn testPolicyRandomU64() u64 {
 }
 
 fn testRetryPolicy(budget_config: RetryBudgetConfig) RetryPolicy {
-    return RetryPolicy.init(budget_config, testPolicyRandomU64, .{ .now_unix_seconds = testPolicyNowUnixSeconds });
+    return RetryPolicy.init(.{ .budget = budget_config }, testPolicyRandomU64, .{
+        .now_unix_seconds = testPolicyNowUnixSeconds,
+    });
+}
+
+test "retryPolicyConfig projects only budget fields from Config" {
+    const config = Config{
+        .max_network_retries = 4,
+        .max_rate_limit_retries = 5,
+        .connect_timeout_ms = 9_000,
+        .rate_limit_enabled = true,
+    };
+
+    const policy_config = retryPolicyConfig(config);
+    try std.testing.expectEqual(@as(u8, 4), policy_config.budget.max_network_retries);
+    try std.testing.expectEqual(@as(u8, 5), policy_config.budget.max_rate_limit_retries);
+    try std.testing.expectEqual(@as(u32, 1_000), policy_config.backoff.base_delay_ms);
+    try std.testing.expectEqual(@as(u32, 30_000), policy_config.backoff.max_delay_ms);
+}
+
+test "retryPolicyFromConfig uses injected clock and random hooks" {
+    test_policy_now_unix_seconds = 1_700_000_000;
+    test_policy_random_u64 = 0;
+
+    var policy = retryPolicyFromConfig(.{
+        .max_rate_limit_retries = 1,
+    }, .{
+        .clock = .{ .now_unix_seconds = testPolicyNowUnixSeconds },
+        .random_u64 = testPolicyRandomU64,
+    });
+
+    const decision = policy.decideHttpRetry(.too_many_requests, .{
+        .retry_at_unix_seconds = 1_700_000_120,
+    });
+    try std.testing.expectEqual(RetryDecision.Action.retry, decision.action);
+    try std.testing.expectEqual(@as(u32, 120_000), decision.delay_ms);
+}
+
+test "RetryPolicy keeps network and rate-limit budgets independent" {
+    test_policy_random_u64 = 0;
+
+    var policy = testRetryPolicy(retryBudgetConfig(.{
+        .max_network_retries = 1,
+        .max_rate_limit_retries = 1,
+    }));
+
+    const rate_limited = policy.decideHttpRetry(.too_many_requests, .{ .delay_seconds = 5 });
+    try std.testing.expectEqual(RetryDecision.Action.retry, rate_limited.action);
+    try std.testing.expectEqual(@as(u8, 1), policy.budget.rate_limit_attempts_used);
+    try std.testing.expectEqual(@as(u8, 0), policy.budget.network_attempts_used);
+
+    const gateway = policy.decideHttpRetry(.bad_gateway, null);
+    try std.testing.expectEqual(RetryDecision.Action.retry, gateway.action);
+    try std.testing.expectEqual(@as(u8, 1), policy.budget.rate_limit_attempts_used);
+    try std.testing.expectEqual(@as(u8, 1), policy.budget.network_attempts_used);
+}
+
+test "RetryPolicy uses jitter backoff for 429 without Retry-After" {
+    test_policy_random_u64 = 999;
+
+    var policy = testRetryPolicy(retryBudgetConfig(.{
+        .max_rate_limit_retries = 1,
+    }));
+
+    const decision = policy.decideHttpRetry(.too_many_requests, null);
+    try std.testing.expectEqual(RetryDecision.Action.retry, decision.action);
+    try std.testing.expectEqual(RetryKind.rate_limit, decision.kind);
+    try std.testing.expectEqual(@as(u32, 999), decision.delay_ms);
+}
+
+test "RetryPolicy classifies 502 and 504 as network retries" {
+    var policy = testRetryPolicy(retryBudgetConfig(.{
+        .max_network_retries = 2,
+    }));
+
+    const bad_gateway = policy.decideHttpRetry(.bad_gateway, null);
+    try std.testing.expectEqual(RetryKind.network, bad_gateway.kind);
+    try std.testing.expectEqual(RetryDecision.Action.retry, bad_gateway.action);
+
+    const gateway_timeout = policy.decideHttpRetry(.gateway_timeout, null);
+    try std.testing.expectEqual(RetryKind.network, gateway_timeout.kind);
+    try std.testing.expectEqual(RetryDecision.Action.retry, gateway_timeout.action);
+
+    try std.testing.expectEqual(@as(u8, 2), policy.budget.network_attempts_used);
 }
 
 test "RetryPolicy ignores reserved config fields when budgets are built from Config" {
@@ -1182,7 +1303,7 @@ test "RetryPolicy retries transient 5xx and transport errors on the network budg
     try std.testing.expectEqual(RetryDecision.Action.give_up, exhausted.action);
 }
 
-test "RetryPolicy gives up on non-retryable HTTP statuses" {
+test "RetryPolicy gives up on non-retryable HTTP statuses and transport errors" {
     var policy = testRetryPolicy(retryBudgetConfig(.{
         .max_network_retries = 3,
         .max_rate_limit_retries = 3,
@@ -1192,6 +1313,10 @@ test "RetryPolicy gives up on non-retryable HTTP statuses" {
     try std.testing.expectEqual(RetryDecision.Action.give_up, not_found.action);
     try std.testing.expectEqual(@as(u8, 0), policy.budget.network_attempts_used);
     try std.testing.expectEqual(@as(u8, 0), policy.budget.rate_limit_attempts_used);
+
+    const opaque_transport = policy.decideTransportRetry(error.UnexpectedEndOfInput);
+    try std.testing.expectEqual(RetryDecision.Action.give_up, opaque_transport.action);
+    try std.testing.expectEqual(@as(u8, 0), policy.budget.network_attempts_used);
 }
 
 test "exponential backoff caps delay and applies full jitter deterministically" {
@@ -1206,4 +1331,7 @@ test "exponential backoff caps delay and applies full jitter deterministically" 
         .max_delay_ms = 2_000,
     }, 3, 1_500);
     try std.testing.expectEqual(@as(u32, 1_500), capped);
+
+    const first_attempt = exponentialBackoffDelayMs(.{}, 0, 0);
+    try std.testing.expectEqual(@as(u32, 0), first_attempt);
 }
