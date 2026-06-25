@@ -19,6 +19,7 @@
 //!
 const std = @import("std");
 const resolver = @import("resolver.zig");
+const resilience = @import("resilience.zig");
 
 pub const Digest = @import("Digest.zig");
 pub const MediaType = @import("MediaType.zig").MediaType;
@@ -76,6 +77,7 @@ pub const testing = struct {
         platform: ?Platform,
         token_exchanger: TokenHttpExchanger,
         manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
     ) PublicApiError!ResolveOutcome {
         return root.resolveWithExchangers(
             allocator,
@@ -85,6 +87,7 @@ pub const testing = struct {
             platform,
             token_exchanger,
             manifest_exchanger,
+            transport_hooks,
         );
     }
 
@@ -96,6 +99,7 @@ pub const testing = struct {
         platform: ?Platform,
         token_exchanger: TokenHttpExchanger,
         manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
     ) PublicApiError!ValidateOutcome {
         return root.validateWithExchangers(
             allocator,
@@ -105,6 +109,7 @@ pub const testing = struct {
             platform,
             token_exchanger,
             manifest_exchanger,
+            transport_hooks,
         );
     }
 
@@ -116,6 +121,7 @@ pub const testing = struct {
         platform: ?Platform,
         token_exchanger: TokenHttpExchanger,
         manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
     ) PublicApiError!ManifestOutcome {
         return root.getManifestWithExchangers(
             allocator,
@@ -125,6 +131,7 @@ pub const testing = struct {
             platform,
             token_exchanger,
             manifest_exchanger,
+            transport_hooks,
         );
     }
 
@@ -208,6 +215,7 @@ pub fn resolve(
         platform,
         auth.liveTokenHttpExchanger,
         resolver.liveManifestHttpExchanger,
+        resilience.liveTransportHooks(),
     );
 }
 
@@ -239,6 +247,7 @@ pub fn validate(
         platform,
         auth.liveTokenHttpExchanger,
         resolver.liveManifestHttpExchanger,
+        resilience.liveTransportHooks(),
     );
 }
 
@@ -270,6 +279,7 @@ pub fn getManifest(
         platform,
         auth.liveTokenHttpExchanger,
         resolver.liveManifestHttpExchanger,
+        resilience.liveTransportHooks(),
     );
 }
 
@@ -281,8 +291,9 @@ fn resolveWithExchangers(
     platform: ?Platform,
     token_exchanger: auth.TokenHttpExchanger,
     manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ResolveOutcome {
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
+    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
 
     var outcome = try fetchResolvedManifestWithExchangers(
@@ -296,6 +307,7 @@ fn resolveWithExchangers(
         manifest_exchanger,
         .resolve,
         0,
+        transport_hooks,
     );
     switch (outcome) {
         .success => |*success| {
@@ -331,18 +343,20 @@ fn validateWithExchangers(
     platform: ?Platform,
     token_exchanger: auth.TokenHttpExchanger,
     manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ValidateOutcome {
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
+    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
 
     const ref_view = referenceView(ref);
-    const ctx = resolver.ResolverContext.init(
+    const ctx = resolver.ResolverContext.initWithTransportHooks(
         allocator,
         client,
         config,
         ref_view,
         platform,
         .validate,
+        transport_hooks,
     );
 
     const head_outcome = try resolver.performManifestHead(ctx, &engine, manifest_exchanger, manifestAcceptValues());
@@ -374,6 +388,7 @@ fn validateWithExchangers(
         manifest_exchanger,
         .validate,
         0,
+        transport_hooks,
     );
     return validateOutcomeFromResolvedManifestOutcome(allocator, &outcome);
 }
@@ -430,8 +445,9 @@ fn getManifestWithExchangers(
     platform: ?Platform,
     token_exchanger: auth.TokenHttpExchanger,
     manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ManifestOutcome {
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, config, token_exchanger);
+    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
 
     var outcome = try fetchResolvedManifestWithExchangers(
@@ -445,6 +461,7 @@ fn getManifestWithExchangers(
         manifest_exchanger,
         .get_manifest,
         0,
+        transport_hooks,
     );
     switch (outcome) {
         .success => |*success| {
@@ -472,18 +489,20 @@ fn fetchResolvedManifestWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     operation: resolver.ResolverOperation,
     depth: usize,
+    transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ResolvedManifestOutcome {
     if (depth > max_child_manifest_depth) {
         return .{ .failure = try depthLimitExceededErrorAlloc(allocator, ref_view) };
     }
 
-    const ctx = resolver.ResolverContext.init(
+    const ctx = resolver.ResolverContext.initWithTransportHooks(
         allocator,
         client,
         config,
         ref_view,
         platform,
         if (depth == 0) operation else .resolve_child_manifest,
+        transport_hooks,
     );
 
     var outcome = try resolver.performManifestGet(ctx, engine, manifest_exchanger, manifestAcceptValues());
@@ -593,6 +612,7 @@ fn recurseIntoMultiArchDocument(
         manifest_exchanger,
         .resolve_child_manifest,
         depth + 1,
+        engine.transport_hooks,
     );
 
     switch (child_outcome) {
@@ -893,6 +913,7 @@ test "resolveWithExchangers returns pinned single-arch result for tag reference"
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     switch (outcome) {
@@ -958,6 +979,7 @@ test "resolveWithExchangers repeated single-arch runs leave no residual allocati
             null,
             State.tokenExchange,
             State.manifestExchange,
+            .{},
         );
 
         switch (outcome) {
@@ -1013,6 +1035,7 @@ test "getManifestWithExchangers returns parsed single-arch manifest" {
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     switch (outcome) {
@@ -1056,6 +1079,7 @@ test "validateWithExchangers returns not_found for missing manifest" {
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     try std.testing.expectEqual(ValidateOutcome.not_found, outcome);
@@ -1100,6 +1124,7 @@ test "validateWithExchangers returns valid from HEAD for single-arch manifest" {
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     try std.testing.expect(State.saw_head);
@@ -1144,6 +1169,7 @@ test "validateWithExchangers returns platform_required from HEAD for multi-arch 
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
     defer switch (outcome) {
         .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
@@ -1304,6 +1330,7 @@ test "resolveWithExchangers propagates resolver failure matrix with full context
             null,
             State.tokenExchange,
             State.manifestExchange,
+            .{},
         );
         defer switch (outcome) {
             .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
@@ -1366,6 +1393,7 @@ test "resolveWithExchangers returns platform_required when multi-arch request om
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
     defer switch (outcome) {
         .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
@@ -1464,6 +1492,7 @@ test "validateWithExchangers returns valid for selected multi-arch child manifes
         .{ .os = "linux", .architecture = "arm64" },
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     try std.testing.expectEqual(ValidateOutcome.valid, outcome);
@@ -1520,6 +1549,7 @@ test "validateWithExchangers returns platform_required when multi-arch request o
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
     defer switch (outcome) {
         .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
@@ -1586,6 +1616,7 @@ test "getManifestWithExchangers returns platform_required when multi-arch reques
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
     defer switch (outcome) {
         .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
@@ -1690,6 +1721,7 @@ test "resolveWithExchangers resolves multi-arch index to selected child manifest
         .{ .os = "linux", .architecture = "arm64" },
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     switch (outcome) {
@@ -1792,6 +1824,7 @@ test "resolveWithExchangers repeated multi-arch runs leave no residual allocatio
             .{ .os = "linux", .architecture = "arm64" },
             State.tokenExchange,
             State.manifestExchange,
+            .{},
         );
 
         switch (outcome) {
@@ -1855,6 +1888,7 @@ test "resolveWithExchangers returns platform_not_found when multi-arch platform 
         .{ .os = "windows", .architecture = "amd64" },
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
     defer switch (outcome) {
         .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
@@ -1973,6 +2007,7 @@ test "getManifestWithExchangers resolves nested index to leaf manifest" {
         .{ .os = "linux", .architecture = "arm64" },
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     switch (outcome) {
@@ -2058,6 +2093,7 @@ test "resolveWithExchangers returns depth_limit_exceeded for nested indexes beyo
         .{ .os = "linux", .architecture = "arm64" },
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
     defer switch (outcome) {
         .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),

@@ -196,6 +196,7 @@ test "workflow smoke: public resolve pins a single-arch manifest" {
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     switch (outcome) {
@@ -301,6 +302,7 @@ test "workflow smoke: public validate follows selected multi-arch child" {
         .{ .os = "linux", .architecture = "arm64" },
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
 
     try std.testing.expectEqual(z_oci.ValidateOutcome.valid, outcome);
@@ -362,6 +364,7 @@ test "workflow smoke: public getManifest reports platform_required for multi-arc
         null,
         State.tokenExchange,
         State.manifestExchange,
+        .{},
     );
     defer switch (outcome) {
         .failure => |failure| z_oci.testing.deinitResolveError(failure, std.testing.allocator),
@@ -468,6 +471,7 @@ test "workflow smoke: public resolve failure matrix preserves full error context
             null,
             State.tokenExchange,
             State.manifestExchange,
+            .{},
         );
         defer switch (outcome) {
             .failure => |failure| z_oci.testing.deinitResolveError(failure, std.testing.allocator),

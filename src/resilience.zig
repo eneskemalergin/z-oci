@@ -198,6 +198,107 @@ pub const RetryPolicy = struct {
     }
 };
 
+/// Injectable sleep hook so unit tests avoid real delays.
+pub const TransportSleeper = *const fn (delay_ms: u32) void;
+
+/// Hooks transport wrappers inject for clock, jitter, and sleep.
+pub const TransportHooks = struct {
+    sleeper: TransportSleeper = noopTransportSleeper,
+    random_u64: RetryRandomSource = systemRetryRandomU64,
+    clock: RetryClock = systemRetryClock,
+    /// When true, resolver/auth sleep through `std.http.Client.io` instead of `sleeper`.
+    use_live_sleep: bool = false,
+};
+
+pub fn noopTransportSleeper(_: u32) void {}
+
+pub fn liveTransportHooks() TransportHooks {
+    return .{ .use_live_sleep = true };
+}
+
+fn systemNowUnixSeconds() i64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+    return @intCast(ts.sec);
+}
+
+threadlocal var transport_prng_initialized = false;
+threadlocal var transport_prng: std.Random.DefaultPrng = undefined;
+
+fn systemRetryRandomU64() u64 {
+    if (!transport_prng_initialized) {
+        transport_prng = std.Random.DefaultPrng.init(@bitCast(systemNowUnixSeconds()));
+        transport_prng_initialized = true;
+    }
+    return transport_prng.random().int(u64);
+}
+
+pub const systemRetryClock: RetryClock = .{ .now_unix_seconds = systemNowUnixSeconds };
+
+pub fn retryPolicyFromConfig(config: Config, hooks: TransportHooks) RetryPolicy {
+    return RetryPolicy.init(resilienceConfigView(config), hooks.random_u64, hooks.clock);
+}
+
+pub fn sleepForTransportRetry(
+    client: *std.http.Client,
+    hooks: TransportHooks,
+    delay_ms: u32,
+) void {
+    if (delay_ms == 0) return;
+    if (hooks.use_live_sleep) {
+        std.Io.Timeout.sleep(.{
+            .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(delay_ms),
+                .clock = .real,
+            },
+        }, client.io) catch {};
+        return;
+    }
+    hooks.sleeper(delay_ms);
+}
+
+/// Returns true for rate-limit and retry-after header names the transport layer keeps.
+pub fn isTrackedResilienceHeaderName(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "RateLimit-")) return true;
+    if (std.ascii.startsWithIgnoreCase(name, "X-RateLimit-")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "Retry-After")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "X-Retry-After")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "Date")) return true;
+    return false;
+}
+
+pub fn retryAfterFromHeaders(
+    headers: []const HttpHeader,
+    now_unix_seconds: i64,
+) ResilienceParseError!?RetryAfter {
+    return parseRetryAfterFromHeaders(headers, now_unix_seconds);
+}
+
+pub fn deinitOwnedHttpHeaders(allocator: std.mem.Allocator, headers: []HttpHeader) void {
+    for (headers) |header| {
+        allocator.free(header.name);
+        allocator.free(header.value);
+    }
+    allocator.free(headers);
+}
+
+pub fn duplicateHttpHeadersAlloc(
+    allocator: std.mem.Allocator,
+    headers: []const HttpHeader,
+) ![]HttpHeader {
+    const owned = try allocator.alloc(HttpHeader, headers.len);
+    errdefer allocator.free(owned);
+
+    for (headers, 0..) |header, index| {
+        owned[index] = .{
+            .name = try allocator.dupe(u8, header.name),
+            .value = try allocator.dupe(u8, header.value),
+        };
+    }
+
+    return owned;
+}
+
 /// Convert a parsed `Retry-After` value into milliseconds to sleep from `now`.
 pub fn retryAfterDelayMs(retry_after: RetryAfter, now_unix_seconds: i64) u32 {
     switch (retry_after) {

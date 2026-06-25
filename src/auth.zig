@@ -13,6 +13,7 @@ const CredentialHandle = ConfigModule.CredentialHandle;
 const CredentialProvider = ConfigModule.CredentialProvider;
 const Reference = @import("Reference.zig");
 const json = @import("json.zig");
+const resilience = @import("resilience.zig");
 
 /// Internal Phase 2 auth-only error set.
 ///
@@ -59,8 +60,13 @@ pub const TokenExchangeResponse = struct {
     status: std.http.Status,
     body: []const u8,
     owned_body: ?[]u8 = null,
+    resilience_headers: []const resilience.HttpHeader = &.{},
+    owned_resilience_headers: ?[]resilience.HttpHeader = null,
 
     pub fn deinit(self: TokenExchangeResponse, allocator: std.mem.Allocator) void {
+        if (self.owned_resilience_headers) |headers| {
+            resilience.deinitOwnedHttpHeaders(allocator, headers);
+        }
         const owned_body = self.owned_body orelse return;
         std.crypto.secureZero(u8, owned_body);
         allocator.free(owned_body);
@@ -459,6 +465,7 @@ pub const AuthEngine = struct {
     config: Config,
     helper_process_context: ?HelperProcessContext = null,
     token_http_exchanger: ?TokenHttpExchanger = null,
+    transport_hooks: resilience.TransportHooks = .{},
     now_unix_seconds_fn: NowUnixSecondsFn = currentUnixSeconds,
     environ_map: ?*const std.process.Environ.Map = null,
     docker_config: ?DockerConfig = null,
@@ -499,12 +506,35 @@ pub const AuthEngine = struct {
         config: Config,
         token_http_exchanger: TokenHttpExchanger,
     ) AuthEngine {
+        return initWithTokenHttpExchangerAndHooks(allocator, config, token_http_exchanger, .{});
+    }
+
+    pub fn initWithTokenHttpExchangerAndHooks(
+        allocator: std.mem.Allocator,
+        config: Config,
+        token_http_exchanger: TokenHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
+    ) AuthEngine {
         return .{
             .allocator = allocator,
             .config = config,
             .token_http_exchanger = token_http_exchanger,
+            .transport_hooks = transport_hooks,
             .now_unix_seconds_fn = currentUnixSeconds,
         };
+    }
+
+    pub fn initWithTokenHttpExchangerLive(
+        allocator: std.mem.Allocator,
+        config: Config,
+        token_http_exchanger: TokenHttpExchanger,
+    ) AuthEngine {
+        return initWithTokenHttpExchangerAndHooks(
+            allocator,
+            config,
+            token_http_exchanger,
+            resilience.liveTransportHooks(),
+        );
     }
 
     pub fn initWithEnvironmentMap(
@@ -657,31 +687,68 @@ pub const AuthEngine = struct {
         request: AuthenticateRequest,
         credential: ?ConfigModule.Credential,
     ) AuthError!TokenResponse {
-        const exchanger = self.token_http_exchanger orelse return error.NotYetImplemented;
-
-        const get_request = try buildTokenHttpRequest(
-            self.allocator,
+        const get_response = try exchangeTokenHttpRequestWithRetries(
+            self,
+            client,
             request,
             .get,
             credential,
         );
-        const get_response = try exchanger(self.allocator, client, get_request);
         defer get_response.deinit(self.allocator);
         if (get_response.status == .ok) {
             return try parseTokenResponse(self.allocator, get_response.body);
         }
 
-        const post_request = try buildTokenHttpRequest(
-            self.allocator,
+        const post_response = try exchangeTokenHttpRequestWithRetries(
+            self,
+            client,
             request,
             .post,
             credential,
         );
-        const post_response = try exchanger(self.allocator, client, post_request);
         defer post_response.deinit(self.allocator);
         if (post_response.status != .ok) return error.TokenExchangeFailed;
 
         return try parseTokenResponse(self.allocator, post_response.body);
+    }
+
+    fn exchangeTokenHttpRequestWithRetries(
+        self: *AuthEngine,
+        client: *std.http.Client,
+        request: AuthenticateRequest,
+        method: TokenRequestMethod,
+        credential: ?ConfigModule.Credential,
+    ) AuthError!TokenExchangeResponse {
+        const exchanger = self.token_http_exchanger orelse return error.NotYetImplemented;
+        var policy = resilience.retryPolicyFromConfig(self.config, self.transport_hooks);
+
+        while (true) {
+            const http_request = try buildTokenHttpRequest(
+                self.allocator,
+                request,
+                method,
+                credential,
+            );
+
+            const response = exchanger(self.allocator, client, http_request) catch |err| {
+                const decision = policy.decideTransportRetry(err);
+                if (decision.action == .give_up) return err;
+                resilience.sleepForTransportRetry(client, self.transport_hooks, decision.delay_ms);
+                continue;
+            };
+
+            const now_unix_seconds = policy.clock.now_unix_seconds();
+            const retry_after = resilience.retryAfterFromHeaders(
+                response.resilience_headers,
+                now_unix_seconds,
+            ) catch null;
+
+            const decision = policy.decideHttpRetry(response.status, retry_after);
+            if (decision.action == .give_up) return response;
+
+            response.deinit(self.allocator);
+            resilience.sleepForTransportRetry(client, self.transport_hooks, decision.delay_ms);
+        }
     }
 
     fn cachedTokenIndexForKey(self: *AuthEngine, key: TokenCacheKey) ?usize {
@@ -1258,37 +1325,74 @@ pub fn liveTokenHttpExchanger(
     defer request.deinit(allocator);
 
     const uri = std.Uri.parse(request.url) catch return error.TokenExchangeFailed;
-    var response_body: std.Io.Writer.Allocating = .init(allocator);
-    errdefer response_body.deinit();
 
-    const result = client.fetch(.{
-        .location = .{ .uri = uri },
-        .method = switch (request.method) {
+    var http_request = client.request(
+        switch (request.method) {
             .get => .GET,
             .post => .POST,
         },
-        .payload = request.body,
-        .headers = .{
-            .authorization = if (request.authorization) |authorization|
-                .{ .override = authorization }
-            else
-                .default,
-            .content_type = if (request.content_type) |content_type|
-                .{ .override = content_type }
-            else
-                .default,
+        uri,
+        .{
+            .headers = .{
+                .authorization = if (request.authorization) |authorization|
+                    .{ .override = authorization }
+                else
+                    .default,
+                .content_type = if (request.content_type) |content_type|
+                    .{ .override = content_type }
+                else
+                    .default,
+            },
         },
-        .response_writer = &response_body.writer,
-    }) catch |err| switch (err) {
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TokenExchangeFailed,
+    };
+    defer http_request.deinit();
+
+    if (request.body) |body| {
+        http_request.transfer_encoding = .{ .content_length = body.len };
+        var req_body = http_request.sendBodyUnflushed(&.{}) catch return error.TokenExchangeFailed;
+        req_body.writer.writeAll(body) catch return error.TokenExchangeFailed;
+        req_body.end() catch return error.TokenExchangeFailed;
+        http_request.connection.?.flush() catch return error.TokenExchangeFailed;
+    } else {
+        http_request.sendBodiless() catch return error.TokenExchangeFailed;
+    }
+
+    var head_buffer: [8 * 1024]u8 = undefined;
+    var response = http_request.receiveHead(&head_buffer) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.TokenExchangeFailed,
     };
 
-    const owned_body = try response_body.toOwnedSlice();
+    var resilience_headers = std.ArrayList(resilience.HttpHeader).empty;
+    errdefer {
+        resilience.deinitOwnedHttpHeaders(allocator, resilience_headers.items);
+        resilience_headers.deinit(allocator);
+    }
+
+    var header_it = response.head.iterateHeaders();
+    while (header_it.next()) |header| {
+        if (!resilience.isTrackedResilienceHeaderName(header.name)) continue;
+        try resilience_headers.append(allocator, .{
+            .name = try allocator.dupe(u8, header.name),
+            .value = try allocator.dupe(u8, header.value),
+        });
+    }
+
+    const owned_body = response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TokenExchangeFailed,
+    };
+
+    const owned_headers = try resilience_headers.toOwnedSlice(allocator);
     return .{
-        .status = result.status,
+        .status = response.head.status,
         .body = owned_body,
         .owned_body = owned_body,
+        .resilience_headers = owned_headers,
+        .owned_resilience_headers = owned_headers,
     };
 }
 
