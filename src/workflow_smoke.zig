@@ -491,6 +491,115 @@ test "workflow smoke: public resolve failure matrix preserves full error context
     }
 }
 
+test "workflow smoke: public resolve maps exhausted manifest 429 to rate_limited" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .too_many_requests,
+                .resilience_headers = &.{
+                    .{ .name = "Retry-After", .value = "1" },
+                },
+            }, null);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try z_oci.testing.resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .max_rate_limit_retries = 0 },
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .failure => |failure| z_oci.testing.deinitResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .failure => |failure| try expectWorkflowResolveFailure(
+            failure,
+            "rate_limited",
+            "registry-1.docker.io",
+            "registry-1.docker.io/library/busybox:latest",
+            429,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "workflow smoke: public resolve maps exhausted transport timeout to timeout" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return error.Timeout;
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try z_oci.testing.resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .max_network_retries = 0 },
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .failure => |failure| z_oci.testing.deinitResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .failure => |failure| try expectWorkflowResolveFailure(
+            failure,
+            "timeout",
+            "registry-1.docker.io",
+            "registry-1.docker.io/library/busybox:latest",
+            null,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 // Kept local on purpose: workflow_smoke builds as its own root module under
 // `zig build test`, so importing test_support.zig here would make that file
 // belong to two modules at once.

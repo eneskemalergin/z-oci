@@ -1,9 +1,21 @@
 //! Resolver configuration.
 //!
 //! Config holds the caller-provided knobs the current resolver surface accepts.
-//! Not every field is wired into live manifest HTTP yet because callers still
-//! own `std.http.Client`. A bare Config{} works for anonymous access to public
-//! registries.
+//! Callers still own `std.http.Client`; a bare `Config{}` works for anonymous
+//! public registry access.
+//!
+//! Retry budget split (live today):
+//! - `max_retries` — cached-401 auth invalidation only (`AuthEngine.retryAuthenticateAfterCachedUnauthorized`).
+//! - `max_network_retries` / `max_rate_limit_retries` — reactive transport retries on
+//!   manifest `HEAD`/`GET` and token HTTP (`exchangeManifestRequest`,
+//!   `exchangeTokenHttpRequestWithRetries`).
+//!
+//! Timeout field liveness:
+//! - `read_timeout_ms` — Docker credential helper subprocess I/O in `auth.zig`.
+//! - `connect_timeout_ms` — exposed via `connectIoTimeout` for caller-owned
+//!   `connectTcpOptions` recipes; live z-oci exchangers use `client.request`, which
+//!   does not honor it until Zig passes `ConnectTcpOptions.timeout` through
+//!   (zig#31305). Manifest/token HTTP read timeouts are not configurable per request.
 //!
 //! CredentialProvider and Credential are defined here because they describe
 //! the interface slot, not the implementation. Concrete providers (env vars,
@@ -54,10 +66,11 @@ pub const Config = struct {
     /// Credential provider for authenticated registries. Null means anonymous.
     credential_provider: ?*const CredentialProvider = null,
 
-    /// Reserved for v0.3.5 manifest/token connect timeout wiring. `0` means unset.
+    /// Connect timeout in milliseconds for caller-owned TCP setup. `0` means unset.
     ///
-    /// Live manifest and token HTTP ignore this today because callers own
-    /// `std.http.Client` and Zig 0.16 lacks a clean per-request hook.
+    /// Use `connectIoTimeout` when calling `std.http.Client.connectTcpOptions`
+    /// yourself. Live manifest and token exchangers inside z-oci do not read this
+    /// field because `client.request` does not forward the timeout today (zig#31305).
     connect_timeout_ms: u32 = 0,
 
     /// Timeout in milliseconds for Docker credential helper subprocess I/O.
@@ -80,17 +93,40 @@ pub const Config = struct {
     /// `HEAD`/`GET` and token HTTP traffic.
     max_rate_limit_retries: u8 = 1,
 
-    /// Reserved for v0.3.6 custom CA bundle integration.
-    ///
-    /// Today the live resolver uses the CA bundle already configured on the
-    /// caller-owned `std.http.Client`.
+    /// Custom CA bundle path for caller-owned TLS setup. Not read by live z-oci
+    /// exchangers today; callers configure `std.http.Client.ca_bundle` directly.
     ca_bundle_path: ?[]const u8 = null,
 
-    /// Reserved for v0.3.7 pre-emptive throttling when rate-limit headers look trustworthy.
+    /// Opt-in pre-emptive throttling when rate-limit headers look trustworthy.
     ///
     /// Defaults off because nothing reads it yet. Reactive `429` backoff stays on
     /// regardless through the transport retry budgets above.
     rate_limit_enabled: bool = false,
+
+    /// Returns the `std.Io.Timeout` value for caller-owned `connectTcpOptions`.
+    ///
+    /// Live z-oci manifest and token traffic does not apply this until upstream Zig
+    /// wires `ConnectTcpOptions.timeout` into the host connect path.
+    pub fn connectIoTimeout(self: Config) std.Io.Timeout {
+        if (self.connect_timeout_ms == 0) return .none;
+        return .{
+            .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(self.connect_timeout_ms),
+                .clock = .real,
+            },
+        };
+    }
+
+    /// Applies `Config` fields that caller-owned clients can honor today.
+    ///
+    /// No-op on the client handle today. `read_timeout_ms` is consumed by auth
+    /// helper subprocess I/O, not here. `ca_bundle_path` is not applied automatically.
+    /// Callers that manage their own connects should pair `connectIoTimeout` with
+    /// `std.http.Client.connectTcpOptions` when building pooled connections.
+    pub fn applyToClient(self: Config, client: *std.http.Client) void {
+        _ = self;
+        _ = client;
+    }
 };
 
 // Tests
@@ -200,9 +236,22 @@ test "Config: max_retries zero disables retries" {
     try std.testing.expectEqual(@as(u8, 0), c.max_retries);
 }
 
-test "Config: connect_timeout_ms zero means unset until v0.3.5 wiring" {
+test "Config: connect_timeout_ms zero means unset connect Io timeout" {
     const c = Config{ .connect_timeout_ms = 0 };
     try std.testing.expectEqual(@as(u32, 0), c.connect_timeout_ms);
+    try std.testing.expectEqual(std.Io.Timeout.none, c.connectIoTimeout());
+}
+
+test "Config: connectIoTimeout maps milliseconds to real clock duration" {
+    const c = Config{ .connect_timeout_ms = 5_000 };
+    const timeout = c.connectIoTimeout();
+    try std.testing.expect(timeout.duration.raw.toMilliseconds() == 5_000);
+}
+
+test "Config: applyToClient accepts caller-owned client without crashing" {
+    var client: std.http.Client = undefined;
+    const config = Config{ .connect_timeout_ms = 1_000 };
+    config.applyToClient(&client);
 }
 
 test "Config: read_timeout_ms zero means no timeout" {

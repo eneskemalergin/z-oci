@@ -11,27 +11,29 @@
 //! - `ConnectTcpOptions.timeout` exists, but `connectTcpOptions` does not pass
 //!   it through to `host.connect` today (zig#31305).
 //! - Custom CA trust lives on `std.http.Client.ca_bundle`; `Config.ca_bundle_path`
-//!   still needs a caller-side apply helper (v0.3.6).
+//!   is not applied automatically on caller-owned clients today.
 //!
 //! Config field liveness:
 //! - Live on transport path: `max_network_retries`, `max_rate_limit_retries`.
 //! - Live on helper subprocess only: `read_timeout_ms` (via auth, not this module).
-//! - Reserved in `ResilienceConfigView` until later milestones: connect/read HTTP
-//!   timeouts on manifest/token traffic, `ca_bundle_path`, `rate_limit_enabled`.
+//! - Caller recipe via `Config.connectIoTimeout` / `Config.applyToClient`; live
+//!   manifest/token `client.request` paths do not enforce connect timeout (zig#31305).
+//! - Stored but not consumed on live transport yet: manifest/token HTTP read
+//!   timeouts, `ca_bundle_path`, `rate_limit_enabled` (pre-emptive throttling).
 //!
-//! Parser liveness (v0.3.2):
+//! Parser liveness:
 //! - Live on transport path: `retryAfterFromHeaders` / `parseRetryAfterFromHeaders`
 //!   (`Retry-After`, `X-Retry-After`, optional response `Date` anchoring).
-//! - Parser-only until v0.3.7 pre-emptive throttling: `parseRateLimitHeaders` and
-//!   the registry/API rate-limit parsers. Headers are captured on responses but
-//!   rate-limit snapshots do not affect retry policy yet.
+//! - Parser-only on live transport: `parseRateLimitHeaders` and the registry/API
+//!   rate-limit parsers. Headers are captured on responses but rate-limit snapshots
+//!   do not affect retry policy yet.
 //!
-//! Policy liveness (v0.3.3):
+//! Policy liveness:
 //! - Pure policy core: `RetryPolicy`, `decideHttpRetry`, `decideTransportRetry`,
 //!   `RetryBackoffConfig` defaults, injected `RetryClock` / `RetryRandomSource`.
-//! - Live via transport wrappers (v0.3.4): `retryPolicyFromConfig` on manifest
-//!   HEAD/GET and token HTTP paths. Wrappers sleep on `RetryDecision.delay_ms`
-//!   and re-invoke the inner exchanger.
+//! - Live via transport wrappers: `retryPolicyFromConfig` on manifest HEAD/GET and
+//!   token HTTP paths. Wrappers sleep on `RetryDecision.delay_ms` and re-invoke
+//!   the inner exchanger.
 //! - `TransportHooks` sleep wiring is a transport concern, not part of the pure
 //!   policy decision. `retryPolicyFromConfig` only borrows clock/RNG hooks.
 //! - `classifyNetworkTransportError` only retries errors the exchanger surfaces.
@@ -50,7 +52,7 @@ const json = @import("json.zig");
 /// Parsed rate-limit snapshot from response headers.
 ///
 /// Populated by the rate-limit header parsers. Transport wrappers do not read
-/// this today; v0.3.7 pre-emptive throttling will consume `parseRateLimitHeaders`.
+/// this today; pre-emptive throttling would consume `parseRateLimitHeaders`.
 /// Callers treat missing fields as "header not provided", not zero.
 pub const RateLimitInfo = struct {
     pub const Source = enum {
@@ -95,7 +97,7 @@ pub const HttpHeader = struct {
 /// Fields that actually drive `RetryBudget` on the live transport path.
 ///
 /// Kept separate from `ResilienceConfigView` so reserved config slots do not
-/// look wired into retry policy before v0.3.5+ work lands.
+/// look wired into retry policy before their live paths land.
 pub const RetryBudgetConfig = struct {
     max_network_retries: u8,
     max_rate_limit_retries: u8,
@@ -107,20 +109,19 @@ pub const RetryBudgetConfig = struct {
 /// snapshot. Only `max_network_retries` and `max_rate_limit_retries` feed
 /// `RetryPolicy` today via `retryBudgetConfig`.
 pub const ResilienceConfigView = struct {
-    /// Reserved for v0.3.5 manifest/token connect timeout wiring.
+    /// Connect timeout for caller recipes. `0` means unset. Projected in
+    /// `ResilienceConfigView` only; does not feed `RetryPolicy` directly.
     connect_timeout_ms: u32,
-    /// Reserved for v0.3.5 manifest/token read timeout wiring.
-    ///
-    /// Docker credential helper subprocess I/O reads `Config.read_timeout_ms`
-    /// directly in auth instead of through this view.
+    /// Manifest/token HTTP read timeout. Helper subprocess I/O reads
+    /// `Config.read_timeout_ms` directly in auth instead of through this view.
     read_timeout_ms: u32,
     /// Live: reactive retry budget for transient `5xx` and socket errors.
     max_network_retries: u8,
     /// Live: reactive retry budget for `429` responses.
     max_rate_limit_retries: u8,
-    /// Reserved for v0.3.6 custom CA bundle apply helper.
+    /// Custom CA bundle path. Not applied by live transport wrappers today.
     ca_bundle_path: ?[]const u8,
-    /// Reserved for v0.3.7 pre-emptive throttling. Reactive `429` backoff ignores this.
+    /// Pre-emptive throttling gate. Reactive `429` backoff ignores this today.
     rate_limit_enabled: bool,
 };
 
@@ -542,8 +543,9 @@ pub fn parseApiRateLimitHeaders(headers: []const HttpHeader) ResilienceParseErro
 /// Parse rate-limit headers, preferring registry `RateLimit-*` over API
 /// `X-RateLimit-*` when both families are present.
 ///
-/// Parser-only until v0.3.7. Reactive transport retry uses `retryAfterFromHeaders`
-/// instead; captured rate-limit header names on responses are not fed here yet.
+/// Parser-only on live transport today. Reactive transport retry uses
+/// `retryAfterFromHeaders` instead; captured rate-limit header names on responses
+/// are not fed here yet.
 pub fn parseRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!RateLimitInfo {
     const registry = try parseRegistryRateLimitHeaders(headers);
     if (registry.isSet()) return registry;

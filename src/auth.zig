@@ -1,9 +1,12 @@
-//! Phase 2 auth engine.
+//! Auth engine for registry token exchange and credential resolution.
 //!
-//! /v2/ probe flow, Bearer challenge parsing, token exchange (GET + POST
-//! fallback), credential-provider chain, and per-scope token caching.
-//! AuthError stays separate from ResolveError until Phase 3 wires auth
-//! through the public resolver surface.
+//! Live resolve/validate/getManifest traffic probes registries through manifest
+//! `HEAD`/`GET` (see `root.zig` auth handoff docs). A `401` with
+//! `WWW-Authenticate` triggers bearer challenge parsing, token exchange (GET +
+//! POST fallback), credential-provider chain, and per-scope token caching.
+//!
+//! `AuthError` stays separate from `ResolveError`; the resolver maps auth failures
+//! into public `ResolveError` variants at the manifest boundary.
 
 const builtin = @import("builtin");
 const std = @import("std");

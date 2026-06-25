@@ -692,13 +692,17 @@ fn resolveErrorFromAuthError(
             .reference = reference,
             .http_status = http_status,
         } },
+        error.Timeout => .{ .timeout = .{
+            .registry = registry,
+            .reference = reference,
+            .http_status = http_status,
+        } },
         error.UnsupportedProbeStatus => .{ .network_error = .{
             .registry = registry,
             .reference = reference,
             .http_status = http_status,
         } },
         error.ConnectionResetByPeer,
-        error.Timeout,
         error.NetworkUnreachable,
         error.ConnectionRefused,
         error.UnknownHostName,
@@ -731,6 +735,14 @@ fn networkError(registry: []const u8, reference: []const u8, http_status: ?u16) 
     } };
 }
 
+fn timeoutError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+    return .{ .timeout = .{
+        .registry = registry,
+        .reference = reference,
+        .http_status = http_status,
+    } };
+}
+
 fn rateLimitedError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .rate_limited = .{
         .registry = registry,
@@ -746,6 +758,7 @@ fn mapExhaustedManifestTransportError(
 ) error{OutOfMemory}!Outcome {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.Timeout => mappedFailureOutcome(Outcome, ctx, null, timeoutError),
         else => mappedFailureOutcome(Outcome, ctx, null, networkError),
     };
 }
@@ -1430,6 +1443,9 @@ test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible 
 
     const auth_failed = try resolveErrorFromAuthError(error.TokenExchangeFailed, "r", "ref", 401);
     try std.testing.expectEqualStrings("auth_failed", @tagName(auth_failed));
+
+    const transport_timeout = try resolveErrorFromAuthError(error.Timeout, "r", "ref", null);
+    try std.testing.expectEqualStrings("timeout", @tagName(transport_timeout));
 
     const network_error = try resolveErrorFromAuthError(error.UnsupportedProbeStatus, "r", "ref", 500);
     try std.testing.expectEqualStrings("network_error", @tagName(network_error));
@@ -2827,6 +2843,137 @@ test "performManifestGet retries transient 503 then succeeds" {
     try std.testing.expectEqual(@as(usize, 2), State.attempts);
     switch (outcome) {
         .success => |success| try std.testing.expectEqual(MediaType.oci_manifest_v1, success.document.mediaType()),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet maps exhausted 429 to rate_limited" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .too_many_requests,
+                .resilience_headers = &.{
+                    .{ .name = "Retry-After", .value = "1" },
+                },
+            }, null);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_rate_limit_retries = 0,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        .{ .max_rate_limit_retries = 0 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    const outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    switch (outcome) {
+        .failure => |failure| {
+            try std.testing.expectEqualStrings("rate_limited", @tagName(failure));
+            failure.deinitOwned(std.testing.allocator);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet retries connection reset then succeeds" {
+    const State = struct {
+        var attempts: usize = 0;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            attempts += 1;
+            if (attempts == 1) return error.ConnectionResetByPeer;
+
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            defer allocator.free(body);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+            }, body);
+        }
+    };
+
+    defer State.attempts = 0;
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_network_retries = 1,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        .{ .max_network_retries = 1 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), State.attempts);
+    switch (outcome) {
+        .success => |success| try std.testing.expectEqual(MediaType.oci_manifest_v1, success.document.mediaType()),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet maps exhausted transport timeout to timeout failure" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return error.Timeout;
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_network_retries = 0,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        .{ .max_network_retries = 0 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    const outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    switch (outcome) {
+        .failure => |failure| {
+            try std.testing.expectEqualStrings("timeout", @tagName(failure));
+            failure.deinitOwned(std.testing.allocator);
+        },
         else => return error.TestUnexpectedResult,
     }
 }
