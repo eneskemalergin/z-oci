@@ -737,10 +737,8 @@ pub const AuthEngine = struct {
                 continue;
             };
 
-            const now_unix_seconds = policy.clock.now_unix_seconds();
             const retry_after = resilience.retryAfterFromHeaders(
                 response.resilience_headers,
-                now_unix_seconds,
             ) catch null;
 
             const decision = policy.decideHttpRetry(response.status, retry_after);

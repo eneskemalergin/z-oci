@@ -1,0 +1,9 @@
+{
+  "headers": [
+    { "name": "RateLimit-Limit", "value": "100;w=21600" },
+    { "name": "RateLimit-Remaining", "value": "0" },
+    { "name": "RateLimit-Reset", "value": "1746136938" },
+    { "name": "Retry-After", "value": "60" },
+    { "name": "Date", "value": "Thu, 01 May 2025 22:02:18 GMT" }
+  ]
+}

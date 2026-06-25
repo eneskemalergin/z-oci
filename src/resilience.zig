@@ -19,6 +19,13 @@
 //! - Reserved in `ResilienceConfigView` until later milestones: connect/read HTTP
 //!   timeouts on manifest/token traffic, `ca_bundle_path`, `rate_limit_enabled`.
 //!
+//! Parser liveness (v0.3.2):
+//! - Live on transport path: `retryAfterFromHeaders` / `parseRetryAfterFromHeaders`
+//!   (`Retry-After`, `X-Retry-After`, optional response `Date` anchoring).
+//! - Parser-only until v0.3.7 pre-emptive throttling: `parseRateLimitHeaders` and
+//!   the registry/API rate-limit parsers. Headers are captured on responses but
+//!   rate-limit snapshots do not affect retry policy yet.
+//!
 //! Retry budgets:
 //! - `Config.max_retries` stays auth-only (cached-401 invalidation).
 //! - `Config.max_network_retries` and `Config.max_rate_limit_retries` own
@@ -26,11 +33,13 @@
 
 const std = @import("std");
 const Config = @import("Config.zig").Config;
+const json = @import("json.zig");
 
 /// Parsed rate-limit snapshot from response headers.
 ///
-/// Populated by the rate-limit header parsers. Callers treat missing fields as
-/// "header not provided", not zero.
+/// Populated by the rate-limit header parsers. Transport wrappers do not read
+/// this today; v0.3.7 pre-emptive throttling will consume `parseRateLimitHeaders`.
+/// Callers treat missing fields as "header not provided", not zero.
 pub const RateLimitInfo = struct {
     pub const Source = enum {
         none,
@@ -291,9 +300,14 @@ pub fn isTrackedResilienceHeaderName(name: []const u8) bool {
 
 pub fn retryAfterFromHeaders(
     headers: []const HttpHeader,
-    now_unix_seconds: i64,
 ) ResilienceParseError!?RetryAfter {
-    return parseRetryAfterFromHeaders(headers, now_unix_seconds);
+    return parseRetryAfterFromHeaders(headers, null);
+}
+
+/// Parse the response `Date` header into Unix seconds when present.
+pub fn responseDateUnixSecondsFromHeaders(headers: []const HttpHeader) ResilienceParseError!?i64 {
+    const raw = findHeaderValue(headers, "Date") orelse return null;
+    return try parseImfFixdateHttpDate(std.mem.trim(u8, raw, " \t\r\n"));
 }
 
 pub fn deinitOwnedHttpHeaders(allocator: std.mem.Allocator, headers: []HttpHeader) void {
@@ -493,6 +507,9 @@ pub fn parseApiRateLimitHeaders(headers: []const HttpHeader) ResilienceParseErro
 
 /// Parse rate-limit headers, preferring registry `RateLimit-*` over API
 /// `X-RateLimit-*` when both families are present.
+///
+/// Parser-only until v0.3.7. Reactive transport retry uses `retryAfterFromHeaders`
+/// instead; captured rate-limit header names on responses are not fed here yet.
 pub fn parseRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!RateLimitInfo {
     const registry = try parseRegistryRateLimitHeaders(headers);
     if (registry.isSet()) return registry;
@@ -501,24 +518,35 @@ pub fn parseRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!R
 
 /// Parse `Retry-After` or `X-Retry-After` when either header is present.
 ///
-/// Returns `null` when neither header exists. `response_date_unix_seconds` is
-/// optional context for callers that already parsed the response `Date` header.
+/// Returns `null` when neither header exists. When `response_date_unix_seconds`
+/// is null, a captured `Date` header in `headers` anchors integer-second delays
+/// per RFC 7231 (seconds after the response time).
 pub fn parseRetryAfterFromHeaders(
     headers: []const HttpHeader,
     response_date_unix_seconds: ?i64,
 ) ResilienceParseError!?RetryAfter {
-    _ = response_date_unix_seconds;
+    const response_date: ?i64 = if (response_date_unix_seconds) |date|
+        date
+    else
+        try responseDateUnixSecondsFromHeaders(headers);
 
     if (findHeaderValue(headers, "Retry-After")) |raw| {
-        return try parseRetryAfterValue(raw);
+        return try parseRetryAfterValueWithContext(raw, response_date);
     }
     if (findHeaderValue(headers, "X-Retry-After")) |raw| {
-        return try parseRetryAfterValue(raw);
+        return try parseRetryAfterValueWithContext(raw, response_date);
     }
     return null;
 }
 
 pub fn parseRetryAfterValue(raw: []const u8) ResilienceParseError!RetryAfter {
+    return parseRetryAfterValueWithContext(raw, null);
+}
+
+fn parseRetryAfterValueWithContext(
+    raw: []const u8,
+    response_date_unix_seconds: ?i64,
+) ResilienceParseError!RetryAfter {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidRetryAfterHeader;
 
@@ -535,7 +563,13 @@ pub fn parseRetryAfterValue(raw: []const u8) ResilienceParseError!RetryAfter {
     }
 
     if (parsed > std.math.maxInt(u32)) return error.InvalidRetryAfterHeader;
-    return .{ .delay_seconds = @intCast(parsed) };
+    const delay_seconds: u32 = @intCast(parsed);
+
+    if (response_date_unix_seconds) |response_date| {
+        return .{ .retry_at_unix_seconds = response_date + @as(i64, delay_seconds) };
+    }
+
+    return .{ .delay_seconds = delay_seconds };
 }
 
 const RegistryRateLimitQuantity = struct {
@@ -819,6 +853,20 @@ test "RetryAfter union stores delay and absolute retry instants separately" {
     try std.testing.expectEqual(@as(i64, 1_746_136_938), absolute.retry_at_unix_seconds);
 }
 
+test "parseRegistryRateLimitHeaders parses RateLimit-Reset on registry path" {
+    const headers = [_]HttpHeader{
+        .{ .name = "RateLimit-Limit", .value = "200" },
+        .{ .name = "RateLimit-Remaining", .value = "5" },
+        .{ .name = "RateLimit-Reset", .value = "1746136938" },
+    };
+
+    const info = try parseRegistryRateLimitHeaders(&headers);
+    try std.testing.expectEqual(RateLimitInfo.Source.registry_rate_limit, info.source);
+    try std.testing.expectEqual(@as(u32, 200), info.limit.?);
+    try std.testing.expectEqual(@as(u32, 5), info.remaining.?);
+    try std.testing.expectEqual(@as(u64, 1_746_136_938), info.reset_unix_seconds.?);
+}
+
 test "parseRegistryRateLimitHeaders parses docker registry pull headers with window" {
     const headers = [_]HttpHeader{
         .{ .name = "RateLimit-Limit", .value = "100;w=21600" },
@@ -882,6 +930,24 @@ test "parseRetryAfterValue parses IMF-fixdate HTTP-date values" {
     try std.testing.expectEqual(@as(i64, 1_746_136_938), parsed.retry_at_unix_seconds);
 }
 
+test "parseRetryAfterFromHeaders anchors integer delays to response Date" {
+    const headers = [_]HttpHeader{
+        .{ .name = "Date", .value = "Thu, 01 May 2025 22:02:18 GMT" },
+        .{ .name = "Retry-After", .value = "60" },
+    };
+
+    const parsed = (try parseRetryAfterFromHeaders(&headers, null)).?;
+    const response_date = (try responseDateUnixSecondsFromHeaders(&headers)).?;
+    try std.testing.expectEqual(
+        response_date + 60,
+        parsed.retry_at_unix_seconds,
+    );
+    try std.testing.expectEqual(
+        @as(u32, 30_000),
+        retryAfterDelayMs(parsed, response_date + 30),
+    );
+}
+
 test "parseRetryAfterFromHeaders prefers Retry-After over X-Retry-After" {
     const headers = [_]HttpHeader{
         .{ .name = "Retry-After", .value = "30" },
@@ -930,6 +996,7 @@ test "rate-limit header fragments parse deterministically across table cases" {
         headers: []const HttpHeader,
         expected_source: RateLimitInfo.Source,
         expected_remaining: ?u32,
+        expected_window_seconds: ?u32 = null,
     }{
         .{
             .headers = &.{
@@ -951,6 +1018,7 @@ test "rate-limit header fragments parse deterministically across table cases" {
             },
             .expected_source = .registry_rate_limit,
             .expected_remaining = null,
+            .expected_window_seconds = 3600,
         },
     };
 
@@ -958,7 +1026,60 @@ test "rate-limit header fragments parse deterministically across table cases" {
         const info = try parseRateLimitHeaders(case.headers);
         try std.testing.expectEqual(case.expected_source, info.source);
         try std.testing.expectEqual(case.expected_remaining, info.remaining);
+        if (case.expected_window_seconds) |window| {
+            try std.testing.expectEqual(window, info.window_seconds.?);
+        }
     }
+}
+
+test "parser liveness: transport retry uses retry-after parsers only" {
+    const headers = [_]HttpHeader{
+        .{ .name = "Retry-After", .value = "30" },
+        .{ .name = "RateLimit-Remaining", .value = "0" },
+    };
+
+    const retry_after = (try retryAfterFromHeaders(&headers)).?;
+    try std.testing.expectEqual(@as(u32, 30), retry_after.delay_seconds);
+
+    const rate_limit = try parseRateLimitHeaders(&headers);
+    try std.testing.expect(rate_limit.isSet());
+}
+
+const ResilienceHeaderFixture = struct {
+    headers: []const struct {
+        name: []const u8,
+        value: []const u8,
+    },
+};
+
+test "parseRateLimitHeaders parses checked-in docker hub 429 fixture" {
+    var bytes_buffer: [4 * 1024]u8 = undefined;
+    const bytes = try std.Io.Dir.cwd().readFile(
+        std.testing.io,
+        "fixtures/resilience/docker-hub-429-headers.json",
+        &bytes_buffer,
+    );
+
+    const parsed = try json.parse(ResilienceHeaderFixture, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    var headers: [8]HttpHeader = undefined;
+    try std.testing.expect(parsed.value.headers.len <= headers.len);
+    for (parsed.value.headers, 0..) |entry, index| {
+        headers[index] = .{ .name = entry.name, .value = entry.value };
+    }
+    const header_slice = headers[0..parsed.value.headers.len];
+
+    const rate_limit = try parseRateLimitHeaders(header_slice);
+    try std.testing.expectEqual(RateLimitInfo.Source.registry_rate_limit, rate_limit.source);
+    try std.testing.expectEqual(@as(u32, 100), rate_limit.limit.?);
+    try std.testing.expectEqual(@as(u32, 0), rate_limit.remaining.?);
+    try std.testing.expectEqual(@as(u64, 1_746_136_938), rate_limit.reset_unix_seconds.?);
+    try std.testing.expectEqual(@as(u32, 21_600), rate_limit.window_seconds.?);
+
+    const retry_after = (try parseRetryAfterFromHeaders(header_slice, null)).?;
+    const response_date = (try responseDateUnixSecondsFromHeaders(header_slice)).?;
+    try std.testing.expectEqual(response_date + 60, retry_after.retry_at_unix_seconds);
 }
 
 test "findHeaderValue returns the first match when duplicate headers exist" {

@@ -827,10 +827,8 @@ fn exchangeManifestRequest(
             continue;
         };
 
-        const now_unix_seconds = policy.clock.now_unix_seconds();
         const retry_after = resilience.retryAfterFromHeaders(
             response.metadata.resilience_headers,
-            now_unix_seconds,
         ) catch null;
 
         const decision = policy.decideHttpRetry(response.metadata.status, retry_after);
