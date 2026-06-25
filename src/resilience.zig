@@ -312,7 +312,9 @@ pub fn sleepForTransportRetry(
                 .raw = std.Io.Duration.fromMilliseconds(delay_ms),
                 .clock = .real,
             },
-        }, client.io) catch {};
+        }, client.io) catch {
+            hooks.sleeper(delay_ms);
+        };
         return;
     }
     hooks.sleeper(delay_ms);
@@ -1334,4 +1336,19 @@ test "exponential backoff caps delay and applies full jitter deterministically" 
 
     const first_attempt = exponentialBackoffDelayMs(.{}, 0, 0);
     try std.testing.expectEqual(@as(u32, 0), first_attempt);
+}
+
+test "sleepForTransportRetry invokes injected sleeper with delay" {
+    const State = struct {
+        var recorded_ms: u32 = 0;
+
+        fn sleeper(delay_ms: u32) void {
+            recorded_ms = delay_ms;
+        }
+    };
+
+    State.recorded_ms = 0;
+    var client: std.http.Client = undefined;
+    sleepForTransportRetry(&client, .{ .sleeper = State.sleeper }, 250);
+    try std.testing.expectEqual(@as(u32, 250), State.recorded_ms);
 }

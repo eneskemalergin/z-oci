@@ -3,7 +3,7 @@
 //! Current scope:
 //! - offline OCI/Docker reference parsing and normalization
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
-//! - auth engine: /v2/ probe, challenge parsing, token exchange, credential providers
+//! - auth engine: manifest HEAD/GET challenge handling, token exchange, credential providers
 //! - public manifest resolution for single-arch and supported multi-arch flows
 //!
 //! Ownership conventions:
@@ -193,8 +193,8 @@ const ResolvedManifestOutcome = union(enum) {
 ///
 /// Auth handoff contract:
 /// - derive `AuthReferenceView` from the normalized `Reference` with `referenceView(ref)`
-/// - probe `view.probeUriAlloc(...)` first; only enter auth when `ProbeHttpResponse.classify()`
-///   returns `.auth_required`
+/// - manifest HEAD/GET is the live probe path today; a `401` with `WWW-Authenticate`
+///   triggers auth via `ProbeHttpResponse.classify()` on response metadata
 /// - turn that bearer challenge into `AuthenticateRequest.init(view.registry, challenge)` and call
 ///   `AuthEngine.authenticate(...)`
 /// - attach the returned bearer token to the retried HEAD/GET request; if that retry comes back
@@ -227,7 +227,7 @@ pub fn resolve(
 ///   parsing, and any structured failure context that must outlive internal temporaries.
 ///
 /// Auth handoff contract:
-/// - validation follows the same probe -> classify -> authenticate -> retry-once flow as `resolve`
+/// - validation follows the same manifest HEAD/GET -> classify -> authenticate -> retry-once flow as `resolve`
 /// - validation must treat `.not_found` as terminal and must not attempt auth in that case
 /// - multi-arch validation follows the selected child manifest when `platform` is provided
 /// - multi-arch validation returns `ResolveError.platform_required` instead of guessing a child when

@@ -32,6 +32,11 @@ pub const AuthError = error{
     TokenExchangeFailed,
     HelperFailed,
     HelperTimedOut,
+    ConnectionResetByPeer,
+    Timeout,
+    NetworkUnreachable,
+    ConnectionRefused,
+    UnknownHostName,
 };
 
 pub const TokenRequestMethod = enum {
@@ -76,9 +81,8 @@ pub const TokenExchangeResponse = struct {
 /// Exchanges a `TokenHttpRequest` for a token response.
 ///
 /// Ownership: the exchanger takes ownership of `request` and must call
-/// `request.deinit(allocator)` before or after producing the response.
-/// The caller (engine) relies on this contract, where there is no fallback
-/// deinit in `exchangeTokenResponse`.
+/// `request.deinit(allocator)` on every return path, including errors.
+/// The engine does not deinit the request after a failed exchange.
 pub const TokenHttpExchanger = *const fn (
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -509,6 +513,7 @@ pub const AuthEngine = struct {
         return initWithTokenHttpExchangerAndHooks(allocator, config, token_http_exchanger, .{});
     }
 
+    /// `config` must match `ResolverContext.config` on the same public API call.
     pub fn initWithTokenHttpExchangerAndHooks(
         allocator: std.mem.Allocator,
         config: Config,
@@ -1314,6 +1319,18 @@ pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: Co
     return buffer;
 }
 
+fn mapLiveTokenTransportError(err: anyerror) AuthError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.Timeout => error.Timeout,
+        error.NetworkUnreachable => error.NetworkUnreachable,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.UnknownHostName => error.UnknownHostName,
+        else => error.TokenExchangeFailed,
+    };
+}
+
 /// Live HTTP exchanger for token requests using Zig 0.16 `std.http.Client`.
 pub fn liveTokenHttpExchanger(
     allocator: std.mem.Allocator,
@@ -1342,27 +1359,21 @@ pub fn liveTokenHttpExchanger(
                     .default,
             },
         },
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.TokenExchangeFailed,
-    };
+    ) catch |err| return mapLiveTokenTransportError(err);
     defer http_request.deinit();
 
     if (request.body) |body| {
         http_request.transfer_encoding = .{ .content_length = body.len };
-        var req_body = http_request.sendBodyUnflushed(&.{}) catch return error.TokenExchangeFailed;
-        req_body.writer.writeAll(body) catch return error.TokenExchangeFailed;
-        req_body.end() catch return error.TokenExchangeFailed;
-        http_request.connection.?.flush() catch return error.TokenExchangeFailed;
+        var req_body = http_request.sendBodyUnflushed(&.{}) catch |err| return mapLiveTokenTransportError(err);
+        req_body.writer.writeAll(body) catch |err| return mapLiveTokenTransportError(err);
+        req_body.end() catch |err| return mapLiveTokenTransportError(err);
+        http_request.connection.?.flush() catch |err| return mapLiveTokenTransportError(err);
     } else {
-        http_request.sendBodiless() catch return error.TokenExchangeFailed;
+        http_request.sendBodiless() catch |err| return mapLiveTokenTransportError(err);
     }
 
     var head_buffer: [8 * 1024]u8 = undefined;
-    var response = http_request.receiveHead(&head_buffer) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.TokenExchangeFailed,
-    };
+    var response = http_request.receiveHead(&head_buffer) catch |err| return mapLiveTokenTransportError(err);
 
     var resilience_headers = std.ArrayList(resilience.HttpHeader).empty;
     errdefer {
@@ -1379,10 +1390,7 @@ pub fn liveTokenHttpExchanger(
         });
     }
 
-    const owned_body = response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.TokenExchangeFailed,
-    };
+    const owned_body = response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| return mapLiveTokenTransportError(err);
 
     const owned_headers = try resilience_headers.toOwnedSlice(allocator);
     return .{
@@ -2900,6 +2908,124 @@ test "AuthEngine.authenticate: uses post fallback after get failure" {
     try std.testing.expectEqual(@as(usize, 2), State.calls);
     try std.testing.expectEqualStrings("post-token", response.access_token.value);
     try std.testing.expectEqual(@as(?u64, 120), response.access_token.expires_in_seconds);
+}
+
+test "AuthEngine.authenticate: retries transient 503 on token exchange then succeeds" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+
+            if (request.method != .get) return error.TokenExchangeFailed;
+            if (calls == 1) return .{ .status = .service_unavailable, .body = "" };
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "retry-token",
+            \\  "expires_in": 120
+            \\}
+            };
+        }
+    };
+
+    defer State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_network_retries = 1,
+    }, State.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    var response = (try engine.authenticate(&client, request)).?;
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqualStrings("retry-token", response.access_token.value);
+}
+
+test "AuthEngine.authenticate: retries connection reset on token exchange then succeeds" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+
+            if (request.method != .get) return error.TokenExchangeFailed;
+            if (calls == 1) return error.ConnectionResetByPeer;
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "reset-token",
+            \\  "expires_in": 120
+            \\}
+            };
+        }
+    };
+
+    defer State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_network_retries = 1,
+    }, State.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    var response = (try engine.authenticate(&client, request)).?;
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqualStrings("reset-token", response.access_token.value);
+}
+
+test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+            return .{
+                .status = .too_many_requests,
+                .body = "",
+                .resilience_headers = &.{
+                    .{ .name = "Retry-After", .value = "1" },
+                },
+            };
+        }
+    };
+
+    defer State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_rate_limit_retries = 0,
+    }, State.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    try std.testing.expectError(error.TokenExchangeFailed, engine.authenticate(&client, request));
+    try std.testing.expectEqual(@as(usize, 2), State.calls);
 }
 
 test "AuthEngine.authenticate: cache hit reuses valid token response" {
