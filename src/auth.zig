@@ -71,7 +71,7 @@ pub const TokenExchangeResponse = struct {
 ///
 /// Ownership: the exchanger takes ownership of `request` and must call
 /// `request.deinit(allocator)` before or after producing the response.
-/// The caller (engine) relies on this contract — there is no fallback
+/// The caller (engine) relies on this contract, where there is no fallback
 /// deinit in `exchangeTokenResponse`.
 pub const TokenHttpExchanger = *const fn (
     allocator: std.mem.Allocator,
@@ -467,7 +467,7 @@ pub const AuthEngine = struct {
     /// Cache identity: realm + service + scope. Entries older than
     /// valid_until_unix_seconds (accounting for the fixed refresh window)
     /// are dropped on lookup. The cache is an ArrayList with no maximum
-    /// size — for short-lived CLI use (10-50 images per run), the worst-case
+    /// size, for short-lived CLI use (10-50 images per run), the worst-case
     /// is ~50 entries × ~200 bytes ≈ 10 KB. If long-lived daemon operation
     /// is ever required, add a max_cache_entries config field with LRU
     /// eviction and cap the ArrayList.

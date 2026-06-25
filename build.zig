@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Library module — the importable z-oci package
+    // Library module: the importable z-oci package
     const mod = b.addModule("z_oci", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,

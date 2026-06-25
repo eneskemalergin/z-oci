@@ -842,6 +842,7 @@ test {
     _ = @import("ResolveResult.zig");
     _ = @import("Config.zig");
     _ = @import("resolver.zig");
+    _ = @import("resilience.zig");
     _ = @import("test_support.zig");
 }
 

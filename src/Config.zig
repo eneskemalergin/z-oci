@@ -6,8 +6,8 @@
 //! registries.
 //!
 //! CredentialProvider and Credential are defined here because they describe
-//! the interface slot, not the implementation. Phase 2 provides concrete
-//! implementations (EnvProvider, DockerConfigProvider, etc.).
+//! the interface slot, not the implementation. Concrete providers (env vars,
+//! Docker config, credential helpers) live in `auth.zig`.
 //!
 //! Config fields are copied by value. Slices (ca_bundle_path,
 //! Credential.secret) borrow from the caller. The caller is responsible for
@@ -68,8 +68,17 @@ pub const Config = struct {
 
     /// Maximum auth retry count for the cached-401 invalidation path.
     ///
-    /// Wider transient-network retry policy remains deferred.
+    /// Transport retries use `max_network_retries` and `max_rate_limit_retries`
+    /// instead. Auth and transport budgets stay separate on purpose.
     max_retries: u8 = 1,
+
+    /// Maximum reactive retries for transient network failures on idempotent
+    /// `HEAD`/`GET` traffic. Not yet wired into live manifest or token HTTP.
+    max_network_retries: u8 = 1,
+
+    /// Maximum reactive retries for `429` / rate-limit responses. Not yet
+    /// wired into live manifest or token HTTP.
+    max_rate_limit_retries: u8 = 1,
 
     /// Reserved for future custom CA bundle integration.
     ///
@@ -77,7 +86,8 @@ pub const Config = struct {
     /// caller-owned `std.http.Client`.
     ca_bundle_path: ?[]const u8 = null,
 
-    /// Reserved for the future resilience/rate-limit phase.
+    /// Gates pre-emptive throttling when rate-limit headers are trustworthy.
+    /// Not yet wired. Reactive `429` backoff is independent of this flag.
     rate_limit_enabled: bool = true,
 };
 
@@ -90,6 +100,8 @@ test "Config: bare Config{} compiles with all defaults" {
     try std.testing.expectEqual(@as(u32, 10_000), c.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 30_000), c.read_timeout_ms);
     try std.testing.expectEqual(@as(u8, 1), c.max_retries);
+    try std.testing.expectEqual(@as(u8, 1), c.max_network_retries);
+    try std.testing.expectEqual(@as(u8, 1), c.max_rate_limit_retries);
     try std.testing.expect(c.ca_bundle_path == null);
     try std.testing.expect(c.rate_limit_enabled);
 }
@@ -169,6 +181,15 @@ test "Config: rate_limit_enabled can be disabled" {
 test "Config: ca_bundle_path stores and returns path" {
     const c = Config{ .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt" };
     try std.testing.expectEqualSlices(u8, "/etc/ssl/certs/ca-certificates.crt", c.ca_bundle_path.?);
+}
+
+test "Config: max_network_retries and max_rate_limit_retries accept custom values" {
+    const c = Config{
+        .max_network_retries = 2,
+        .max_rate_limit_retries = 4,
+    };
+    try std.testing.expectEqual(@as(u8, 2), c.max_network_retries);
+    try std.testing.expectEqual(@as(u8, 4), c.max_rate_limit_retries);
 }
 
 test "Config: max_retries zero disables retries" {
