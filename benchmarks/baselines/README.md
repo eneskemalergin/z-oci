@@ -78,3 +78,5 @@ zig build -Doptimize=ReleaseFast
 ```
 
 For `v0.4.0.json`, use the same command list with output path `benchmarks/baselines/v0.4.0.json`.
+
+On-the-fly comparison snapshots (not committed) can go under `benchmarks/tmp/`.

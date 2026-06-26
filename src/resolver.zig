@@ -288,15 +288,17 @@ pub const OwnedManifestResponseMetadata = struct {
     }
 };
 
-/// Parsed manifest document owned by a JSON arena.
+/// Parsed manifest document owned by a JSON arena, or a resolve-depth media type tag.
 pub const ParsedManifestDocument = union(enum) {
     manifest: std.json.Parsed(Manifest),
+    manifest_media_type: MediaType,
     oci_index: std.json.Parsed(OciImageIndex),
     docker_manifest_list: std.json.Parsed(DockerManifestList),
 
     pub fn deinit(self: *ParsedManifestDocument) void {
         switch (self.*) {
             .manifest => |parsed| parsed.deinit(),
+            .manifest_media_type => {},
             .oci_index => |parsed| parsed.deinit(),
             .docker_manifest_list => |parsed| parsed.deinit(),
         }
@@ -305,6 +307,7 @@ pub const ParsedManifestDocument = union(enum) {
     pub fn mediaType(self: ParsedManifestDocument) MediaType {
         return switch (self) {
             .manifest => |parsed| parsed.value.media_type,
+            .manifest_media_type => |media_type| media_type,
             .oci_index => |parsed| parsed.value.media_type,
             .docker_manifest_list => |parsed| parsed.value.media_type,
         };
@@ -314,13 +317,11 @@ pub const ParsedManifestDocument = union(enum) {
 /// Success payload for the internal GET path.
 pub const ManifestGetSuccess = struct {
     request: ManifestRequest,
-    metadata: ManifestResponseMetadata,
     resolved_digest: Digest,
     resolved_digest_raw: []u8,
     document: ParsedManifestDocument,
 
     pub fn deinit(self: *ManifestGetSuccess, allocator: std.mem.Allocator) void {
-        self.metadata.deinitOwned(allocator);
         allocator.free(self.resolved_digest_raw);
         self.document.deinit();
     }
@@ -481,7 +482,7 @@ pub fn liveManifestHttpExchanger(
         var owned_metadata = try ownedManifestResponseMetadataFromHead(allocator, response.head);
         errdefer owned_metadata.deinit(allocator);
 
-        const body = if (request.method == .get)
+        const body = if (request.method == .get and !resilience.isRetryableHttpStatus(response.head.status))
             response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.ConnectionResetByPeer,
@@ -843,23 +844,45 @@ pub fn performManifestGet(
     }
 }
 
-fn exchangeManifestRequestOnce(
-    ctx: ResolverContext,
-    exchanger: ManifestHttpExchanger,
-    request: ManifestRequest,
-    bearer_token: ?[]const u8,
-) ManifestExchangeError!ManifestHttpResponse {
-    const http_request = try buildManifestHttpRequestAlloc(ctx.allocator, request, bearer_token);
-    return exchanger(ctx.allocator, ctx.client, http_request);
-}
-
 const ManifestExchangeLoopContext = struct {
     resolver_ctx: ResolverContext,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
     bearer_token: ?[]const u8,
+    cached_url: ?[]u8 = null,
+    exchange_attempt: usize = 0,
 };
+
+fn exchangeManifestRequestOnce(
+    loop_ctx: *ManifestExchangeLoopContext,
+    exchanger: ManifestHttpExchanger,
+) ManifestExchangeError!ManifestHttpResponse {
+    const allocator = loop_ctx.resolver_ctx.allocator;
+    loop_ctx.exchange_attempt += 1;
+
+    const url = if (loop_ctx.cached_url) |cached|
+        try allocator.dupe(u8, cached)
+    else
+        try loop_ctx.request.uriAlloc(allocator);
+
+    if (loop_ctx.cached_url == null and loop_ctx.exchange_attempt > 1) {
+        loop_ctx.cached_url = try allocator.dupe(u8, url);
+    }
+
+    const authorization = if (loop_ctx.bearer_token) |token|
+        try std.fmt.allocPrint(allocator, "Bearer {s}", .{token})
+    else
+        null;
+
+    const http_request = ManifestHttpRequest{
+        .method = loop_ctx.request.method,
+        .url = url,
+        .authorization = authorization,
+        .accept = loop_ctx.request.accept,
+    };
+    return exchanger(allocator, loop_ctx.resolver_ctx.client, http_request);
+}
 
 fn exchangeManifestRequest(
     ctx: ResolverContext,
@@ -877,6 +900,7 @@ fn exchangeManifestRequest(
         .request = request,
         .bearer_token = bearer_token,
     };
+    defer if (loop_ctx.cached_url) |cached_url| ctx.allocator.free(cached_url);
 
     const hooks = resilience.HttpRetryLoopHooks{
         .before_first_attempt = beforeManifestExchangeAttempt,
@@ -914,13 +938,8 @@ fn afterManifestExchangeAttempt(ctx_ptr: *anyopaque, _: std.http.Status, headers
 }
 
 fn manifestExchangeOnceOpaque(ctx_ptr: *anyopaque) ManifestExchangeError!ManifestHttpResponse {
-    const loop_ctx: *const ManifestExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
-    return exchangeManifestRequestOnce(
-        loop_ctx.resolver_ctx,
-        loop_ctx.exchanger,
-        loop_ctx.request,
-        loop_ctx.bearer_token,
-    );
+    const loop_ctx: *ManifestExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    return exchangeManifestRequestOnce(loop_ctx, loop_ctx.exchanger);
 }
 
 fn manifestResponseStatus(response: ManifestHttpResponse) std.http.Status {
@@ -1215,7 +1234,7 @@ fn classifyUsableGetResponse(
     var resolved_digest_raw: ?[]u8 = resolved_digest.raw;
     defer if (resolved_digest_raw) |raw| ctx.allocator.free(raw);
 
-    var document = parseManifestDocument(ctx.allocator, media_type, response_body) catch |err| switch (err) {
+    var document = parseManifestDocument(ctx.allocator, ctx.operation, media_type, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError),
     };
@@ -1232,7 +1251,6 @@ fn classifyUsableGetResponse(
 
     return .{ .success = .{
         .request = request,
-        .metadata = try metadata.cloneAlloc(ctx.allocator),
         .resolved_digest = resolved_digest.digest,
         .resolved_digest_raw = owned_digest_raw,
         .document = document,
@@ -1273,11 +1291,16 @@ fn acceptsManifestMediaType(accept: []const []const u8, media_type: MediaType) b
 
 fn parseManifestDocument(
     allocator: std.mem.Allocator,
+    operation: ResolverOperation,
     media_type: MediaType,
     body: []const u8,
 ) !ParsedManifestDocument {
+    const shallow_single_manifest = operation == .resolve or operation == .resolve_child_manifest;
     return switch (media_type) {
-        .oci_manifest_v1, .docker_manifest_v2 => .{ .manifest = try json.parse(Manifest, allocator, body) },
+        .oci_manifest_v1, .docker_manifest_v2 => if (shallow_single_manifest)
+            .{ .manifest_media_type = try Manifest.parseMediaTypeShallow(allocator, body) }
+        else
+            .{ .manifest = try json.parse(Manifest, allocator, body) },
         .oci_index_v1 => .{ .oci_index = try json.parse(OciImageIndex, allocator, body) },
         .docker_manifest_list_v2 => .{ .docker_manifest_list = try json.parse(DockerManifestList, allocator, body) },
         else => error.UnexpectedToken,
@@ -1300,15 +1323,10 @@ fn verifyManifestBodyIntegrityAlloc(
     metadata: ManifestResponseMetadata,
     body: []const u8,
 ) ManifestIntegrityError!VerifiedManifestDigest {
-    const body_digest_raw = try sha256DigestStringAlloc(ctx.allocator, body);
-    errdefer ctx.allocator.free(body_digest_raw);
-    const body_digest = Digest{
-        .algorithm = .sha256,
-        .hex = body_digest_raw["sha256:".len..],
-    };
+    const digest_hex = bodySha256DigestHex(body);
 
     if (try expectedReferenceDigest(ctx.reference.ref_string)) |expected_digest| {
-        if (!digestMatchesSha256Hex(expected_digest, body_digest.hex)) return error.DigestMismatch;
+        if (!digestMatchesSha256Hex(expected_digest, digest_hex[0..])) return error.DigestMismatch;
     }
 
     if (metadata.docker_content_digest) |header_digest_text| {
@@ -1317,11 +1335,17 @@ fn verifyManifestBodyIntegrityAlloc(
             else => return error.DigestMismatch,
         };
 
-        if (!digestMatchesSha256Hex(header_digest, body_digest.hex)) return error.DigestMismatch;
+        if (!digestMatchesSha256Hex(header_digest, digest_hex[0..])) return error.DigestMismatch;
     }
 
+    const body_digest_raw = try std.fmt.allocPrint(ctx.allocator, "sha256:{s}", .{digest_hex[0..]});
+    errdefer ctx.allocator.free(body_digest_raw);
+
     return .{
-        .digest = body_digest,
+        .digest = .{
+            .algorithm = .sha256,
+            .hex = body_digest_raw["sha256:".len..],
+        },
         .raw = body_digest_raw,
     };
 }
@@ -2622,7 +2646,7 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
         Config{},
         .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
         null,
-        .resolve,
+        .get_manifest,
     );
 
     var outcome = try performManifestGet(
@@ -2680,7 +2704,7 @@ test "performManifestGet parses Docker manifest fixture" {
         Config{},
         .{ .registry = "quay.io", .repository_path = "prometheus/busybox", .ref_string = "latest" },
         null,
-        .resolve,
+        .get_manifest,
     );
 
     var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.docker.distribution.manifest.v2+json"});

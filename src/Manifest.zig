@@ -77,6 +77,51 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
     return result;
 }
 
+/// Parse only the `mediaType` field for resolve-depth workloads.
+pub fn parseMediaTypeShallow(allocator: std.mem.Allocator, bytes: []const u8) !MediaType {
+    var parsed = try std.json.parseFromSlice(
+        ManifestMediaTypeProbe,
+        allocator,
+        bytes,
+        .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_if_needed,
+        },
+    );
+    defer parsed.deinit();
+    return parsed.value.media_type;
+}
+
+const ManifestMediaTypeProbe = struct {
+    media_type: MediaType,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ManifestMediaTypeProbe {
+        if (.object_begin != try source.next()) return error.UnexpectedToken;
+        var seen_media_type = false;
+        var media_type: MediaType = undefined;
+        while (true) {
+            const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+            const field_name: []const u8 = switch (tok) {
+                inline .string, .allocated_string => |s| s,
+                .object_end => break,
+                else => return error.UnexpectedToken,
+            };
+            defer switch (tok) {
+                .allocated_string => |s| allocator.free(s),
+                else => {},
+            };
+            if (std.mem.eql(u8, field_name, "mediaType")) {
+                media_type = try std.json.innerParse(MediaType, allocator, source, options);
+                seen_media_type = true;
+            } else {
+                try source.skipValue();
+            }
+        }
+        if (!seen_media_type) return error.MissingField;
+        return .{ .media_type = media_type };
+    }
+};
+
 /// Stringify to a JSON manifest object with camelCase OCI field names.
 pub fn jsonStringify(self: Manifest, jw: anytype) !void {
     try jw.beginObject();

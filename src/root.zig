@@ -317,21 +317,23 @@ fn resolveWithExchangers(
     );
     switch (outcome) {
         .success => |*success| {
-            defer success.deinit(allocator);
-            const manifest = switch (success.document) {
-                .manifest => |parsed| parsed.value,
-                else => unreachable,
-            };
             const selected_platform = success.platform;
             success.platform = null;
             const resolved_digest_raw = success.resolved_digest_raw;
             success.resolved_digest_raw = "";
 
+            const media_type = switch (success.document) {
+                .manifest => |parsed| parsed.value.media_type,
+                .manifest_media_type => |value| value,
+                else => unreachable,
+            };
+            defer success.deinit(allocator);
+
             return .{ .success = try buildResolveResultAlloc(
                 allocator,
                 ref,
                 resolved_digest_raw,
-                manifest.media_type,
+                media_type,
                 selected_platform,
             ) };
         },
@@ -409,7 +411,7 @@ fn validateOutcomeFromResolvedManifestOutcome(
         .success => |*success| {
             defer success.deinit(allocator);
             return switch (success.document) {
-                .manifest => .valid,
+                .manifest, .manifest_media_type => .valid,
                 else => unreachable,
             };
         },
@@ -511,21 +513,22 @@ fn fetchResolvedManifestWithExchangers(
         config,
         ref_view,
         platform,
-        if (depth == 0) operation else .resolve_child_manifest,
+        if (depth == 0) operation else switch (operation) {
+            .get_manifest, .validate => operation,
+            else => .resolve_child_manifest,
+        },
         transport_hooks,
     );
 
     var outcome = try resolver.performManifestGet(ctx, engine, manifest_exchanger, manifestAcceptValues());
     switch (outcome) {
         .success => |*success| {
-            success.metadata.deinitOwned(allocator);
-
             const document = success.document;
             const resolved_digest = success.resolved_digest;
             const resolved_digest_raw = success.resolved_digest_raw;
 
             switch (document) {
-                .manifest => {
+                .manifest, .manifest_media_type => {
                     return .{ .success = .{
                         .resolved_digest = resolved_digest,
                         .resolved_digest_raw = resolved_digest_raw,
@@ -542,6 +545,7 @@ fn fetchResolvedManifestWithExchangers(
                         ref_view,
                         platform,
                         manifest_exchanger,
+                        operation,
                         depth,
                         resolved_digest_raw,
                         document,
@@ -557,6 +561,7 @@ fn fetchResolvedManifestWithExchangers(
                         ref_view,
                         platform,
                         manifest_exchanger,
+                        operation,
                         depth,
                         resolved_digest_raw,
                         document,
@@ -582,16 +587,17 @@ fn recurseIntoMultiArchDocument(
     ref_view: AuthReferenceView,
     platform: ?Platform,
     manifest_exchanger: resolver.ManifestHttpExchanger,
+    operation: resolver.ResolverOperation,
     depth: usize,
     parent_digest_raw: []u8,
     parent_document: resolver.ParsedManifestDocument,
     multi_arch: MultiArchManifest,
 ) PublicApiError!ResolvedManifestOutcome {
     defer allocator.free(parent_digest_raw);
-    defer {
-        var owned_document = parent_document;
-        owned_document.deinit();
-    }
+
+    var owned_parent_document = parent_document;
+    var parent_document_live = true;
+    defer if (parent_document_live) owned_parent_document.deinit();
 
     const requested_platform = platform orelse {
         return .{ .failure = try platformRequiredErrorAlloc(allocator, ref_view) };
@@ -600,12 +606,20 @@ fn recurseIntoMultiArchDocument(
         return .{ .failure = try platformNotFoundErrorAlloc(allocator, ref_view) };
     };
 
+    var selected_child_platform: ?Platform = null;
+    if (child_descriptor.platform) |child_platform| {
+        selected_child_platform = try clonePlatformAlloc(allocator, child_platform);
+    }
+
     var child_ref_string_buffer: [128]u8 = undefined;
     const child_ref_string = std.fmt.bufPrint(
         &child_ref_string_buffer,
         "{s}:{s}",
         .{ @tagName(child_descriptor.digest.algorithm), child_descriptor.digest.hex },
     ) catch unreachable;
+
+    owned_parent_document.deinit();
+    parent_document_live = false;
 
     var child_outcome = try fetchResolvedManifestWithExchangers(
         allocator,
@@ -620,7 +634,7 @@ fn recurseIntoMultiArchDocument(
         platform,
         auth.liveTokenHttpExchanger,
         manifest_exchanger,
-        .resolve_child_manifest,
+        operation,
         depth + 1,
         engine.transport_hooks,
     );
@@ -628,12 +642,25 @@ fn recurseIntoMultiArchDocument(
     switch (child_outcome) {
         .success => |*child_success| {
             if (child_success.platform == null) {
-                if (child_descriptor.platform) |child_platform| {
-                    child_success.platform = try clonePlatformAlloc(allocator, child_platform);
+                if (selected_child_platform) |child_platform| {
+                    child_success.platform = child_platform;
+                    selected_child_platform = null;
                 }
+            } else if (selected_child_platform) |child_platform| {
+                deinitOwnedPlatform(child_platform, allocator);
+                selected_child_platform = null;
             }
         },
-        .failure => {},
+        .failure => {
+            if (selected_child_platform) |child_platform| {
+                deinitOwnedPlatform(child_platform, allocator);
+                selected_child_platform = null;
+            }
+        },
+    }
+
+    if (selected_child_platform) |child_platform| {
+        deinitOwnedPlatform(child_platform, allocator);
     }
 
     return child_outcome;

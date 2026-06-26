@@ -489,6 +489,7 @@ pub const AuthEngine = struct {
     /// is ever required, add a max_cache_entries config field with LRU
     /// eviction and cap the ArrayList.
     token_cache: std.ArrayList(TokenCacheEntry) = .empty,
+    preferred_token_method_by_realm: std.StringHashMapUnmanaged(TokenRequestMethod) = .{},
     /// Last trustworthy registry `RateLimit-*` snapshot for manifest pre-emption.
     manifest_rate_limit_state: resilience.ManifestRateLimitState = .{},
 
@@ -576,6 +577,12 @@ pub const AuthEngine = struct {
     pub fn deinit(self: *AuthEngine) void {
         for (self.token_cache.items) |*entry| entry.deinit(self.allocator);
         self.token_cache.deinit(self.allocator);
+
+        var preferred_methods = self.preferred_token_method_by_realm.iterator();
+        while (preferred_methods.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.preferred_token_method_by_realm.deinit(self.allocator);
 
         if (self.docker_config) |*docker_config| {
             docker_config.deinit(self.allocator);
@@ -680,10 +687,7 @@ pub const AuthEngine = struct {
     }
 
     fn cachedTokenResponseForRequest(self: *AuthEngine, client: *std.http.Client, request: AuthenticateRequest) AuthError!?TokenResponse {
-        var key = try TokenCacheKey.initOwnedFromRequest(self.allocator, request);
-        defer key.deinit(self.allocator);
-
-        const index = self.cachedTokenIndexForKey(key) orelse return null;
+        const index = self.cachedTokenIndexForRequest(request) orelse return null;
         const entry = self.token_cache.items[index];
         if (self.cachedTokenIsExpired(client, entry.cached_token)) {
             self.token_cache.items[index].deinit(self.allocator);
@@ -700,29 +704,36 @@ pub const AuthEngine = struct {
         request: AuthenticateRequest,
         credential: ?ConfigModule.Credential,
     ) AuthError!TokenResponse {
-        const get_response = try exchangeTokenHttpRequestWithRetries(
-            self,
-            client,
-            request,
-            .get,
-            credential,
-        );
-        defer get_response.deinit(self.allocator);
-        if (get_response.status == .ok) {
-            return try parseTokenResponse(self.allocator, get_response.body);
+        const methods = preferredTokenMethodsForRealm(self, request.challenge.realm);
+
+        for (methods) |method| {
+            const response = try exchangeTokenHttpRequestWithRetries(
+                self,
+                client,
+                request,
+                method,
+                credential,
+            );
+            defer response.deinit(self.allocator);
+            if (response.status != .ok) continue;
+
+            try rememberPreferredTokenMethod(self, request.challenge.realm, method);
+            return try parseTokenResponse(self.allocator, response.body);
         }
 
-        const post_response = try exchangeTokenHttpRequestWithRetries(
-            self,
-            client,
-            request,
-            .post,
-            credential,
-        );
-        defer post_response.deinit(self.allocator);
-        if (post_response.status != .ok) return error.TokenExchangeFailed;
+        return error.TokenExchangeFailed;
+    }
 
-        return try parseTokenResponse(self.allocator, post_response.body);
+    fn rememberPreferredTokenMethod(
+        self: *AuthEngine,
+        realm: []const u8,
+        method: TokenRequestMethod,
+    ) AuthError!void {
+        const gop = try self.preferred_token_method_by_realm.getOrPut(self.allocator, realm);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, realm);
+        }
+        gop.value_ptr.* = method;
     }
 
     fn exchangeTokenHttpRequestWithRetries(
@@ -742,6 +753,15 @@ pub const AuthEngine = struct {
             .method = method,
             .credential = credential,
         };
+        defer {
+            const allocator = self.allocator;
+            if (loop_ctx.cached_url) |url| allocator.free(url);
+            if (loop_ctx.cached_authorization) |authorization| {
+                std.crypto.secureZero(u8, authorization);
+                allocator.free(authorization);
+            }
+            if (loop_ctx.cached_body) |body| allocator.free(body);
+        }
 
         const loop_outcome = resilience.runHttpRetryLoop(
             client,
@@ -767,6 +787,13 @@ pub const AuthEngine = struct {
     fn cachedTokenIndexForKey(self: *AuthEngine, key: TokenCacheKey) ?usize {
         for (self.token_cache.items, 0..) |entry, index| {
             if (tokenCacheKeysEqual(entry.key, key)) return index;
+        }
+        return null;
+    }
+
+    fn cachedTokenIndexForRequest(self: *AuthEngine, request: AuthenticateRequest) ?usize {
+        for (self.token_cache.items, 0..) |entry, index| {
+            if (tokenCacheKeyMatchesRequest(entry.key, request)) return index;
         }
         return null;
     }
@@ -802,19 +829,11 @@ pub const AuthEngine = struct {
     }
 
     fn invalidateCachedTokenForRequest(self: *AuthEngine, request: AuthenticateRequest) AuthError!bool {
-        var key = try TokenCacheKey.initOwnedFromRequest(self.allocator, request);
-        defer key.deinit(self.allocator);
+        const index = self.cachedTokenIndexForRequest(request) orelse return false;
 
-        var index: usize = 0;
-        while (index < self.token_cache.items.len) : (index += 1) {
-            if (!tokenCacheKeysEqual(self.token_cache.items[index].key, key)) continue;
-
-            self.token_cache.items[index].deinit(self.allocator);
-            _ = self.token_cache.swapRemove(index);
-            return true;
-        }
-
-        return false;
+        self.token_cache.items[index].deinit(self.allocator);
+        _ = self.token_cache.swapRemove(index);
+        return true;
     }
 
     fn credentialForRegistryForAuth(self: AuthEngine, registry: []const u8) AuthError!?CredentialHandle {
@@ -1191,6 +1210,16 @@ fn currentUnixSeconds(_: *std.http.Client) u64 {
     }
 }
 
+fn preferredTokenMethodsForRealm(engine: *const AuthEngine, realm: []const u8) [2]TokenRequestMethod {
+    if (engine.preferred_token_method_by_realm.get(realm)) |method| {
+        return switch (method) {
+            .get => .{ .get, .post },
+            .post => .{ .post, .get },
+        };
+    }
+    return .{ .get, .post };
+}
+
 fn tokenCacheKeysEqual(a: TokenCacheKey, b: TokenCacheKey) bool {
     if (!std.mem.eql(u8, a.realm, b.realm)) return false;
 
@@ -1205,6 +1234,28 @@ fn tokenCacheKeysEqual(a: TokenCacheKey, b: TokenCacheKey) bool {
     }
 
     return true;
+}
+
+fn tokenCacheKeyMatchesRequest(key: TokenCacheKey, request: AuthenticateRequest) bool {
+    return tokenCacheKeyMatchesBorrowed(
+        key,
+        request.challenge.realm,
+        request.service(),
+        request.scope(),
+    );
+}
+
+fn tokenCacheKeyMatchesBorrowed(
+    key: TokenCacheKey,
+    realm: []const u8,
+    service: ?[]const u8,
+    scope: ?[]const u8,
+) bool {
+    return tokenCacheKeysEqual(key, .{
+        .realm = realm,
+        .service = service,
+        .scope = scope,
+    });
 }
 
 fn cloneCachedTokenResponse(allocator: std.mem.Allocator, cached_token: CachedToken) AuthError!TokenResponse {
@@ -1263,18 +1314,53 @@ const TokenExchangeLoopContext = struct {
     request: AuthenticateRequest,
     method: TokenRequestMethod,
     credential: ?ConfigModule.Credential,
+    cached_url: ?[]u8 = null,
+    cached_authorization: ?[]u8 = null,
+    cached_content_type: ?[]const u8 = null,
+    cached_body: ?[]u8 = null,
+    exchange_attempt: usize = 0,
 };
 
 fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse {
-    const loop_ctx: *const TokenExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    const loop_ctx: *TokenExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    const allocator = loop_ctx.engine.allocator;
     const exchanger = loop_ctx.engine.token_http_exchanger orelse return error.NotYetImplemented;
-    const http_request = try buildTokenHttpRequest(
-        loop_ctx.engine.allocator,
+    loop_ctx.exchange_attempt += 1;
+
+    if (loop_ctx.cached_url) |cached_url| {
+        const http_request = TokenHttpRequest{
+            .method = loop_ctx.method,
+            .url = try allocator.dupe(u8, cached_url),
+            .authorization = if (loop_ctx.cached_authorization) |authorization|
+                try allocator.dupe(u8, authorization)
+            else
+                null,
+            .content_type = loop_ctx.cached_content_type,
+            .body = if (loop_ctx.cached_body) |body| try allocator.dupe(u8, body) else null,
+        };
+        return exchanger(allocator, loop_ctx.client, http_request);
+    }
+
+    const built = try buildTokenHttpRequest(
+        allocator,
         loop_ctx.request,
         loop_ctx.method,
         loop_ctx.credential,
     );
-    return exchanger(loop_ctx.engine.allocator, loop_ctx.client, http_request);
+
+    if (loop_ctx.exchange_attempt > 1) {
+        loop_ctx.cached_url = try allocator.dupe(u8, built.url);
+        loop_ctx.cached_authorization = if (built.authorization) |authorization|
+            try allocator.dupe(u8, authorization)
+        else
+            null;
+        loop_ctx.cached_content_type = built.content_type;
+        if (built.body) |body| {
+            loop_ctx.cached_body = try allocator.dupe(u8, body);
+        }
+    }
+
+    return exchanger(allocator, loop_ctx.client, built);
 }
 
 fn tokenExchangeResponseStatus(response: TokenExchangeResponse) std.http.Status {

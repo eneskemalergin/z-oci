@@ -156,9 +156,9 @@ pub const Config = struct {
     /// pins `client.now` so Zig does not replace the bundle with an OS rescan on the
     /// next HTTPS request. When `ca_bundle_path` is null, this is a no-op.
     ///
-    /// `resolve`, `validate`, and `getManifest` call this when `ca_bundle_path` is set,
-    /// reloading the PEM from disk on each entry (full replacement, not merge with the
-    /// OS store). Callers may also invoke this directly before other client use.
+    /// `resolve`, `validate`, and `getManifest` call this when `ca_bundle_path` is set.
+    /// When the resolved path and file mtime match the last successful apply for the
+    /// same client, the PEM is not re-read from disk.
     ///
     /// Only `ca_bundle_path` is applied here. `connect_timeout_ms` is exposed via
     /// `connectIoTimeout` for caller-owned TCP setup (zig#31305). `read_timeout_ms` is
@@ -179,16 +179,27 @@ pub const Config = struct {
             break :resolved abs_buf[0..len];
         };
 
-        var loaded: std.crypto.Certificate.Bundle = .empty;
-        errdefer loaded.deinit(gpa);
-
-        const now = std.Io.Clock.real.now(io);
-
         var file = std.Io.Dir.openFileAbsolute(io, resolved_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return error.CaBundleFileNotFound,
             else => return error.CaBundleInvalid,
         };
         defer file.close(io);
+
+        const stat = file.stat(io) catch return error.CaBundleInvalid;
+        try validateCaBundleFileStat(stat);
+
+        const mtime_nsec = stat.mtime.toNanoseconds();
+
+        if (client.ca_bundle.bytes.items.len > 0 and
+            caBundleApplyCacheMatches(client, resolved_path, mtime_nsec))
+        {
+            return;
+        }
+
+        var loaded: std.crypto.Certificate.Bundle = .empty;
+        errdefer loaded.deinit(gpa);
+
+        const now = std.Io.Clock.real.now(io);
 
         try loadCaBundleFromOpenFile(&loaded, gpa, io, &file, now);
 
@@ -201,8 +212,37 @@ pub const Config = struct {
         client.ca_bundle = .empty;
         client.now = now;
         std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &loaded);
+
+        caBundleApplyCacheRemember(client, resolved_path, mtime_nsec);
     }
 };
+
+const CaBundleApplyCache = struct {
+    client: ?*std.http.Client = null,
+    path: [std.fs.max_path_bytes]u8 = undefined,
+    path_len: usize = 0,
+    mtime_nsec: i128 = 0,
+};
+
+var ca_bundle_apply_cache: CaBundleApplyCache = .{};
+
+fn caBundleApplyCacheMatches(client: *std.http.Client, path: []const u8, mtime_nsec: i128) bool {
+    return ca_bundle_apply_cache.client == client and
+        ca_bundle_apply_cache.mtime_nsec == mtime_nsec and
+        ca_bundle_apply_cache.path_len == path.len and
+        std.mem.eql(u8, ca_bundle_apply_cache.path[0..ca_bundle_apply_cache.path_len], path);
+}
+
+fn caBundleApplyCacheRemember(
+    client: *std.http.Client,
+    path: []const u8,
+    mtime_nsec: i128,
+) void {
+    @memcpy(ca_bundle_apply_cache.path[0..path.len], path);
+    ca_bundle_apply_cache.client = client;
+    ca_bundle_apply_cache.path_len = path.len;
+    ca_bundle_apply_cache.mtime_nsec = mtime_nsec;
+}
 
 const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
 const max_ca_bundle_bytes: u64 = 10 * 1024 * 1024;
@@ -421,6 +461,30 @@ test "Config: applyToClient is no-op when ca_bundle_path is null" {
 
     const config = Config{};
     try config.applyToClient(&client);
+}
+
+test "Config: applyToClient skips reload when path and mtime are unchanged" {
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const abs_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
+    defer std.testing.allocator.free(abs_path);
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try config.applyToClient(&client);
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    const first_len = client.ca_bundle.bytes.items.len;
+    client.ca_bundle_lock.unlockShared(std.testing.io);
+
+    try config.applyToClient(&client);
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    defer client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expectEqual(first_len, client.ca_bundle.bytes.items.len);
 }
 
 test "Config: applyToClient loads fixture PEM into client ca_bundle" {
