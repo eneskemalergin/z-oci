@@ -129,10 +129,11 @@ pub const Config = struct {
     /// the client keeps Zig's lazy OS trust scan on first HTTPS.
     ca_bundle_path: ?[]const u8 = null,
 
-    /// Opt-in pre-emptive throttling when rate-limit headers look trustworthy.
+    /// Opt-in pre-emptive throttling when prior manifest responses had trustworthy
+    /// registry `RateLimit-*` headers with `remaining` at zero.
     ///
-    /// Defaults off because nothing reads it yet. Reactive `429` backoff stays on
-    /// regardless through the transport retry budgets above.
+    /// Defaults off. Reactive `429` backoff stays on regardless through the
+    /// transport retry budgets above.
     rate_limit_enabled: bool = false,
 
     /// Returns the `std.Io.Timeout` value for caller-owned `connectTcpOptions`.

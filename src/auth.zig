@@ -371,9 +371,8 @@ const NowUnixSecondsFn = *const fn (client: *std.http.Client) u64;
 /// Live today: credentials, helper `read_timeout_ms`, cached-401 auth retry
 /// (`max_retries`), transport retry budgets on token HTTP (via resilience), and
 /// `ca_bundle_path` via `Config.applyToClient` at the public API boundary.
-/// Storage-only until caller recipes wire them: `connect_timeout_ms` (see
-/// `Config.connectIoTimeout`). Pre-emptive rate limiting (`rate_limit_enabled`)
-/// is not on the live path yet.
+/// Pre-emptive rate limiting (`rate_limit_enabled`) applies on manifest transport
+/// via `AuthEngine.manifest_rate_limit_state`.
 pub const Phase2ConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,
@@ -490,6 +489,8 @@ pub const AuthEngine = struct {
     /// is ever required, add a max_cache_entries config field with LRU
     /// eviction and cap the ArrayList.
     token_cache: std.ArrayList(TokenCacheEntry) = .empty,
+    /// Last trustworthy registry `RateLimit-*` snapshot for manifest pre-emption.
+    manifest_rate_limit_state: resilience.ManifestRateLimitState = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
         return .{

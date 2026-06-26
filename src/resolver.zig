@@ -802,7 +802,7 @@ pub fn performManifestHead(
         .accept = accept,
     };
 
-    const response = exchangeManifestRequest(ctx, exchanger, request, null) catch |err|
+    const response = exchangeManifestRequest(ctx, engine, exchanger, request, null) catch |err|
         return mapExhaustedManifestTransportError(HeadRequestOutcome, ctx, err);
     defer response.deinit(ctx.allocator);
 
@@ -824,7 +824,7 @@ pub fn performManifestGet(
         .accept = accept,
     };
 
-    const response = exchangeManifestRequest(ctx, exchanger, request, null) catch |err|
+    const response = exchangeManifestRequest(ctx, engine, exchanger, request, null) catch |err|
         return mapExhaustedManifestTransportError(GetRequestOutcome, ctx, err);
 
     return classifyGetResponse(ctx, engine, exchanger, request, response, true);
@@ -842,11 +842,18 @@ fn exchangeManifestRequestOnce(
 
 fn exchangeManifestRequest(
     ctx: ResolverContext,
+    engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
     bearer_token: ?[]const u8,
 ) ManifestExchangeError!ManifestHttpResponse {
     var policy = resilience.retryPolicyFromConfig(ctx.config, ctx.transport_hooks);
+
+    engine.manifest_rate_limit_state.sleepBeforeManifestRequestIfNeeded(
+        ctx.config,
+        ctx.client,
+        ctx.transport_hooks,
+    );
 
     while (true) {
         const response = exchangeManifestRequestOnce(ctx, exchanger, request, bearer_token) catch |err| {
@@ -855,6 +862,10 @@ fn exchangeManifestRequest(
             resilience.sleepForTransportRetry(ctx.client, ctx.transport_hooks, decision.delay_ms);
             continue;
         };
+
+        engine.manifest_rate_limit_state.recordManifestResponseHeaders(
+            response.metadata.resilience_headers,
+        );
 
         const retry_after = resilience.retryAfterFromHeaders(
             response.metadata.resilience_headers,
@@ -1011,7 +1022,7 @@ fn authenticateManifestRequest(
     };
     defer token_response.deinit(ctx.allocator);
 
-    const retry_response = exchangeManifestRequest(ctx, exchanger, request, token_response.access_token.value) catch |err|
+    const retry_response = exchangeManifestRequest(ctx, engine, exchanger, request, token_response.access_token.value) catch |err|
         return mapExhaustedManifestTransportError(Outcome, ctx, err);
 
     if (retry_response.metadata.status != .unauthorized) {
@@ -1032,7 +1043,7 @@ fn authenticateManifestRequest(
     var retried_request = request;
     retried_request.allow_cached_auth_retry = false;
 
-    const refreshed_response = exchangeManifestRequest(ctx, exchanger, retried_request, refreshed_token_response.access_token.value) catch |err|
+    const refreshed_response = exchangeManifestRequest(ctx, engine, exchanger, retried_request, refreshed_token_response.access_token.value) catch |err|
         return mapExhaustedManifestTransportError(Outcome, ctx, err);
 
     if (refreshed_response.metadata.status == .unauthorized) {
@@ -1599,6 +1610,84 @@ test "performManifestHead maps exhausted transport timeout to timeout failure" {
             try std.testing.expectEqualStrings("timeout", @tagName(failure));
             failure.deinitOwned(std.testing.allocator);
         },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet preemptive sleep before request when engine carries exhausted registry rate limit" {
+    const State = struct {
+        var attempts: usize = 0;
+        var preemptive_sleep_ms: u32 = 0;
+        var now_unix_seconds: i64 = 1_700_000_000;
+
+        fn now() i64 {
+            return now_unix_seconds;
+        }
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            attempts += 1;
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            defer allocator.free(body);
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = digest,
+            }, body);
+        }
+
+        fn sleeper(delay_ms: u32) void {
+            preemptive_sleep_ms = delay_ms;
+        }
+    };
+    defer {
+        State.attempts = 0;
+        State.preemptive_sleep_ms = 0;
+        State.now_unix_seconds = 1_700_000_000;
+    }
+
+    const hooks = resilience.TransportHooks{
+        .sleeper = State.sleeper,
+        .clock = .{ .now_unix_seconds = State.now },
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(std.testing.allocator, .{
+        .rate_limit_enabled = true,
+    }, State.tokenExchange, hooks);
+    defer engine.deinit();
+
+    engine.manifest_rate_limit_state.prior = .{
+        .source = .registry_rate_limit,
+        .limit = 100,
+        .remaining = 0,
+        .reset_unix_seconds = 1_700_000_030,
+    };
+
+    const ctx = ResolverContext.initWithTransportHooks(
+        std.testing.allocator,
+        &client,
+        .{ .rate_limit_enabled = true },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+        hooks,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), State.attempts);
+    try std.testing.expectEqual(@as(u32, 30_000), State.preemptive_sleep_ms);
+    switch (outcome) {
+        .success => {},
         else => return error.TestUnexpectedResult,
     }
 }

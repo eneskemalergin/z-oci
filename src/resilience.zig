@@ -20,15 +20,13 @@
 //! - Caller recipe via `Config.connectIoTimeout`; live manifest/token `client.request`
 //!   paths do not enforce connect timeout (zig#31305).
 //! - Live on public API boundary: `ca_bundle_path` via `Config.applyToClient`.
-//! - Stored but not consumed on live transport yet: manifest/token HTTP read
-//!   timeouts, `rate_limit_enabled` (pre-emptive throttling).
+//! - Live on manifest transport when `rate_limit_enabled`: `ManifestRateLimitState`
+//!   and `parseRateLimitHeaders` for opt-in pre-emptive throttling.
 //!
 //! Parser liveness:
 //! - Live on transport path: `retryAfterFromHeaders` / `parseRetryAfterFromHeaders`
 //!   (`Retry-After`, `X-Retry-After`, optional response `Date` anchoring).
-//! - Parser-only on live transport: `parseRateLimitHeaders` and the registry/API
-//!   rate-limit parsers. Headers are captured on responses but rate-limit snapshots
-//!   do not affect retry policy yet.
+//! - Live on manifest transport when pre-emptive mode is enabled: `parseRateLimitHeaders`.
 //!
 //! Policy liveness:
 //! - Pure policy core: `RetryPolicy`, `decideHttpRetry`, `decideTransportRetry`,
@@ -53,9 +51,9 @@ const json = @import("json.zig");
 
 /// Parsed rate-limit snapshot from response headers.
 ///
-/// Populated by the rate-limit header parsers. Transport wrappers do not read
-/// this today; pre-emptive throttling would consume `parseRateLimitHeaders`.
-/// Callers treat missing fields as "header not provided", not zero.
+/// Populated by the rate-limit header parsers. Manifest transport records the
+/// last trustworthy registry snapshot via `ManifestRateLimitState` for opt-in
+/// pre-emptive throttling when `Config.rate_limit_enabled` is true.
 pub const RateLimitInfo = struct {
     pub const Source = enum {
         none,
@@ -123,7 +121,9 @@ pub const ResilienceConfigView = struct {
     max_rate_limit_retries: u8,
     /// Custom CA bundle path. Not applied by live transport wrappers today.
     ca_bundle_path: ?[]const u8,
-    /// Pre-emptive throttling gate. Reactive `429` backoff ignores this today.
+    /// Pre-emptive throttling gate. When true, manifest transport may pause before
+    /// the next request when the prior response had trustworthy registry `RateLimit-*`
+    /// headers with `remaining` at zero. Reactive `429` backoff ignores this.
     rate_limit_enabled: bool,
 };
 
@@ -545,14 +545,78 @@ pub fn parseApiRateLimitHeaders(headers: []const HttpHeader) ResilienceParseErro
 /// Parse rate-limit headers, preferring registry `RateLimit-*` over API
 /// `X-RateLimit-*` when both families are present.
 ///
-/// Parser-only on live transport today. Reactive transport retry uses
-/// `retryAfterFromHeaders` instead; captured rate-limit header names on responses
-/// are not fed here yet.
+/// Live on manifest transport via `ManifestRateLimitState` when pre-emptive
+/// throttling is enabled. Reactive transport retry uses `retryAfterFromHeaders`.
 pub fn parseRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!RateLimitInfo {
     const registry = try parseRegistryRateLimitHeaders(headers);
     if (registry.isSet()) return registry;
     return parseApiRateLimitHeaders(headers);
 }
+
+/// Returns true when registry pull `RateLimit-*` headers are complete enough for
+/// Docker Hub-style pre-emptive throttling. Partial sets and API-only headers are
+/// rejected so registries with unreliable metadata are not slowed down.
+pub fn isTrustworthyPreemptiveRateLimit(info: RateLimitInfo) bool {
+    if (info.source != .registry_rate_limit) return false;
+    if (info.limit == null or info.remaining == null) return false;
+    if (info.reset_unix_seconds == null) return false;
+    return true;
+}
+
+/// Milliseconds to sleep before the next manifest request when pre-emptive mode is
+/// enabled and the prior response shows the registry pull bucket is exhausted.
+///
+/// Returns `null` when pre-emption should not run (disabled, untrustworthy headers,
+/// remaining above `remaining_threshold`, or reset time already passed).
+pub fn preemptiveRateLimitDelayMs(
+    rate_limit_enabled: bool,
+    info: RateLimitInfo,
+    now_unix_seconds: i64,
+    remaining_threshold: u32,
+) ?u32 {
+    if (!rate_limit_enabled) return null;
+    if (!isTrustworthyPreemptiveRateLimit(info)) return null;
+    if (info.remaining.? > remaining_threshold) return null;
+
+    const reset_at: i64 = @intCast(info.reset_unix_seconds.?);
+    const delay = retryAfterDelayMs(.{ .retry_at_unix_seconds = reset_at }, now_unix_seconds);
+    if (delay == 0) return null;
+    return delay;
+}
+
+/// Carries the last trustworthy registry rate-limit snapshot across manifest HTTP
+/// calls within one resolve/validate/get operation (via `AuthEngine`).
+pub const ManifestRateLimitState = struct {
+    prior: ?RateLimitInfo = null,
+
+    pub fn recordManifestResponseHeaders(self: *ManifestRateLimitState, headers: []const HttpHeader) void {
+        const parsed = parseRateLimitHeaders(headers) catch {
+            self.prior = null;
+            return;
+        };
+        if (isTrustworthyPreemptiveRateLimit(parsed)) {
+            self.prior = parsed;
+        } else {
+            self.prior = null;
+        }
+    }
+
+    pub fn sleepBeforeManifestRequestIfNeeded(
+        self: *const ManifestRateLimitState,
+        config: Config,
+        client: *std.http.Client,
+        hooks: TransportHooks,
+    ) void {
+        const prior = self.prior orelse return;
+        const delay = preemptiveRateLimitDelayMs(
+            config.rate_limit_enabled,
+            prior,
+            hooks.clock.now_unix_seconds(),
+            0,
+        ) orelse return;
+        sleepForTransportRetry(client, hooks, delay);
+    }
+};
 
 /// Parse `Retry-After` or `X-Retry-After` when either header is present.
 ///
@@ -1139,6 +1203,109 @@ test "retryAfterDelayMs converts delay seconds and absolute retry instants" {
     try std.testing.expectEqual(@as(u32, 120_000), retryAfterDelayMs(.{ .delay_seconds = 120 }, 1_700_000_000));
     try std.testing.expectEqual(@as(u32, 45_000), retryAfterDelayMs(.{ .retry_at_unix_seconds = 1_700_000_045 }, 1_700_000_000));
     try std.testing.expectEqual(@as(u32, 0), retryAfterDelayMs(.{ .retry_at_unix_seconds = 1_699_999_999 }, 1_700_000_000));
+}
+
+test "isTrustworthyPreemptiveRateLimit requires registry RateLimit family with limit remaining reset" {
+    const trusted: RateLimitInfo = .{
+        .source = .registry_rate_limit,
+        .limit = 100,
+        .remaining = 0,
+        .reset_unix_seconds = 1_700_000_060,
+        .window_seconds = 21_600,
+    };
+    try std.testing.expect(isTrustworthyPreemptiveRateLimit(trusted));
+
+    const api_only: RateLimitInfo = .{
+        .source = .api_x_rate_limit,
+        .limit = 180,
+        .remaining = 0,
+        .reset_unix_seconds = 1_700_000_060,
+    };
+    try std.testing.expect(!isTrustworthyPreemptiveRateLimit(api_only));
+
+    const partial: RateLimitInfo = .{
+        .source = .registry_rate_limit,
+        .remaining = 0,
+    };
+    try std.testing.expect(!isTrustworthyPreemptiveRateLimit(partial));
+}
+
+test "preemptiveRateLimitDelayMs sleeps until reset when remaining is zero" {
+    test_policy_now_unix_seconds = 1_700_000_000;
+    const info: RateLimitInfo = .{
+        .source = .registry_rate_limit,
+        .limit = 100,
+        .remaining = 0,
+        .reset_unix_seconds = 1_700_000_045,
+    };
+    try std.testing.expectEqual(@as(?u32, 45_000), preemptiveRateLimitDelayMs(true, info, 1_700_000_000, 0));
+    try std.testing.expect(preemptiveRateLimitDelayMs(false, info, 1_700_000_000, 0) == null);
+    try std.testing.expect(preemptiveRateLimitDelayMs(true, info, 1_700_000_100, 0) == null);
+}
+
+test "preemptiveRateLimitDelayMs ignores remaining above threshold" {
+    const info: RateLimitInfo = .{
+        .source = .registry_rate_limit,
+        .limit = 100,
+        .remaining = 3,
+        .reset_unix_seconds = 1_700_000_045,
+    };
+    try std.testing.expect(preemptiveRateLimitDelayMs(true, info, 1_700_000_000, 0) == null);
+}
+
+test "ManifestRateLimitState records trustworthy headers and rejects partial API headers" {
+    var state: ManifestRateLimitState = .{};
+    const registry_headers = [_]HttpHeader{
+        .{ .name = "RateLimit-Limit", .value = "100;w=21600" },
+        .{ .name = "RateLimit-Remaining", .value = "0" },
+        .{ .name = "RateLimit-Reset", .value = "1700000045" },
+    };
+    state.recordManifestResponseHeaders(&registry_headers);
+    try std.testing.expect(state.prior != null);
+    try std.testing.expectEqual(@as(u32, 0), state.prior.?.remaining.?);
+
+    const api_headers = [_]HttpHeader{
+        .{ .name = "X-RateLimit-Remaining", .value = "0" },
+        .{ .name = "X-RateLimit-Reset", .value = "1700000045" },
+        .{ .name = "X-RateLimit-Limit", .value = "180" },
+    };
+    state.recordManifestResponseHeaders(&api_headers);
+    try std.testing.expect(state.prior == null);
+}
+
+test "ManifestRateLimitState sleepBeforeManifestRequestIfNeeded uses transport hooks" {
+    const State = struct {
+        var slept_ms: u32 = 0;
+
+        fn sleeper(delay_ms: u32) void {
+            slept_ms = delay_ms;
+        }
+    };
+    defer State.slept_ms = 0;
+
+    test_policy_now_unix_seconds = 1_700_000_000;
+    var state: ManifestRateLimitState = .{
+        .prior = .{
+            .source = .registry_rate_limit,
+            .limit = 100,
+            .remaining = 0,
+            .reset_unix_seconds = 1_700_000_030,
+        },
+    };
+
+    var client: std.http.Client = undefined;
+    const config = Config{ .rate_limit_enabled = true };
+    state.sleepBeforeManifestRequestIfNeeded(config, &client, .{
+        .sleeper = State.sleeper,
+        .clock = .{ .now_unix_seconds = testPolicyNowUnixSeconds },
+    });
+    try std.testing.expectEqual(@as(u32, 30_000), State.slept_ms);
+
+    state.sleepBeforeManifestRequestIfNeeded(.{ .rate_limit_enabled = false }, &client, .{
+        .sleeper = State.sleeper,
+        .clock = .{ .now_unix_seconds = testPolicyNowUnixSeconds },
+    });
+    try std.testing.expectEqual(@as(u32, 30_000), State.slept_ms);
 }
 
 var test_policy_now_unix_seconds: i64 = 1_700_000_000;
