@@ -1637,6 +1637,62 @@ test "performManifestHead retries transient 503 then succeeds" {
     }
 }
 
+test "performManifestHead retry path leaves no residual allocations under DebugAllocator" {
+    const State = struct {
+        var attempts: usize = 0;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            attempts += 1;
+            if (@rem(attempts, 2) == 1) {
+                return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .service_unavailable,
+                }, null);
+            }
+
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+            }, null);
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{
+        .max_network_retries = 1,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverContext.init(
+        allocator,
+        &client,
+        .{ .max_network_retries = 1 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    for (0..32) |_| {
+        var outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        defer outcome.deinit(allocator);
+
+        switch (outcome) {
+            .success => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 test "performManifestHead maps exhausted 429 to rate_limited" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {

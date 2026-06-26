@@ -14,6 +14,9 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - `ResolveError.rate_limited`, `network_error`, and `timeout` now expose `transport_retries_exhausted` to distinguish immediate hard failures from post-retry exhaustion.
 - Fixture-backed resilience header negative cases under `fixtures/resilience/` (malformed rate-limit values, conflicting `Retry-After` headers).
 - Build-time PEM private-key scan via `zig build security-check` (also runs as part of `zig build test`).
+- Deterministic retry-path benchmark ops in `z-oci-bench`: `resolve-single-retry` (transient `503` then success) and `authenticate-rate-limit` (`429` then success) with noop transport sleep hooks.
+- DebugAllocator repeated-run checks for manifest HEAD and token-exchange retry wrappers.
+- Phase 4 pre-release benchmark baseline at `benchmarks/baselines/v0.4.0.json` (includes retry ops plus existing resolver/auth operations).
 
 ### Changed
 

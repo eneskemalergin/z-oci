@@ -3071,6 +3071,59 @@ test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
     try std.testing.expectEqual(@as(usize, 2), State.calls);
 }
 
+test "AuthEngine.authenticate: rate-limit retry path stays leak-free under DebugAllocator" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(allocator);
+            calls += 1;
+            if (@rem(calls, 2) == 1) {
+                return .{
+                    .status = .too_many_requests,
+                    .body = "",
+                    .resilience_headers = &.{
+                        .{ .name = "Retry-After", .value = "1" },
+                    },
+                };
+            }
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "retry-debug-token",
+            \\  "expires_in": 3600
+            \\}
+            };
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var engine = AuthEngine.initWithTokenHttpExchanger(allocator, .{
+        .max_rate_limit_retries = 1,
+    }, State.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+
+    for (0..32) |i| {
+        var buf: [96]u8 = undefined;
+        const scope = try std.fmt.bufPrint(&buf, "repository:owner/image{d}:pull", .{i});
+        const request = try AuthenticateRequest.init(
+            "registry.example.test",
+            .{
+                .realm = "https://auth.example.test/token",
+                .service = "registry.example.test",
+                .scope = scope,
+            },
+        );
+
+        var response = (try engine.authenticate(&client, request)).?;
+        defer response.deinit(allocator);
+        try std.testing.expectEqualStrings("retry-debug-token", response.access_token.value);
+    }
+}
+
 test "AuthEngine.authenticate: cache hit reuses valid token response" {
     const State = struct {
         var calls: usize = 0;

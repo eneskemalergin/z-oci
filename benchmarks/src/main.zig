@@ -13,7 +13,9 @@ const usage =
     \\  platform-match    Platform.match throughput
     \\  authenticate-miss AuthEngine.authenticate (cache miss per iteration)
     \\  authenticate-hit  AuthEngine.authenticate (cached token, second call)
+    \\  authenticate-rate-limit AuthEngine.authenticate (429 then success per call)
     \\  resolve-single    public resolve() single-arch path via injected transports
+    \\  resolve-single-retry public resolve() with one transient 503 retry per call
     \\  resolve-multi     public resolve() multi-arch child-selection path via injected transports
     \\  validate-single   public validate() single-arch path via injected transports
     \\  get-manifest      public getManifest() single-arch path via injected transports
@@ -60,7 +62,9 @@ pub fn main(init: std.process.Init) !void {
         try benchPlatformMatch(io, iterations, counting);
         try benchAuthenticateMiss(io, iterations, counting);
         try benchAuthenticateHit(io, iterations, counting);
+        try benchAuthenticateRateLimit(io, iterations, counting);
         try benchResolveSingle(io, iterations, counting);
+        try benchResolveSingleRetry(io, iterations, counting);
         try benchResolveMulti(io, iterations, counting);
         try benchValidateSingle(io, iterations, counting);
         try benchGetManifest(io, iterations, counting);
@@ -78,8 +82,12 @@ pub fn main(init: std.process.Init) !void {
         try benchAuthenticateMiss(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "authenticate-hit")) {
         try benchAuthenticateHit(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "authenticate-rate-limit")) {
+        try benchAuthenticateRateLimit(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "resolve-single")) {
         try benchResolveSingle(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "resolve-single-retry")) {
+        try benchResolveSingleRetry(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "resolve-multi")) {
         try benchResolveMulti(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "validate-single")) {
@@ -403,6 +411,68 @@ fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
     printReport("authenticate-hit", "same scope, cached", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
 }
 
+fn benchAuthenticateRateLimit(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const ExchangeState = struct {
+        var calls: usize = 0;
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(allocator);
+            calls += 1;
+            if (@rem(calls, 2) == 1) {
+                return .{
+                    .status = .too_many_requests,
+                    .body = "",
+                    .resilience_headers = &.{
+                        .{ .name = "Retry-After", .value = "1" },
+                    },
+                };
+            }
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "bench-retry-token",
+            \\  "expires_in": 3600
+            \\}
+            };
+        }
+    };
+
+    var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{
+        .max_rate_limit_retries = 1,
+    }, ExchangeState.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+
+    {
+        const request = try z_oci.AuthenticateRequest.init("registry.example.test", .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:bench/retry:pull",
+        });
+        var response = (try engine.authenticate(&client, request)).?;
+        response.deinit(alloc);
+    }
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |i| {
+        var buf: [128]u8 = undefined;
+        const scope = try std.fmt.bufPrint(&buf, "repository:bench/retry{d}:pull", .{i});
+        const request = try z_oci.AuthenticateRequest.init("registry.example.test", .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = scope,
+        });
+        var response = (try engine.authenticate(&client, request)).?;
+        response.deinit(alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("authenticate-rate-limit", "429 then success via injected token transport", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
 const ResolverBenchFixture = struct {
     index_body: []u8,
     index_digest: []u8,
@@ -452,6 +522,36 @@ const SingleManifestBenchState = struct {
         request: z_oci.testing.ManifestHttpRequest,
     ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
         defer request.deinit(allocator);
+        return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+            .status = .ok,
+            .content_type = oci_manifest_media_type,
+            .docker_content_digest = busybox_manifest_digest,
+        }, body);
+    }
+};
+
+const SingleManifestRetryBenchState = struct {
+    var body: []const u8 = undefined;
+    var attempts: usize = 0;
+
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+        request.deinit(allocator);
+        return error.TokenExchangeFailed;
+    }
+
+    fn manifestExchange(
+        allocator: std.mem.Allocator,
+        _: *std.http.Client,
+        request: z_oci.testing.ManifestHttpRequest,
+    ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+        defer request.deinit(allocator);
+        attempts += 1;
+        if (@rem(attempts, 2) == 1) {
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .service_unavailable,
+            }, null);
+        }
+
         return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
             .status = .ok,
             .content_type = oci_manifest_media_type,
@@ -537,6 +637,7 @@ fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
         null,
         SingleManifestBenchState.tokenExchange,
         SingleManifestBenchState.manifestExchange,
+        .{},
     ), alloc);
 
     ca.reset();
@@ -550,11 +651,62 @@ fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
             null,
             SingleManifestBenchState.tokenExchange,
             SingleManifestBenchState.manifestExchange,
+            .{},
         ), alloc);
     }
     const elapsed = nanoTime() - start;
 
     printReport("resolve-single", "single-arch resolve via injected manifest fixture", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn benchResolveSingleRetry(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const manifest_body = try readFixtureAlloc(alloc, io, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 32 * 1024);
+    defer alloc.free(manifest_body);
+
+    SingleManifestRetryBenchState.body = manifest_body;
+    SingleManifestRetryBenchState.attempts = 0;
+
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+    const config = z_oci.Config{ .max_network_retries = 1 };
+
+    try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
+        alloc,
+        &client,
+        config,
+        ref,
+        null,
+        SingleManifestRetryBenchState.tokenExchange,
+        SingleManifestRetryBenchState.manifestExchange,
+        .{},
+    ), alloc);
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
+            alloc,
+            &client,
+            config,
+            ref,
+            null,
+            SingleManifestRetryBenchState.tokenExchange,
+            SingleManifestRetryBenchState.manifestExchange,
+            .{},
+        ), alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("resolve-single-retry", "503 then success via injected manifest transport", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
 }
 
 fn benchResolveMulti(io: Io, iterations: usize, counting: bool) !void {
@@ -584,6 +736,7 @@ fn benchResolveMulti(io: Io, iterations: usize, counting: bool) !void {
         platform,
         MultiManifestBenchState.tokenExchange,
         MultiManifestBenchState.manifestExchange,
+        .{},
     ), alloc);
 
     ca.reset();
@@ -597,6 +750,7 @@ fn benchResolveMulti(io: Io, iterations: usize, counting: bool) !void {
             platform,
             MultiManifestBenchState.tokenExchange,
             MultiManifestBenchState.manifestExchange,
+            .{},
         ), alloc);
     }
     const elapsed = nanoTime() - start;
@@ -625,6 +779,7 @@ fn benchValidateSingle(io: Io, iterations: usize, counting: bool) !void {
         null,
         ValidateBenchState.tokenExchange,
         ValidateBenchState.manifestExchange,
+        .{},
     ), alloc);
 
     ca.reset();
@@ -638,6 +793,7 @@ fn benchValidateSingle(io: Io, iterations: usize, counting: bool) !void {
             null,
             ValidateBenchState.tokenExchange,
             ValidateBenchState.manifestExchange,
+            .{},
         ), alloc);
     }
     const elapsed = nanoTime() - start;
@@ -671,6 +827,7 @@ fn benchGetManifest(io: Io, iterations: usize, counting: bool) !void {
         null,
         SingleManifestBenchState.tokenExchange,
         SingleManifestBenchState.manifestExchange,
+        .{},
     ), alloc);
 
     ca.reset();
@@ -684,6 +841,7 @@ fn benchGetManifest(io: Io, iterations: usize, counting: bool) !void {
             null,
             SingleManifestBenchState.tokenExchange,
             SingleManifestBenchState.manifestExchange,
+            .{},
         ), alloc);
     }
     const elapsed = nanoTime() - start;
