@@ -14,6 +14,11 @@ zig-*/
 *.swp
 *~
 
+# TLS / crypto private keys (never commit)
+*.key
+*-key.pem
+*private*.pem
+
 # Ignored folders (dev only)
 plan/
 # assets/

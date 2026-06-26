@@ -82,7 +82,12 @@ When refreshing one of these fixtures, use the exact URL and `Accept` header rec
 
 ## TLS test fixtures
 
-Synthetic PEM material for `Config.applyToClient` unit tests. No private keys are checked in.
+Synthetic PEM material for `Config.applyToClient` unit tests. **No private keys are checked in.**
+
+Repository guards:
+
+- `.gitignore` blocks `*.key`, `*-key.pem`, and `*private*.pem`.
+- `zig build security-check` (also runs as part of `zig build test`) scans `fixtures/`, `src/`, `examples/`, and `benchmarks/` for private-key PEM markers. This is a **build-time** tool under `tools/`; it is not linked into the z-oci library binary.
 
 - `fixtures/tls/enterprise-test-ca.pem`
     - Source: repository-generated self-signed CA (`openssl req -x509`, 10-year validity)

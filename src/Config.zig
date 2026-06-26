@@ -5,14 +5,14 @@
 //! public registry access.
 //!
 //! Retry budget split (live today):
-//! - `max_retries` — cached-401 auth invalidation only (`AuthEngine.retryAuthenticateAfterCachedUnauthorized`).
-//! - `max_network_retries` / `max_rate_limit_retries` — reactive transport retries on
+//! - `max_retries`: cached-401 auth invalidation only (`AuthEngine.retryAuthenticateAfterCachedUnauthorized`).
+//! - `max_network_retries` / `max_rate_limit_retries`: reactive transport retries on
 //!   manifest `HEAD`/`GET` and token HTTP (`exchangeManifestRequest`,
 //!   `exchangeTokenHttpRequestWithRetries`).
 //!
 //! Timeout field liveness:
-//! - `read_timeout_ms` — Docker credential helper subprocess I/O in `auth.zig`.
-//! - `connect_timeout_ms` — exposed via `connectIoTimeout` for caller-owned
+//! - `read_timeout_ms`: Docker credential helper subprocess I/O in `auth.zig`.
+//! - `connect_timeout_ms`: exposed via `connectIoTimeout` for caller-owned
 //!   `connectTcpOptions` recipes; live z-oci exchangers use `client.request`, which
 //!   does not honor it until Zig passes `ConnectTcpOptions.timeout` through
 //!   (zig#31305). Manifest/token HTTP read timeouts are not configurable per request.
@@ -25,6 +25,11 @@
 //!   file only. It does not merge with the OS store. Enterprise deployments should
 //!   concatenate corporate CAs with their distro bundle in the PEM file when both
 //!   are required.
+//! - Prefer an absolute `ca_bundle_path`. The file must be a public CA trust store
+//!   (certificate PEM only). Private keys used for registry auth, client TLS, or
+//!   credential helpers are unaffected; this check applies only to `ca_bundle_path`.
+//!   On POSIX, that bundle file must not be world-writable (`other` write bit).
+//!   Each public API entry reloads the file when this path is set.
 //! - Custom CA support does not make Windows a supported host. Zig 0.16 TLS on
 //!   Windows remains out of scope for z-oci regardless of bundle configuration.
 //!
@@ -81,6 +86,8 @@ pub const Config = struct {
         CaBundleInvalid,
         CaBundleEmpty,
         CaBundleTlsDisabled,
+        CaBundleInsecurePermissions,
+        CaBundleContainsPrivateKey,
     };
 
     /// Credential provider for authenticated registries. Null means anonymous.
@@ -116,9 +123,10 @@ pub const Config = struct {
     /// Custom CA bundle PEM path for caller-owned TLS trust.
     ///
     /// When non-null, `applyToClient` loads this file into `std.http.Client.ca_bundle`
-    /// before HTTPS traffic. The path may be absolute or relative to the process cwd.
-    /// The file must contain one or more `BEGIN CERTIFICATE` blocks. When null, the
-    /// client keeps Zig's lazy OS trust scan on first HTTPS.
+    /// before HTTPS traffic. Prefer an absolute path. The file must contain public CA
+    /// certificates only; private keys belong in auth/TLS identity paths,
+    /// not the trust store). On POSIX, the file must not be world-writable. When null,
+    /// the client keeps Zig's lazy OS trust scan on first HTTPS.
     ca_bundle_path: ?[]const u8 = null,
 
     /// Opt-in pre-emptive throttling when rate-limit headers look trustworthy.
@@ -174,11 +182,14 @@ pub const Config = struct {
         errdefer loaded.deinit(gpa);
 
         const now = std.Io.Clock.real.now(io);
-        loaded.addCertsFromFilePathAbsolute(gpa, io, now, resolved_path) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+
+        var file = std.Io.Dir.openFileAbsolute(io, resolved_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return error.CaBundleFileNotFound,
             else => return error.CaBundleInvalid,
         };
+        defer file.close(io);
+
+        try loadCaBundleFromOpenFile(&loaded, gpa, io, &file, now);
 
         if (loaded.bytes.items.len == 0) return error.CaBundleEmpty;
 
@@ -191,6 +202,91 @@ pub const Config = struct {
         std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &loaded);
     }
 };
+
+const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+const max_ca_bundle_bytes: u64 = 10 * 1024 * 1024;
+
+/// PEM blocks that belong in a key file, not in a CA trust bundle (`ca_bundle_path`).
+const private_key_pem_markers = [_][]const u8{
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+};
+
+fn validateCaBundleFileStat(stat: std.Io.File.Stat) Config.ApplyError!void {
+    if (stat.size > max_ca_bundle_bytes) return error.CaBundleInvalid;
+    if (@hasDecl(std.Io.File.Permissions, "toMode")) {
+        if (stat.permissions.toMode() & 0o002 != 0) return error.CaBundleInsecurePermissions;
+    }
+}
+
+fn caBundlePemContainsPrivateKey(pem_bytes: []const u8) bool {
+    if (!std.mem.containsAtLeast(u8, pem_bytes, 1, "BEGIN")) return false;
+    inline for (private_key_pem_markers) |marker| {
+        if (std.mem.indexOf(u8, pem_bytes, marker) != null) return true;
+    }
+    return false;
+}
+
+const AddCertsFromPemBytesError = std.mem.Allocator.Error ||
+    std.crypto.Certificate.Bundle.ParseCertError ||
+    std.base64.Error ||
+    error{MissingEndCertificateMarker};
+
+/// Parses `BEGIN CERTIFICATE` blocks from an in-memory PEM buffer.
+/// Vendored from `std.crypto.Certificate.Bundle.addCertsFromFile` so
+/// `loadCaBundleFromOpenFile` can read the file once and scan before parse.
+fn addCertsFromPemBytes(
+    cb: *std.crypto.Certificate.Bundle,
+    gpa: std.mem.Allocator,
+    encoded_bytes: []const u8,
+    now_sec: i64,
+) AddCertsFromPemBytesError!void {
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+
+    var start_index: usize = 0;
+    while (std.mem.findPos(u8, encoded_bytes, start_index, begin_marker)) |begin_marker_start| {
+        const cert_start = begin_marker_start + begin_marker.len;
+        const cert_end = std.mem.findPos(u8, encoded_bytes, cert_start, end_marker) orelse
+            return error.MissingEndCertificateMarker;
+        start_index = cert_end + end_marker.len;
+        const encoded_cert = std.mem.trim(u8, encoded_bytes[cert_start..cert_end], " \t\r\n");
+        const decoded_start: u32 = @intCast(cb.bytes.items.len);
+        const decoded_upper = encoded_cert.len / 4 * 3 + 4;
+        try cb.bytes.ensureUnusedCapacity(gpa, decoded_upper);
+        const dest_buf = cb.bytes.allocatedSlice()[decoded_start..];
+        cb.bytes.items.len += try base64_decoder.decode(dest_buf, encoded_cert);
+        try cb.parseCert(gpa, decoded_start, now_sec);
+    }
+}
+
+fn loadCaBundleFromOpenFile(
+    bundle: *std.crypto.Certificate.Bundle,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    file: *std.Io.File,
+    now: std.Io.Timestamp,
+) Config.ApplyError!void {
+    const stat = file.stat(io) catch return error.CaBundleInvalid;
+    try validateCaBundleFileStat(stat);
+
+    const read_len = std.math.cast(usize, stat.size) orelse return error.CaBundleInvalid;
+    const pem_bytes = gpa.alloc(u8, read_len) catch return error.OutOfMemory;
+    defer gpa.free(pem_bytes);
+
+    var file_reader = file.reader(io, &.{});
+    const n = file_reader.interface.readSliceShort(pem_bytes) catch return error.CaBundleInvalid;
+    if (n != read_len) return error.CaBundleInvalid;
+
+    if (caBundlePemContainsPrivateKey(pem_bytes)) return error.CaBundleContainsPrivateKey;
+    addCertsFromPemBytes(bundle, gpa, pem_bytes, now.toSeconds()) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CaBundleInvalid,
+    };
+}
 
 // Tests
 
@@ -467,6 +563,77 @@ test "Config: applyToClient returns empty when pem contains only expired certifi
 
     const config = Config{ .ca_bundle_path = "fixtures/tls/expired-only-ca.pem" };
     try std.testing.expectError(error.CaBundleEmpty, config.applyToClient(&client));
+}
+
+test "Config: applyToClient rejects world-writable ca bundle file on POSIX" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+    if (!@hasDecl(std.Io.File.Permissions, "toMode")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = "world-writable-ca.pem";
+    const enterprise = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/tls/enterprise-test-ca.pem",
+        std.testing.allocator,
+        std.Io.Limit.limited64(max_ca_bundle_bytes),
+    );
+    defer std.testing.allocator.free(enterprise);
+    {
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, enterprise);
+        try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o666));
+    }
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
+    const abs_path = abs_buf[0..abs_len];
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try std.testing.expectError(error.CaBundleInsecurePermissions, config.applyToClient(&client));
+}
+
+test "Config: applyToClient rejects pem files containing private key blocks" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = "ca-with-key.pem";
+    const enterprise = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/tls/enterprise-test-ca.pem",
+        std.testing.allocator,
+        std.Io.Limit.limited64(max_ca_bundle_bytes),
+    );
+    defer std.testing.allocator.free(enterprise);
+    {
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, enterprise);
+        try file.writeStreamingAll(std.testing.io, "\n-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n");
+    }
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
+    const abs_path = abs_buf[0..abs_len];
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try std.testing.expectError(error.CaBundleContainsPrivateKey, config.applyToClient(&client));
 }
 
 test "Config: loaded ca bundle verifies fixture server certificate signed by that ca" {

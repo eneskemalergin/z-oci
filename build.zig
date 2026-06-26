@@ -54,6 +54,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_workflow_smoke_tests.step);
 
+    const security_check = b.addExecutable(.{
+        .name = "check-repo-security",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/check_repo_security.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_security_check = b.addRunArtifact(security_check);
+    const security_check_step = b.step("security-check", "Reject private keys in tracked PEM material");
+    security_check_step.dependOn(&run_security_check.step);
+    test_step.dependOn(security_check_step);
+
     const workflow_smoke_step = b.step("workflow-smoke", "Run offline workflow smoke tests");
     workflow_smoke_step.dependOn(&run_workflow_smoke_tests.step);
 
