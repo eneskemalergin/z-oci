@@ -18,10 +18,11 @@ const Reference = @import("Reference.zig");
 const json = @import("json.zig");
 const resilience = @import("resilience.zig");
 
-/// Internal Phase 2 auth-only error set.
+/// Internal auth error set for token exchange and credential helpers.
 ///
-/// Stays separate from `ResolveError` until Phase 3 threads auth failures
-/// through real resolve/validate/getManifest behavior.
+/// Stays separate from `ResolveError` inside auth. The resolver maps selected
+/// variants into public `ResolveError` at manifest boundaries for
+/// `resolve`, `validate`, and `getManifest`.
 pub const AuthError = error{
     NotYetImplemented,
     OutOfMemory,
@@ -365,11 +366,13 @@ const TokenCacheEntry = struct {
 
 const NowUnixSecondsFn = *const fn (client: *std.http.Client) u64;
 
-/// Narrow Phase 2 view of `Config`.
+/// Narrow auth-facing view of `Config`.
 ///
-/// Relevant now: credentials, helper timeout, cached-401 auth retry policy.
-/// Deferred on the live HTTP path: connect timeout, custom CA bundle wiring,
-/// and rate-limit policy.
+/// Live today: credentials, helper `read_timeout_ms`, cached-401 auth retry
+/// (`max_retries`), and transport retry budgets on token HTTP (via resilience).
+/// Storage-only until caller recipes wire them: `connect_timeout_ms`,
+/// `ca_bundle_path` (see `Config.connectIoTimeout` and `Config.applyToClient`).
+/// Pre-emptive rate limiting (`rate_limit_enabled`) is not on the live path yet.
 pub const Phase2ConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,

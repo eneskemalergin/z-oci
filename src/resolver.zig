@@ -1565,6 +1565,44 @@ test "performManifestHead maps exhausted 429 to rate_limited" {
     }
 }
 
+test "performManifestHead maps exhausted transport timeout to timeout failure" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return error.Timeout;
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_network_retries = 0,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        .{ .max_network_retries = 0 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    const outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    switch (outcome) {
+        .failure => |failure| {
+            try std.testing.expectEqualStrings("timeout", @tagName(failure));
+            failure.deinitOwned(std.testing.allocator);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "performManifestHead retries connection reset then succeeds" {
     const State = struct {
         var attempts: usize = 0;

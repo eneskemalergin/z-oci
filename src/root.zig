@@ -1350,6 +1350,107 @@ test "resolveWithExchangers propagates resolver failure matrix with full context
     }
 }
 
+test "resolveWithExchangers maps exhausted manifest 429 to rate_limited" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .too_many_requests,
+                .resilience_headers = &.{
+                    .{ .name = "Retry-After", .value = "1" },
+                },
+            }, null);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .max_rate_limit_retries = 0 },
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .failure => |failure| try expectResolveFailure(
+            failure,
+            "rate_limited",
+            "registry-1.docker.io",
+            "registry-1.docker.io/library/busybox:latest",
+            429,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "resolveWithExchangers maps exhausted transport timeout to timeout" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return error.Timeout;
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .max_network_retries = 0 },
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .failure => |failure| try expectResolveFailure(
+            failure,
+            "timeout",
+            "registry-1.docker.io",
+            "registry-1.docker.io/library/busybox:latest",
+            null,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "resolveWithExchangers returns platform_required when multi-arch request omits platform" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
