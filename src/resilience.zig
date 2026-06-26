@@ -10,16 +10,18 @@
 //!   has no per-request read/connect timeout field today.
 //! - `ConnectTcpOptions.timeout` exists, but `connectTcpOptions` does not pass
 //!   it through to `host.connect` today (zig#31305).
-//! - Custom CA trust lives on `std.http.Client.ca_bundle`; `Config.ca_bundle_path`
-//!   is not applied automatically on caller-owned clients today.
+//! - Custom CA trust lives on `std.http.Client.ca_bundle`. When `Config.ca_bundle_path`
+//!   is set, `Config.applyToClient` loads that PEM file at the public API boundary
+//!   (`resolve`, `validate`, `getManifest`). When unset, Zig lazy-scans OS trust.
 //!
 //! Config field liveness:
 //! - Live on transport path: `max_network_retries`, `max_rate_limit_retries`.
 //! - Live on helper subprocess only: `read_timeout_ms` (via auth, not this module).
-//! - Caller recipe via `Config.connectIoTimeout` / `Config.applyToClient`; live
-//!   manifest/token `client.request` paths do not enforce connect timeout (zig#31305).
+//! - Caller recipe via `Config.connectIoTimeout`; live manifest/token `client.request`
+//!   paths do not enforce connect timeout (zig#31305).
+//! - Live on public API boundary: `ca_bundle_path` via `Config.applyToClient`.
 //! - Stored but not consumed on live transport yet: manifest/token HTTP read
-//!   timeouts, `ca_bundle_path`, `rate_limit_enabled` (pre-emptive throttling).
+//!   timeouts, `rate_limit_enabled` (pre-emptive throttling).
 //!
 //! Parser liveness:
 //! - Live on transport path: `retryAfterFromHeaders` / `parseRetryAfterFromHeaders`

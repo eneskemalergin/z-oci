@@ -79,3 +79,16 @@ When refreshing one of these fixtures, use the exact URL and `Accept` header rec
     - Response content-type: `application/vnd.docker.distribution.manifest.v2+json`
     - Response docker-content-digest: `sha256:35e7e430350711653810b2b3cc889fec2a6e0175c078e4114964c7252c411209`
     - Notes: child manifest selected from the live `linux/amd64` descriptor in the Quay manifest list snapshot above.
+
+## TLS test fixtures
+
+Synthetic PEM material for `Config.applyToClient` unit tests. No private keys are checked in.
+
+- `fixtures/tls/enterprise-test-ca.pem`
+    - Source: repository-generated self-signed CA (`openssl req -x509`, 10-year validity)
+    - Created: 2026-06-25
+    - Purpose: positive-path CA bundle load into `std.http.Client.ca_bundle`
+- `fixtures/tls/invalid-ca-bundle.pem`
+    - Source: repository-authored synthetic fixture
+    - Created: 2026-06-25
+    - Purpose: assert `Config.ApplyError.CaBundleInvalid` on malformed PEM

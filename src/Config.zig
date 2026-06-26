@@ -17,6 +17,17 @@
 //!   does not honor it until Zig passes `ConnectTcpOptions.timeout` through
 //!   (zig#31305). Manifest/token HTTP read timeouts are not configurable per request.
 //!
+//! TLS trust (`ca_bundle_path`):
+//! - When unset, the caller-owned `std.http.Client` loads OS trust roots on the first
+//!   HTTPS request (Linux: `/etc/ssl/certs/...` and distro-specific paths; macOS:
+//!   Keychain via Zig `Certificate.Bundle.rescan`; BSD variants: `/etc/ssl/cert.pem`).
+//! - When set, `applyToClient` replaces `client.ca_bundle` with PEM certs from that
+//!   file only. It does not merge with the OS store. Enterprise deployments should
+//!   concatenate corporate CAs with their distro bundle in the PEM file when both
+//!   are required.
+//! - Custom CA support does not make Windows a supported host. Zig 0.16 TLS on
+//!   Windows remains out of scope for z-oci regardless of bundle configuration.
+//!
 //! CredentialProvider and Credential are defined here because they describe
 //! the interface slot, not the implementation. Concrete providers (env vars,
 //! Docker config, credential helpers) live in `auth.zig`.
@@ -63,6 +74,15 @@ pub const CredentialProvider = struct {
 /// Resolver configuration. All fields are optional with safe defaults.
 /// A bare Config{} compiles and works for anonymous public registry access.
 pub const Config = struct {
+    /// Errors from `applyToClient` when `ca_bundle_path` is set.
+    pub const ApplyError = error{
+        OutOfMemory,
+        CaBundleFileNotFound,
+        CaBundleInvalid,
+        CaBundleEmpty,
+        CaBundleTlsDisabled,
+    };
+
     /// Credential provider for authenticated registries. Null means anonymous.
     credential_provider: ?*const CredentialProvider = null,
 
@@ -93,8 +113,12 @@ pub const Config = struct {
     /// `HEAD`/`GET` and token HTTP traffic.
     max_rate_limit_retries: u8 = 1,
 
-    /// Custom CA bundle path for caller-owned TLS setup. Not read by live z-oci
-    /// exchangers today; callers configure `std.http.Client.ca_bundle` directly.
+    /// Custom CA bundle PEM path for caller-owned TLS trust.
+    ///
+    /// When non-null, `applyToClient` loads this file into `std.http.Client.ca_bundle`
+    /// before HTTPS traffic. The path may be absolute or relative to the process cwd.
+    /// The file must contain one or more `BEGIN CERTIFICATE` blocks. When null, the
+    /// client keeps Zig's lazy OS trust scan on first HTTPS.
     ca_bundle_path: ?[]const u8 = null,
 
     /// Opt-in pre-emptive throttling when rate-limit headers look trustworthy.
@@ -117,19 +141,58 @@ pub const Config = struct {
         };
     }
 
-    /// Applies `Config` fields that caller-owned clients can honor today.
+    /// Applies caller-owned client configuration that z-oci can honor today.
     ///
-    /// No-op on the client handle today. `read_timeout_ms` is consumed by auth
-    /// helper subprocess I/O, not here. `ca_bundle_path` is not applied automatically.
-    /// Callers that manage their own connects should pair `connectIoTimeout` with
-    /// `std.http.Client.connectTcpOptions` when building pooled connections.
-    pub fn applyToClient(self: Config, client: *std.http.Client) void {
-        _ = self;
-        _ = client;
+    /// When `ca_bundle_path` is set, loads that PEM file into `client.ca_bundle` and
+    /// pins `client.now` so Zig does not replace the bundle with an OS rescan on the
+    /// next HTTPS request. When `ca_bundle_path` is null, this is a no-op.
+    ///
+    /// `read_timeout_ms` is consumed by auth helper subprocess I/O, not here.
+    /// `connect_timeout_ms` is exposed via `connectIoTimeout` for caller-owned TCP
+    /// setup; live manifest/token exchangers do not read it (zig#31305).
+    pub fn applyToClient(self: Config, client: *std.http.Client) ApplyError!void {
+        const ca_path = self.ca_bundle_path orelse return;
+        if (comptime std.http.Client.disable_tls) return error.CaBundleTlsDisabled;
+
+        const gpa = client.allocator;
+        const io = client.io;
+
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const resolved_path: []const u8 = if (std.fs.path.isAbsolute(ca_path)) ca_path else resolved: {
+            const len = std.Io.Dir.cwd().realPathFile(io, ca_path, &abs_buf) catch |err| switch (err) {
+                error.FileNotFound => return error.CaBundleFileNotFound,
+                else => return error.CaBundleInvalid,
+            };
+            break :resolved abs_buf[0..len];
+        };
+
+        var loaded: std.crypto.Certificate.Bundle = .empty;
+        errdefer loaded.deinit(gpa);
+
+        const now = std.Io.Clock.real.now(io);
+        loaded.addCertsFromFilePathAbsolute(gpa, io, now, resolved_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.FileNotFound => return error.CaBundleFileNotFound,
+            else => return error.CaBundleInvalid,
+        };
+
+        if (loaded.bytes.items.len == 0) return error.CaBundleEmpty;
+
+        client.ca_bundle_lock.lockUncancelable(io);
+        defer client.ca_bundle_lock.unlock(io);
+
+        client.ca_bundle.deinit(gpa);
+        client.ca_bundle = .empty;
+        client.now = now;
+        std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &loaded);
     }
 };
 
 // Tests
+
+fn fixtureAbsPath(allocator: std.mem.Allocator, rel_path: []const u8) ![:0]u8 {
+    return try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, rel_path, allocator);
+}
 
 test "Config: bare Config{} compiles with all defaults" {
     // A caller using Config{} for anonymous access must not need to set anything.
@@ -248,10 +311,138 @@ test "Config: connectIoTimeout maps milliseconds to real clock duration" {
     try std.testing.expect(timeout.duration.raw.toMilliseconds() == 5_000);
 }
 
-test "Config: applyToClient accepts caller-owned client without crashing" {
-    var client: std.http.Client = undefined;
-    const config = Config{ .connect_timeout_ms = 1_000 };
-    config.applyToClient(&client);
+test "Config: applyToClient is no-op when ca_bundle_path is null" {
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{};
+    try config.applyToClient(&client);
+}
+
+test "Config: applyToClient loads fixture PEM into client ca_bundle" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    const rel_path = "fixtures/tls/enterprise-test-ca.pem";
+    const abs_path = try fixtureAbsPath(std.testing.allocator, rel_path);
+    defer std.testing.allocator.free(abs_path);
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try config.applyToClient(&client);
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    defer client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expect(client.ca_bundle.bytes.items.len > 0);
+    try std.testing.expect(client.now != null);
+}
+
+test "Config: applyToClient accepts relative ca_bundle_path" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = "fixtures/tls/enterprise-test-ca.pem" };
+    try config.applyToClient(&client);
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    defer client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expect(client.ca_bundle.bytes.items.len > 0);
+}
+
+test "Config: applyToClient returns file not found for missing bundle path" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = "/nonexistent/z-oci-ca-bundle.pem" };
+    try std.testing.expectError(error.CaBundleFileNotFound, config.applyToClient(&client));
+}
+
+test "Config: applyToClient rejects invalid PEM bundle" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    const rel_path = "fixtures/tls/invalid-ca-bundle.pem";
+    const abs_path = try fixtureAbsPath(std.testing.allocator, rel_path);
+    defer std.testing.allocator.free(abs_path);
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try std.testing.expectError(error.CaBundleInvalid, config.applyToClient(&client));
+}
+
+test "Config: applyToClient rejects empty PEM bundle" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = "empty-ca.pem";
+    {
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+    }
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
+    const abs_path = abs_buf[0..abs_len];
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try std.testing.expectError(error.CaBundleEmpty, config.applyToClient(&client));
+}
+
+test "Config: applyToClient replaces prior bundle on second load" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    const rel_path = "fixtures/tls/enterprise-test-ca.pem";
+    const abs_path = try fixtureAbsPath(std.testing.allocator, rel_path);
+    defer std.testing.allocator.free(abs_path);
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try config.applyToClient(&client);
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    const first_len = client.ca_bundle.bytes.items.len;
+    client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expect(first_len > 0);
+
+    try config.applyToClient(&client);
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    defer client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expectEqual(first_len, client.ca_bundle.bytes.items.len);
 }
 
 test "Config: read_timeout_ms zero means no timeout" {

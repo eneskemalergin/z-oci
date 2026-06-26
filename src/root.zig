@@ -55,7 +55,7 @@ pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
 pub const CredentialHandle = @import("Config.zig").CredentialHandle;
 
-pub const PublicApiError = error{OutOfMemory};
+pub const PublicApiError = Config.ApplyError;
 const root = @This();
 
 /// Narrow testing seam for repository smoke tests.
@@ -283,6 +283,10 @@ pub fn getManifest(
     );
 }
 
+fn ensureClientConfigured(config: Config, client: *std.http.Client) PublicApiError!void {
+    return config.applyToClient(client);
+}
+
 fn resolveWithExchangers(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -293,6 +297,8 @@ fn resolveWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ResolveOutcome {
+    try ensureClientConfigured(config, client);
+
     var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
 
@@ -345,6 +351,8 @@ fn validateWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ValidateOutcome {
+    try ensureClientConfigured(config, client);
+
     var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
 
@@ -447,6 +455,8 @@ fn getManifestWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ManifestOutcome {
+    try ensureClientConfigured(config, client);
+
     var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
 
@@ -1449,6 +1459,120 @@ test "resolveWithExchangers maps exhausted transport timeout to timeout" {
         ),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "resolveWithExchangers returns CaBundleFileNotFound when ca_bundle_path is missing" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .ca_bundle_path = "/nonexistent/z-oci-ca-bundle.pem" },
+        ref,
+        null,
+        struct {
+            fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+                return error.TokenExchangeFailed;
+            }
+        }.tokenExchange,
+        struct {
+            fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+                defer request.deinit(allocator);
+                unreachable;
+            }
+        }.manifestExchange,
+        .{},
+    );
+
+    try std.testing.expectError(error.CaBundleFileNotFound, outcome);
+}
+
+test "resolveWithExchangers applies fixture ca_bundle_path without breaking mock resolve" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    const rel_path = "fixtures/tls/enterprise-test-ca.pem";
+    const abs_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, rel_path, std.testing.allocator);
+    defer std.testing.allocator.free(abs_path);
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const body = readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
+
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .ca_bundle_path = abs_path },
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .success => |result| {
+            var owned = result;
+            defer owned.deinit(std.testing.allocator);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    defer client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expect(client.ca_bundle.bytes.items.len > 0);
 }
 
 test "resolveWithExchangers returns platform_required when multi-arch request omits platform" {

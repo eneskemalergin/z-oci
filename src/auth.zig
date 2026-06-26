@@ -369,10 +369,11 @@ const NowUnixSecondsFn = *const fn (client: *std.http.Client) u64;
 /// Narrow auth-facing view of `Config`.
 ///
 /// Live today: credentials, helper `read_timeout_ms`, cached-401 auth retry
-/// (`max_retries`), and transport retry budgets on token HTTP (via resilience).
-/// Storage-only until caller recipes wire them: `connect_timeout_ms`,
-/// `ca_bundle_path` (see `Config.connectIoTimeout` and `Config.applyToClient`).
-/// Pre-emptive rate limiting (`rate_limit_enabled`) is not on the live path yet.
+/// (`max_retries`), transport retry budgets on token HTTP (via resilience), and
+/// `ca_bundle_path` via `Config.applyToClient` at the public API boundary.
+/// Storage-only until caller recipes wire them: `connect_timeout_ms` (see
+/// `Config.connectIoTimeout`). Pre-emptive rate limiting (`rate_limit_enabled`)
+/// is not on the live path yet.
 pub const Phase2ConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,
