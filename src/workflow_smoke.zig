@@ -600,6 +600,50 @@ test "workflow smoke: public resolve maps exhausted transport timeout to timeout
     }
 }
 
+test "workflow smoke: public resolve returns CaBundleFileNotFound for missing ca bundle path" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = z_oci.testing.resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .ca_bundle_path = "/nonexistent/z-oci-ca-bundle.pem" },
+        ref,
+        null,
+        struct {
+            fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+                return error.TokenExchangeFailed;
+            }
+        }.tokenExchange,
+        struct {
+            fn manifestExchange(
+                allocator: std.mem.Allocator,
+                _: *std.http.Client,
+                request: z_oci.testing.ManifestHttpRequest,
+            ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+                defer request.deinit(allocator);
+                unreachable;
+            }
+        }.manifestExchange,
+        .{},
+    );
+
+    try std.testing.expectError(error.CaBundleFileNotFound, outcome);
+}
+
 // Kept local on purpose: workflow_smoke builds as its own root module under
 // `zig build test`, so importing test_support.zig here would make that file
 // belong to two modules at once.

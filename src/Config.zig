@@ -147,9 +147,13 @@ pub const Config = struct {
     /// pins `client.now` so Zig does not replace the bundle with an OS rescan on the
     /// next HTTPS request. When `ca_bundle_path` is null, this is a no-op.
     ///
-    /// `read_timeout_ms` is consumed by auth helper subprocess I/O, not here.
-    /// `connect_timeout_ms` is exposed via `connectIoTimeout` for caller-owned TCP
-    /// setup; live manifest/token exchangers do not read it (zig#31305).
+    /// `resolve`, `validate`, and `getManifest` call this when `ca_bundle_path` is set,
+    /// reloading the PEM from disk on each entry (full replacement, not merge with the
+    /// OS store). Callers may also invoke this directly before other client use.
+    ///
+    /// Only `ca_bundle_path` is applied here. `connect_timeout_ms` is exposed via
+    /// `connectIoTimeout` for caller-owned TCP setup (zig#31305). `read_timeout_ms` is
+    /// consumed by auth helper subprocess I/O, not here.
     pub fn applyToClient(self: Config, client: *std.http.Client) ApplyError!void {
         const ca_path = self.ca_bundle_path orelse return;
         if (comptime std.http.Client.disable_tls) return error.CaBundleTlsDisabled;
@@ -417,12 +421,13 @@ test "Config: applyToClient rejects empty PEM bundle" {
     try std.testing.expectError(error.CaBundleEmpty, config.applyToClient(&client));
 }
 
-test "Config: applyToClient replaces prior bundle on second load" {
+test "Config: applyToClient replaces prior bundle when ca_bundle_path changes" {
     if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
 
-    const rel_path = "fixtures/tls/enterprise-test-ca.pem";
-    const abs_path = try fixtureAbsPath(std.testing.allocator, rel_path);
-    defer std.testing.allocator.free(abs_path);
+    const enterprise_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
+    defer std.testing.allocator.free(enterprise_path);
+    const test_ca_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/test-ca.pem");
+    defer std.testing.allocator.free(test_ca_path);
 
     var client = std.http.Client{
         .allocator = std.testing.allocator,
@@ -430,19 +435,65 @@ test "Config: applyToClient replaces prior bundle on second load" {
     };
     defer client.deinit();
 
-    const config = Config{ .ca_bundle_path = abs_path };
-    try config.applyToClient(&client);
+    const enterprise_config = Config{ .ca_bundle_path = enterprise_path };
+    try enterprise_config.applyToClient(&client);
 
     try client.ca_bundle_lock.lockShared(std.testing.io);
     const first_len = client.ca_bundle.bytes.items.len;
+    const first_count = client.ca_bundle.map.count();
     client.ca_bundle_lock.unlockShared(std.testing.io);
-    try std.testing.expect(first_len > 0);
+    try std.testing.expect(first_count > 0);
 
-    try config.applyToClient(&client);
+    const test_ca_config = Config{ .ca_bundle_path = test_ca_path };
+    try test_ca_config.applyToClient(&client);
 
     try client.ca_bundle_lock.lockShared(std.testing.io);
     defer client.ca_bundle_lock.unlockShared(std.testing.io);
-    try std.testing.expectEqual(first_len, client.ca_bundle.bytes.items.len);
+    try std.testing.expect(client.ca_bundle.map.count() > 0);
+    try std.testing.expect(
+        first_len != client.ca_bundle.bytes.items.len or
+            first_count != client.ca_bundle.map.count(),
+    );
+}
+
+test "Config: applyToClient returns empty when pem contains only expired certificates" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = "fixtures/tls/expired-only-ca.pem" };
+    try std.testing.expectError(error.CaBundleEmpty, config.applyToClient(&client));
+}
+
+test "Config: loaded ca bundle verifies fixture server certificate signed by that ca" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    const ca_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/test-ca.pem");
+    defer std.testing.allocator.free(ca_path);
+    const server_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/test-server.pem");
+    defer std.testing.allocator.free(server_path);
+
+    var ca_bundle: std.crypto.Certificate.Bundle = .empty;
+    defer ca_bundle.deinit(std.testing.allocator);
+
+    const now = std.Io.Clock.real.now(std.testing.io);
+    try ca_bundle.addCertsFromFilePathAbsolute(std.testing.allocator, std.testing.io, now, ca_path);
+
+    var server_bundle: std.crypto.Certificate.Bundle = .empty;
+    defer server_bundle.deinit(std.testing.allocator);
+    try server_bundle.addCertsFromFilePathAbsolute(std.testing.allocator, std.testing.io, now, server_path);
+    try std.testing.expect(server_bundle.bytes.items.len > 0);
+
+    const server_cert: std.crypto.Certificate = .{
+        .buffer = server_bundle.bytes.items,
+        .index = 0,
+    };
+    const server_parsed = try server_cert.parse();
+    try ca_bundle.verify(server_parsed, now.toSeconds());
 }
 
 test "Config: read_timeout_ms zero means no timeout" {

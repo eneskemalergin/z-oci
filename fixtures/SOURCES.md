@@ -92,3 +92,11 @@ Synthetic PEM material for `Config.applyToClient` unit tests. No private keys ar
     - Source: repository-authored synthetic fixture
     - Created: 2026-06-25
     - Purpose: assert `Config.ApplyError.CaBundleInvalid` on malformed PEM
+- `fixtures/tls/test-ca.pem` and `fixtures/tls/test-server.pem`
+    - Source: repository-generated test PKI (`openssl req` / `openssl x509 -req`)
+    - Created: 2026-06-25
+    - Purpose: `Certificate.Bundle.verify` trusts server cert signed by test CA (no live HTTPS)
+- `fixtures/tls/expired-only-ca.pem`
+    - Source: repository-generated self-signed CA with validity ending 2000-01-31 (Python `cryptography`)
+    - Created: 2026-06-25
+    - Purpose: assert `Config.ApplyError.CaBundleEmpty` when Zig drops expired certs from PEM
