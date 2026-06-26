@@ -32,6 +32,8 @@ pub const RateLimited = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
+    /// True when reactive transport retries were consumed before this `429`.
+    transport_retries_exhausted: bool = false,
 };
 
 /// The pulled content digest does not match the requested digest.
@@ -67,6 +69,8 @@ pub const NetworkError = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
+    /// True when reactive transport retries were consumed before this failure.
+    transport_retries_exhausted: bool = false,
 };
 
 /// The digest algorithm in the response is not supported by the resolver.
@@ -88,6 +92,8 @@ pub const Timeout = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
+    /// True when reactive transport retries were consumed before this timeout.
+    transport_retries_exhausted: bool = false,
 };
 
 /// Manifest index nesting exceeded the maximum allowed depth.
@@ -122,6 +128,18 @@ pub const ResolveError = union(enum) {
         if (ctx.http_status) |status| {
             try w.print(" (HTTP {d})", .{status});
         }
+        if (self.transportRetriesExhausted()) {
+            try w.writeAll(" after transport retries exhausted");
+        }
+    }
+
+    fn transportRetriesExhausted(self: ResolveError) bool {
+        return switch (self) {
+            .rate_limited => |v| v.transport_retries_exhausted,
+            .network_error => |v| v.transport_retries_exhausted,
+            .timeout => |v| v.transport_retries_exhausted,
+            else => false,
+        };
     }
 
     /// Release the owned `reference` string carried by public resolver failures.
@@ -339,6 +357,20 @@ test "ResolveError.format: very long registry and reference are not truncated" {
     try std.testing.expect(std.mem.indexOf(u8, out, long_reg) != null);
     try std.testing.expect(std.mem.indexOf(u8, out, long_ref) != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "429") != null);
+}
+
+test "ResolveError.format: transport retry exhaustion appears in retry-related failures" {
+    const err = ResolveError{ .rate_limited = .{
+        .registry = "registry-1.docker.io",
+        .reference = "library/busybox:latest",
+        .http_status = 429,
+        .transport_retries_exhausted = true,
+    } };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try err.format(&w);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "after transport retries exhausted") != null);
 }
 
 test "ResolveError.format: typical error output length is bounded" {

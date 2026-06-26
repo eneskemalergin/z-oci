@@ -1,0 +1,8 @@
+{
+  "headers": [
+    { "name": "Retry-After", "value": "30" },
+    { "name": "X-Retry-After", "value": "99" },
+    { "name": "Date", "value": "Thu, 01 May 2025 22:02:18 GMT" }
+  ],
+  "expected_delay_seconds": 30
+}

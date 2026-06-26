@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "headers": [
+        { "name": "RateLimit-Limit", "value": "not-a-number" }
+      ],
+      "expected_error": "InvalidRateLimitHeader"
+    },
+    {
+      "headers": [
+        { "name": "X-RateLimit-Remaining", "value": "" }
+      ],
+      "expected_error": "InvalidRateLimitHeader"
+    },
+    {
+      "headers": [
+        { "name": "Retry-After", "value": "soon" }
+      ],
+      "expected_error": "InvalidRetryAfterHeader"
+    }
+  ]
+}

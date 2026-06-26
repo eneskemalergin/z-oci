@@ -727,27 +727,30 @@ fn manifestParseError(registry: []const u8, reference: []const u8, http_status: 
     } };
 }
 
-fn networkError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+fn networkError(registry: []const u8, reference: []const u8, http_status: ?u16, transport_retries_exhausted: bool) ResolveError {
     return .{ .network_error = .{
         .registry = registry,
         .reference = reference,
         .http_status = http_status,
+        .transport_retries_exhausted = transport_retries_exhausted,
     } };
 }
 
-fn timeoutError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+fn timeoutError(registry: []const u8, reference: []const u8, http_status: ?u16, transport_retries_exhausted: bool) ResolveError {
     return .{ .timeout = .{
         .registry = registry,
         .reference = reference,
         .http_status = http_status,
+        .transport_retries_exhausted = transport_retries_exhausted,
     } };
 }
 
-fn rateLimitedError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+fn rateLimitedError(registry: []const u8, reference: []const u8, http_status: ?u16, transport_retries_exhausted: bool) ResolveError {
     return .{ .rate_limited = .{
         .registry = registry,
         .reference = reference,
         .http_status = http_status,
+        .transport_retries_exhausted = transport_retries_exhausted,
     } };
 }
 
@@ -755,11 +758,13 @@ fn mapExhaustedManifestTransportError(
     comptime Outcome: type,
     ctx: ResolverContext,
     err: ManifestExchangeError,
+    budget: resilience.RetryBudget,
 ) error{OutOfMemory}!Outcome {
+    const transport_retries_exhausted = budget.networkRetriesExhausted();
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.Timeout => mappedFailureOutcome(Outcome, ctx, null, timeoutError),
-        else => mappedFailureOutcome(Outcome, ctx, null, networkError),
+        error.Timeout => mappedRetryFailureOutcome(Outcome, ctx, null, timeoutError, transport_retries_exhausted),
+        else => mappedRetryFailureOutcome(Outcome, ctx, null, networkError, transport_retries_exhausted),
     };
 }
 
@@ -802,11 +807,16 @@ pub fn performManifestHead(
         .accept = accept,
     };
 
-    const response = exchangeManifestRequest(ctx, engine, exchanger, request, null) catch |err|
-        return mapExhaustedManifestTransportError(HeadRequestOutcome, ctx, err);
-    defer response.deinit(ctx.allocator);
-
-    return classifyHeadResponse(ctx, engine, exchanger, request, response.metadata, true);
+    const exchange_outcome = exchangeManifestRequest(ctx, engine, exchanger, request, null);
+    switch (exchange_outcome) {
+        .ok => |ok| {
+            defer ok.response.deinit(ctx.allocator);
+            return classifyHeadResponse(ctx, engine, exchanger, request, ok.response.metadata, true, ok.budget);
+        },
+        .transport_failed => |failure| {
+            return mapExhaustedManifestTransportError(HeadRequestOutcome, ctx, failure.err, failure.budget);
+        },
+    }
 }
 
 /// Execute the internal GET path through the resolver transport seam.
@@ -824,10 +834,13 @@ pub fn performManifestGet(
         .accept = accept,
     };
 
-    const response = exchangeManifestRequest(ctx, engine, exchanger, request, null) catch |err|
-        return mapExhaustedManifestTransportError(GetRequestOutcome, ctx, err);
-
-    return classifyGetResponse(ctx, engine, exchanger, request, response, true);
+    const exchange_outcome = exchangeManifestRequest(ctx, engine, exchanger, request, null);
+    switch (exchange_outcome) {
+        .ok => |ok| return classifyGetResponse(ctx, engine, exchanger, request, ok.response, true, ok.budget),
+        .transport_failed => |failure| {
+            return mapExhaustedManifestTransportError(GetRequestOutcome, ctx, failure.err, failure.budget);
+        },
+    }
 }
 
 fn exchangeManifestRequestOnce(
@@ -840,43 +853,117 @@ fn exchangeManifestRequestOnce(
     return exchanger(ctx.allocator, ctx.client, http_request);
 }
 
+const ManifestExchangeLoopContext = struct {
+    resolver_ctx: ResolverContext,
+    engine: *auth.AuthEngine,
+    exchanger: ManifestHttpExchanger,
+    request: ManifestRequest,
+    bearer_token: ?[]const u8,
+};
+
 fn exchangeManifestRequest(
     ctx: ResolverContext,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
     bearer_token: ?[]const u8,
-) ManifestExchangeError!ManifestHttpResponse {
+) resilience.HttpRetryLoopResult(ManifestHttpResponse, ManifestExchangeError) {
     var policy = resilience.retryPolicyFromConfig(ctx.config, ctx.transport_hooks);
 
-    engine.manifest_rate_limit_state.sleepBeforeManifestRequestIfNeeded(
-        ctx.config,
+    var loop_ctx = ManifestExchangeLoopContext{
+        .resolver_ctx = ctx,
+        .engine = engine,
+        .exchanger = exchanger,
+        .request = request,
+        .bearer_token = bearer_token,
+    };
+
+    const hooks = resilience.HttpRetryLoopHooks{
+        .before_first_attempt = beforeManifestExchangeAttempt,
+        .after_successful_exchange = afterManifestExchangeAttempt,
+    };
+
+    return resilience.runHttpRetryLoop(
         ctx.client,
         ctx.transport_hooks,
+        &policy,
+        hooks,
+        ManifestExchangeError,
+        ManifestHttpResponse,
+        @ptrCast(&loop_ctx),
+        manifestExchangeOnceOpaque,
+        manifestResponseStatus,
+        manifestResponseResilienceHeaders,
+        deinitManifestHttpResponse,
+        ctx.allocator,
     );
+}
 
-    while (true) {
-        const response = exchangeManifestRequestOnce(ctx, exchanger, request, bearer_token) catch |err| {
-            const decision = policy.decideTransportRetry(err);
-            if (decision.action == .give_up) return err;
-            resilience.sleepForTransportRetry(ctx.client, ctx.transport_hooks, decision.delay_ms);
-            continue;
-        };
+fn beforeManifestExchangeAttempt(ctx_ptr: *anyopaque) void {
+    const loop_ctx: *const ManifestExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    loop_ctx.engine.manifest_rate_limit_state.sleepBeforeManifestRequestIfNeeded(
+        loop_ctx.resolver_ctx.config,
+        loop_ctx.resolver_ctx.client,
+        loop_ctx.resolver_ctx.transport_hooks,
+    );
+}
 
-        engine.manifest_rate_limit_state.recordManifestResponseHeaders(
-            response.metadata.resilience_headers,
+fn afterManifestExchangeAttempt(ctx_ptr: *anyopaque, _: std.http.Status, headers: []const resilience.HttpHeader) void {
+    const loop_ctx: *const ManifestExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    loop_ctx.engine.manifest_rate_limit_state.recordManifestResponseHeaders(headers);
+}
+
+fn manifestExchangeOnceOpaque(ctx_ptr: *anyopaque) ManifestExchangeError!ManifestHttpResponse {
+    const loop_ctx: *const ManifestExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    return exchangeManifestRequestOnce(
+        loop_ctx.resolver_ctx,
+        loop_ctx.exchanger,
+        loop_ctx.request,
+        loop_ctx.bearer_token,
+    );
+}
+
+fn manifestResponseStatus(response: ManifestHttpResponse) std.http.Status {
+    return response.metadata.status;
+}
+
+fn manifestResponseResilienceHeaders(response: ManifestHttpResponse) []const resilience.HttpHeader {
+    return response.metadata.resilience_headers;
+}
+
+fn deinitManifestHttpResponse(allocator: std.mem.Allocator, response: ManifestHttpResponse) void {
+    var owned = response;
+    owned.deinit(allocator);
+}
+
+fn mapRetryableManifestStatusFailure(
+    comptime Outcome: type,
+    ctx: ResolverContext,
+    http_status: ?u16,
+    status: std.http.Status,
+    budget: resilience.RetryBudget,
+) error{OutOfMemory}!?Outcome {
+    if (status == .too_many_requests) {
+        return try mappedRetryFailureOutcome(
+            Outcome,
+            ctx,
+            http_status,
+            rateLimitedError,
+            budget.rateLimitRetriesExhausted(),
         );
-
-        const retry_after = resilience.retryAfterFromHeaders(
-            response.metadata.resilience_headers,
-        ) catch null;
-
-        const decision = policy.decideHttpRetry(response.metadata.status, retry_after);
-        if (decision.action == .give_up) return response;
-
-        response.deinit(ctx.allocator);
-        resilience.sleepForTransportRetry(ctx.client, ctx.transport_hooks, decision.delay_ms);
     }
+
+    if (resilience.classifyHttpStatus(status) == .network) {
+        return try mappedRetryFailureOutcome(
+            Outcome,
+            ctx,
+            http_status,
+            networkError,
+            budget.networkRetriesExhausted(),
+        );
+    }
+
+    return null;
 }
 
 fn classifyHeadResponse(
@@ -886,18 +973,15 @@ fn classifyHeadResponse(
     request: ManifestRequest,
     metadata: ManifestResponseMetadata,
     allow_auth: bool,
+    retry_budget: resilience.RetryBudget,
 ) error{OutOfMemory}!HeadRequestOutcome {
     if (isRedirectStatus(metadata.status)) {
         if (metadata.location != null) return .{ .redirect = try metadata.cloneAlloc(ctx.allocator) };
-        return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), networkError);
+        return mappedRetryFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), networkError, retry_budget.networkRetriesExhausted());
     }
 
-    if (metadata.status == .too_many_requests) {
-        return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), rateLimitedError);
-    }
-
-    if (resilience.classifyHttpStatus(metadata.status) == .network) {
-        return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), networkError);
+    if (try mapRetryableManifestStatusFailure(HeadRequestOutcome, ctx, metadata.httpStatus(), metadata.status, retry_budget)) |failure| {
+        return failure;
     }
 
     if (metadata.status == .unauthorized and !allow_auth) {
@@ -943,21 +1027,18 @@ fn classifyGetResponse(
     request: ManifestRequest,
     response: ManifestHttpResponse,
     allow_auth: bool,
+    retry_budget: resilience.RetryBudget,
 ) error{OutOfMemory}!GetRequestOutcome {
     defer response.deinit(ctx.allocator);
     const metadata = response.metadata;
 
     if (isRedirectStatus(metadata.status)) {
         if (metadata.location != null) return .{ .redirect = try metadata.cloneAlloc(ctx.allocator) };
-        return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), networkError);
+        return mappedRetryFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), networkError, retry_budget.networkRetriesExhausted());
     }
 
-    if (metadata.status == .too_many_requests) {
-        return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), rateLimitedError);
-    }
-
-    if (resilience.classifyHttpStatus(metadata.status) == .network) {
-        return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), networkError);
+    if (try mapRetryableManifestStatusFailure(GetRequestOutcome, ctx, metadata.httpStatus(), metadata.status, retry_budget)) |failure| {
+        return failure;
     }
 
     if (metadata.status == .unauthorized and !allow_auth) {
@@ -1003,7 +1084,7 @@ fn authenticateManifestRequest(
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
     challenge: auth.AuthChallenge,
-    comptime classify_authenticated_response_fn: fn (ResolverContext, *auth.AuthEngine, ManifestHttpExchanger, ManifestRequest, ManifestHttpResponse) error{OutOfMemory}!Outcome,
+    comptime classify_authenticated_response_fn: fn (ResolverContext, *auth.AuthEngine, ManifestHttpExchanger, ManifestRequest, ManifestHttpResponse, resilience.RetryBudget) error{OutOfMemory}!Outcome,
 ) error{OutOfMemory}!Outcome {
     const unauthorized_status = @intFromEnum(std.http.Status.unauthorized);
     const bearer_challenge = switch (challenge) {
@@ -1022,14 +1103,19 @@ fn authenticateManifestRequest(
     };
     defer token_response.deinit(ctx.allocator);
 
-    const retry_response = exchangeManifestRequest(ctx, engine, exchanger, request, token_response.access_token.value) catch |err|
-        return mapExhaustedManifestTransportError(Outcome, ctx, err);
+    const retry_exchange_outcome = exchangeManifestRequest(ctx, engine, exchanger, request, token_response.access_token.value);
+    const retry_response = switch (retry_exchange_outcome) {
+        .ok => |ok| ok,
+        .transport_failed => |failure| {
+            return mapExhaustedManifestTransportError(Outcome, ctx, failure.err, failure.budget);
+        },
+    };
 
-    if (retry_response.metadata.status != .unauthorized) {
-        return classify_authenticated_response_fn(ctx, engine, exchanger, request, retry_response);
+    if (retry_response.response.metadata.status != .unauthorized) {
+        return classify_authenticated_response_fn(ctx, engine, exchanger, request, retry_response.response, retry_response.budget);
     }
 
-    retry_response.deinit(ctx.allocator);
+    retry_response.response.deinit(ctx.allocator);
 
     if (!request.allow_cached_auth_retry) return authFailureOutcome(Outcome, ctx, unauthorized_status);
 
@@ -1043,15 +1129,20 @@ fn authenticateManifestRequest(
     var retried_request = request;
     retried_request.allow_cached_auth_retry = false;
 
-    const refreshed_response = exchangeManifestRequest(ctx, engine, exchanger, retried_request, refreshed_token_response.access_token.value) catch |err|
-        return mapExhaustedManifestTransportError(Outcome, ctx, err);
+    const refreshed_exchange_outcome = exchangeManifestRequest(ctx, engine, exchanger, retried_request, refreshed_token_response.access_token.value);
+    const refreshed_response = switch (refreshed_exchange_outcome) {
+        .ok => |ok| ok,
+        .transport_failed => |failure| {
+            return mapExhaustedManifestTransportError(Outcome, ctx, failure.err, failure.budget);
+        },
+    };
 
-    if (refreshed_response.metadata.status == .unauthorized) {
-        refreshed_response.deinit(ctx.allocator);
+    if (refreshed_response.response.metadata.status == .unauthorized) {
+        refreshed_response.response.deinit(ctx.allocator);
         return authFailureOutcome(Outcome, ctx, unauthorized_status);
     }
 
-    return classify_authenticated_response_fn(ctx, engine, exchanger, retried_request, refreshed_response);
+    return classify_authenticated_response_fn(ctx, engine, exchanger, retried_request, refreshed_response.response, refreshed_response.budget);
 }
 
 fn classifyAuthenticatedHeadResponse(
@@ -1060,9 +1151,10 @@ fn classifyAuthenticatedHeadResponse(
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
     response: ManifestHttpResponse,
+    retry_budget: resilience.RetryBudget,
 ) error{OutOfMemory}!HeadRequestOutcome {
     defer response.deinit(ctx.allocator);
-    return classifyHeadResponse(ctx, engine, exchanger, request, response.metadata, false);
+    return classifyHeadResponse(ctx, engine, exchanger, request, response.metadata, false, retry_budget);
 }
 
 fn classifyAuthenticatedGetResponse(
@@ -1071,8 +1163,9 @@ fn classifyAuthenticatedGetResponse(
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
     response: ManifestHttpResponse,
+    retry_budget: resilience.RetryBudget,
 ) error{OutOfMemory}!GetRequestOutcome {
-    return classifyGetResponse(ctx, engine, exchanger, request, response, false);
+    return classifyGetResponse(ctx, engine, exchanger, request, response, false, retry_budget);
 }
 
 fn classifyUsableHeadMetadata(
@@ -1274,6 +1367,17 @@ fn mappedFailureOutcome(
     return failureOutcome(Outcome, failure_factory(ctx.reference.registry, reference, http_status));
 }
 
+fn mappedRetryFailureOutcome(
+    comptime Outcome: type,
+    ctx: ResolverContext,
+    http_status: ?u16,
+    comptime failure_factory: *const fn ([]const u8, []const u8, ?u16, bool) ResolveError,
+    transport_retries_exhausted: bool,
+) error{OutOfMemory}!Outcome {
+    const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
+    return failureOutcome(Outcome, failure_factory(ctx.reference.registry, reference, http_status, transport_retries_exhausted));
+}
+
 fn authFailureOutcome(
     comptime Outcome: type,
     ctx: ResolverContext,
@@ -1467,7 +1571,7 @@ test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible 
 
 test "resolver error helpers keep registry, reference, and status" {
     const parse_err = manifestParseError("ghcr.io", "ghcr.io/owner/repo:v1", 200);
-    const network_err = networkError("ghcr.io", "ghcr.io/owner/repo:v1", 503);
+    const network_err = networkError("ghcr.io", "ghcr.io/owner/repo:v1", 503, false);
     const content_type_err = contentTypeMismatchError("ghcr.io", "ghcr.io/owner/repo:v1", 415);
     const digest_mismatch_err = digestMismatchError("ghcr.io", "ghcr.io/owner/repo:v1", 412);
     const unsupported_algorithm_err = unsupportedAlgorithmError("ghcr.io", "ghcr.io/owner/repo:v1", 400);
@@ -1570,6 +1674,57 @@ test "performManifestHead maps exhausted 429 to rate_limited" {
     switch (outcome) {
         .failure => |failure| {
             try std.testing.expectEqualStrings("rate_limited", @tagName(failure));
+            try std.testing.expectEqual(false, failure.rate_limited.transport_retries_exhausted);
+            failure.deinitOwned(std.testing.allocator);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestHead marks transport_retries_exhausted after rate-limit retries" {
+    const State = struct {
+        var attempts: usize = 0;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            attempts += 1;
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .too_many_requests,
+                .resilience_headers = &.{
+                    .{ .name = "Retry-After", .value = "1" },
+                },
+            }, null);
+        }
+    };
+
+    defer State.attempts = 0;
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_rate_limit_retries = 1,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        .{ .max_rate_limit_retries = 1 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    const outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    switch (outcome) {
+        .failure => |failure| {
+            try std.testing.expectEqualStrings("rate_limited", @tagName(failure));
+            try std.testing.expectEqual(true, failure.rate_limited.transport_retries_exhausted);
+            try std.testing.expectEqual(@as(usize, 2), State.attempts);
             failure.deinitOwned(std.testing.allocator);
         },
         else => return error.TestUnexpectedResult,

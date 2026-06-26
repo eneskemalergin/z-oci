@@ -80,6 +80,23 @@ When refreshing one of these fixtures, use the exact URL and `Accept` header rec
     - Response docker-content-digest: `sha256:35e7e430350711653810b2b3cc889fec2a6e0175c078e4114964c7252c411209`
     - Notes: child manifest selected from the live `linux/amd64` descriptor in the Quay manifest list snapshot above.
 
+## Resilience header fixtures
+
+Checked-in header snapshots for rate-limit and `Retry-After` parser tests. See `src/resilience.zig` for registry assumptions (Docker Hub epoch `Retry-After`, `X-RateLimit-Reset` as Unix seconds, `Retry-After` preferred over `X-Retry-After`).
+
+- `fixtures/resilience/docker-hub-429-headers.json`
+    - Source: repository-authored snapshot modeled on Docker Hub anonymous pull throttling
+    - Created: 2026-06-25
+    - Purpose: positive-path `RateLimit-*` and `Retry-After` parsing with response `Date` anchoring
+- `fixtures/resilience/malformed-rate-limit-headers.json`
+    - Source: repository-authored synthetic fixture
+    - Created: 2026-06-25
+    - Purpose: deterministic negative-path parser errors for invalid rate-limit and retry-after values
+- `fixtures/resilience/conflicting-retry-after.json`
+    - Source: repository-authored synthetic fixture
+    - Created: 2026-06-25
+    - Purpose: assert `Retry-After` wins over `X-Retry-After` when both are present
+
 ## TLS test fixtures
 
 Synthetic PEM material for `Config.applyToClient` unit tests. **No private keys are checked in.**

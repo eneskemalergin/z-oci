@@ -43,9 +43,23 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 
 ### Current limitations
 
-- Multi-arch public calls without an explicit platform now fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
-- Retry and rate-limit policy beyond the current correctness-first fetch path remains deferred to Phase 4. `Config.max_retries` only governs the cached-401 auth retry path today, while live HTTP timeout and custom CA bundle wiring remain deferred because callers own `std.http.Client`.
+- Multi-arch public calls without an explicit platform fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
+- Per-request HTTP read/connect timeouts are not wired through `std.http.Client.request` on Zig 0.16 yet (`connect_timeout_ms` is exposed for caller-owned `connectTcpOptions` recipes; see `Config` docs and zig#31305).
+- Windows is not a supported host for live HTTPS registry traffic. Offline parsing works cross-platform; TLS to registries is validated on Linux and macOS only.
 - User-facing CLI commands built on top of the live resolver surface are still future work.
+
+### Resilience (Phase 4)
+
+Reactive transport retries are live on manifest `HEAD`/`GET` and token HTTP paths:
+
+- `Config.max_network_retries` retries transient `5xx` responses and socket-level transport errors.
+- `Config.max_rate_limit_retries` retries `429` responses using `Retry-After` / `X-Retry-After` (and response `Date` when present).
+- `Config.max_retries` stays auth-only: cached-token invalidation after a manifest `401`.
+- `Config.rate_limit_enabled` (default `false`) opts into pre-emptive manifest throttling when trustworthy registry `RateLimit-*` headers show `remaining == 0`.
+- `Config.ca_bundle_path` loads a PEM CA trust bundle at the public API boundary (`resolve`, `validate`, `getManifest`).
+- `ResolveError.rate_limited`, `network_error`, and `timeout` carry `transport_retries_exhausted` so callers can distinguish immediate hard failures from post-retry exhaustion.
+
+See [CHANGELOG.md](CHANGELOG.md) and `src/resilience.zig` for registry header assumptions (Docker Hub epoch `Retry-After`, `X-RateLimit-Reset`, and related parser behavior).
 
 ### Registry coverage
 
@@ -178,9 +192,8 @@ See [examples](examples) for the source of the packaged examples.
 
 ## Next
 
-- Rate limiting and retry logic
 - CLI for resolve, validate, and inspect
-- More registry compatibility testing
+- More registry compatibility testing and v0.4.0 resilience release
 
 ## References
 

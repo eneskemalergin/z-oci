@@ -7,6 +7,24 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
+### Added
+
+- Reactive transport retries on manifest `HEAD`/`GET` and token HTTP exchangers via shared `resilience.runHttpRetryLoop`, with separate `max_network_retries` and `max_rate_limit_retries` budgets.
+- Opt-in pre-emptive manifest throttling when `Config.rate_limit_enabled` is true and registry `RateLimit-*` headers are trustworthy (`remaining == 0`).
+- `ResolveError.rate_limited`, `network_error`, and `timeout` now expose `transport_retries_exhausted` to distinguish immediate hard failures from post-retry exhaustion.
+- Fixture-backed resilience header negative cases under `fixtures/resilience/` (malformed rate-limit values, conflicting `Retry-After` headers).
+- Build-time PEM private-key scan via `zig build security-check` (also runs as part of `zig build test`).
+
+### Changed
+
+- Manifest and token transport wrappers share one reactive retry loop in `resilience.zig` instead of duplicating sleep/retry branches in `auth.zig` and `resolver.zig`.
+- `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, and rejects private-key PEM markers in CA bundles.
+- Public docs (`README.md`, `Config.zig`, `resilience.zig`) now describe live retry budgets, CA bundle behavior, and registry header assumptions honestly.
+
+### Fixed
+
+- Redirect-without-`Location` and exhausted reactive failures now preserve HTTP status and retry-budget context on the public resolver error path.
+
 ## [0.3.0] - 2026-05-24 - [Tagged]
 
 ### Added

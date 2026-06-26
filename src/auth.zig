@@ -732,34 +732,36 @@ pub const AuthEngine = struct {
         method: TokenRequestMethod,
         credential: ?ConfigModule.Credential,
     ) AuthError!TokenExchangeResponse {
-        const exchanger = self.token_http_exchanger orelse return error.NotYetImplemented;
+        if (self.token_http_exchanger == null) return error.NotYetImplemented;
         var policy = resilience.retryPolicyFromConfig(self.config, self.transport_hooks);
 
-        while (true) {
-            const http_request = try buildTokenHttpRequest(
-                self.allocator,
-                request,
-                method,
-                credential,
-            );
+        var loop_ctx = TokenExchangeLoopContext{
+            .engine = self,
+            .client = client,
+            .request = request,
+            .method = method,
+            .credential = credential,
+        };
 
-            const response = exchanger(self.allocator, client, http_request) catch |err| {
-                const decision = policy.decideTransportRetry(err);
-                if (decision.action == .give_up) return err;
-                resilience.sleepForTransportRetry(client, self.transport_hooks, decision.delay_ms);
-                continue;
-            };
+        const loop_outcome = resilience.runHttpRetryLoop(
+            client,
+            self.transport_hooks,
+            &policy,
+            .{},
+            AuthError,
+            TokenExchangeResponse,
+            @ptrCast(&loop_ctx),
+            tokenExchangeOnceOpaque,
+            tokenExchangeResponseStatus,
+            tokenExchangeResponseHeaders,
+            deinitTokenExchangeResponse,
+            self.allocator,
+        );
 
-            const retry_after = resilience.retryAfterFromHeaders(
-                response.resilience_headers,
-            ) catch null;
-
-            const decision = policy.decideHttpRetry(response.status, retry_after);
-            if (decision.action == .give_up) return response;
-
-            response.deinit(self.allocator);
-            resilience.sleepForTransportRetry(client, self.transport_hooks, decision.delay_ms);
-        }
+        return switch (loop_outcome) {
+            .ok => |ok| ok.response,
+            .transport_failed => |failure| failure.err,
+        };
     }
 
     fn cachedTokenIndexForKey(self: *AuthEngine, key: TokenCacheKey) ?usize {
@@ -1253,6 +1255,39 @@ pub fn referenceView(ref: Reference) AuthReferenceView {
         .repository_path = ref.repositoryPath(),
         .ref_string = ref.refString(),
     };
+}
+
+const TokenExchangeLoopContext = struct {
+    engine: *AuthEngine,
+    client: *std.http.Client,
+    request: AuthenticateRequest,
+    method: TokenRequestMethod,
+    credential: ?ConfigModule.Credential,
+};
+
+fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse {
+    const loop_ctx: *const TokenExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    const exchanger = loop_ctx.engine.token_http_exchanger orelse return error.NotYetImplemented;
+    const http_request = try buildTokenHttpRequest(
+        loop_ctx.engine.allocator,
+        loop_ctx.request,
+        loop_ctx.method,
+        loop_ctx.credential,
+    );
+    return exchanger(loop_ctx.engine.allocator, loop_ctx.client, http_request);
+}
+
+fn tokenExchangeResponseStatus(response: TokenExchangeResponse) std.http.Status {
+    return response.status;
+}
+
+fn tokenExchangeResponseHeaders(response: TokenExchangeResponse) []const resilience.HttpHeader {
+    return response.resilience_headers;
+}
+
+fn deinitTokenExchangeResponse(allocator: std.mem.Allocator, response: TokenExchangeResponse) void {
+    var owned = response;
+    owned.deinit(allocator);
 }
 
 pub fn buildTokenHttpRequest(

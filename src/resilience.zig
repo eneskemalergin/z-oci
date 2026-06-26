@@ -76,6 +76,17 @@ pub const RateLimitInfo = struct {
 ///
 /// Registries mix seconds, HTTP-date, and (on Docker Hub) Unix timestamps in
 /// `Retry-After` / `X-Retry-After`. Store the normalized form, not raw bytes.
+///
+/// Registry assumptions encoded in the parsers:
+/// - Docker Hub may send large integer `Retry-After` values as Unix epoch seconds
+///   rather than delay seconds; values above `1_000_000_000` are treated as absolute
+///   retry instants.
+/// - `X-RateLimit-Reset` on Docker Hub token/API responses is a Unix epoch second.
+///   Registry `RateLimit-Reset` follows the same rule when present.
+/// - `Retry-After` wins over `X-Retry-After` when both are present.
+/// - Integer delay seconds anchor to the response `Date` header when available.
+/// - Pre-emptive throttling trusts registry `RateLimit-*` only, not `X-RateLimit-*`
+///   alone, and requires `limit`, `remaining`, and `RateLimit-Reset`.
 pub const RetryAfter = union(enum) {
     delay_seconds: u32,
     retry_at_unix_seconds: i64,
@@ -155,6 +166,16 @@ pub const RetryBudget = struct {
 
     pub fn recordRateLimitAttempt(self: *RetryBudget) void {
         self.rate_limit_attempts_used +%= 1;
+    }
+
+    /// True when at least one reactive rate-limit retry was attempted.
+    pub fn rateLimitRetriesExhausted(self: RetryBudget) bool {
+        return self.rate_limit_attempts_used > 0;
+    }
+
+    /// True when at least one reactive network retry was attempted.
+    pub fn networkRetriesExhausted(self: RetryBudget) bool {
+        return self.network_attempts_used > 0;
     }
 };
 
@@ -321,6 +342,72 @@ pub fn sleepForTransportRetry(
         return;
     }
     hooks.sleeper(delay_ms);
+}
+
+/// Optional hooks for the shared manifest/token transport retry loop.
+pub const HttpRetryLoopHooks = struct {
+    before_first_attempt: ?*const fn (*anyopaque) void = null,
+    after_successful_exchange: ?*const fn (*anyopaque, std.http.Status, []const HttpHeader) void = null,
+};
+
+/// Outcome of `runHttpRetryLoop` for manifest and token transport wrappers.
+pub fn HttpRetryLoopResult(comptime Response: type, comptime ExchangeError: type) type {
+    return union(enum) {
+        ok: struct {
+            response: Response,
+            budget: RetryBudget,
+        },
+        transport_failed: struct {
+            err: ExchangeError,
+            budget: RetryBudget,
+        },
+    };
+}
+
+/// Shared reactive retry loop for manifest and token HTTP exchangers.
+///
+/// Transport wrappers pass exchange-specific callbacks; manifest transport uses
+/// `before_first_attempt` for opt-in pre-emptive rate limiting and
+/// `after_successful_exchange` to record rate-limit headers.
+pub fn runHttpRetryLoop(
+    client: *std.http.Client,
+    transport_hooks: TransportHooks,
+    policy: *RetryPolicy,
+    loop_hooks: HttpRetryLoopHooks,
+    comptime ExchangeError: type,
+    comptime Response: type,
+    exchange_ctx: *anyopaque,
+    exchange_once: *const fn (*anyopaque) ExchangeError!Response,
+    response_status: *const fn (Response) std.http.Status,
+    response_headers: *const fn (Response) []const HttpHeader,
+    deinit_response: *const fn (std.mem.Allocator, Response) void,
+    allocator: std.mem.Allocator,
+) HttpRetryLoopResult(Response, ExchangeError) {
+    if (loop_hooks.before_first_attempt) |hook| hook(exchange_ctx);
+
+    while (true) {
+        const response = exchange_once(exchange_ctx) catch |err| {
+            const decision = policy.decideTransportRetry(err);
+            if (decision.action == .give_up) {
+                return .{ .transport_failed = .{ .err = err, .budget = policy.budget } };
+            }
+            sleepForTransportRetry(client, transport_hooks, decision.delay_ms);
+            continue;
+        };
+
+        if (loop_hooks.after_successful_exchange) |hook| {
+            hook(exchange_ctx, response_status(response), response_headers(response));
+        }
+
+        const retry_after = retryAfterFromHeaders(response_headers(response)) catch null;
+        const decision = policy.decideHttpRetry(response_status(response), retry_after);
+        if (decision.action == .give_up) {
+            return .{ .ok = .{ .response = response, .budget = policy.budget } };
+        }
+
+        deinit_response(allocator, response);
+        sleepForTransportRetry(client, transport_hooks, decision.delay_ms);
+    }
 }
 
 /// Returns true for rate-limit and retry-after header names the transport layer keeps.
@@ -1188,6 +1275,78 @@ test "parseRateLimitHeaders parses checked-in docker hub 429 fixture" {
     const retry_after = (try parseRetryAfterFromHeaders(header_slice, null)).?;
     const response_date = (try responseDateUnixSecondsFromHeaders(header_slice)).?;
     try std.testing.expectEqual(response_date + 60, retry_after.retry_at_unix_seconds);
+}
+
+const MalformedResilienceHeaderFixture = struct {
+    cases: []const struct {
+        headers: []const struct {
+            name: []const u8,
+            value: []const u8,
+        },
+        expected_error: []const u8,
+    },
+};
+
+test "malformed resilience header fixture rejects invalid rate-limit and retry-after values" {
+    var bytes_buffer: [8 * 1024]u8 = undefined;
+    const bytes = try std.Io.Dir.cwd().readFile(
+        std.testing.io,
+        "fixtures/resilience/malformed-rate-limit-headers.json",
+        &bytes_buffer,
+    );
+
+    const parsed = try json.parse(MalformedResilienceHeaderFixture, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    for (parsed.value.cases) |case| {
+        var headers: [4]HttpHeader = undefined;
+        try std.testing.expect(case.headers.len <= headers.len);
+        for (case.headers, 0..) |entry, index| {
+            headers[index] = .{ .name = entry.name, .value = entry.value };
+        }
+        const header_slice = headers[0..case.headers.len];
+
+        if (std.mem.eql(u8, case.expected_error, "InvalidRateLimitHeader")) {
+            try std.testing.expectError(error.InvalidRateLimitHeader, parseRateLimitHeaders(header_slice));
+            continue;
+        }
+        if (std.mem.eql(u8, case.expected_error, "InvalidRetryAfterHeader")) {
+            try std.testing.expectError(error.InvalidRetryAfterHeader, parseRetryAfterValue(case.headers[0].value));
+            continue;
+        }
+        return error.TestUnexpectedResult;
+    }
+}
+
+const ConflictingRetryAfterFixture = struct {
+    headers: []const struct {
+        name: []const u8,
+        value: []const u8,
+    },
+    expected_delay_seconds: u32,
+};
+
+test "conflicting retry-after fixture prefers Retry-After over X-Retry-After" {
+    var bytes_buffer: [4 * 1024]u8 = undefined;
+    const bytes = try std.Io.Dir.cwd().readFile(
+        std.testing.io,
+        "fixtures/resilience/conflicting-retry-after.json",
+        &bytes_buffer,
+    );
+
+    const parsed = try json.parse(ConflictingRetryAfterFixture, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    var headers: [4]HttpHeader = undefined;
+    try std.testing.expect(parsed.value.headers.len <= headers.len);
+    for (parsed.value.headers, 0..) |entry, index| {
+        headers[index] = .{ .name = entry.name, .value = entry.value };
+    }
+    const header_slice = headers[0..parsed.value.headers.len];
+
+    const retry_after = (try parseRetryAfterFromHeaders(header_slice, null)).?;
+    const response_date = (try responseDateUnixSecondsFromHeaders(header_slice)).?;
+    try std.testing.expectEqual(response_date + parsed.value.expected_delay_seconds, retry_after.retry_at_unix_seconds);
 }
 
 test "findHeaderValue returns the first match when duplicate headers exist" {
