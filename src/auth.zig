@@ -251,6 +251,7 @@ pub const Token = struct {
 };
 
 pub const token_refresh_window_seconds: u64 = 5;
+pub const default_token_cache_ttl_seconds: u64 = 60;
 
 pub const TokenResponse = struct {
     /// Owned token-response payload.
@@ -339,6 +340,7 @@ pub const TokenCacheKey = struct {
 pub const CachedToken = struct {
     token: Token,
     valid_until_unix_seconds: ?u64 = null,
+    last_used_unix_seconds: u64 = 0,
 
     pub fn initOwned(
         allocator: std.mem.Allocator,
@@ -497,13 +499,12 @@ pub const AuthEngine = struct {
     now_unix_seconds_fn: NowUnixSecondsFn = currentUnixSeconds,
     environ_map: ?*const std.process.Environ.Map = null,
     docker_config: ?DockerConfig = null,
-    /// Per-scope token cache with no eviction policy beyond TTL expiry.
+    /// Per-scope token cache with TTL expiry and LRU eviction at
+    /// `config.max_token_cache_entries`.
     ///
     /// Cache identity: realm + service + scope. Entries older than
     /// valid_until_unix_seconds (accounting for the fixed refresh window)
-    /// are dropped on lookup. The cache is a hash map sized for short-lived
-    /// CLI use (10-50 images per run). If long-lived daemon operation is
-    /// ever required, add a max_cache_entries config field with LRU eviction.
+    /// are dropped on lookup.
     token_cache: TokenCacheMap = .empty,
     preferred_token_method_by_realm: std.StringHashMapUnmanaged(TokenRequestMethod) = .{},
     /// Last trustworthy registry `RateLimit-*` snapshot for manifest pre-emption.
@@ -658,8 +659,10 @@ pub const AuthEngine = struct {
     ///   config/helper -> anonymous token request
     /// - helper failures and helper timeouts are terminal; auth does not silently
     ///   downgrade them to anonymous requests
-    /// - successful responses are caller-owned and must be `deinit()`ed exactly
-    ///   once after the resolver has copied or used the access token
+    /// - successful responses borrow the cached access token
+    ///   (`owns_access_token == false`); call `deinit()` to release any owned
+    ///   refresh token only. Do not use the access token after `deinit()` on
+    ///   this engine
     /// - successful responses are cached inside the engine by
     ///   `realm + service + scope` for reuse across later manifest requests
     pub fn authenticate(
@@ -678,13 +681,17 @@ pub const AuthEngine = struct {
         defer if (credential_handle) |handle| handle.release();
 
         const credential = if (credential_handle) |handle| handle.credential else null;
-        const token_response = try self.exchangeTokenResponse(client, request, credential);
-        self.storeTokenResponseForRequest(client, request, token_response) catch |err| {
-            var owned_response = token_response;
-            owned_response.deinit(self.allocator);
+        var token_response = try self.exchangeTokenResponse(client, request, credential);
+        self.storeTokenResponseForRequest(client, request, &token_response) catch |err| {
+            token_response.deinit(self.allocator);
             return err;
         };
-        return token_response;
+        if (token_response.refresh_token) |refresh_token| {
+            std.crypto.secureZero(u8, @constCast(refresh_token));
+            self.allocator.free(refresh_token);
+            token_response.refresh_token = null;
+        }
+        return self.borrowedCachedTokenResponseForRequest(request) orelse error.TokenExchangeFailed;
     }
 
     /// Retry auth exactly once after an upstream request rejects a cached token.
@@ -709,13 +716,19 @@ pub const AuthEngine = struct {
     }
 
     fn cachedTokenResponseForRequest(self: *AuthEngine, client: *std.http.Client, request: AuthenticateRequest) AuthError!?TokenResponse {
-        const cached_token = self.token_cache.getAdapted(request, TokenCacheRequestContext{}) orelse return null;
-        if (self.cachedTokenIsExpired(client, cached_token)) {
+        const entry = self.token_cache.getPtrAdapted(request, TokenCacheRequestContext{}) orelse return null;
+        if (self.cachedTokenIsExpired(client, entry.*)) {
             _ = self.removeCachedTokenForRequest(request);
             return null;
         }
 
-        return borrowedCachedTokenResponse(cached_token);
+        entry.last_used_unix_seconds = self.now_unix_seconds_fn(client);
+        return borrowedCachedTokenResponse(entry.*);
+    }
+
+    fn borrowedCachedTokenResponseForRequest(self: *AuthEngine, request: AuthenticateRequest) ?TokenResponse {
+        const entry = self.token_cache.getPtrAdapted(request, TokenCacheRequestContext{}) orelse return null;
+        return borrowedCachedTokenResponse(entry.*);
     }
 
     fn exchangeTokenResponse(
@@ -809,15 +822,14 @@ pub const AuthEngine = struct {
         return valid_until <= self.now_unix_seconds_fn(client);
     }
 
-    fn storeTokenResponseForRequest(self: *AuthEngine, client: *std.http.Client, request: AuthenticateRequest, token_response: TokenResponse) AuthError!void {
+    fn storeTokenResponseForRequest(
+        self: *AuthEngine,
+        client: *std.http.Client,
+        request: AuthenticateRequest,
+        token_response: *TokenResponse,
+    ) AuthError!void {
         var key = try TokenCacheKey.initOwnedFromRequest(self.allocator, request);
         errdefer key.deinit(self.allocator);
-
-        const cached_token = try cachedTokenFromResponse(self.allocator, token_response, self.now_unix_seconds_fn(client));
-        errdefer {
-            var owned_cached_token = cached_token;
-            owned_cached_token.deinit(self.allocator);
-        }
 
         const gop = try self.token_cache.getOrPut(self.allocator, key);
         if (gop.found_existing) {
@@ -825,7 +837,35 @@ pub const AuthEngine = struct {
             var old_token = gop.value_ptr.*;
             old_token.deinit(self.allocator);
         }
-        gop.value_ptr.* = cached_token;
+
+        const now = self.now_unix_seconds_fn(client);
+        gop.value_ptr.* = cachedTokenFromResponse(token_response, now, default_token_cache_ttl_seconds);
+        self.evictLruTokenCacheEntriesUntilWithinLimit();
+    }
+
+    fn evictLruTokenCacheEntriesUntilWithinLimit(self: *AuthEngine) void {
+        const limit = self.config.max_token_cache_entries;
+        if (limit == 0) return;
+
+        while (self.token_cache.count() > limit) {
+            var victim_key: ?TokenCacheKey = null;
+            var victim_last_used: u64 = std.math.maxInt(u64);
+
+            var it = self.token_cache.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.last_used_unix_seconds <= victim_last_used) {
+                    victim_last_used = entry.value_ptr.last_used_unix_seconds;
+                    victim_key = entry.key_ptr.*;
+                }
+            }
+
+            const key = victim_key orelse break;
+            const removed = self.token_cache.fetchRemove(key) orelse break;
+            var removed_key = removed.key;
+            removed_key.deinit(self.allocator);
+            var removed_token = removed.value;
+            removed_token.deinit(self.allocator);
+        }
     }
 
     fn invalidateCachedTokenForRequest(self: *AuthEngine, request: AuthenticateRequest) AuthError!bool {
@@ -1301,16 +1341,24 @@ fn borrowedCachedTokenResponse(cached_token: CachedToken) TokenResponse {
 }
 
 fn cachedTokenFromResponse(
-    allocator: std.mem.Allocator,
-    token_response: TokenResponse,
+    token_response: *TokenResponse,
     now_unix_seconds: u64,
-) AuthError!CachedToken {
-    const valid_until_unix_seconds = if (token_response.access_token.expires_in_seconds) |expires_in_seconds| blk: {
-        const usable_lifetime = expires_in_seconds -| token_refresh_window_seconds;
-        break :blk now_unix_seconds + usable_lifetime;
-    } else null;
+    default_ttl_seconds: u64,
+) CachedToken {
+    const ttl_seconds = token_response.access_token.expires_in_seconds orelse default_ttl_seconds;
+    const usable_lifetime = ttl_seconds -| token_refresh_window_seconds;
+    const stolen_value = token_response.access_token.value;
+    token_response.access_token.value = &.{};
+    token_response.owns_access_token = false;
 
-    return CachedToken.initOwned(allocator, token_response.access_token, valid_until_unix_seconds);
+    return .{
+        .token = .{
+            .value = stolen_value,
+            .expires_in_seconds = token_response.access_token.expires_in_seconds,
+        },
+        .valid_until_unix_seconds = now_unix_seconds + usable_lifetime,
+        .last_used_unix_seconds = now_unix_seconds,
+    };
 }
 
 fn dockerConfigRegistryKeyMatches(config_key: []const u8, registry: []const u8) bool {
@@ -1577,10 +1625,10 @@ pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) AuthEr
     const token_value = tokenValueFromParsedBody(parsed.value) orelse return error.InvalidTokenResponse;
     if (token_value.len == 0) return error.InvalidTokenResponse;
 
-    const expires_in_seconds = if (parsed.value.expires_in) |expires_in| blk: {
+    const expires_in_seconds: ?u64 = if (parsed.value.expires_in) |expires_in| blk: {
         if (expires_in == 0 or expires_in > std.math.maxInt(u32)) return error.InvalidTokenResponse;
         break :blk expires_in;
-    } else 60;
+    } else null;
 
     if (parsed.value.refresh_token) |refresh_token| {
         if (refresh_token.len == 0) return error.InvalidTokenResponse;
@@ -2936,7 +2984,7 @@ test "parseTokenResponse: accepts matching duplicate token fields and preserves 
     try std.testing.expectEqualStrings("ignored-for-now", response.refresh_token.?);
 }
 
-test "parseTokenResponse: falls back to token and defaults expiry" {
+test "parseTokenResponse: falls back to token without expires_in" {
     var response = try parseTokenResponse(std.testing.allocator,
         \\{
         \\  "token": "fallback-token"
@@ -2945,7 +2993,7 @@ test "parseTokenResponse: falls back to token and defaults expiry" {
     defer response.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("fallback-token", response.access_token.value);
-    try std.testing.expectEqual(@as(?u64, 60), response.access_token.expires_in_seconds);
+    try std.testing.expect(response.access_token.expires_in_seconds == null);
     try std.testing.expect(response.refresh_token == null);
 }
 
@@ -3292,7 +3340,7 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("cached-token", first.access_token.value);
     try std.testing.expectEqualStrings("cached-token", second.access_token.value);
-    try std.testing.expect(first.owns_access_token);
+    try std.testing.expect(!first.owns_access_token);
     try std.testing.expect(!second.owns_access_token);
     try std.testing.expectEqual(
         engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value.ptr,
@@ -3304,6 +3352,176 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
     defer third.deinit(std.testing.allocator);
     try std.testing.expect(!third.owns_access_token);
     try std.testing.expectEqualStrings("cached-token", third.access_token.value);
+}
+
+test "AuthEngine.authenticate: cache miss borrows stored token without duplicate buffer" {
+    const State = struct {
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "single-copy-token",
+            \\  "expires_in": 90
+            \\}
+            };
+        }
+
+        fn now(_: *std.http.Client) u64 {
+            return 1_000;
+        }
+    };
+
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    defer engine.deinit();
+    engine.now_unix_seconds_fn = State.now;
+
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    var response = (try engine.authenticate(&client, request)).?;
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expect(!response.owns_access_token);
+    try std.testing.expectEqual(
+        engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value.ptr,
+        response.access_token.value.ptr,
+    );
+}
+
+test "AuthEngine.authenticate: token without expires_in expires after default cache TTL" {
+    const State = struct {
+        var calls: usize = 0;
+        var fake_now: u64 = 1_000;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+            return .{ .status = .ok, .body =
+            \\{
+            \\  "access_token": "no-expiry-token"
+            \\}
+            };
+        }
+
+        fn now(_: *std.http.Client) u64 {
+            return fake_now;
+        }
+    };
+
+    State.calls = 0;
+    State.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    defer engine.deinit();
+    engine.now_unix_seconds_fn = State.now;
+
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    var first = (try engine.authenticate(&client, request)).?;
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    try std.testing.expectEqualStrings("no-expiry-token", first.access_token.value);
+
+    State.fake_now = 1_000 + default_token_cache_ttl_seconds - token_refresh_window_seconds - 1;
+    var second = (try engine.authenticate(&client, request)).?;
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), State.calls);
+
+    State.fake_now += 1;
+    var third = (try engine.authenticate(&client, request)).?;
+    defer third.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqualStrings("no-expiry-token", third.access_token.value);
+}
+
+test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
+    const State = struct {
+        var calls: usize = 0;
+        var fake_now: u64 = 1_000;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+            return switch (calls) {
+                1 => .{ .status = .ok, .body = "{\"access_token\": \"token-a\", \"expires_in\": 3600}" },
+                2 => .{ .status = .ok, .body = "{\"access_token\": \"token-b\", \"expires_in\": 3600}" },
+                3 => .{ .status = .ok, .body = "{\"access_token\": \"token-c\", \"expires_in\": 3600}" },
+                else => unreachable,
+            };
+        }
+
+        fn now(_: *std.http.Client) u64 {
+            return fake_now;
+        }
+    };
+
+    State.calls = 0;
+    State.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_token_cache_entries = 2,
+    }, State.exchange);
+    defer engine.deinit();
+    engine.now_unix_seconds_fn = State.now;
+
+    var client: std.http.Client = undefined;
+    const request_a = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:scope=a:pull",
+        },
+    );
+    const request_b = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:scope=b:pull",
+        },
+    );
+    const request_c = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:scope=c:pull",
+        },
+    );
+
+    var first_a = (try engine.authenticate(&client, request_a)).?;
+    defer first_a.deinit(std.testing.allocator);
+    State.fake_now += 1;
+    var first_b = (try engine.authenticate(&client, request_b)).?;
+    defer first_b.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), engine.token_cache.count());
+
+    State.fake_now += 1;
+    var first_c = (try engine.authenticate(&client, request_c)).?;
+    defer first_c.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), engine.token_cache.count());
+    try std.testing.expect(engine.token_cache.getAdapted(request_a, TokenCacheRequestContext{}) == null);
+    try std.testing.expectEqualStrings("token-b", engine.token_cache.getAdapted(request_b, TokenCacheRequestContext{}).?.token.value);
+    try std.testing.expectEqualStrings("token-c", engine.token_cache.getAdapted(request_c, TokenCacheRequestContext{}).?.token.value);
+
+    State.fake_now += 1;
+    var hit_b = (try engine.authenticate(&client, request_b)).?;
+    defer hit_b.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), State.calls);
+    try std.testing.expectEqualStrings("token-b", hit_b.access_token.value);
 }
 
 test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
@@ -3354,6 +3572,8 @@ test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
 
     var first = (try engine.authenticate(&client, request)).?;
     defer first.deinit(std.testing.allocator);
+    const first_token_value = try std.testing.allocator.dupe(u8, first.access_token.value);
+    defer std.testing.allocator.free(first_token_value);
     State.fake_now = 1_006;
     var second = (try engine.authenticate(&client, request)).?;
     defer second.deinit(std.testing.allocator);
@@ -3361,7 +3581,7 @@ test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
     try std.testing.expectEqual(@as(usize, 2), State.calls);
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("second-token", engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value);
-    try std.testing.expectEqualStrings("first-token", first.access_token.value);
+    try std.testing.expectEqualStrings("first-token", first_token_value);
     try std.testing.expectEqualStrings("second-token", second.access_token.value);
 }
 
@@ -3643,9 +3863,15 @@ test "AuthEngine.authenticate: allocation failures do not leak during cache inse
                 },
             );
 
-            try engine.storeTokenResponseForRequest(&client, request, .{
-                .access_token = .{ .value = "alloc-check-token", .expires_in_seconds = 90 },
-            });
+            var response = TokenResponse{
+                .access_token = .{
+                    .value = try allocator.dupe(u8, "alloc-check-token"),
+                    .expires_in_seconds = 90,
+                },
+            };
+            defer response.deinit(allocator);
+
+            try engine.storeTokenResponseForRequest(&client, request, &response);
         }
     };
 

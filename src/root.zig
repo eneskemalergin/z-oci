@@ -12,9 +12,9 @@
 //! - Functions returning `std.json.Parsed(T)` own an arena (pattern A): the caller
 //!   calls `parsed.deinit()` to free everything.
 //! - `AuthEngine` wraps persistent cache storage with its own `deinit()`.
-//!   Engine-created tokens (`TokenResponse`) are caller-owned → `.deinit(allocator)`.
-//!   Cache hits return a borrowed access token (`owns_access_token == false`);
-//!   `deinit()` is a no-op for the token bytes in that case.
+//!   Successful `authenticate()` responses borrow the cached access token
+//!   (`owns_access_token == false`); do not use the token after `AuthEngine.deinit()`.
+//!   Call `TokenResponse.deinit(allocator)` to release any owned refresh token.
 //! - Batch workloads should reuse one `std.http.Client` and one `AuthEngine` across
 //!   multiple manifest operations so per-scope token cache entries stay warm.
 //!   Public `resolve`/`validate`/`getManifest` create a fresh engine per call; use

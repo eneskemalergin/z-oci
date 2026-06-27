@@ -45,6 +45,7 @@ const std = @import("std");
 
 pub const default_max_manifest_bytes = 8 * 1024 * 1024;
 pub const default_max_token_response_bytes = 64 * 1024;
+pub const default_max_token_cache_entries: u32 = 128;
 
 /// A username/secret pair for HTTP Basic authentication.
 pub const Credential = struct {
@@ -144,6 +145,9 @@ pub const Config = struct {
 
     /// Maximum token endpoint response body size for live HTTP transport.
     max_token_response_bytes: usize = default_max_token_response_bytes,
+
+    /// Maximum cached bearer tokens per `AuthEngine`. `0` means unbounded.
+    max_token_cache_entries: u32 = default_max_token_cache_entries,
 
     /// Returns the `std.Io.Timeout` value for caller-owned `connectTcpOptions`.
     ///
@@ -447,6 +451,7 @@ test "Config: max_manifest_bytes and max_token_response_bytes use safe defaults"
     const c = Config{};
     try std.testing.expectEqual(default_max_manifest_bytes, c.max_manifest_bytes);
     try std.testing.expectEqual(default_max_token_response_bytes, c.max_token_response_bytes);
+    try std.testing.expectEqual(default_max_token_cache_entries, c.max_token_cache_entries);
 }
 
 test "Config: max_retries zero disables retries" {
