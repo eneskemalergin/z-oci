@@ -5,6 +5,9 @@
 //! `WWW-Authenticate` triggers bearer challenge parsing, token exchange (GET +
 //! POST fallback), credential-provider chain, and per-scope token caching.
 //!
+//! Docker config (`setDockerConfigBytes`, `loadDockerConfigFromEnvironment`)
+//! stores raw JSON and decodes auth entries lazily per registry lookup.
+//!
 //! `AuthError` stays separate from `ResolveError`; the resolver maps auth failures
 //! into public `ResolveError` variants at the manifest boundary.
 
@@ -129,92 +132,114 @@ const DockerCredentialSource = union(enum) {
     helper: DockerCredentialHelperLookup,
 };
 
-const DockerConfigAuthEntry = struct {
-    registry_key: []const u8,
-    credential: ConfigModule.Credential,
-
-    fn deinit(self: *DockerConfigAuthEntry, allocator: std.mem.Allocator) void {
-        allocator.free(self.registry_key);
-        allocator.free(self.credential.username);
-        std.crypto.secureZero(u8, @constCast(self.credential.secret));
-        allocator.free(self.credential.secret);
-    }
-};
-
-const DockerConfigHelperEntry = struct {
-    registry_key: []const u8,
-    helper_suffix: []const u8,
-
-    fn deinit(self: *DockerConfigHelperEntry, allocator: std.mem.Allocator) void {
-        allocator.free(self.registry_key);
-        allocator.free(self.helper_suffix);
-    }
-};
-
 const DockerConfig = struct {
-    auths: []DockerConfigAuthEntry = &.{},
-    cred_helpers: []DockerConfigHelperEntry = &.{},
+    owned_json: []u8,
     creds_store: ?[]const u8 = null,
+    creds_store_resolved: bool = false,
+    auth_cache: std.StringHashMapUnmanaged(ConfigModule.Credential) = .empty,
+    helper_suffix_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     fn deinit(self: *DockerConfig, allocator: std.mem.Allocator) void {
-        for (self.auths) |*entry| entry.deinit(allocator);
-        allocator.free(self.auths);
+        allocator.free(self.owned_json);
 
-        for (self.cred_helpers) |*entry| entry.deinit(allocator);
-        allocator.free(self.cred_helpers);
+        var auth_it = self.auth_cache.iterator();
+        while (auth_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.username);
+            std.crypto.secureZero(u8, @constCast(entry.value_ptr.secret));
+            allocator.free(entry.value_ptr.secret);
+        }
+        self.auth_cache.deinit(allocator);
+
+        var helper_it = self.helper_suffix_cache.iterator();
+        while (helper_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.helper_suffix_cache.deinit(allocator);
 
         if (self.creds_store) |creds_store| allocator.free(creds_store);
-        self.* = .{};
     }
 
-    fn credentialForRegistry(self: DockerConfig, registry: []const u8) ?CredentialHandle {
-        const credential = self.authCredentialForRegistry(registry) orelse return null;
+    fn credentialForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?CredentialHandle {
+        const credential = try self.authCredentialForRegistry(allocator, registry) orelse return null;
         return .{ .credential = credential };
     }
 
-    fn authCredentialForRegistry(self: DockerConfig, registry: []const u8) ?ConfigModule.Credential {
-        for (self.auths) |entry| {
-            if (dockerConfigRegistryKeyMatches(entry.registry_key, registry)) {
-                return entry.credential;
-            }
-        }
-        return null;
+    fn authCredentialForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?ConfigModule.Credential {
+        const cache_key = try dockerConfigRegistryCacheKeyAlloc(allocator, registry);
+        defer allocator.free(cache_key);
+
+        if (self.auth_cache.get(cache_key)) |cached| return cached;
+
+        const encoded_auth = try dockerConfigAuthEncodedForRegistry(allocator, self.owned_json, registry) orelse return null;
+        defer allocator.free(encoded_auth);
+
+        const credential = try decodeDockerConfigAuthCredential(allocator, encoded_auth);
+
+        const owned_key = try allocator.dupe(u8, cache_key);
+        errdefer allocator.free(owned_key);
+        try self.auth_cache.put(allocator, owned_key, credential);
+
+        return self.auth_cache.get(owned_key).?;
     }
 
-    fn credentialSourceForRegistry(self: DockerConfig, registry: []const u8) ?DockerCredentialSource {
-        if (self.registrySpecificHelperLookupForRegistry(registry)) |helper_lookup| {
+    fn credentialSourceForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?DockerCredentialSource {
+        if (try self.registrySpecificHelperLookupForRegistry(allocator, registry)) |helper_lookup| {
             return .{ .helper = helper_lookup };
         }
 
-        if (self.authCredentialForRegistry(registry)) |credential| {
+        if (try self.authCredentialForRegistry(allocator, registry)) |credential| {
             return .{ .auth = credential };
         }
 
-        if (self.globalHelperLookupForRegistry(registry)) |helper_lookup| {
+        if (try self.globalHelperLookupForRegistry(allocator, registry)) |helper_lookup| {
             return .{ .helper = helper_lookup };
         }
 
         return null;
     }
 
-    fn registrySpecificHelperLookupForRegistry(self: DockerConfig, registry: []const u8) ?DockerCredentialHelperLookup {
-        for (self.cred_helpers) |entry| {
-            if (dockerConfigRegistryKeyMatches(entry.registry_key, registry)) {
-                return .{
-                    .server_url = dockerCredentialHelperServer(registry),
-                    .helper_suffix = entry.helper_suffix,
-                };
-            }
-        }
-        return null;
+    fn registrySpecificHelperLookupForRegistry(
+        self: *DockerConfig,
+        allocator: std.mem.Allocator,
+        registry: []const u8,
+    ) AuthError!?DockerCredentialHelperLookup {
+        const cache_key = try dockerConfigRegistryCacheKeyAlloc(allocator, registry);
+        defer allocator.free(cache_key);
+
+        const helper_suffix = if (self.helper_suffix_cache.get(cache_key)) |cached|
+            cached
+        else blk: {
+            const owned_suffix = try dockerConfigHelperSuffixForRegistry(allocator, self.owned_json, registry) orelse return null;
+            const owned_key = try allocator.dupe(u8, cache_key);
+            errdefer allocator.free(owned_key);
+            errdefer allocator.free(owned_suffix);
+            try self.helper_suffix_cache.put(allocator, owned_key, owned_suffix);
+            break :blk owned_suffix;
+        };
+
+        return .{
+            .server_url = dockerCredentialHelperServer(registry),
+            .helper_suffix = helper_suffix,
+        };
     }
 
-    fn globalHelperLookupForRegistry(self: DockerConfig, registry: []const u8) ?DockerCredentialHelperLookup {
+    fn globalHelperLookupForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?DockerCredentialHelperLookup {
+        try self.resolveCredsStore(allocator);
         const helper_suffix = self.creds_store orelse return null;
         return .{
             .server_url = dockerCredentialHelperServer(registry),
             .helper_suffix = helper_suffix,
         };
+    }
+
+    fn resolveCredsStore(self: *DockerConfig, allocator: std.mem.Allocator) AuthError!void {
+        if (self.creds_store_resolved) return;
+        self.creds_store_resolved = true;
+        if (try dockerConfigRootStringField(allocator, self.owned_json, "credsStore")) |value| {
+            self.creds_store = value;
+        }
     }
 };
 
@@ -617,9 +642,12 @@ pub const AuthEngine = struct {
     }
 
     pub fn setDockerConfigBytes(self: *AuthEngine, docker_config_json: []const u8) AuthError!void {
-        const parsed = try parseDockerConfig(self.allocator, docker_config_json);
+        try validateDockerConfigJson(docker_config_json);
+        const owned_json = try self.allocator.dupe(u8, docker_config_json);
+        errdefer self.allocator.free(owned_json);
+
         if (self.docker_config) |*docker_config| docker_config.deinit(self.allocator);
-        self.docker_config = parsed;
+        self.docker_config = .{ .owned_json = owned_json };
     }
 
     pub fn loadDockerConfigFromEnvironment(self: *AuthEngine, io: std.Io) AuthError!bool {
@@ -885,7 +913,7 @@ pub const AuthEngine = struct {
         return true;
     }
 
-    fn credentialForRegistryForAuth(self: AuthEngine, registry: []const u8) AuthError!?CredentialHandle {
+    fn credentialForRegistryForAuth(self: *AuthEngine, registry: []const u8) AuthError!?CredentialHandle {
         if (self.config.credential_provider) |provider| {
             if (provider.getCredential(registry)) |handle| return handle;
         }
@@ -897,7 +925,20 @@ pub const AuthEngine = struct {
         return try self.dockerCredentialForRegistry(registry);
     }
 
-    pub fn credentialForRegistry(self: AuthEngine, registry: []const u8) ?CredentialHandle {
+    /// Resolve credentials for `registry` in provider order: config provider,
+    /// environment map, then lazy docker config auth.
+    ///
+    /// `self` must be the live engine (pointer required so docker config cache
+    /// updates stay on the same `AuthEngine` instance).
+    ///
+    /// Docker config hits borrow username/secret slices from the engine's
+    /// `auth_cache` until `deinit()`. `CredentialHandle.release()` is a no-op
+    /// for those hits.
+    ///
+    /// Malformed docker config auth for the requested registry returns `null`
+    /// here (not `InvalidDockerConfig`). Use `authenticate()` when auth errors
+    /// must propagate.
+    pub fn credentialForRegistry(self: *AuthEngine, registry: []const u8) ?CredentialHandle {
         if (self.config.credential_provider) |provider| {
             if (provider.getCredential(registry)) |handle| return handle;
         }
@@ -906,31 +947,32 @@ pub const AuthEngine = struct {
             if (envCredentialForRegistry(environ_map, registry)) |handle| return handle;
         }
 
-        if (self.docker_config) |docker_config| {
-            if (docker_config.credentialForRegistry(registry)) |handle| return handle;
+        if (self.docker_config) |*docker_config| {
+            if (docker_config.credentialForRegistry(self.allocator, registry) catch return null) |handle| return handle;
         }
 
         return null;
     }
 
-    fn dockerCredentialForRegistry(self: AuthEngine, registry: []const u8) AuthError!?CredentialHandle {
-        const docker_config = self.docker_config orelse return null;
+    fn dockerCredentialForRegistry(self: *AuthEngine, registry: []const u8) AuthError!?CredentialHandle {
+        if (self.docker_config == null) return null;
+        const docker_config = &self.docker_config.?;
         const helper_timeout = dockerCredentialHelperTimeout(self.config);
 
         if (self.helper_process_context) |context| {
-            if (docker_config.registrySpecificHelperLookupForRegistry(registry)) |helper_lookup| {
+            if (try docker_config.registrySpecificHelperLookupForRegistry(self.allocator, registry)) |helper_lookup| {
                 const helper_server = try canonicalDockerCredentialHelperServerAlloc(self.allocator, helper_lookup.server_url);
                 defer self.allocator.free(helper_server);
                 return try context.runner(self.allocator, context.io, helper_lookup.helper_suffix, helper_server, helper_timeout);
             }
         }
 
-        if (docker_config.authCredentialForRegistry(registry)) |credential| {
+        if (try docker_config.authCredentialForRegistry(self.allocator, registry)) |credential| {
             return .{ .credential = credential };
         }
 
         if (self.helper_process_context) |context| {
-            if (docker_config.globalHelperLookupForRegistry(registry)) |helper_lookup| {
+            if (try docker_config.globalHelperLookupForRegistry(self.allocator, registry)) |helper_lookup| {
                 const helper_server = try canonicalDockerCredentialHelperServerAlloc(self.allocator, helper_lookup.server_url);
                 defer self.allocator.free(helper_server);
                 return try context.runner(self.allocator, context.io, helper_lookup.helper_suffix, helper_server, helper_timeout);
@@ -964,81 +1006,260 @@ pub fn envCredentialForRegistry(environ_map: *const std.process.Environ.Map, reg
     } };
 }
 
-fn parseDockerConfig(allocator: std.mem.Allocator, docker_config_json: []const u8) AuthError!DockerConfig {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, docker_config_json, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch return error.InvalidDockerConfig;
-    defer parsed.deinit();
-
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidDockerConfig,
-    };
-
-    var auth_entries: std.ArrayList(DockerConfigAuthEntry) = .empty;
-    defer auth_entries.deinit(allocator);
-
-    if (root.get("auths")) |auths_value| {
-        const auths_object = switch (auths_value) {
-            .object => |object| object,
-            else => return error.InvalidDockerConfig,
-        };
-        var auths_iter = auths_object.iterator();
-        while (auths_iter.next()) |entry| {
-            const entry_object = switch (entry.value_ptr.*) {
-                .object => |object| object,
-                else => return error.InvalidDockerConfig,
-            };
-            const encoded_auth = switch (entry_object.get("auth") orelse continue) {
-                .string => |value| value,
-                else => return error.InvalidDockerConfig,
-            };
-            try auth_entries.append(allocator, try initDockerConfigAuthEntry(allocator, entry.key_ptr.*, encoded_auth));
-        }
-    }
-
-    var helper_entries: std.ArrayList(DockerConfigHelperEntry) = .empty;
-    defer helper_entries.deinit(allocator);
-
-    if (root.get("credHelpers")) |helpers_value| {
-        const helpers_object = switch (helpers_value) {
-            .object => |object| object,
-            else => return error.InvalidDockerConfig,
-        };
-        var helpers_iter = helpers_object.iterator();
-        while (helpers_iter.next()) |entry| {
-            const helper_suffix = switch (entry.value_ptr.*) {
-                .string => |value| value,
-                else => return error.InvalidDockerConfig,
-            };
-            try helper_entries.append(allocator, .{
-                .registry_key = try allocator.dupe(u8, entry.key_ptr.*),
-                .helper_suffix = try allocator.dupe(u8, helper_suffix),
-            });
-        }
-    }
-
-    const creds_store = if (root.get("credsStore")) |creds_store_value|
-        switch (creds_store_value) {
-            .string => |value| try allocator.dupe(u8, value),
-            else => return error.InvalidDockerConfig,
-        }
-    else
-        null;
-
-    return .{
-        .auths = try auth_entries.toOwnedSlice(allocator),
-        .cred_helpers = try helper_entries.toOwnedSlice(allocator),
-        .creds_store = creds_store,
+fn mapDockerConfigJsonError(err: anyerror) AuthError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidDockerConfig,
     };
 }
 
-fn initDockerConfigAuthEntry(
+fn dockerConfigScannerNext(scanner: *std.json.Scanner) AuthError!std.json.Scanner.Token {
+    return scanner.next() catch |err| return mapDockerConfigJsonError(err);
+}
+
+fn dockerConfigScannerNextAllocMax(scanner: *std.json.Scanner) AuthError!std.json.Scanner.Token {
+    return scanner.nextAllocMax(std.heap.page_allocator, .alloc_if_needed, docker_config_file_size_limit) catch |err| return mapDockerConfigJsonError(err);
+}
+
+fn dockerConfigScannerSkipValue(scanner: *std.json.Scanner) AuthError!void {
+    return scanner.skipValue() catch |err| return mapDockerConfigJsonError(err);
+}
+
+fn dockerConfigScannerPeekTokenType(scanner: *std.json.Scanner) AuthError!std.json.Scanner.TokenType {
+    return scanner.peekNextTokenType() catch |err| return mapDockerConfigJsonError(err);
+}
+
+fn parseDockerConfig(allocator: std.mem.Allocator, docker_config_json: []const u8) AuthError!DockerConfig {
+    try validateDockerConfigJson(docker_config_json);
+    return .{ .owned_json = try allocator.dupe(u8, docker_config_json) };
+}
+
+fn validateDockerConfigJson(docker_config_json: []const u8) AuthError!void {
+    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json);
+    defer scanner.deinit();
+
+    switch (try dockerConfigScannerNext(&scanner)) {
+        .object_begin => {},
+        else => return error.InvalidDockerConfig,
+    }
+
+    while (true) {
+        const key_token = try dockerConfigScannerNextAllocMax(&scanner);
+        switch (key_token) {
+            .string, .allocated_string => |key| {
+                if (std.mem.eql(u8, key, "auths") or std.mem.eql(u8, key, "credHelpers")) {
+                    freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                    switch (try dockerConfigScannerPeekTokenType(&scanner)) {
+                        .object_begin => try dockerConfigScannerSkipValue(&scanner),
+                        else => return error.InvalidDockerConfig,
+                    }
+                    continue;
+                }
+
+                if (std.mem.eql(u8, key, "credsStore")) {
+                    freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                    const value_token = try dockerConfigScannerNextAllocMax(&scanner);
+                    defer freeDockerConfigScannerToken(std.heap.page_allocator, value_token);
+                    switch (value_token) {
+                        .string, .allocated_string => {},
+                        else => return error.InvalidDockerConfig,
+                    }
+                    continue;
+                }
+
+                freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                try dockerConfigScannerSkipValue(&scanner);
+            },
+            .object_end => break,
+            else => return error.InvalidDockerConfig,
+        }
+    }
+
+    switch (try dockerConfigScannerNext(&scanner)) {
+        .end_of_document => {},
+        else => return error.InvalidDockerConfig,
+    }
+}
+
+fn dockerConfigRegistryCacheKeyAlloc(allocator: std.mem.Allocator, registry: []const u8) AuthError![]u8 {
+    const owned = try allocator.alloc(u8, registry.len);
+    for (registry, 0..) |char, index| {
+        owned[index] = std.ascii.toLower(char);
+    }
+    return owned;
+}
+
+fn freeDockerConfigScannerToken(allocator: std.mem.Allocator, token: std.json.Scanner.Token) void {
+    switch (token) {
+        .allocated_string, .allocated_number => |owned| allocator.free(owned),
+        else => {},
+    }
+}
+
+fn dockerConfigStringFromScannerToken(allocator: std.mem.Allocator, token: std.json.Scanner.Token) AuthError![]const u8 {
+    switch (token) {
+        .string => |value| return try allocator.dupe(u8, value),
+        .allocated_string => |value| {
+            defer std.heap.page_allocator.free(value);
+            return try allocator.dupe(u8, value);
+        },
+        else => {
+            freeDockerConfigScannerToken(std.heap.page_allocator, token);
+            return error.InvalidDockerConfig;
+        },
+    }
+}
+
+fn dockerConfigRootStringField(
     allocator: std.mem.Allocator,
-    registry_key: []const u8,
+    docker_config_json: []const u8,
+    field_name: []const u8,
+) AuthError!?[]const u8 {
+    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json);
+    defer scanner.deinit();
+
+    switch (try dockerConfigScannerNext(&scanner)) {
+        .object_begin => {},
+        else => return error.InvalidDockerConfig,
+    }
+
+    while (true) {
+        const key_token = try dockerConfigScannerNextAllocMax(&scanner);
+        switch (key_token) {
+            .string, .allocated_string => |key| {
+                if (!std.mem.eql(u8, key, field_name)) {
+                    freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                    try dockerConfigScannerSkipValue(&scanner);
+                    continue;
+                }
+                freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+
+                const value_token = try dockerConfigScannerNextAllocMax(&scanner);
+                return try dockerConfigStringFromScannerToken(allocator, value_token);
+            },
+            .object_end => return null,
+            else => return error.InvalidDockerConfig,
+        }
+    }
+}
+
+fn dockerConfigAuthEncodedForRegistry(
+    allocator: std.mem.Allocator,
+    docker_config_json: []const u8,
+    registry: []const u8,
+) AuthError!?[]const u8 {
+    return dockerConfigRegistrySectionValue(allocator, docker_config_json, "auths", registry, "auth");
+}
+
+fn dockerConfigHelperSuffixForRegistry(
+    allocator: std.mem.Allocator,
+    docker_config_json: []const u8,
+    registry: []const u8,
+) AuthError!?[]const u8 {
+    return dockerConfigRegistrySectionValue(allocator, docker_config_json, "credHelpers", registry, null);
+}
+
+fn dockerConfigRegistrySectionValue(
+    allocator: std.mem.Allocator,
+    docker_config_json: []const u8,
+    section_name: []const u8,
+    registry: []const u8,
+    object_field: ?[]const u8,
+) AuthError!?[]const u8 {
+    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json);
+    defer scanner.deinit();
+
+    switch (try dockerConfigScannerNext(&scanner)) {
+        .object_begin => {},
+        else => return error.InvalidDockerConfig,
+    }
+
+    while (true) {
+        const root_key_token = try dockerConfigScannerNextAllocMax(&scanner);
+        switch (root_key_token) {
+            .string, .allocated_string => |root_key| {
+                if (!std.mem.eql(u8, root_key, section_name)) {
+                    freeDockerConfigScannerToken(std.heap.page_allocator, root_key_token);
+                    try dockerConfigScannerSkipValue(&scanner);
+                    continue;
+                }
+                freeDockerConfigScannerToken(std.heap.page_allocator, root_key_token);
+
+                switch (try dockerConfigScannerNext(&scanner)) {
+                    .object_begin => {},
+                    else => return error.InvalidDockerConfig,
+                }
+
+                while (true) {
+                    const entry_key_token = try dockerConfigScannerNextAllocMax(&scanner);
+                    switch (entry_key_token) {
+                        .string, .allocated_string => |entry_key| {
+                            const matches = dockerConfigRegistryKeyMatches(entry_key, registry);
+                            if (object_field) |field_name| {
+                                if (!matches) {
+                                    freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
+                                    try dockerConfigScannerSkipValue(&scanner);
+                                    continue;
+                                }
+                                freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
+
+                                switch (try dockerConfigScannerNext(&scanner)) {
+                                    .object_begin => {},
+                                    else => return error.InvalidDockerConfig,
+                                }
+                                return dockerConfigReadObjectStringField(allocator, &scanner, field_name);
+                            }
+
+                            if (!matches) {
+                                freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
+                                try dockerConfigScannerSkipValue(&scanner);
+                                continue;
+                            }
+                            freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
+
+                            const value_token = try dockerConfigScannerNextAllocMax(&scanner);
+                            return try dockerConfigStringFromScannerToken(allocator, value_token);
+                        },
+                        .object_end => return null,
+                        else => return error.InvalidDockerConfig,
+                    }
+                }
+            },
+            .object_end => return null,
+            else => return error.InvalidDockerConfig,
+        }
+    }
+}
+
+fn dockerConfigReadObjectStringField(
+    allocator: std.mem.Allocator,
+    scanner: *std.json.Scanner,
+    field_name: []const u8,
+) AuthError!?[]const u8 {
+    while (true) {
+        const key_token = try dockerConfigScannerNextAllocMax(scanner);
+        switch (key_token) {
+            .string, .allocated_string => |key| {
+                if (!std.mem.eql(u8, key, field_name)) {
+                    freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                    try dockerConfigScannerSkipValue(scanner);
+                    continue;
+                }
+                freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+
+                const value_token = try dockerConfigScannerNextAllocMax(scanner);
+                return try dockerConfigStringFromScannerToken(allocator, value_token);
+            },
+            .object_end => return null,
+            else => return error.InvalidDockerConfig,
+        }
+    }
+}
+
+fn decodeDockerConfigAuthCredential(
+    allocator: std.mem.Allocator,
     encoded_auth: []const u8,
-) AuthError!DockerConfigAuthEntry {
+) AuthError!ConfigModule.Credential {
     const decoder = std.base64.standard.Decoder;
     const decoded_len = decoder.calcSizeForSlice(encoded_auth) catch return error.InvalidDockerConfig;
     const decoded_auth = try allocator.alloc(u8, decoded_len);
@@ -1061,11 +1282,8 @@ fn initDockerConfigAuthEntry(
     }
 
     return .{
-        .registry_key = try allocator.dupe(u8, registry_key),
-        .credential = .{
-            .username = username,
-            .secret = secret,
-        },
+        .username = username,
+        .secret = secret,
     };
 }
 
@@ -1991,7 +2209,7 @@ test "auth scaffolding: engine can request credential handle" {
             }
         }.get,
     };
-    const engine = AuthEngine.init(std.testing.allocator, .{ .credential_provider = &provider });
+    var engine = AuthEngine.init(std.testing.allocator, .{ .credential_provider = &provider });
     const handle = engine.credentialForRegistry("ghcr.io").?;
 
     try std.testing.expectEqualStrings("user", handle.credential.username);
@@ -2021,7 +2239,7 @@ test "AuthEngine.credentialForRegistry: explicit config provider wins before env
     try environ_map.put(env_registry_token_var, "env-token");
 
     const provider = CredentialProvider{ .getCredentialFn = State.get };
-    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
     const handle = engine.credentialForRegistry("ghcr.io").?;
 
     try std.testing.expectEqualStrings("config-user", handle.credential.username);
@@ -2035,7 +2253,7 @@ test "AuthEngine.credentialForRegistry: env provider supplies fallback credentia
     try environ_map.put(env_registry_user_var, "env-user");
     try environ_map.put(env_registry_token_var, "env-token");
 
-    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     const handle = engine.credentialForRegistry("ghcr.io").?;
 
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
@@ -2049,7 +2267,7 @@ test "AuthEngine.credentialForRegistry: env provider normalizes Docker Hub alias
     try environ_map.put(env_registry_user_var, "env-user");
     try environ_map.put(env_registry_token_var, "env-token");
 
-    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     const handle = engine.credentialForRegistry("registry-1.docker.io").?;
 
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
@@ -2063,7 +2281,7 @@ test "AuthEngine.credentialForRegistry: env provider treats GHCR host case-insen
     try environ_map.put(env_registry_user_var, "env-user");
     try environ_map.put(env_registry_token_var, "env-token");
 
-    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     const handle = engine.credentialForRegistry("GHCR.IO").?;
 
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
@@ -2076,7 +2294,7 @@ test "AuthEngine.credentialForRegistry: env provider ignores registry mismatch a
     try environ_map.put(env_registry_host_var, "ghcr.io");
     try environ_map.put(env_registry_user_var, "env-user");
 
-    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     try std.testing.expect(engine.credentialForRegistry("registry-1.docker.io") == null);
     try std.testing.expect(engine.credentialForRegistry("ghcr.io") == null);
 }
@@ -2092,7 +2310,7 @@ test "AuthEngine.credentialForRegistry: anonymous fallback is explicit when no p
             }
         }.get,
     };
-    const engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
 
     try std.testing.expect(engine.credentialForRegistry("registry-1.docker.io") == null);
 }
@@ -2116,21 +2334,23 @@ test "parseDockerConfig: decodes auths and records helper metadata" {
     );
     defer docker_config.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), docker_config.auths.len);
-    try std.testing.expectEqual(@as(usize, 1), docker_config.cred_helpers.len);
+    const ghcr_auth = (try docker_config.authCredentialForRegistry(std.testing.allocator, "ghcr.io")).?;
+    try std.testing.expectEqualStrings("octocat", ghcr_auth.username);
+    try std.testing.expectEqualStrings("ghp_example", ghcr_auth.secret);
+
+    const docker_hub_auth = (try docker_config.authCredentialForRegistry(std.testing.allocator, "registry-1.docker.io")).?;
+    try std.testing.expectEqualStrings("dockeruser", docker_hub_auth.username);
+    try std.testing.expectEqualStrings("secret", docker_hub_auth.secret);
+
+    const ghcr_helper = (try docker_config.registrySpecificHelperLookupForRegistry(std.testing.allocator, "ghcr.io")).?;
+    try std.testing.expectEqualStrings("secretservice", ghcr_helper.helper_suffix);
+
+    try docker_config.resolveCredsStore(std.testing.allocator);
     try std.testing.expectEqualStrings("pass", docker_config.creds_store.?);
-    try std.testing.expectEqualStrings("ghcr.io", docker_config.auths[0].registry_key);
-    try std.testing.expectEqualStrings("octocat", docker_config.auths[0].credential.username);
-    try std.testing.expectEqualStrings("ghp_example", docker_config.auths[0].credential.secret);
-    try std.testing.expectEqualStrings(docker_hub_auth_key, docker_config.auths[1].registry_key);
-    try std.testing.expectEqualStrings("dockeruser", docker_config.auths[1].credential.username);
-    try std.testing.expectEqualStrings("secret", docker_config.auths[1].credential.secret);
-    try std.testing.expectEqualStrings("ghcr.io", docker_config.cred_helpers[0].registry_key);
-    try std.testing.expectEqualStrings("secretservice", docker_config.cred_helpers[0].helper_suffix);
 }
 
-test "parseDockerConfig: rejects malformed auth entries" {
-    try std.testing.expectError(error.InvalidDockerConfig, parseDockerConfig(std.testing.allocator,
+test "AuthEngine.credentialForRegistry: malformed docker config auth returns null" {
+    var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
         \\{
         \\  "auths": {
         \\    "ghcr.io": {
@@ -2138,15 +2358,68 @@ test "parseDockerConfig: rejects malformed auth entries" {
         \\    }
         \\  }
         \\}
-    ));
+    );
+    defer engine.deinit();
 
-    try std.testing.expectError(error.InvalidDockerConfig, parseDockerConfig(std.testing.allocator,
+    try std.testing.expect(engine.credentialForRegistry("ghcr.io") == null);
+}
+
+test "parseDockerConfig: rejects malformed auth entries at lookup time" {
+    var docker_config = try parseDockerConfig(std.testing.allocator,
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "not-base64"
+        \\    }
+        \\  }
+        \\}
+    );
+    defer docker_config.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.InvalidDockerConfig, docker_config.authCredentialForRegistry(std.testing.allocator, "ghcr.io"));
+
+    var valid_config = try parseDockerConfig(std.testing.allocator,
         \\{
         \\  "auths": {
         \\    "ghcr.io": {
         \\      "auth": "bm9fY29sb24="
         \\    }
         \\  }
+        \\}
+    );
+    defer valid_config.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.InvalidDockerConfig, valid_config.authCredentialForRegistry(std.testing.allocator, "ghcr.io"));
+}
+
+test "parseDockerConfig: single-registry lookup ignores malformed auths for other registries" {
+    var docker_config = try parseDockerConfig(std.testing.allocator,
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    },
+        \\    "quay.io": {
+        \\      "auth": "not-base64"
+        \\    }
+        \\  }
+        \\}
+    );
+    defer docker_config.deinit(std.testing.allocator);
+
+    const ghcr_auth = (try docker_config.authCredentialForRegistry(std.testing.allocator, "ghcr.io")).?;
+    try std.testing.expectEqualStrings("octocat", ghcr_auth.username);
+    try std.testing.expectEqualStrings("ghp_example", ghcr_auth.secret);
+}
+
+test "parseDockerConfig: rejects malformed auth entries" {
+    try std.testing.expectError(error.InvalidDockerConfig, parseDockerConfig(std.testing.allocator,
+        \\{ not json }
+    ));
+
+    try std.testing.expectError(error.InvalidDockerConfig, parseDockerConfig(std.testing.allocator,
+        \\{
+        \\  "auths": []
         \\}
     ));
 }
@@ -2242,7 +2515,7 @@ test "DockerConfig.credentialSourceForRegistry: registry helper beats auth and g
     );
     defer docker_config.deinit(std.testing.allocator);
 
-    const ghcr_source = docker_config.credentialSourceForRegistry("ghcr.io").?;
+    const ghcr_source = (try docker_config.credentialSourceForRegistry(std.testing.allocator, "ghcr.io")).?;
     switch (ghcr_source) {
         .helper => |helper| {
             try std.testing.expectEqualStrings("ghcr.io", helper.server_url);
@@ -2251,7 +2524,7 @@ test "DockerConfig.credentialSourceForRegistry: registry helper beats auth and g
         else => return error.TestUnexpectedResult,
     }
 
-    const self_hosted_source = docker_config.credentialSourceForRegistry("registry.example.com").?;
+    const self_hosted_source = (try docker_config.credentialSourceForRegistry(std.testing.allocator, "registry.example.com")).?;
     switch (self_hosted_source) {
         .auth => |credential| {
             try std.testing.expectEqualStrings("internal-user", credential.username);
@@ -2260,7 +2533,7 @@ test "DockerConfig.credentialSourceForRegistry: registry helper beats auth and g
         else => return error.TestUnexpectedResult,
     }
 
-    const quay_source = docker_config.credentialSourceForRegistry("quay.io").?;
+    const quay_source = (try docker_config.credentialSourceForRegistry(std.testing.allocator, "quay.io")).?;
     switch (quay_source) {
         .helper => |helper| {
             try std.testing.expectEqualStrings("quay.io", helper.server_url);
@@ -2280,7 +2553,7 @@ test "DockerConfig.credentialSourceForRegistry: Docker Hub helper uses historica
     );
     defer docker_config.deinit(std.testing.allocator);
 
-    const source = docker_config.credentialSourceForRegistry("registry-1.docker.io").?;
+    const source = (try docker_config.credentialSourceForRegistry(std.testing.allocator, "registry-1.docker.io")).?;
     switch (source) {
         .helper => |helper| {
             try std.testing.expectEqualStrings(docker_hub_auth_key, helper.server_url);
@@ -4809,7 +5082,7 @@ test "parseDockerConfig: 1000x repeated parse/deinit under DebugAllocator" {
     const config_json =
         \\{
         \\  "auths": {
-        \\    "ghcr.io": {
+        \\    "\u0067\u0068\u0063\u0072\u002e\u0069\u006f": {
         \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
         \\    },
         \\    "https://index.docker.io/v1/": {
@@ -4820,14 +5093,24 @@ test "parseDockerConfig: 1000x repeated parse/deinit under DebugAllocator" {
         \\    }
         \\  },
         \\  "credHelpers": {
-        \\    "ghcr.io": "secretservice",
+        \\    "\u0067\u0068\u0063\u0072\u002e\u0069\u006f": "\u0073\u0065\u0063\u0072\u0065\u0074\u0073\u0065\u0072\u0076\u0069\u0063\u0065",
         \\    "gcr.io": "gcloud"
         \\  },
-        \\  "credsStore": "pass"
+        \\  "credsStore": "\u0070\u0061\u0073\u0073"
         \\}
     ;
     for (0..1000) |_| {
         var docker_config = try parseDockerConfig(allocator, config_json);
-        docker_config.deinit(allocator);
+        defer docker_config.deinit(allocator);
+
+        const ghcr_auth = (try docker_config.authCredentialForRegistry(allocator, "ghcr.io")).?;
+        try std.testing.expectEqualStrings("octocat", ghcr_auth.username);
+        try std.testing.expectEqualStrings("ghp_example", ghcr_auth.secret);
+
+        const ghcr_helper = (try docker_config.registrySpecificHelperLookupForRegistry(allocator, "ghcr.io")).?;
+        try std.testing.expectEqualStrings("secretservice", ghcr_helper.helper_suffix);
+
+        try docker_config.resolveCredsStore(allocator);
+        try std.testing.expectEqualStrings("pass", docker_config.creds_store.?);
     }
 }
