@@ -346,6 +346,8 @@ pub const GetRequestOutcome = union(enum) {
 /// Resolver-visible outcome for the HEAD path.
 pub const HeadRequestOutcome = union(enum) {
     success: ManifestResponseMetadata,
+    /// Single-arch HEAD satisfied `validate` without retaining response metadata.
+    validate_single_arch_ok,
     use_get_fallback: ManifestResponseMetadata,
     not_found,
     redirect: ManifestResponseMetadata,
@@ -902,10 +904,13 @@ fn exchangeManifestRequest(
     };
     defer if (loop_ctx.cached_url) |cached_url| ctx.allocator.free(cached_url);
 
-    const hooks = resilience.HttpRetryLoopHooks{
-        .before_first_attempt = beforeManifestExchangeAttempt,
-        .after_successful_exchange = afterManifestExchangeAttempt,
-    };
+    const hooks: resilience.HttpRetryLoopHooks = if (ctx.config.rate_limit_enabled)
+        .{
+            .before_first_attempt = beforeManifestExchangeAttempt,
+            .after_successful_exchange = afterManifestExchangeAttempt,
+        }
+    else
+        .{};
 
     return resilience.runHttpRetryLoop(
         ctx.client,
@@ -1203,6 +1208,14 @@ fn classifyUsableHeadMetadata(
     };
     if (!acceptsManifestMediaType(request.accept, media_type)) {
         return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
+    }
+
+    if (ctx.operation == .validate and !media_type.isMultiArch()) {
+        return .validate_single_arch_ok;
+    }
+
+    if (ctx.operation == .validate and ctx.platform != null) {
+        return .{ .use_get_fallback = .{ .status = metadata.status } };
     }
 
     return .{ .success = try metadata.cloneAlloc(ctx.allocator) };
@@ -2100,6 +2113,39 @@ test "acceptsManifestMediaType matches normalized exact entries and wildcard" {
     try std.testing.expect(acceptsManifestMediaType(&.{" application/vnd.oci.image.manifest.v1+json; q=1.0 "}, .oci_manifest_v1));
     try std.testing.expect(acceptsManifestMediaType(&.{"*/*"}, .docker_manifest_list_v2));
     try std.testing.expect(!acceptsManifestMediaType(&.{"application/vnd.oci.image.index.v1+json"}, .docker_manifest_v2));
+}
+
+test "performManifestHead returns validate_single_arch_ok for validate operation" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+            } };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        Config{},
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .validate,
+    );
+
+    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    try std.testing.expectEqual(HeadRequestOutcome.validate_single_arch_ok, outcome);
 }
 
 test "performManifestHead returns success for anonymous usable HEAD metadata" {

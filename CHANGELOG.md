@@ -16,17 +16,26 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 - Build-time PEM private-key scan via `zig build security-check` (also runs as part of `zig build test`).
 - Deterministic retry-path benchmark ops in `z-oci-bench`: `resolve-single-retry` (transient `503` then success) and `authenticate-rate-limit` (`429` then success) with noop transport sleep hooks.
 - DebugAllocator repeated-run checks for manifest HEAD and token-exchange retry wrappers.
-- Phase 4 pre-release benchmark baseline at `benchmarks/baselines/v0.4.0.json` (includes retry ops plus existing resolver/auth operations).
+- Phase 4 pre-release benchmark baseline at `benchmarks/baselines/v0.4.0.json` (includes retry ops plus existing resolver/auth operations; refreshed after v0.3.9 P hot-path work).
+- `Manifest.parseMediaTypeShallow` and resolve-depth `manifest_media_type` document variant for `resolve` workloads.
+- CA bundle mtime cache in `Config.applyToClient` when `ca_bundle_path` is set.
+- `benchmarks/tmp/` for on-the-fly zebrac comparison snapshots (gitignored).
 
 ### Changed
 
 - Manifest and token transport wrappers share one reactive retry loop in `resilience.zig` instead of duplicating sleep/retry branches in `auth.zig` and `resolver.zig`.
-- `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, and rejects private-key PEM markers in CA bundles.
+- `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, rejects private-key PEM markers in CA bundles, and skips reload when path and mtime are unchanged for the same client.
 - Public docs (`README.md`, `Config.zig`, `resilience.zig`) now describe live retry budgets, CA bundle behavior, and registry header assumptions honestly.
+- Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; drops wasted GET metadata clone; uses stack SHA-256 hex before digest string alloc.
+- Manifest and token retry loops cache built request fields lazily (attempt 2+) so single-shot paths pay no cache overhead.
+- Token cache lookup uses borrowed keys (no `TokenCacheKey` alloc on hit); preferred GET/POST method remembered per realm.
+- Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
 
 ### Fixed
 
 - Redirect-without-`Location` and exhausted reactive failures now preserve HTTP status and retry-budget context on the public resolver error path.
+- `recurseIntoMultiArchDocument` parent document lifecycle on `platform_required` / `platform_not_found` early returns (no DebugAllocator leaks).
+- P4/P13 eager retry-cache no longer adds extra URL/token request allocations on single-attempt paths (fixes `get-manifest` regression).
 
 ## [0.3.0] - 2026-05-24 - [Tagged]
 

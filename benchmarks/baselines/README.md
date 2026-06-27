@@ -6,62 +6,51 @@ JSON files in this directory are zebrac output snapshots from milestone releases
 
 - `v0.2.0.json` is the tagged Phase 2 auth-engine release baseline.
 - `v0.3.0.json` is the Phase 3 resolver baseline generated after the public resolver and packaged benchmark CLI gained deterministic resolver operations.
-- `v0.4.0.json` is the Phase 4 pre-release baseline after reactive transport retries landed; it adds `resolve-single-retry` and `authenticate-rate-limit` alongside the Phase 3 operations.
+- `v0.4.0.json` is the Phase 4 pre-release baseline: reactive transport retries (wave 1) plus v0.3.9 performance hot-path work (wave 2). Includes `resolve-single-retry` and `authenticate-rate-limit`.
 
-| Operation                    | Mean wall time | Mean RSS | Samples |
-| ---------------------------- | -------------- | -------- | ------- |
-| reference-parse (10k iters)  | ~338ms         | 4.69 MB  | 12      |
-| digest-parse (10k iters)     | ~13ms          | 4.69 MB  | 314     |
-| manifest-parse (10k iters)   | ~478ms         | 4.69 MB  | 9       |
-| challenge-parse (10k iters)  | ~63ms          | 4.70 MB  | 64      |
-| platform-match (10k iters)   | ~10ms          | 4.70 MB  | 388     |
-| authenticate-miss (1k iters) | ~584ms         | 4.73 MB  | 7       |
-| authenticate-hit (1k iters)  | ~43ms          | 4.70 MB  | 94      |
+### `v0.4.0.json`: ReleaseFast zebrac (per iteration)
 
-Retry-path wall-time summary from `v0.4.0.json` (ReleaseFast, 1k iters):
+Captured with `zig build -Doptimize=ReleaseFast`, `zebrac -d 4000 -w 1`.
 
-| Operation               | Mean wall time | Mean per iteration | Mean RSS |
-| ----------------------- | -------------- | ------------------ | -------- |
-| resolve-single-retry    | ~110ms         | ~110 us            | ~1.1 MB  |
-| authenticate-rate-limit | ~152ms         | ~152 us            | ~4.7 MB  |
+| Operation               | Mean per iteration | Mean RSS | Samples |
+| ----------------------- | ------------------ | -------- | ------- |
+| reference-parse         | 29.8 us            | 0.77 MB  | 14      |
+| digest-parse            | 0.2 us             | 0.77 MB  | 1931    |
+| manifest-parse          | 26.6 us            | 0.77 MB  | 16      |
+| challenge-parse         | 1.0 us             | 0.77 MB  | 384     |
+| platform-match          | 0.1 us             | 0.77 MB  | 2612    |
+| authenticate-miss       | 118.6 us           | 16.5 MB  | 34      |
+| authenticate-hit        | 9.9 us             | 0.77 MB  | 401     |
+| authenticate-rate-limit | 129.8 us           | 16.5 MB  | 31      |
+| resolve-single          | 91.4 us            | 0.77 MB  | 44      |
+| resolve-single-retry    | 98.6 us            | 0.77 MB  | 41      |
+| resolve-multi           | 300.0 us           | 1.02 MB  | 14      |
+| validate-single         | 41.1 us            | 0.77 MB  | 98      |
+| get-manifest            | 79.6 us            | 0.77 MB  | 51      |
 
-Resolver wall-time summary from the refreshed `v0.3.0` baseline:
-
-| Operation       | Mean wall time | Mean per iteration | Mean RSS |
-| --------------- | -------------- | ------------------ | -------- |
-| resolve-single  | ~99ms          | ~99 us             | 1.10 MB  |
-| resolve-multi   | ~286ms         | ~286 us            | 1.12 MB  |
-| validate-single | ~26ms          | ~26 us             | 799 KB   |
-| get-manifest    | ~78ms          | ~78 us             | 1.10 MB  |
-
-Per-operation internal timing (from `z-oci-bench --counting`):
-
-| Operation         | Mean per iteration | Allocs per call |
-| ----------------- | ------------------ | --------------- |
-| reference-parse   | 33 us              | 4               |
-| digest-parse      | 0.4 us             | 0               |
-| manifest-parse    | 46 us              | 3               |
-| challenge-parse   | 5.6 us             | 0               |
-| platform-match    | 0.15 us            | 0               |
-| authenticate-miss | 145 us             | 13              |
-| authenticate-hit  | 31 us              | 4               |
-
-Resolver-surface counting snapshot from the current `v0.3.0` baseline pass after the repeated-allocation audit:
+### `v0.4.0.json`: Debug `--counting` (per call)
 
 | Operation               | Mean per iteration | Allocs per call |
 | ----------------------- | ------------------ | --------------- |
-| resolve-single          | 95 us              | 13              |
-| resolve-multi           | 284 us             | 28              |
-| validate-single         | 24 us              | 3               |
-| get-manifest            | 74 us              | 10              |
-| resolve-single-retry    | 105 us             | 14              |
-| authenticate-rate-limit | 128 us             | 15              |
+| reference-parse         | 30.8 us            | 4               |
+| digest-parse            | 0.1 us             | 0               |
+| manifest-parse          | 28.1 us            | 3               |
+| challenge-parse         | 0.9 us             | 0               |
+| platform-match          | 0.02 us            | 0               |
+| authenticate-miss       | 107.8 us           | 11              |
+| authenticate-hit        | 8.0 us             | 1               |
+| authenticate-rate-limit | 112.0 us           | 12              |
+| resolve-single          | 89.1 us            | 12              |
+| resolve-single-retry    | 94.7 us            | 13              |
+| resolve-multi           | 304.4 us           | 27              |
+| validate-single         | 42.7 us            | 5               |
+| get-manifest            | 76.1 us            | 10              |
 
 ## Regenerating
 
 ```sh
 zig build -Doptimize=ReleaseFast
-./tools/zebrac -d 4000 -w 1 --json benchmarks/baselines/v0.3.0.json \
+./tools/zebrac -d 4000 -w 1 --json benchmarks/baselines/v0.4.0.json \
   './zig-out/bin/z-oci-bench reference-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench digest-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench manifest-parse --iterations 10000' \
@@ -76,7 +65,5 @@ zig build -Doptimize=ReleaseFast
   './zig-out/bin/z-oci-bench validate-single --iterations 1000' \
   './zig-out/bin/z-oci-bench get-manifest --iterations 1000'
 ```
-
-For `v0.4.0.json`, use the same command list with output path `benchmarks/baselines/v0.4.0.json`.
 
 On-the-fly comparison snapshots (not committed) can go under `benchmarks/tmp/`.

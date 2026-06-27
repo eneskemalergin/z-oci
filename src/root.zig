@@ -371,6 +371,7 @@ fn validateWithExchangers(
 
     const head_outcome = try resolver.performManifestHead(ctx, &engine, manifest_exchanger, manifestAcceptValues());
     switch (head_outcome) {
+        .validate_single_arch_ok => return .valid,
         .success => |metadata| {
             defer metadata.deinitOwned(allocator);
 
@@ -1166,6 +1167,51 @@ test "validateWithExchangers returns valid from HEAD for single-arch manifest" {
 
     try std.testing.expect(State.saw_head);
     try std.testing.expectEqual(ValidateOutcome.valid, outcome);
+}
+
+test "validateWithExchangers single-arch HEAD avoids metadata clone allocations" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            if (request.method != .head) return error.TransportFailed;
+            return .{ .metadata = .{
+                .status = .ok,
+                .content_type = MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            } };
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/alpine",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    for (0..32) |_| {
+        const outcome = try validateWithExchangers(
+            allocator,
+            &client,
+            Config{},
+            ref,
+            null,
+            State.tokenExchange,
+            State.manifestExchange,
+            .{},
+        );
+        try std.testing.expectEqual(ValidateOutcome.valid, outcome);
+    }
 }
 
 test "validateWithExchangers returns platform_required from HEAD for multi-arch request without platform" {
