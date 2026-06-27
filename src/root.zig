@@ -13,7 +13,9 @@
 //!   calls `parsed.deinit()` to free everything.
 //! - `AuthEngine` wraps persistent cache storage with its own `deinit()`.
 //!   Successful `authenticate()` responses borrow the cached access token
-//!   (`owns_access_token == false`); do not use the token after `AuthEngine.deinit()`.
+//!   (`owns_access_token == false`). The borrow ends when `AuthEngine.deinit()`
+//!   runs, the entry is evicted, or another auth call replaces the same
+//!   `realm + service + scope` slot. Copy the token before retaining it.
 //!   Call `TokenResponse.deinit(allocator)` to release any owned refresh token.
 //! - Batch workloads should reuse one `std.http.Client` and one `AuthEngine` across
 //!   multiple manifest operations so per-scope token cache entries stay warm.

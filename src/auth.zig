@@ -260,6 +260,9 @@ pub const TokenResponse = struct {
     /// to ignore or surface it deliberately.
     refresh_token: ?[]const u8 = null,
     /// When false, `access_token.value` is borrowed from the engine token cache.
+    /// The borrow is valid only while that cache entry remains and before
+    /// `AuthEngine.deinit()`. Do not retain the response across another
+    /// `authenticate()` for the same `realm + service + scope`.
     /// `deinit()` does not free or zero borrowed bytes.
     owns_access_token: bool = true,
 
@@ -661,8 +664,9 @@ pub const AuthEngine = struct {
     ///   downgrade them to anonymous requests
     /// - successful responses borrow the cached access token
     ///   (`owns_access_token == false`); call `deinit()` to release any owned
-    ///   refresh token only. Do not use the access token after `deinit()` on
-    ///   this engine
+    ///   refresh token only. The access token borrow is invalidated by
+    ///   `AuthEngine.deinit()`, cache eviction, or another auth call that
+    ///   replaces the same `realm + service + scope` entry
     /// - successful responses are cached inside the engine by
     ///   `realm + service + scope` for reuse across later manifest requests
     pub fn authenticate(
@@ -818,7 +822,7 @@ pub const AuthEngine = struct {
     }
 
     fn cachedTokenIsExpired(self: *AuthEngine, client: *std.http.Client, cached_token: CachedToken) bool {
-        const valid_until = cached_token.valid_until_unix_seconds orelse return false;
+        const valid_until = cached_token.valid_until_unix_seconds orelse return true;
         return valid_until <= self.now_unix_seconds_fn(client);
     }
 
@@ -1051,6 +1055,10 @@ fn initDockerConfigAuthEntry(
     const username = try allocator.dupe(u8, decoded[0..separator_index]);
     errdefer allocator.free(username);
     const secret = try allocator.dupe(u8, decoded[separator_index + 1 ..]);
+    errdefer {
+        std.crypto.secureZero(u8, secret);
+        allocator.free(secret);
+    }
 
     return .{
         .registry_key = try allocator.dupe(u8, registry_key),
@@ -1519,7 +1527,10 @@ pub fn buildTokenQueryAlloc(allocator: std.mem.Allocator, request: AuthenticateR
 
 pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: ConfigModule.Credential) ![]u8 {
     const joined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ credential.username, credential.secret });
-    defer allocator.free(joined);
+    defer {
+        std.crypto.secureZero(u8, joined);
+        allocator.free(joined);
+    }
 
     const encoder = std.base64.standard.Encoder;
     const encoded_len = encoder.calcSize(joined.len);
@@ -3617,6 +3628,41 @@ test "AuthEngine.cachedTokenResponseForRequest: expired entry is dropped before 
 
     var client: std.http.Client = undefined;
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
+    try std.testing.expect((try engine.cachedTokenResponseForRequest(&client, request)) == null);
+    try std.testing.expectEqual(@as(usize, 0), engine.token_cache.count());
+}
+
+test "AuthEngine.cachedTokenResponseForRequest: missing valid_until is treated as expired" {
+    const State = struct {
+        fn now(_: *std.http.Client) u64 {
+            return 2_000;
+        }
+    };
+
+    var engine = AuthEngine.init(std.testing.allocator, Config{});
+    defer engine.deinit();
+    engine.now_unix_seconds_fn = State.now;
+
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    try putCachedTokenEntryForTest(
+        &engine,
+        request,
+        try CachedToken.initOwned(
+            std.testing.allocator,
+            .{ .value = "missing-ttl-token", .expires_in_seconds = 3600 },
+            null,
+        ),
+    );
+
+    var client: std.http.Client = undefined;
     try std.testing.expect((try engine.cachedTokenResponseForRequest(&client, request)) == null);
     try std.testing.expectEqual(@as(usize, 0), engine.token_cache.count());
 }
