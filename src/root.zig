@@ -223,6 +223,8 @@ const ResolvedManifestOutcome = union(enum) {
 ///
 /// Ownership contract:
 /// - The returned ResolveResult is owned through the caller-provided allocator.
+/// - On success, `registry`, `repository`, and `tag` from the input `ref` are moved into
+///   `result.reference`; do not call `ref.deinit()` after a successful resolve.
 /// - Call `result.deinit(allocator)` when using a non-arena allocator.
 /// - If the allocator is an arena, tearing the arena down is also sufficient.
 /// - `ResolveResult.clone()` is only needed when moving the result into a different allocator.
@@ -799,7 +801,7 @@ fn buildResolveResultAlloc(
     media_type: MediaType,
     platform: ?Platform,
 ) error{OutOfMemory}!ResolveResult {
-    var resolved_reference = try buildResolvedReferenceAlloc(allocator, ref, resolved_digest_raw);
+    var resolved_reference = buildResolvedReferenceAlloc(allocator, ref, resolved_digest_raw);
     errdefer resolved_reference.deinit(allocator);
 
     return .{
@@ -814,29 +816,13 @@ fn buildResolvedReferenceAlloc(
     allocator: std.mem.Allocator,
     ref: Reference,
     resolved_digest_raw: []u8,
-) error{OutOfMemory}!Reference {
-    const registry = try allocator.dupe(u8, ref.registry);
-    errdefer allocator.free(registry);
+) Reference {
+    var resolved = ref;
+    if (resolved.digest_raw) |old_raw| allocator.free(old_raw);
 
-    const repository = try allocator.dupe(u8, ref.repository);
-    errdefer allocator.free(repository);
-
-    const tag = if (ref.tag) |value|
-        try allocator.dupe(u8, value)
-    else
-        null;
-    errdefer if (tag) |value| allocator.free(value);
-
-    errdefer allocator.free(resolved_digest_raw);
-
-    const digest = Digest.parse(resolved_digest_raw) catch unreachable;
-    return .{
-        .registry = registry,
-        .repository = repository,
-        .tag = tag,
-        .digest = digest,
-        .digest_raw = resolved_digest_raw,
-    };
+    resolved.digest_raw = resolved_digest_raw;
+    resolved.digest = Digest.parse(resolved_digest_raw) catch unreachable;
+    return resolved;
 }
 
 fn notFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
@@ -1091,6 +1077,65 @@ test "resolveWithExchangers returns pinned single-arch result for tag reference"
     }
 }
 
+test "resolveWithExchangers moves input reference strings into result without re-duping" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
+
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
+    const registry_ptr = ref.registry.ptr;
+    const repository_ptr = ref.repository.ptr;
+    const tag_ptr = ref.tag.?.ptr;
+
+    var client: std.http.Client = undefined;
+    const outcome = try resolveWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+
+    switch (outcome) {
+        .success => |result| {
+            try std.testing.expect(result.reference.registry.ptr == registry_ptr);
+            try std.testing.expect(result.reference.repository.ptr == repository_ptr);
+            try std.testing.expect(result.reference.tag.?.ptr == tag_ptr);
+            try std.testing.expect(result.reference.digest != null);
+            try std.testing.expect(result.reference.digest_raw != null);
+            try std.testing.expectEqualSlices(u8, result.digest.hex, result.reference.digest.?.hex);
+
+            var owned = result;
+            owned.deinit(allocator);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
 test "resolveWithExchangers repeated single-arch runs leave no residual allocations under DebugAllocator" {
     const State = struct {
         var body: []u8 = undefined;
@@ -1121,15 +1166,9 @@ test "resolveWithExchangers repeated single-arch runs leave no residual allocati
     const allocator = gpa.allocator();
 
     var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
 
     for (0..32) |_| {
+        const ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
         const outcome = try resolveWithExchangers(
             allocator,
             &client,
@@ -1733,13 +1772,7 @@ test "resolveWithExchangers applies fixture ca_bundle_path without breaking mock
     };
     defer client.deinit();
 
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
+    const ref = try Reference.parse(std.testing.allocator, "registry-1.docker.io/library/busybox:latest");
 
     const outcome = try resolveWithExchangers(
         std.testing.allocator,
@@ -2317,15 +2350,9 @@ test "resolveWithExchangers repeated multi-arch runs leave no residual allocatio
     const allocator = gpa.allocator();
 
     var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
 
     for (0..32) |_| {
+        const ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
         const outcome = try resolveWithExchangers(
             allocator,
             &client,

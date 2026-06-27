@@ -227,6 +227,11 @@ const oci_manifest_media_type = "application/vnd.oci.image.manifest.v1+json";
 const oci_index_media_type = "application/vnd.oci.image.index.v1+json";
 const busybox_manifest_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65";
 const busybox_index_digest = "sha256:924ad1d57c2cb496c959c157fd3562d2abb87e98efd9f62912fb8ff975bbafc3";
+const bench_busybox_ref = "registry-1.docker.io/library/busybox:latest";
+
+fn parseBusyboxBenchRef(alloc: std.mem.Allocator) !z_oci.Reference {
+    return z_oci.Reference.parse(alloc, bench_busybox_ref);
+}
 
 fn benchReferenceParse(io: Io, iterations: usize, counting: bool) !void {
     var ca = CountingAllocator{ .inner = std.heap.page_allocator };
@@ -625,19 +630,12 @@ fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
     SingleManifestBenchState.body = manifest_body;
 
     var client: std.http.Client = undefined;
-    const ref = z_oci.Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
 
     try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
         alloc,
         &client,
         z_oci.Config{},
-        ref,
+        try parseBusyboxBenchRef(alloc),
         null,
         SingleManifestBenchState.tokenExchange,
         SingleManifestBenchState.manifestExchange,
@@ -651,7 +649,7 @@ fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
             alloc,
             &client,
             z_oci.Config{},
-            ref,
+            try parseBusyboxBenchRef(alloc),
             null,
             SingleManifestBenchState.tokenExchange,
             SingleManifestBenchState.manifestExchange,
@@ -675,20 +673,13 @@ fn benchResolveSession(io: Io, iterations: usize, counting: bool) !void {
     var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{}, SingleManifestBenchState.tokenExchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
-    const ref = z_oci.Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
 
     try deinitResolveSuccess(try z_oci.testing.resolveWithEngine(
         alloc,
         &client,
         z_oci.Config{},
         &engine,
-        ref,
+        try parseBusyboxBenchRef(alloc),
         null,
         SingleManifestBenchState.tokenExchange,
         SingleManifestBenchState.manifestExchange,
@@ -703,7 +694,7 @@ fn benchResolveSession(io: Io, iterations: usize, counting: bool) !void {
             &client,
             z_oci.Config{},
             &engine,
-            ref,
+            try parseBusyboxBenchRef(alloc),
             null,
             SingleManifestBenchState.tokenExchange,
             SingleManifestBenchState.manifestExchange,
@@ -726,20 +717,13 @@ fn benchResolveSingleRetry(io: Io, iterations: usize, counting: bool) !void {
     SingleManifestRetryBenchState.attempts = 0;
 
     var client: std.http.Client = undefined;
-    const ref = z_oci.Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
     const config = z_oci.Config{ .max_network_retries = 1 };
 
     try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
         alloc,
         &client,
         config,
-        ref,
+        try parseBusyboxBenchRef(alloc),
         null,
         SingleManifestRetryBenchState.tokenExchange,
         SingleManifestRetryBenchState.manifestExchange,
@@ -753,7 +737,7 @@ fn benchResolveSingleRetry(io: Io, iterations: usize, counting: bool) !void {
             alloc,
             &client,
             config,
-            ref,
+            try parseBusyboxBenchRef(alloc),
             null,
             SingleManifestRetryBenchState.tokenExchange,
             SingleManifestRetryBenchState.manifestExchange,
@@ -775,20 +759,13 @@ fn benchResolveMulti(io: Io, iterations: usize, counting: bool) !void {
     MultiManifestBenchState.fixture_ref = &fixture;
 
     var client: std.http.Client = undefined;
-    const ref = z_oci.Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
     const platform = z_oci.Platform{ .os = "linux", .architecture = "amd64" };
 
     try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
         alloc,
         &client,
         z_oci.Config{},
-        ref,
+        try parseBusyboxBenchRef(alloc),
         platform,
         MultiManifestBenchState.tokenExchange,
         MultiManifestBenchState.manifestExchange,
@@ -802,7 +779,7 @@ fn benchResolveMulti(io: Io, iterations: usize, counting: bool) !void {
             alloc,
             &client,
             z_oci.Config{},
-            ref,
+            try parseBusyboxBenchRef(alloc),
             platform,
             MultiManifestBenchState.tokenExchange,
             MultiManifestBenchState.manifestExchange,
