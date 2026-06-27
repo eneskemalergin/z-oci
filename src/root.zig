@@ -13,6 +13,13 @@
 //!   calls `parsed.deinit()` to free everything.
 //! - `AuthEngine` wraps persistent cache storage with its own `deinit()`.
 //!   Engine-created tokens (`TokenResponse`) are caller-owned → `.deinit(allocator)`.
+//!   Cache hits return a borrowed access token (`owns_access_token == false`);
+//!   `deinit()` is a no-op for the token bytes in that case.
+//! - Batch workloads should reuse one `std.http.Client` and one `AuthEngine` across
+//!   multiple manifest operations so per-scope token cache entries stay warm.
+//!   Public `resolve`/`validate`/`getManifest` create a fresh engine per call; use
+//!   `testing.resolveWithEngine` (or the same pattern in application code) when
+//!   measuring or implementing session reuse.
 //! - Types that never allocate: `Digest` (borrowed view), `MediaType` (enum),
 //!   `Platform` (struct of slices), `AuthChallenge`/`BearerChallenge` (borrowed views).
 //!   These need no deinit.
@@ -83,6 +90,31 @@ pub const testing = struct {
             allocator,
             client,
             config,
+            ref,
+            platform,
+            token_exchanger,
+            manifest_exchanger,
+            transport_hooks,
+        );
+    }
+
+    /// Same as `resolveWithExchangers`, but reuses an existing `AuthEngine` for token cache warmth.
+    pub fn resolveWithEngine(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        config: Config,
+        engine: *auth.AuthEngine,
+        ref: Reference,
+        platform: ?Platform,
+        token_exchanger: TokenHttpExchanger,
+        manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
+    ) PublicApiError!ResolveOutcome {
+        return root.resolveWithEngine(
+            allocator,
+            client,
+            config,
+            engine,
             ref,
             platform,
             token_exchanger,
@@ -170,10 +202,12 @@ const ResolvedManifestSuccess = struct {
     resolved_digest_raw: []u8,
     document: resolver.ParsedManifestDocument,
     platform: ?Platform,
+    backing_body: ?[]u8 = null,
 
     fn deinit(self: *ResolvedManifestSuccess, allocator: std.mem.Allocator) void {
         if (self.resolved_digest_raw.len != 0) allocator.free(self.resolved_digest_raw);
         self.document.deinit();
+        if (self.backing_body) |body| allocator.free(body);
         if (self.platform) |platform| deinitOwnedPlatform(platform, allocator);
     }
 };
@@ -302,11 +336,35 @@ fn resolveWithExchangers(
     var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
 
-    var outcome = try fetchResolvedManifestWithExchangers(
+    return resolveWithEngine(
         allocator,
         client,
         config,
         &engine,
+        ref,
+        platform,
+        token_exchanger,
+        manifest_exchanger,
+        transport_hooks,
+    );
+}
+
+fn resolveWithEngine(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    ref: Reference,
+    platform: ?Platform,
+    token_exchanger: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+) PublicApiError!ResolveOutcome {
+    var outcome = try fetchResolvedManifestWithExchangers(
+        allocator,
+        client,
+        config,
+        engine,
         referenceView(ref),
         platform,
         token_exchanger,
@@ -371,7 +429,7 @@ fn validateWithExchangers(
 
     const head_outcome = try resolver.performManifestHead(ctx, &engine, manifest_exchanger, manifestAcceptValues());
     switch (head_outcome) {
-        .validate_single_arch_ok => return .valid,
+        .validate_manifest_ok => return .valid,
         .success => |metadata| {
             defer metadata.deinitOwned(allocator);
 
@@ -491,6 +549,55 @@ fn getManifestWithExchangers(
     }
 }
 
+fn validateResolvedManifestFromChildHead(
+    allocator: std.mem.Allocator,
+    ref_view: AuthReferenceView,
+    head_outcome: resolver.HeadRequestOutcome,
+) PublicApiError!ResolvedManifestOutcome {
+    switch (head_outcome) {
+        .validate_manifest_ok => |media_type| {
+            const resolved_digest = Digest.parse(ref_view.ref_string) catch {
+                return .{ .failure = try digestMismatchErrorAlloc(allocator, ref_view) };
+            };
+            const resolved_digest_raw = try allocator.dupe(u8, ref_view.ref_string);
+            errdefer allocator.free(resolved_digest_raw);
+
+            return .{ .success = .{
+                .resolved_digest = resolved_digest,
+                .resolved_digest_raw = resolved_digest_raw,
+                .document = .{ .manifest_media_type = media_type },
+                .platform = null,
+            } };
+        },
+        .not_found => return .{ .failure = try notFoundErrorAlloc(allocator, ref_view) },
+        .redirect => |metadata| {
+            defer metadata.deinitOwned(allocator);
+            return .{ .failure = try networkErrorAlloc(allocator, ref_view, metadata.httpStatus()) };
+        },
+        .failure => |failure| return .{ .failure = failure },
+        .success => |metadata| {
+            defer metadata.deinitOwned(allocator);
+            return .{ .failure = try contentTypeMismatchErrorAlloc(allocator, ref_view) };
+        },
+        .use_get_fallback => |metadata| {
+            metadata.deinitOwned(allocator);
+            return .{ .failure = try manifestParseErrorAlloc(allocator, ref_view) };
+        },
+    }
+}
+
+fn digestMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
+    return allocatedResolveError(allocator, ref, .digest_mismatch, null);
+}
+
+fn contentTypeMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
+    return allocatedResolveError(allocator, ref, .content_type_mismatch, null);
+}
+
+fn manifestParseErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
+    return allocatedResolveError(allocator, ref, .manifest_parse_error, null);
+}
+
 fn fetchResolvedManifestWithExchangers(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -521,12 +628,19 @@ fn fetchResolvedManifestWithExchangers(
         transport_hooks,
     );
 
+    if (operation == .validate and depth > 0) {
+        const head_outcome = try resolver.performManifestHead(ctx, engine, manifest_exchanger, manifestAcceptValues());
+        return try validateResolvedManifestFromChildHead(allocator, ref_view, head_outcome);
+    }
+
     var outcome = try resolver.performManifestGet(ctx, engine, manifest_exchanger, manifestAcceptValues());
     switch (outcome) {
         .success => |*success| {
             const document = success.document;
             const resolved_digest = success.resolved_digest;
             const resolved_digest_raw = success.resolved_digest_raw;
+            const backing_body = success.backing_body;
+            success.backing_body = null;
 
             switch (document) {
                 .manifest, .manifest_media_type => {
@@ -535,6 +649,7 @@ fn fetchResolvedManifestWithExchangers(
                         .resolved_digest_raw = resolved_digest_raw,
                         .document = document,
                         .platform = null,
+                        .backing_body = backing_body,
                     } };
                 },
                 .oci_index => |parsed| {
@@ -550,6 +665,7 @@ fn fetchResolvedManifestWithExchangers(
                         depth,
                         resolved_digest_raw,
                         document,
+                        backing_body,
                         .{ .oci = parsed.value },
                     );
                 },
@@ -566,6 +682,7 @@ fn fetchResolvedManifestWithExchangers(
                         depth,
                         resolved_digest_raw,
                         document,
+                        backing_body,
                         .{ .docker = parsed.value },
                     );
                 },
@@ -592,9 +709,11 @@ fn recurseIntoMultiArchDocument(
     depth: usize,
     parent_digest_raw: []u8,
     parent_document: resolver.ParsedManifestDocument,
+    parent_backing_body: ?[]u8,
     multi_arch: MultiArchManifest,
 ) PublicApiError!ResolvedManifestOutcome {
     defer allocator.free(parent_digest_raw);
+    defer if (parent_backing_body) |body| allocator.free(body);
 
     var owned_parent_document = parent_document;
     var parent_document_live = true;
@@ -1793,6 +1912,8 @@ test "validateWithExchangers returns valid for selected multi-arch child manifes
         var index_digest: []u8 = undefined;
         var child_body: []u8 = undefined;
         var child_digest: []u8 = undefined;
+        var child_head_calls: usize = 0;
+        var child_get_calls: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
             return error.TokenExchangeFailed;
@@ -1810,6 +1931,10 @@ test "validateWithExchangers returns valid for selected multi-arch child manifes
             }
 
             if (std.mem.endsWith(u8, request.url, child_digest)) {
+                switch (request.method) {
+                    .head => child_head_calls += 1,
+                    .get => child_get_calls += 1,
+                }
                 return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
                     .status = .ok,
                     .content_type = MediaType.oci_manifest_v1.toString(),
@@ -1853,6 +1978,9 @@ test "validateWithExchangers returns valid for selected multi-arch child manifes
     State.index_digest = try sha256DigestStringAlloc(std.testing.allocator, State.index_body);
     defer std.testing.allocator.free(State.index_digest);
 
+    State.child_head_calls = 0;
+    State.child_get_calls = 0;
+
     var client: std.http.Client = undefined;
     const ref = Reference{
         .registry = "registry-1.docker.io",
@@ -1874,6 +2002,8 @@ test "validateWithExchangers returns valid for selected multi-arch child manifes
     );
 
     try std.testing.expectEqual(ValidateOutcome.valid, outcome);
+    try std.testing.expectEqual(@as(usize, 1), State.child_head_calls);
+    try std.testing.expectEqual(@as(usize, 0), State.child_get_calls);
 }
 
 test "validateWithExchangers returns platform_required when multi-arch request omits platform" {

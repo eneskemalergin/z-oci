@@ -320,10 +320,13 @@ pub const ManifestGetSuccess = struct {
     resolved_digest: Digest,
     resolved_digest_raw: []u8,
     document: ParsedManifestDocument,
+    /// When set, JSON strings in `document` may borrow from this buffer.
+    backing_body: ?[]u8 = null,
 
     pub fn deinit(self: *ManifestGetSuccess, allocator: std.mem.Allocator) void {
         allocator.free(self.resolved_digest_raw);
         self.document.deinit();
+        if (self.backing_body) |body| allocator.free(body);
     }
 };
 
@@ -347,7 +350,7 @@ pub const GetRequestOutcome = union(enum) {
 pub const HeadRequestOutcome = union(enum) {
     success: ManifestResponseMetadata,
     /// Single-arch HEAD satisfied `validate` without retaining response metadata.
-    validate_single_arch_ok,
+    validate_manifest_ok: MediaType,
     use_get_fallback: ManifestResponseMetadata,
     not_found,
     redirect: ManifestResponseMetadata,
@@ -1053,8 +1056,9 @@ fn classifyGetResponse(
     allow_auth: bool,
     retry_budget: resilience.RetryBudget,
 ) error{OutOfMemory}!GetRequestOutcome {
-    defer response.deinit(ctx.allocator);
-    const metadata = response.metadata;
+    var owned_response = response;
+    defer owned_response.deinit(ctx.allocator);
+    const metadata = owned_response.metadata;
 
     if (isRedirectStatus(metadata.status)) {
         if (metadata.location != null) return .{ .redirect = try metadata.cloneAlloc(ctx.allocator) };
@@ -1074,7 +1078,11 @@ fn classifyGetResponse(
     };
 
     return switch (classification) {
-        .ok => classifyUsableGetResponse(ctx, request, metadata, response.body),
+        .ok => blk: {
+            const stolen_body = owned_response.body;
+            owned_response.body = null;
+            break :blk classifyUsableGetResponse(ctx, request, metadata, stolen_body);
+        },
         .not_found => .not_found,
         .auth_required => |challenge| if (allow_auth)
             authenticateGetRequest(ctx, engine, exchanger, request, challenge)
@@ -1211,7 +1219,17 @@ fn classifyUsableHeadMetadata(
     }
 
     if (ctx.operation == .validate and !media_type.isMultiArch()) {
-        return .validate_single_arch_ok;
+        if (Digest.parse(ctx.reference.ref_string)) |expected_digest| {
+            const header_digest = Digest.parse(metadata.docker_content_digest.?) catch unreachable;
+            if (!digestMatchesSha256Hex(expected_digest, header_digest.hex)) {
+                return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), digestMismatchError);
+            }
+        } else |err| switch (err) {
+            error.MissingColon => {},
+            error.UnsupportedAlgorithm => return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), unsupportedAlgorithmError),
+            else => return mappedFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus(), digestMismatchError),
+        }
+        return .{ .validate_manifest_ok = media_type };
     }
 
     if (ctx.operation == .validate and ctx.platform != null) {
@@ -1227,6 +1245,9 @@ fn classifyUsableGetResponse(
     metadata: ManifestResponseMetadata,
     body: ?[]u8,
 ) error{OutOfMemory}!GetRequestOutcome {
+    var owned_body = body;
+    defer if (owned_body) |b| ctx.allocator.free(b);
+
     const content_type = metadata.content_type orelse {
         return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     };
@@ -1236,7 +1257,7 @@ fn classifyUsableGetResponse(
     if (!acceptsManifestMediaType(request.accept, media_type)) {
         return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     }
-    const response_body = body orelse return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
+    const response_body = owned_body orelse return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
     if (response_body.len == 0) return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
 
     const resolved_digest = verifyManifestBodyIntegrityAlloc(ctx, metadata, response_body) catch |err| switch (err) {
@@ -1258,6 +1279,12 @@ fn classifyUsableGetResponse(
         return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     }
 
+    const backing_body: ?[]u8 = if (ctx.operation == .get_manifest) null else blk: {
+        const stolen = owned_body.?;
+        owned_body = null;
+        break :blk stolen;
+    };
+
     keep_document = true;
     const owned_digest_raw = resolved_digest_raw.?;
     resolved_digest_raw = null;
@@ -1267,6 +1294,7 @@ fn classifyUsableGetResponse(
         .resolved_digest = resolved_digest.digest,
         .resolved_digest_raw = owned_digest_raw,
         .document = document,
+        .backing_body = backing_body,
     } };
 }
 
@@ -1313,9 +1341,18 @@ fn parseManifestDocument(
         .oci_manifest_v1, .docker_manifest_v2 => if (shallow_single_manifest)
             .{ .manifest_media_type = try Manifest.parseMediaTypeShallow(allocator, body) }
         else
-            .{ .manifest = try json.parse(Manifest, allocator, body) },
-        .oci_index_v1 => .{ .oci_index = try json.parse(OciImageIndex, allocator, body) },
-        .docker_manifest_list_v2 => .{ .docker_manifest_list = try json.parse(DockerManifestList, allocator, body) },
+            .{ .manifest = if (operation == .get_manifest)
+                try json.parse(Manifest, allocator, body)
+            else
+                try json.parseBorrowing(Manifest, allocator, body) },
+        .oci_index_v1 => .{ .oci_index = if (operation == .get_manifest)
+            try json.parse(OciImageIndex, allocator, body)
+        else
+            try json.parseBorrowing(OciImageIndex, allocator, body) },
+        .docker_manifest_list_v2 => .{ .docker_manifest_list = if (operation == .get_manifest)
+            try json.parse(DockerManifestList, allocator, body)
+        else
+            try json.parseBorrowing(DockerManifestList, allocator, body) },
         else => error.UnexpectedToken,
     };
 }
@@ -2145,7 +2182,54 @@ test "performManifestHead returns validate_single_arch_ok for validate operation
     );
 
     const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    try std.testing.expectEqual(HeadRequestOutcome.validate_single_arch_ok, outcome);
+    try std.testing.expectEqual(
+        HeadRequestOutcome{ .validate_manifest_ok = MediaType.oci_manifest_v1 },
+        outcome,
+    );
+}
+
+test "performManifestHead rejects mismatched pinned digest on validate" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .metadata = .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            } };
+        }
+    };
+
+    const pinned_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        Config{},
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = pinned_digest },
+        null,
+        .validate,
+    );
+
+    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    switch (outcome) {
+        .failure => |failure| {
+            switch (failure) {
+                .digest_mismatch => {},
+                else => return error.TestUnexpectedResult,
+            }
+            failure.deinitOwned(std.testing.allocator);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "performManifestHead returns success for anonymous usable HEAD metadata" {

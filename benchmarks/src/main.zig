@@ -15,6 +15,7 @@ const usage =
     \\  authenticate-hit  AuthEngine.authenticate (cached token, second call)
     \\  authenticate-rate-limit AuthEngine.authenticate (429 then success per call)
     \\  resolve-single    public resolve() single-arch path via injected transports
+    \\  resolve-session   resolve() reusing one AuthEngine across iterations
     \\  resolve-single-retry public resolve() with one transient 503 retry per call
     \\  resolve-multi     public resolve() multi-arch child-selection path via injected transports
     \\  validate-single   public validate() single-arch path via injected transports
@@ -64,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
         try benchAuthenticateHit(io, iterations, counting);
         try benchAuthenticateRateLimit(io, iterations, counting);
         try benchResolveSingle(io, iterations, counting);
+        try benchResolveSession(io, iterations, counting);
         try benchResolveSingleRetry(io, iterations, counting);
         try benchResolveMulti(io, iterations, counting);
         try benchValidateSingle(io, iterations, counting);
@@ -86,6 +88,8 @@ pub fn main(init: std.process.Init) !void {
         try benchAuthenticateRateLimit(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "resolve-single")) {
         try benchResolveSingle(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "resolve-session")) {
+        try benchResolveSession(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "resolve-single-retry")) {
         try benchResolveSingleRetry(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "resolve-multi")) {
@@ -657,6 +661,58 @@ fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
     const elapsed = nanoTime() - start;
 
     printReport("resolve-single", "single-arch resolve via injected manifest fixture", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn benchResolveSession(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const manifest_body = try readFixtureAlloc(alloc, io, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 32 * 1024);
+    defer alloc.free(manifest_body);
+
+    SingleManifestBenchState.body = manifest_body;
+
+    var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{}, SingleManifestBenchState.tokenExchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+    const ref = z_oci.Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    try deinitResolveSuccess(try z_oci.testing.resolveWithEngine(
+        alloc,
+        &client,
+        z_oci.Config{},
+        &engine,
+        ref,
+        null,
+        SingleManifestBenchState.tokenExchange,
+        SingleManifestBenchState.manifestExchange,
+        .{},
+    ), alloc);
+
+    ca.reset();
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        try deinitResolveSuccess(try z_oci.testing.resolveWithEngine(
+            alloc,
+            &client,
+            z_oci.Config{},
+            &engine,
+            ref,
+            null,
+            SingleManifestBenchState.tokenExchange,
+            SingleManifestBenchState.manifestExchange,
+            .{},
+        ), alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    printReport("resolve-session", "single-arch resolve with reused AuthEngine", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
 }
 
 fn benchResolveSingleRetry(io: Io, iterations: usize, counting: bool) !void {

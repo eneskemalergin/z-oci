@@ -21,6 +21,17 @@ pub fn parse(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) 
     });
 }
 
+/// Parse JSON bytes into T with strings borrowed from `bytes` when possible.
+///
+/// `bytes` must outlive the returned `Parsed(T)` and any values read from it.
+/// Call `.deinit()` when done; it frees only arena-allocated storage.
+pub fn parseBorrowing(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+    });
+}
+
 /// Test helper: stringify any json-serializable value into an owned buffer.
 /// The caller owns the returned Allocating writer and must call .deinit().
 pub fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
@@ -37,6 +48,21 @@ const Manifest = @import("Manifest.zig");
 const Descriptor = @import("Descriptor.zig");
 
 // Lifecycle: Parsed(T).deinit frees all memory
+
+test "json: parseBorrowing requires input bytes to outlive parsed value" {
+    const json_bytes = try std.testing.allocator.dupe(u8,
+        \\{
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        \\  "size": 256
+        \\}
+    );
+    defer std.testing.allocator.free(json_bytes);
+
+    const parsed = try parseBorrowing(Descriptor, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 256), parsed.value.size);
+}
 
 test "json: Parsed lifecycle with testing allocator" {
     // Arrange: use testing.allocator to detect leaks.
