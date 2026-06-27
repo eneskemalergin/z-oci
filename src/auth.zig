@@ -3252,6 +3252,38 @@ test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
     try std.testing.expectEqual(@as(usize, 2), State.calls);
 }
 
+test "AuthEngine.authenticate: oversize token transport body maps to InvalidTokenResponse" {
+    const custom_cap: usize = 4096;
+    const State = struct {
+        var seen_cap: ?usize = null;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            seen_cap = request.max_response_body_bytes;
+            return mapLiveTokenTransportError(error.BodyTooLarge);
+        }
+    };
+
+    State.seen_cap = null;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_token_response_bytes = custom_cap,
+    }, State.exchange);
+    defer engine.deinit();
+
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    try std.testing.expectError(error.InvalidTokenResponse, engine.authenticate(&client, request));
+    try std.testing.expectEqual(custom_cap, State.seen_cap.?);
+}
+
 test "AuthEngine.authenticate: rate-limit retry path stays leak-free under DebugAllocator" {
     const State = struct {
         var calls: usize = 0;
