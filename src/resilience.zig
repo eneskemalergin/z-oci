@@ -562,6 +562,23 @@ pub fn classifyNetworkTransportError(err: anyerror) RetryKind {
     };
 }
 
+pub const HttpBodyReadError = error{
+    OutOfMemory,
+    BodyTooLarge,
+} || std.Io.Reader.ShortError;
+
+pub fn readHttpResponseBodyAlloc(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    max_bytes: usize,
+) HttpBodyReadError![]u8 {
+    return reader.allocRemaining(allocator, .limited(max_bytes)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return error.BodyTooLarge,
+        else => |e| return e,
+    };
+}
+
 pub const ResilienceParseError = error{
     InvalidRateLimitHeader,
     InvalidRetryAfterHeader,
@@ -1681,4 +1698,20 @@ test "sleepForTransportRetry invokes injected sleeper with delay" {
     var client: std.http.Client = undefined;
     sleepForTransportRetry(&client, .{ .sleeper = State.sleeper }, 250);
     try std.testing.expectEqual(@as(u32, 250), State.recorded_ms);
+}
+
+test "readHttpResponseBodyAlloc accepts bodies below the limit" {
+    const payload = "abc";
+    var reader = std.Io.Reader.fixed(payload);
+
+    const body = try readHttpResponseBodyAlloc(std.testing.allocator, &reader, 4);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(payload, body);
+}
+
+test "readHttpResponseBodyAlloc rejects bodies above the limit" {
+    const payload = "abcd";
+    var reader = std.Io.Reader.fixed(payload);
+
+    try std.testing.expectError(error.BodyTooLarge, readHttpResponseBodyAlloc(std.testing.allocator, &reader, 3));
 }

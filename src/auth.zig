@@ -54,6 +54,7 @@ pub const TokenHttpRequest = struct {
     authorization: ?[]u8 = null,
     content_type: ?[]const u8 = null,
     body: ?[]u8 = null,
+    max_response_body_bytes: usize = ConfigModule.default_max_token_response_bytes,
 
     pub fn deinit(self: TokenHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
@@ -1369,16 +1370,18 @@ fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse 
                 null,
             .content_type = loop_ctx.cached_content_type,
             .body = if (loop_ctx.cached_body) |body| try allocator.dupe(u8, body) else null,
+            .max_response_body_bytes = loop_ctx.engine.config.max_token_response_bytes,
         };
         return exchanger(allocator, loop_ctx.client, http_request);
     }
 
-    const built = try buildTokenHttpRequest(
+    var built = try buildTokenHttpRequest(
         allocator,
         loop_ctx.request,
         loop_ctx.method,
         loop_ctx.credential,
     );
+    built.max_response_body_bytes = loop_ctx.engine.config.max_token_response_bytes;
 
     if (loop_ctx.exchange_attempt > 1) {
         loop_ctx.cached_url = try allocator.dupe(u8, built.url);
@@ -1483,6 +1486,7 @@ pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: Co
 fn mapLiveTokenTransportError(err: anyerror) AuthError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.BodyTooLarge => error.InvalidTokenResponse,
         error.ConnectionResetByPeer => error.ConnectionResetByPeer,
         error.Timeout => error.Timeout,
         error.NetworkUnreachable => error.NetworkUnreachable,
@@ -1551,7 +1555,7 @@ pub fn liveTokenHttpExchanger(
         });
     }
 
-    const owned_body = response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| return mapLiveTokenTransportError(err);
+    const owned_body = resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return mapLiveTokenTransportError(err);
 
     const owned_headers = try resilience_headers.toOwnedSlice(allocator);
     return .{

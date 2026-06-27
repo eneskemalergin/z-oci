@@ -6,7 +6,8 @@
 
 const std = @import("std");
 const auth = @import("auth.zig");
-const Config = @import("Config.zig").Config;
+const config_module = @import("Config.zig");
+const Config = config_module.Config;
 const resilience = @import("resilience.zig");
 const Digest = @import("Digest.zig");
 const DockerManifestList = @import("Index.zig").DockerManifestList;
@@ -118,6 +119,7 @@ pub const ManifestHttpRequest = struct {
     url: []u8,
     authorization: ?[]u8 = null,
     accept: []const []const u8 = &.{},
+    max_response_body_bytes: usize = config_module.default_max_manifest_bytes,
 
     pub fn deinit(self: ManifestHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
@@ -166,6 +168,7 @@ pub const ManifestHttpResponse = struct {
 
 pub const ManifestExchangeError = error{
     OutOfMemory,
+    ResponseBodyTooLarge,
     TransportFailed,
     ConnectionResetByPeer,
     Timeout,
@@ -488,8 +491,9 @@ pub fn liveManifestHttpExchanger(
         errdefer owned_metadata.deinit(allocator);
 
         const body = if (request.method == .get and !resilience.isRetryableHttpStatus(response.head.status))
-            response.reader(&.{}).allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+            resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.BodyTooLarge => return error.ResponseBodyTooLarge,
                 error.ConnectionResetByPeer,
                 error.Timeout,
                 error.NetworkUnreachable,
@@ -769,6 +773,7 @@ fn mapExhaustedManifestTransportError(
     const transport_retries_exhausted = budget.networkRetriesExhausted();
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.ResponseBodyTooLarge => mappedFailureOutcome(Outcome, ctx, null, manifestParseError),
         error.Timeout => mappedRetryFailureOutcome(Outcome, ctx, null, timeoutError, transport_retries_exhausted),
         else => mappedRetryFailureOutcome(Outcome, ctx, null, networkError, transport_retries_exhausted),
     };
@@ -885,6 +890,7 @@ fn exchangeManifestRequestOnce(
         .url = url,
         .authorization = authorization,
         .accept = loop_ctx.request.accept,
+        .max_response_body_bytes = loop_ctx.resolver_ctx.config.max_manifest_bytes,
     };
     return exchanger(allocator, loop_ctx.resolver_ctx.client, http_request);
 }
@@ -3752,6 +3758,41 @@ test "performManifestGet rejects unsupported digest algorithm in response header
 
     switch (outcome) {
         .failure => |err| try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(err)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "performManifestGet maps oversize transport body to manifest_parse_error" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(std.testing.allocator);
+            return error.ResponseBodyTooLarge;
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverContext.init(
+        std.testing.allocator,
+        &client,
+        Config{},
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    const outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    switch (outcome) {
+        .failure => |failure| {
+            defer failure.deinitOwned(std.testing.allocator);
+            try std.testing.expectEqualStrings("manifest_parse_error", @tagName(failure));
+        },
         else => return error.TestUnexpectedResult,
     }
 }

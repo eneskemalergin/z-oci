@@ -43,6 +43,9 @@
 
 const std = @import("std");
 
+pub const default_max_manifest_bytes = 8 * 1024 * 1024;
+pub const default_max_token_response_bytes = 64 * 1024;
+
 /// A username/secret pair for HTTP Basic authentication.
 pub const Credential = struct {
     username: []const u8,
@@ -135,6 +138,12 @@ pub const Config = struct {
     /// Defaults off. Reactive `429` backoff stays on regardless through the
     /// transport retry budgets above.
     rate_limit_enabled: bool = false,
+
+    /// Maximum manifest or index GET body size for live HTTP transport.
+    max_manifest_bytes: usize = default_max_manifest_bytes,
+
+    /// Maximum token endpoint response body size for live HTTP transport.
+    max_token_response_bytes: usize = default_max_token_response_bytes,
 
     /// Returns the `std.Io.Timeout` value for caller-owned `connectTcpOptions`.
     ///
@@ -432,6 +441,12 @@ test "Config: max_network_retries and max_rate_limit_retries accept custom value
     };
     try std.testing.expectEqual(@as(u8, 2), c.max_network_retries);
     try std.testing.expectEqual(@as(u8, 4), c.max_rate_limit_retries);
+}
+
+test "Config: max_manifest_bytes and max_token_response_bytes use safe defaults" {
+    const c = Config{};
+    try std.testing.expectEqual(default_max_manifest_bytes, c.max_manifest_bytes);
+    try std.testing.expectEqual(default_max_token_response_bytes, c.max_token_response_bytes);
 }
 
 test "Config: max_retries zero disables retries" {
