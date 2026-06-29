@@ -460,7 +460,7 @@ pub fn classifyValidateManifestHead(
             const http_status = metadata.httpStatus();
             metadata.releaseOwned(allocator);
             head_outcome.* = .not_found;
-            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .network_error, http_status) };
+            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .network_error, http_status, false) };
         },
         .use_get_fallback => return .proceed_with_get,
         .success => return .inspect_multi_arch_head,
@@ -490,19 +490,19 @@ pub fn mapChildValidateHeadOutcome(
             const http_status = metadata.httpStatus();
             metadata.releaseOwned(allocator);
             head_outcome.* = .not_found;
-            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .network_error, http_status) };
+            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .network_error, http_status, false) };
         },
         .success => |*metadata| {
             const http_status = metadata.httpStatus();
             metadata.releaseOwned(allocator);
             head_outcome.* = .not_found;
-            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .content_type_mismatch, http_status) };
+            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .content_type_mismatch, http_status, false) };
         },
         .use_get_fallback => |*metadata| {
             const http_status = metadata.httpStatus();
             metadata.releaseOwned(allocator);
             head_outcome.* = .not_found;
-            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .manifest_parse_error, http_status) };
+            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .manifest_parse_error, http_status, false) };
         },
     }
 }
@@ -512,13 +512,19 @@ pub fn ownedResolveErrorAlloc(
     ref: auth.AuthReferenceView,
     comptime tag: std.meta.Tag(ResolveError),
     http_status: ?u16,
+    transport_retries_exhausted: bool,
 ) error{OutOfMemory}!ResolveError {
     const reference = try canonicalReferenceAlloc(allocator, ref);
-    return @unionInit(ResolveError, @tagName(tag), .{
-        .registry = ref.registry,
-        .reference = reference,
-        .http_status = http_status,
-    });
+    return switch (tag) {
+        .rate_limited => rateLimitedError(ref.registry, reference, http_status, transport_retries_exhausted),
+        .network_error => networkError(ref.registry, reference, http_status, transport_retries_exhausted),
+        .timeout => timeoutError(ref.registry, reference, http_status, transport_retries_exhausted),
+        inline else => |active_tag| @unionInit(ResolveError, @tagName(active_tag), .{
+            .registry = ref.registry,
+            .reference = reference,
+            .http_status = http_status,
+        }),
+    };
 }
 pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.AuthReferenceView) ![]u8 {
     const separator: []const u8 = if (Digest.parse(reference.ref_string)) |_| "@" else |_| ":";
@@ -861,6 +867,7 @@ fn resolveErrorFromAuthError(
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16,
+    token_transport_retries_exhausted: bool,
 ) error{OutOfMemory}!ResolveError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -868,13 +875,21 @@ fn resolveErrorFromAuthError(
             .registry = registry,
             .reference = reference,
             .http_status = http_status,
+            .transport_retries_exhausted = false,
         } },
         error.Timeout => .{ .timeout = .{
             .registry = registry,
             .reference = reference,
             .http_status = http_status,
+            .transport_retries_exhausted = token_transport_retries_exhausted,
         } },
-        error.UnsupportedProbeStatus => .{ .network_error = .{
+        error.UnsupportedProbeStatus => unsupportedProbeStatusResolveError(
+            registry,
+            reference,
+            http_status,
+            token_transport_retries_exhausted,
+        ),
+        error.TokenResponseTooLarge => .{ .response_too_large = .{
             .registry = registry,
             .reference = reference,
             .http_status = http_status,
@@ -887,6 +902,7 @@ fn resolveErrorFromAuthError(
             .registry = registry,
             .reference = reference,
             .http_status = http_status,
+            .transport_retries_exhausted = token_transport_retries_exhausted,
         } },
         error.RateLimited => .{ .rate_limited = .{
             .registry = registry,
@@ -900,6 +916,26 @@ fn resolveErrorFromAuthError(
             .http_status = http_status,
         } },
     };
+}
+fn unsupportedProbeStatusResolveError(
+    registry: []const u8,
+    reference: []const u8,
+    http_status: ?u16,
+    transport_retries_exhausted: bool,
+) ResolveError {
+    if (http_status) |status| {
+        if (status == @intFromEnum(std.http.Status.too_many_requests)) {
+            return rateLimitedError(registry, reference, status, transport_retries_exhausted);
+        }
+        if (status >= 500) {
+            return networkError(registry, reference, status, transport_retries_exhausted);
+        }
+    }
+    return .{ .auth_failed = .{
+        .registry = registry,
+        .reference = reference,
+        .http_status = http_status,
+    } };
 }
 fn manifestParseError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .manifest_parse_error = .{
@@ -924,6 +960,13 @@ fn timeoutError(registry: []const u8, reference: []const u8, http_status: ?u16, 
         .transport_retries_exhausted = transport_retries_exhausted,
     } };
 }
+fn responseTooLargeError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
+    return .{ .response_too_large = .{
+        .registry = registry,
+        .reference = reference,
+        .http_status = http_status,
+    } };
+}
 fn rateLimitedError(registry: []const u8, reference: []const u8, http_status: ?u16, transport_retries_exhausted: bool) ResolveError {
     return .{ .rate_limited = .{
         .registry = registry,
@@ -941,7 +984,7 @@ fn mapExhaustedManifestTransportError(
     const transport_retries_exhausted = budget.networkRetriesExhausted();
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.ResponseBodyTooLarge, error.ResponseHeadersTooLarge => mappedFailureOutcome(Outcome, ctx, null, manifestParseError),
+        error.ResponseBodyTooLarge, error.ResponseHeadersTooLarge => mappedFailureOutcome(Outcome, ctx, null, responseTooLargeError),
         error.Timeout => mappedRetryFailureOutcome(Outcome, ctx, null, timeoutError, transport_retries_exhausted),
         else => mappedRetryFailureOutcome(Outcome, ctx, null, networkError, transport_retries_exhausted),
     };
@@ -1127,7 +1170,7 @@ fn classifyHeadResponse(
     }
 
     const classification = metadata.probeClassification() catch |err| {
-        return mappedAuthFailureOutcome(HeadRequestOutcome, ctx, err, metadata.httpStatus());
+        return mappedAuthFailureOutcome(HeadRequestOutcome, ctx, engine, err, metadata.httpStatus());
     };
 
     return switch (classification) {
@@ -1183,7 +1226,7 @@ fn classifyGetResponse(
     }
 
     const classification = metadata.probeClassification() catch |err| {
-        return mappedAuthFailureOutcome(GetRequestOutcome, ctx, err, metadata.httpStatus());
+        return mappedAuthFailureOutcome(GetRequestOutcome, ctx, engine, err, metadata.httpStatus());
     };
 
     return switch (classification) {
@@ -1233,11 +1276,11 @@ fn authenticateManifestRequest(
     };
 
     const auth_request = auth.AuthenticateRequest.init(ctx.reference.registry, bearer_challenge) catch |err| {
-        return mappedAuthFailureOutcome(Outcome, ctx, err, unauthorized_status);
+        return mappedAuthFailureOutcome(Outcome, ctx, engine, err, unauthorized_status);
     };
 
     var token_response = (engine.authenticate(ctx.client, auth_request) catch |err| {
-        return mappedAuthFailureOutcome(Outcome, ctx, err, unauthorized_status);
+        return mappedAuthFailureOutcome(Outcome, ctx, engine, err, unauthorized_status);
     }) orelse {
         return authFailureOutcome(Outcome, ctx, unauthorized_status);
     };
@@ -1260,7 +1303,7 @@ fn authenticateManifestRequest(
     if (!request.allow_cached_auth_retry) return authFailureOutcome(Outcome, ctx, unauthorized_status);
 
     var refreshed_token_response = (engine.retryAuthenticateAfterCachedUnauthorized(ctx.client, auth_request) catch |err| {
-        return mappedAuthFailureOutcome(Outcome, ctx, err, unauthorized_status);
+        return mappedAuthFailureOutcome(Outcome, ctx, engine, err, unauthorized_status);
     }) orelse {
         return authFailureOutcome(Outcome, ctx, unauthorized_status);
     };
@@ -1551,11 +1594,19 @@ fn authFailureOutcome(
 fn mappedAuthFailureOutcome(
     comptime Outcome: type,
     ctx: ResolverParams,
+    engine: *auth.AuthEngine,
     err: auth.AuthError,
     http_status: ?u16,
 ) error{OutOfMemory}!Outcome {
     const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
-    return failureOutcome(Outcome, try resolveErrorFromAuthError(err, ctx.reference.registry, reference, http_status));
+    const token_transport_retries_exhausted = engine.takeTokenTransportRetriesExhausted();
+    return failureOutcome(Outcome, try resolveErrorFromAuthError(
+        err,
+        ctx.reference.registry,
+        reference,
+        http_status,
+        token_transport_retries_exhausted,
+    ));
 }
 fn isRedirectStatus(status: std.http.Status) bool {
     const code = @intFromEnum(status);
@@ -1970,27 +2021,36 @@ test "ManifestResponseMetadata cloneAllocHeadSuccess omits auth and retry header
 test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible variants" {
     try std.testing.expectError(
         error.OutOfMemory,
-        resolveErrorFromAuthError(error.OutOfMemory, "r", "ref", null),
+        resolveErrorFromAuthError(error.OutOfMemory, "r", "ref", null, false),
     );
 
-    const timed_out = try resolveErrorFromAuthError(error.HelperTimedOut, "r", "ref", 401);
+    const timed_out = try resolveErrorFromAuthError(error.HelperTimedOut, "r", "ref", 401, false);
     try std.testing.expectEqualStrings("timeout", @tagName(timed_out));
+    try std.testing.expect(!timed_out.timeout.transport_retries_exhausted);
 
-    const auth_failed = try resolveErrorFromAuthError(error.TokenExchangeFailed, "r", "ref", 401);
+    const auth_failed = try resolveErrorFromAuthError(error.TokenExchangeFailed, "r", "ref", 401, false);
     try std.testing.expectEqualStrings("auth_failed", @tagName(auth_failed));
 
-    const rate_limited = try resolveErrorFromAuthError(error.RateLimited, "r", "ref", 429);
+    const rate_limited = try resolveErrorFromAuthError(error.RateLimited, "r", "ref", 429, false);
     try std.testing.expectEqualStrings("rate_limited", @tagName(rate_limited));
     try std.testing.expect(rate_limited.rate_limited.transport_retries_exhausted);
 
-    const transport_timeout = try resolveErrorFromAuthError(error.Timeout, "r", "ref", null);
+    const transport_timeout = try resolveErrorFromAuthError(error.Timeout, "r", "ref", null, true);
     try std.testing.expectEqualStrings("timeout", @tagName(transport_timeout));
+    try std.testing.expect(transport_timeout.timeout.transport_retries_exhausted);
 
-    const network_error = try resolveErrorFromAuthError(error.UnsupportedProbeStatus, "r", "ref", 500);
+    const network_error = try resolveErrorFromAuthError(error.UnsupportedProbeStatus, "r", "ref", 500, false);
     try std.testing.expectEqualStrings("network_error", @tagName(network_error));
 
-    const reset = try resolveErrorFromAuthError(error.ConnectionResetByPeer, "r", "ref", null);
+    const forbidden = try resolveErrorFromAuthError(error.UnsupportedProbeStatus, "r", "ref", 403, false);
+    try std.testing.expectEqualStrings("auth_failed", @tagName(forbidden));
+
+    const token_body_too_large = try resolveErrorFromAuthError(error.TokenResponseTooLarge, "r", "ref", null, false);
+    try std.testing.expectEqualStrings("response_too_large", @tagName(token_body_too_large));
+
+    const reset = try resolveErrorFromAuthError(error.ConnectionResetByPeer, "r", "ref", null, true);
     try std.testing.expectEqualStrings("network_error", @tagName(reset));
+    try std.testing.expect(reset.network_error.transport_retries_exhausted);
 }
 test "resolver error helpers keep registry, reference, and status" {
     const parse_err = manifestParseError("ghcr.io", "ghcr.io/owner/repo:v1", 200);
@@ -2010,7 +2070,7 @@ test "performManifestHead retries transient 503 then succeeds" {
         var attempts: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2058,6 +2118,106 @@ test "performManifestHead retries transient 503 then succeeds" {
         else => return error.TestUnexpectedResult,
     }
 }
+test "performManifestHead retries transient 502 then succeeds" {
+    const State = struct {
+        var attempts: usize = 0;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            attempts += 1;
+            if (attempts == 1) {
+                return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .bad_gateway,
+                }, null);
+            }
+
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+            }, null);
+        }
+    };
+
+    defer State.attempts = 0;
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_network_retries = 1,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverParams.init(
+        std.testing.allocator,
+        &client,
+        .{ .max_network_retries = 1 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), State.attempts);
+    switch (outcome) {
+        .success => |metadata| {
+            try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", metadata.content_type.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+test "performManifestGet maps exhausted 504 to network_error" {
+    const State = struct {
+        var attempts: usize = 0;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            attempts += 1;
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .gateway_timeout,
+            }, "not-a-manifest");
+        }
+    };
+
+    defer State.attempts = 0;
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_network_retries = 1,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverParams.init(
+        std.testing.allocator,
+        &client,
+        .{ .max_network_retries = 1 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    const outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    switch (outcome) {
+        .failure => |failure| {
+            try std.testing.expectEqualStrings("network_error", @tagName(failure));
+            try std.testing.expectEqual(true, failure.network_error.transport_retries_exhausted);
+            try std.testing.expectEqual(@as(usize, 2), State.attempts);
+            failure.deinitOwned(std.testing.allocator);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
 test "ManifestResponseMetadata.releaseOwned: clears owned slices in place" {
     const content_type = try std.testing.allocator.dupe(u8, "application/vnd.oci.image.manifest.v1+json");
     const digest = try std.testing.allocator.dupe(u8, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -2084,7 +2244,7 @@ test "performManifestGet repeated GET runs leave no residual allocations under D
         var digest: []u8 = undefined;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2136,7 +2296,7 @@ test "performManifestGet retry path leaves no residual allocations under DebugAl
         var digest: []u8 = undefined;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2197,7 +2357,7 @@ test "performManifestHead retry path leaves no residual allocations under DebugA
         var attempts: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2250,7 +2410,7 @@ test "performManifestHead retry path leaves no residual allocations under DebugA
 test "performManifestHead maps exhausted 429 to rate_limited" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2295,7 +2455,7 @@ test "performManifestHead marks transport_retries_exhausted after rate-limit ret
         var attempts: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2342,7 +2502,7 @@ test "performManifestHead marks transport_retries_exhausted after rate-limit ret
 test "performManifestHead maps exhausted transport timeout to timeout failure" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2387,7 +2547,7 @@ test "performManifestGet preemptive sleep before request when engine carries exh
         }
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2459,7 +2619,7 @@ test "performManifestHead retries connection reset then succeeds" {
         var attempts: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2507,7 +2667,7 @@ test "performManifestHead does not retry not found" {
         var attempts: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2550,7 +2710,7 @@ test "performManifestHead exhausts repeated 429 on rate limit budget" {
         var attempts: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2626,7 +2786,7 @@ test "acceptsManifestMediaType matches normalized exact entries and wildcard" {
 test "performManifestHead returns validate_single_arch_ok for validate operation" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2661,7 +2821,7 @@ test "performManifestHead returns validate_single_arch_ok for validate operation
 test "performManifestHead rejects mismatched pinned digest on validate" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2704,7 +2864,7 @@ test "performManifestHead rejects mismatched pinned digest on validate" {
 test "performManifestHead returns success for anonymous usable HEAD metadata" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2747,7 +2907,7 @@ test "performManifestHead returns success for anonymous usable HEAD metadata" {
 test "performManifestHead falls back to GET when usable HEAD metadata is incomplete" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2782,7 +2942,7 @@ test "performManifestHead falls back to GET when usable HEAD metadata is incompl
 test "performManifestHead returns redirect outcome for redirect metadata with location" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2820,7 +2980,7 @@ test "performManifestHead maps redirect without location into network error" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2852,7 +3012,7 @@ test "performManifestHead maps redirect without location into network error" {
 test "performManifestHead returns not_found for missing manifest" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -2942,7 +3102,7 @@ test "performManifestHead maps malformed authenticate header into auth failure" 
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3055,7 +3215,7 @@ test "performManifestHead maps transport failures into resolver failures" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3090,7 +3250,7 @@ test "performManifestHead rejects unsupported content type on HEAD success" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3129,7 +3289,7 @@ test "performManifestHead rejects known non-manifest content type on HEAD succes
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3168,7 +3328,7 @@ test "performManifestHead rejects recognized media type outside Accept list" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3204,7 +3364,7 @@ test "performManifestHead rejects recognized media type outside Accept list" {
 test "performManifestGet parses OCI manifest fixture with normalized content type" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3266,7 +3426,7 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
 test "performManifestGet parses Docker manifest fixture" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3311,7 +3471,7 @@ test "performManifestGet parses Docker manifest fixture" {
 test "performManifestGet parses OCI index fixture" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3356,7 +3516,7 @@ test "performManifestGet parses OCI index fixture" {
 test "performManifestGet parses Docker manifest list fixture" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3401,7 +3561,7 @@ test "performManifestGet parses Docker manifest list fixture" {
 test "performManifestGet returns redirect outcome for redirect metadata with location" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3439,7 +3599,7 @@ test "performManifestGet maps redirect without location into network error" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3474,7 +3634,7 @@ test "performManifestGet maps missing body into manifest parse error" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3513,7 +3673,7 @@ test "performManifestGet maps empty body into manifest parse error" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3554,7 +3714,7 @@ test "performManifestGet maps unsupported content type into resolver failure" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3593,7 +3753,7 @@ test "performManifestGet maps unsupported content type into resolver failure" {
 test "performManifestGet rejects body whose declared mediaType disagrees with Content-Type" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3638,7 +3798,7 @@ test "performManifestGet rejects recognized media type outside Accept list" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3736,7 +3896,7 @@ test "performManifestGet retries transient 503 then succeeds" {
         var attempts: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3787,7 +3947,7 @@ test "performManifestGet retries transient 503 then succeeds" {
 test "performManifestGet maps exhausted 429 to rate_limited" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3831,7 +3991,7 @@ test "performManifestGet retries connection reset then succeeds" {
         var attempts: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3878,7 +4038,7 @@ test "performManifestGet retries connection reset then succeeds" {
 test "performManifestGet maps exhausted transport timeout to timeout failure" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -3918,7 +4078,7 @@ test "performManifestGet maps malformed authenticate header into auth failure" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -4027,7 +4187,7 @@ test "performManifestGet retries once after cached unauthorized response" {
 test "performManifestGet verifies matching pinned digest reference" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -4073,7 +4233,7 @@ test "performManifestGet rejects mismatched response digest header" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -4115,7 +4275,7 @@ test "performManifestGet rejects mismatched pinned digest reference" {
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -4156,7 +4316,7 @@ test "performManifestGet rejects unsupported digest algorithm in response header
 
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -4192,10 +4352,10 @@ test "performManifestGet rejects unsupported digest algorithm in response header
         else => return error.TestUnexpectedResult,
     }
 }
-test "performManifestGet maps oversize transport body to manifest_parse_error" {
+test "performManifestGet maps oversize transport body to response_too_large" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -4221,15 +4381,15 @@ test "performManifestGet maps oversize transport body to manifest_parse_error" {
     switch (outcome) {
         .failure => |failure| {
             defer failure.deinitOwned(std.testing.allocator);
-            try std.testing.expectEqualStrings("manifest_parse_error", @tagName(failure));
+            try std.testing.expectEqualStrings("response_too_large", @tagName(failure));
         },
         else => return error.TestUnexpectedResult,
     }
 }
-test "performManifestGet maps oversize response headers to manifest_parse_error" {
+test "performManifestGet maps oversize response headers to response_too_large" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            request.deinit(std.testing.allocator);
+            defer request.deinit(std.testing.allocator);
             return error.TokenExchangeFailed;
         }
 
@@ -4255,7 +4415,7 @@ test "performManifestGet maps oversize response headers to manifest_parse_error"
     switch (outcome) {
         .failure => |failure| {
             defer failure.deinitOwned(std.testing.allocator);
-            try std.testing.expectEqualStrings("manifest_parse_error", @tagName(failure));
+            try std.testing.expectEqualStrings("response_too_large", @tagName(failure));
         },
         else => return error.TestUnexpectedResult,
     }
@@ -4304,4 +4464,85 @@ test "performManifestGet maps oversize token response to auth_failed" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectEqual(custom_cap, State.seen_cap.?);
+}
+test "classifyGetManifestBody maps invalid JSON syntax to manifest_parse_error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            const body = try allocator.dupe(u8, "{not-json");
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+            }, body);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverParams.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
+
+    switch (outcome) {
+        .failure => |failure| try std.testing.expectEqualStrings("manifest_parse_error", @tagName(failure)),
+        else => return error.TestUnexpectedResult,
+    }
+}
+test "classifyGetManifestBody maps header digest mismatch to digest_mismatch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            }, body);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    defer engine.deinit();
+    const ctx = ResolverParams.init(
+        arena.allocator(),
+        &client,
+        Config{},
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    defer outcome.deinit(arena.allocator());
+
+    switch (outcome) {
+        .failure => |failure| try std.testing.expectEqualStrings("digest_mismatch", @tagName(failure)),
+        else => return error.TestUnexpectedResult,
+    }
 }

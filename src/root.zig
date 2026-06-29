@@ -13,6 +13,15 @@
 //!   calls `parsed.deinit()` to free everything.
 //! - `AuthEngine` wraps persistent cache storage with its own `deinit()`.
 //!   Successful `authenticate()` responses borrow the cached access token
+//! - `Reference.parse` and `Digest.parse` errors stay outside `ResolveError`;
+//!   callers must parse references before calling `resolve`, `validate`, or `getManifest`.
+//!
+//! Error surfaces at the public boundary:
+//! - `PublicApiError` (`Config.ApplyError`): pre-flight config/TLS setup only (`applyToClient`).
+//!   Returned as the API error union, not inside `ResolveOutcome.failure`.
+//! - `Reference.ParseError` / `Digest.ParseError`: caller parses before invoking resolve APIs.
+//! - `ResolveError`: registry operation failures inside `ResolveOutcome.failure`,
+//!   `ValidateOutcome.failure`, or `ManifestOutcome.failure`.
 //!   (`owns_access_token == false`). The borrow ends when `AuthEngine.deinit()`
 //!   runs, the entry is evicted, or another auth call replaces the same
 //!   `realm + service + scope` slot. Copy the token before retaining it.
@@ -414,7 +423,7 @@ const ResolvedManifestSuccess = struct {
     fn detachManifestForPromotion(
         self: *ResolvedManifestSuccess,
         caller_allocator: std.mem.Allocator,
-    ) PublicApiError!std.json.Parsed(Manifest) {
+    ) !std.json.Parsed(Manifest) {
         const parsed = switch (self.document) {
             .manifest => |parsed| parsed,
             else => unreachable,
@@ -423,7 +432,7 @@ const ResolvedManifestSuccess = struct {
         self.document = .{ .manifest_media_type = media_type };
         errdefer self.document = .{ .manifest = parsed };
 
-        const promoted = try promoteManifestParsedAlloc(caller_allocator, parsed);
+        const promoted = try json.promoteParsed(Manifest, caller_allocator, parsed);
         self.clearDigestAlias();
         return promoted;
     }
@@ -750,7 +759,13 @@ fn getManifestWithEngine(
     );
     switch (outcome) {
         .success => |*success| {
-            const parsed_manifest = try success.detachManifestForPromotion(allocator);
+            const parsed_manifest = success.detachManifestForPromotion(allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    defer success.deinit(transient);
+                    return .{ .failure = try manifestParseErrorAlloc(allocator, referenceView(ref)) };
+                },
+            };
             defer success.deinit(transient);
             return .{ .success = parsed_manifest };
         },
@@ -787,13 +802,13 @@ fn validateResolvedManifestFromChildHead(
     };
 }
 fn digestMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    return allocatedResolveError(allocator, ref, .digest_mismatch, null);
+    return allocatedResolveError(allocator, ref, .digest_mismatch, null, false);
 }
 fn contentTypeMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    return allocatedResolveError(allocator, ref, .content_type_mismatch, null);
+    return allocatedResolveError(allocator, ref, .content_type_mismatch, null, false);
 }
 fn manifestParseErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    return allocatedResolveError(allocator, ref, .manifest_parse_error, null);
+    return allocatedResolveError(allocator, ref, .manifest_parse_error, null, false);
 }
 fn fetchResolvedManifestWithExchangers(
     allocator: std.mem.Allocator,
@@ -1020,27 +1035,28 @@ fn buildResolvedReferenceAlloc(
     return resolved;
 }
 fn notFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    return allocatedResolveError(allocator, ref, .not_found, null);
+    return allocatedResolveError(allocator, ref, .not_found, null, false);
 }
 fn networkErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView, http_status: ?u16) !ResolveError {
-    return allocatedResolveError(allocator, ref, .network_error, http_status);
+    return allocatedResolveError(allocator, ref, .network_error, http_status, false);
 }
 fn platformNotFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    return allocatedResolveError(allocator, ref, .platform_not_found, null);
+    return allocatedResolveError(allocator, ref, .platform_not_found, null, false);
 }
 fn platformRequiredErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    return allocatedResolveError(allocator, ref, .platform_required, null);
+    return allocatedResolveError(allocator, ref, .platform_required, null, false);
 }
 fn depthLimitExceededErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    return allocatedResolveError(allocator, ref, .depth_limit_exceeded, null);
+    return allocatedResolveError(allocator, ref, .depth_limit_exceeded, null, false);
 }
 fn allocatedResolveError(
     allocator: std.mem.Allocator,
     ref: AuthReferenceView,
     comptime tag: std.meta.Tag(ResolveError),
     http_status: ?u16,
+    transport_retries_exhausted: bool,
 ) !ResolveError {
-    return resolver.ownedResolveErrorAlloc(allocator, ref, tag, http_status);
+    return resolver.ownedResolveErrorAlloc(allocator, ref, tag, http_status, transport_retries_exhausted);
 }
 fn clonePlatformAlloc(allocator: std.mem.Allocator, platform: Platform) !Platform {
     const os = try allocator.dupe(u8, platform.os);
@@ -1104,15 +1120,6 @@ fn deinitOwnedPlatform(platform: Platform, allocator: std.mem.Allocator) void {
 fn deinitOwnedResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
     deinitResolveFailure(failure, allocator);
 }
-fn promoteManifestParsedAlloc(
-    allocator: std.mem.Allocator,
-    parsed: std.json.Parsed(Manifest),
-) PublicApiError!std.json.Parsed(Manifest) {
-    return json.promoteParsed(Manifest, allocator, parsed) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.OutOfMemory,
-    };
-}
 fn promoteResolveErrorAlloc(allocator: std.mem.Allocator, failure: ResolveError) !ResolveError {
     const owned_reference = try allocator.dupe(u8, switch (failure) {
         inline else => |value| value.reference,
@@ -1126,6 +1133,7 @@ fn expectResolveFailure(
     expected_registry: []const u8,
     expected_reference: []const u8,
     expected_http_status: ?u16,
+    expected_transport_retries_exhausted: ?bool,
 ) !void {
     try std.testing.expectEqualStrings(expected_tag_name, @tagName(std.meta.activeTag(failure)));
     switch (failure) {
@@ -1134,6 +1142,14 @@ fn expectResolveFailure(
             try std.testing.expectEqualSlices(u8, expected_reference, value.reference);
             try std.testing.expectEqual(expected_http_status, value.http_status);
         },
+    }
+    if (expected_transport_retries_exhausted) |expected| {
+        switch (failure) {
+            .rate_limited => |value| try std.testing.expectEqual(expected, value.transport_retries_exhausted),
+            .network_error => |value| try std.testing.expectEqual(expected, value.transport_retries_exhausted),
+            .timeout => |value| try std.testing.expectEqual(expected, value.transport_retries_exhausted),
+            else => try std.testing.expect(!expected),
+        }
     }
 }
 fn readFixtureAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -2191,6 +2207,7 @@ test "resolveWithExchangers propagates resolver failure matrix with full context
                 "registry-1.docker.io",
                 "registry-1.docker.io/library/busybox:latest",
                 Matrix.expectedHttpStatus(scenario),
+                null,
             ),
         }
     }
@@ -2243,6 +2260,7 @@ test "resolveWithExchangers maps exhausted manifest 429 to rate_limited" {
             "registry-1.docker.io",
             "registry-1.docker.io/library/busybox:latest",
             429,
+            false,
         ),
         else => return error.TestUnexpectedResult,
     }
@@ -2290,7 +2308,79 @@ test "resolveWithExchangers maps exhausted transport timeout to timeout" {
             "registry-1.docker.io",
             "registry-1.docker.io/library/busybox:latest",
             null,
+            false,
         ),
+        else => return error.TestUnexpectedResult,
+    }
+}
+test "resolveWithExchangers maps exhausted token transport timeout to timeout" {
+    const State = struct {
+        var token_attempts: usize = 0;
+        var manifest_calls: usize = 0;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            token_attempts += 1;
+            return error.Timeout;
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            manifest_calls += 1;
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .unauthorized,
+                .www_authenticate_headers = &.{
+                    "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\",scope=\"repository:library/busybox:pull\"",
+                },
+            }, null);
+        }
+    };
+
+    defer {
+        State.token_attempts = 0;
+        State.manifest_calls = 0;
+    }
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .max_network_retries = 1 },
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .failure => |failure| {
+            try expectResolveFailure(
+                failure,
+                "timeout",
+                "registry-1.docker.io",
+                "registry-1.docker.io/library/busybox:latest",
+                401,
+                true,
+            );
+            try std.testing.expectEqual(@as(usize, 2), State.token_attempts);
+        },
         else => return error.TestUnexpectedResult,
     }
 }
@@ -2477,6 +2567,10 @@ test "getManifestWithExchangers returns CaBundleFileNotFound when ca_bundle_path
     );
 
     try std.testing.expectError(error.CaBundleFileNotFound, outcome);
+}
+test "Reference.parse errors stay outside ResolveError surface" {
+    const parsed = Reference.parse(std.testing.allocator, "bad ref with spaces");
+    try std.testing.expectError(error.InvalidReference, parsed);
 }
 test "resolveWithExchangers returns platform_required when multi-arch request omits platform" {
     const State = struct {

@@ -38,6 +38,10 @@ const resilience = @import("resilience.zig");
 /// Stays separate from `ResolveError` inside auth. The resolver maps selected
 /// variants into public `ResolveError` at manifest boundaries for
 /// `resolve`, `validate`, and `getManifest`.
+///
+/// Collapse note: `TokenExchangeFailed`, `InvalidTokenResponse`, `HelperFailed`,
+/// authenticate header/config errors, `InsecureRealmUrl`, and `NotYetImplemented`
+/// map to public `auth_failed` unless noted in `resolveErrorFromAuthError`.
 pub const AuthError = error{
     NotYetImplemented,
     OutOfMemory,
@@ -49,6 +53,7 @@ pub const AuthError = error{
     InsecureRealmUrl,
     InvalidTokenResponse,
     TokenExchangeFailed,
+    TokenResponseTooLarge,
     RateLimited,
     HelperFailed,
     HelperTimedOut,
@@ -368,6 +373,9 @@ pub const AuthEngine = struct {
     /// are dropped on lookup.
     token_cache: TokenCacheMap = .empty,
     preferred_token_method_by_realm: std.StringHashMapUnmanaged(TokenRequestMethod) = .{},
+    /// Set when the token HTTP retry loop gives up on a transport error; consumed
+    /// by the resolver when mapping `AuthError` to `ResolveError`.
+    token_transport_retries_exhausted: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
         return .{
@@ -526,12 +534,21 @@ pub const AuthEngine = struct {
     ///   replaces the same `realm + service + scope` entry
     /// - successful responses are cached inside the engine by
     ///   `realm + service + scope` for reuse across later manifest requests
+    /// Returns whether the last token HTTP transport failure exhausted reactive
+    /// retries. Clears the flag after read.
+    pub fn takeTokenTransportRetriesExhausted(self: *AuthEngine) bool {
+        const exhausted = self.token_transport_retries_exhausted;
+        self.token_transport_retries_exhausted = false;
+        return exhausted;
+    }
+
     pub fn authenticate(
         self: *AuthEngine,
         client: *std.http.Client,
         request: AuthenticateRequest,
     ) AuthError!?TokenResponse {
         _ = self.token_http_exchanger orelse return error.NotYetImplemented;
+        self.token_transport_retries_exhausted = false;
         try validateRealmUrl(request.challenge.realm);
 
         if (try self.cachedTokenResponseForRequest(client, request)) |cached_response| {
@@ -684,7 +701,10 @@ pub const AuthEngine = struct {
 
         return switch (loop_outcome) {
             .ok => |ok| ok.response,
-            .transport_failed => |failure| failure.err,
+            .transport_failed => |failure| {
+                self.token_transport_retries_exhausted = failure.budget.networkRetriesExhausted();
+                return failure.err;
+            },
         };
     }
 
@@ -1156,6 +1176,9 @@ const DockerConfig = struct {
         if (self.creds_store) |creds_store| allocator.free(creds_store);
     }
 
+    /// Returns `null` on missing credentials. Malformed `~/.docker/config.json`
+    /// auth entries also yield `null` so the caller can fall back to anonymous
+    /// token requests instead of failing the whole resolve.
     fn credentialForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?CredentialHandle {
         const credential = self.authCredentialForRegistry(allocator, registry) catch |err| switch (err) {
             error.InvalidDockerConfig => return null,
@@ -1977,7 +2000,7 @@ fn deinitTokenExchangeResponse(allocator: std.mem.Allocator, response: TokenExch
 fn mapLiveTokenTransportError(err: anyerror) AuthError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.BodyTooLarge => error.InvalidTokenResponse,
+        error.BodyTooLarge => error.TokenResponseTooLarge,
         error.ConnectionResetByPeer => error.ConnectionResetByPeer,
         error.Timeout => error.Timeout,
         error.NetworkUnreachable => error.NetworkUnreachable,
@@ -3820,7 +3843,7 @@ test "AuthEngine.authenticate: GET 429 then POST auth failure stays TokenExchang
     try std.testing.expectError(error.TokenExchangeFailed, engine.authenticate(&client, request));
     try std.testing.expectEqual(@as(usize, 2), State.calls);
 }
-test "AuthEngine.authenticate: oversize token transport body maps to InvalidTokenResponse" {
+test "AuthEngine.authenticate: oversize token transport body maps to TokenResponseTooLarge" {
     const custom_cap: usize = 4096;
     const State = struct {
         var seen_cap: ?usize = null;
@@ -3848,7 +3871,7 @@ test "AuthEngine.authenticate: oversize token transport body maps to InvalidToke
         },
     );
 
-    try std.testing.expectError(error.InvalidTokenResponse, engine.authenticate(&client, request));
+    try std.testing.expectError(error.TokenResponseTooLarge, engine.authenticate(&client, request));
     try std.testing.expectEqual(custom_cap, State.seen_cap.?);
 }
 test "AuthEngine.authenticate: rate-limit retry path stays leak-free under DebugAllocator" {

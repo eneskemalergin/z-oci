@@ -10,11 +10,18 @@ const std = @import("std");
 const z_oci = @import("z_oci");
 
 const WorkflowFailureScenario = enum {
-    network_error,
     auth_failed,
     content_type_mismatch,
-    manifest_parse_error,
+    depth_limit_exceeded,
     digest_mismatch,
+    manifest_parse_error,
+    network_error,
+    not_found,
+    platform_not_found,
+    platform_required,
+    rate_limited,
+    response_too_large,
+    timeout,
     unsupported_algorithm,
 };
 
@@ -22,6 +29,7 @@ const WorkflowResponseBodyKind = enum {
     none,
     malformed_manifest_fixture,
     manifest_fixture,
+    index_fixture,
 };
 
 const WorkflowResponsePlan = struct {
@@ -30,15 +38,79 @@ const WorkflowResponsePlan = struct {
     docker_content_digest: ?[]const u8 = null,
     body_kind: WorkflowResponseBodyKind = .none,
     malformed_auth_header: bool = false,
+    manifest_exchange_error: ?z_oci.testing.ManifestExchangeError = null,
 };
 
 const WORKFLOW_PUBLIC_RESOLVE_FAILURE_SCENARIOS = [_]WorkflowFailureScenario{
-    .network_error,
     .auth_failed,
     .content_type_mismatch,
-    .manifest_parse_error,
+    .depth_limit_exceeded,
     .digest_mismatch,
+    .manifest_parse_error,
+    .network_error,
+    .not_found,
+    .platform_not_found,
+    .platform_required,
+    .rate_limited,
+    .response_too_large,
+    .timeout,
     .unsupported_algorithm,
+};
+
+const workflow_index_child_digest = "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+const workflow_depth_limit_levels: usize = 5;
+
+const WorkflowMatrixFixtures = struct {
+    var index_body: ?[]u8 = null;
+    var index_digest: ?[]u8 = null;
+    var depth_bodies: [workflow_depth_limit_levels][]u8 = undefined;
+    var depth_digests: [workflow_depth_limit_levels][]u8 = undefined;
+    var depth_ready: bool = false;
+
+    fn reset(allocator: std.mem.Allocator) void {
+        if (index_body) |body| allocator.free(body);
+        if (index_digest) |digest| allocator.free(digest);
+        index_body = null;
+        index_digest = null;
+        if (depth_ready) {
+            for (depth_bodies) |body| allocator.free(body);
+            for (depth_digests) |digest| allocator.free(digest);
+            depth_ready = false;
+        }
+    }
+
+    fn ensureIndex(allocator: std.mem.Allocator) !void {
+        if (index_body != null) return;
+        index_body = try buildIndexBodyAlloc(
+            allocator,
+            z_oci.MediaType.oci_index_v1.toString(),
+            z_oci.MediaType.oci_manifest_v1.toString(),
+            workflow_index_child_digest,
+            "linux",
+            "arm64",
+        );
+        index_digest = try sha256DigestStringAlloc(allocator, index_body.?);
+    }
+
+    fn ensureDepthChain(allocator: std.mem.Allocator) !void {
+        if (depth_ready) return;
+        var next_digest: []const u8 = workflow_index_child_digest;
+        var reverse_index: usize = depth_bodies.len;
+        while (reverse_index > 0) {
+            reverse_index -= 1;
+            depth_bodies[reverse_index] = try buildIndexBodyAlloc(
+                allocator,
+                z_oci.MediaType.oci_index_v1.toString(),
+                z_oci.MediaType.oci_index_v1.toString(),
+                next_digest,
+                "linux",
+                "arm64",
+            );
+            depth_digests[reverse_index] = try sha256DigestStringAlloc(allocator, depth_bodies[reverse_index]);
+            next_digest = depth_digests[reverse_index];
+        }
+        depth_ready = true;
+    }
 };
 
 // Kept local on purpose: workflow_smoke builds as its own root module under
@@ -94,6 +166,57 @@ fn workflowResponsePlan(scenario: WorkflowFailureScenario) WorkflowResponsePlan 
             .docker_content_digest = "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             .body_kind = .manifest_fixture,
         },
+        .not_found => .{
+            .status = .not_found,
+        },
+        .rate_limited => .{
+            .status = .too_many_requests,
+        },
+        .platform_required => .{
+            .status = .ok,
+            .content_type = z_oci.MediaType.oci_index_v1.toString(),
+            .body_kind = .index_fixture,
+        },
+        .platform_not_found => .{
+            .status = .ok,
+            .content_type = z_oci.MediaType.oci_index_v1.toString(),
+            .body_kind = .index_fixture,
+        },
+        .timeout => .{
+            .status = .ok,
+            .manifest_exchange_error = error.Timeout,
+        },
+        .response_too_large => .{
+            .status = .ok,
+            .manifest_exchange_error = error.ResponseBodyTooLarge,
+        },
+        .depth_limit_exceeded => .{
+            .status = .ok,
+            .content_type = z_oci.MediaType.oci_index_v1.toString(),
+            .body_kind = .index_fixture,
+        },
+    };
+}
+
+fn workflowScenarioConfig(scenario: WorkflowFailureScenario) z_oci.Config {
+    return switch (scenario) {
+        .rate_limited => .{ .max_rate_limit_retries = 0 },
+        else => .{},
+    };
+}
+
+fn workflowScenarioPlatform(scenario: WorkflowFailureScenario) ?z_oci.Platform {
+    return switch (scenario) {
+        .platform_not_found => .{ .os = "linux", .architecture = "ppc64" },
+        .depth_limit_exceeded => .{ .os = "linux", .architecture = "arm64" },
+        else => null,
+    };
+}
+
+fn workflowExpectedHttpStatus(scenario: WorkflowFailureScenario) ?u16 {
+    return switch (scenario) {
+        .timeout, .response_too_large, .depth_limit_exceeded, .not_found, .platform_not_found, .platform_required => null,
+        else => @intCast(@intFromEnum(workflowResponsePlan(scenario).status)),
     };
 }
 
@@ -101,8 +224,20 @@ fn workflowExpectedTagName(scenario: WorkflowFailureScenario) []const u8 {
     return @tagName(scenario);
 }
 
-fn workflowExpectedHttpStatus(scenario: WorkflowFailureScenario) ?u16 {
-    return @intCast(@intFromEnum(workflowResponsePlan(scenario).status));
+fn workflowExpectedReference(scenario: WorkflowFailureScenario) []const u8 {
+    return switch (scenario) {
+        .depth_limit_exceeded => "registry-1.docker.io/library/busybox@" ++ workflow_index_child_digest,
+        else => "registry-1.docker.io/library/busybox:latest",
+    };
+}
+
+fn prepareWorkflowScenario(scenario: WorkflowFailureScenario) !void {
+    const allocator = std.testing.allocator;
+    switch (scenario) {
+        .platform_required, .platform_not_found => try WorkflowMatrixFixtures.ensureIndex(allocator),
+        .depth_limit_exceeded => try WorkflowMatrixFixtures.ensureDepthChain(allocator),
+        else => {},
+    }
 }
 
 fn expectWorkflowResolveFailure(
@@ -111,6 +246,7 @@ fn expectWorkflowResolveFailure(
     expected_registry: []const u8,
     expected_reference: []const u8,
     expected_http_status: ?u16,
+    expected_transport_retries_exhausted: ?bool,
 ) !void {
     try std.testing.expectEqualStrings(expected_tag_name, @tagName(std.meta.activeTag(failure)));
     switch (failure) {
@@ -119,6 +255,14 @@ fn expectWorkflowResolveFailure(
             try std.testing.expectEqualSlices(u8, expected_reference, value.reference);
             try std.testing.expectEqual(expected_http_status, value.http_status);
         },
+    }
+    if (expected_transport_retries_exhausted) |expected| {
+        switch (failure) {
+            .rate_limited => |value| try std.testing.expectEqual(expected, value.transport_retries_exhausted),
+            .network_error => |value| try std.testing.expectEqual(expected, value.transport_retries_exhausted),
+            .timeout => |value| try std.testing.expectEqual(expected, value.transport_retries_exhausted),
+            else => try std.testing.expect(!expected),
+        }
     }
 }
 
@@ -512,6 +656,28 @@ test "workflow smoke: public resolve failure matrix preserves full error context
             defer request.deinit(allocator);
 
             const plan = workflowResponsePlan(scenario);
+            if (plan.manifest_exchange_error) |exchange_error| return exchange_error;
+
+            if (scenario == .depth_limit_exceeded) {
+                if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                    return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = .ok,
+                        .content_type = z_oci.MediaType.oci_index_v1.toString(),
+                        .docker_content_digest = WorkflowMatrixFixtures.depth_digests[0],
+                    }, WorkflowMatrixFixtures.depth_bodies[0]);
+                }
+                for (WorkflowMatrixFixtures.depth_digests, WorkflowMatrixFixtures.depth_bodies) |digest, body| {
+                    if (std.mem.endsWith(u8, request.url, digest)) {
+                        return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                            .status = .ok,
+                            .content_type = z_oci.MediaType.oci_index_v1.toString(),
+                            .docker_content_digest = digest,
+                        }, body);
+                    }
+                }
+                return error.TransportFailed;
+            }
+
             const headers: []const []const u8 = if (plan.malformed_auth_header)
                 &.{"Bearer realm=\"https://auth.example.test/token"}
             else
@@ -524,6 +690,12 @@ test "workflow smoke: public resolve failure matrix preserves full error context
                     .docker_content_digest = plan.docker_content_digest,
                     .www_authenticate_headers = headers,
                 }, null),
+                .index_fixture => z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = plan.status,
+                    .content_type = plan.content_type,
+                    .docker_content_digest = WorkflowMatrixFixtures.index_digest,
+                    .www_authenticate_headers = headers,
+                }, WorkflowMatrixFixtures.index_body.?),
                 .malformed_manifest_fixture => blk: {
                     const body = readWorkflowFixtureAlloc(
                         allocator,
@@ -564,6 +736,8 @@ test "workflow smoke: public resolve failure matrix preserves full error context
         }
     };
 
+    defer WorkflowMatrixFixtures.reset(std.testing.allocator);
+
     var client: std.http.Client = undefined;
     const ref = z_oci.Reference{
         .registry = "registry-1.docker.io",
@@ -575,13 +749,14 @@ test "workflow smoke: public resolve failure matrix preserves full error context
 
     for (WORKFLOW_PUBLIC_RESOLVE_FAILURE_SCENARIOS) |scenario| {
         State.scenario = scenario;
+        try prepareWorkflowScenario(scenario);
 
         const outcome = try z_oci.testing.resolveWithExchangers(
             std.testing.allocator,
             &client,
-            z_oci.Config{},
+            workflowScenarioConfig(scenario),
             ref,
-            null,
+            workflowScenarioPlatform(scenario),
             State.tokenExchange,
             State.manifestExchange,
             .{},
@@ -597,8 +772,9 @@ test "workflow smoke: public resolve failure matrix preserves full error context
                 failure,
                 workflowExpectedTagName(scenario),
                 "registry-1.docker.io",
-                "registry-1.docker.io/library/busybox:latest",
+                workflowExpectedReference(scenario),
                 workflowExpectedHttpStatus(scenario),
+                if (scenario == .rate_limited) false else null,
             ),
         }
     }
@@ -671,6 +847,7 @@ test "workflow smoke: public resolve maps exhausted token 429 to rate_limited" {
             "registry-1.docker.io",
             "registry-1.docker.io/library/busybox:latest",
             401,
+            true,
         ),
         else => return error.TestUnexpectedResult,
     }
@@ -728,6 +905,7 @@ test "workflow smoke: public resolve maps exhausted manifest 429 to rate_limited
             "registry-1.docker.io",
             "registry-1.docker.io/library/busybox:latest",
             429,
+            false,
         ),
         else => return error.TestUnexpectedResult,
     }
@@ -780,6 +958,7 @@ test "workflow smoke: public resolve maps exhausted transport timeout to timeout
             "registry-1.docker.io",
             "registry-1.docker.io/library/busybox:latest",
             null,
+            false,
         ),
         else => return error.TestUnexpectedResult,
     }

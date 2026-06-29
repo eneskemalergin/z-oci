@@ -360,6 +360,7 @@ pub fn runHttpRetryLoop(
         }
 
         const retry_after = retryAfterFromHeaders(response_headers(response)) catch null;
+        // Malformed Retry-After headers fall back to exponential backoff instead of failing the exchange.
         const decision = policy.decideHttpRetry(response_status(response), retry_after);
         if (decision.action == .give_up) {
             return .{ .ok = .{ .response = response, .budget = policy.budget } };

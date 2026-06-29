@@ -104,6 +104,13 @@ pub const DepthLimitExceeded = struct {
     http_status: ?u16 = null,
 };
 
+/// The server response exceeded configured size limits.
+pub const ResponseTooLarge = struct {
+    registry: []const u8,
+    reference: []const u8,
+    http_status: ?u16 = null,
+};
+
 /// Tagged union over all possible OCI resolve failure modes.
 /// Public resolver failures own their `reference` string through the caller allocator.
 pub const ResolveError = union(enum) {
@@ -119,6 +126,7 @@ pub const ResolveError = union(enum) {
     content_type_mismatch: ContentTypeMismatch,
     timeout: Timeout,
     depth_limit_exceeded: DepthLimitExceeded,
+    response_too_large: ResponseTooLarge,
 
     /// Write a human-readable error description.
     /// Format: "summary: registry <reg> for <ref> [status <N>]"
@@ -196,6 +204,7 @@ pub const ResolveError = union(enum) {
                 .transport_retries_exhausted = value.transport_retries_exhausted,
             } },
             .depth_limit_exceeded => |value| .{ .depth_limit_exceeded = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .response_too_large => |value| .{ .response_too_large = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
         };
     }
 
@@ -229,6 +238,7 @@ pub const ResolveError = union(enum) {
             .content_type_mismatch => "content type mismatch",
             .timeout => "timeout",
             .depth_limit_exceeded => "depth limit exceeded",
+            .response_too_large => "response too large",
         };
     }
 };
@@ -283,6 +293,7 @@ test "ResolveError.format: all variants produce non-empty output" {
         .{ .content_type_mismatch = .{ .registry = "r", .reference = "ref", .http_status = 200 } },
         .{ .timeout = .{ .registry = "r", .reference = "ref" } },
         .{ .depth_limit_exceeded = .{ .registry = "r", .reference = "ref" } },
+        .{ .response_too_large = .{ .registry = "r", .reference = "ref" } },
     };
     for (cases) |err| {
         var buf: [256]u8 = undefined;
@@ -328,6 +339,7 @@ test "ResolveError.format: all variants include a plain summary" {
         .{ .err = .{ .content_type_mismatch = .{ .registry = "r", .reference = "ref" } }, .summary = "content type mismatch" },
         .{ .err = .{ .timeout = .{ .registry = "r", .reference = "ref" } }, .summary = "timeout" },
         .{ .err = .{ .depth_limit_exceeded = .{ .registry = "r", .reference = "ref" } }, .summary = "depth limit exceeded" },
+        .{ .err = .{ .response_too_large = .{ .registry = "r", .reference = "ref" } }, .summary = "response too large" },
     };
     for (cases) |tc| {
         var buf: [256]u8 = undefined;
