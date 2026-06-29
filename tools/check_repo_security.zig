@@ -4,7 +4,7 @@
 //! during `zig build security-check` / `zig build test` only.
 const std = @import("std");
 
-const private_key_markers = [_][]const u8{
+const PRIVATE_KEY_MARKERS = [_][]const u8{
     "-----BEGIN PRIVATE KEY-----",
     "-----BEGIN RSA PRIVATE KEY-----",
     "-----BEGIN EC PRIVATE KEY-----",
@@ -12,30 +12,30 @@ const private_key_markers = [_][]const u8{
     "-----BEGIN OPENSSH PRIVATE KEY-----",
 };
 
-const scan_roots = [_][]const u8{
+const SCAN_ROOTS = [_][]const u8{
     "fixtures",
     "src",
     "examples",
     "benchmarks",
 };
 
-const scan_extensions = [_][]const u8{
+const SCAN_EXTENSIONS = [_][]const u8{
     ".pem",
     ".key",
     ".crt",
 };
 
-const max_scan_bytes: u64 = 10 * 1024 * 1024;
-const stack_buf_size = 128 * 1024;
-const chunk_size = 8192;
+const MAX_SCAN_BYTES: u64 = 10 * 1024 * 1024;
+const STACK_BUF_SIZE = 128 * 1024;
+const CHUNK_SIZE = 8192;
 
-const max_marker_len = blk: {
+const MAX_MARKER_LEN = blk: {
     var longest: usize = 0;
-    for (private_key_markers) |marker| longest = @max(longest, marker.len);
+    for (PRIVATE_KEY_MARKERS) |marker| longest = @max(longest, marker.len);
     break :blk longest;
 };
 
-const marker_overlap = max_marker_len - 1;
+const MARKER_OVERLAP = MAX_MARKER_LEN - 1;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
 
     var failures: usize = 0;
 
-    for (scan_roots) |root| {
+    for (SCAN_ROOTS) |root| {
         var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn shouldScan(name: []const u8) bool {
-    for (scan_extensions) |ext| {
+    for (SCAN_EXTENSIONS) |ext| {
         if (std.mem.endsWith(u8, name, ext)) return true;
     }
     return false;
@@ -78,7 +78,7 @@ fn shouldScan(name: []const u8) bool {
 
 fn containsPrivateKeyMarker(body: []const u8) bool {
     if (!std.mem.containsAtLeast(u8, body, 1, "BEGIN")) return false;
-    inline for (private_key_markers) |marker| {
+    inline for (PRIVATE_KEY_MARKERS) |marker| {
         if (std.mem.indexOf(u8, body, marker) != null) return true;
     }
     return false;
@@ -90,7 +90,7 @@ fn scanFile(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
     defer file.close(io);
 
     const stat = try file.stat(io);
-    if (stat.size > max_scan_bytes) {
+    if (stat.size > MAX_SCAN_BYTES) {
         std.log.err("PEM/key file exceeds scan limit ({d} bytes): {s}", .{ stat.size, name });
         return true;
     }
@@ -102,8 +102,8 @@ fn scanFile(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
         return true;
     };
 
-    if (read_len <= stack_buf_size) {
-        var stack_buf: [stack_buf_size]u8 = undefined;
+    if (read_len <= STACK_BUF_SIZE) {
+        var stack_buf: [STACK_BUF_SIZE]u8 = undefined;
         return try scanFromBuffer(io, &file, stack_buf[0..read_len]);
     }
 
@@ -122,17 +122,17 @@ fn scanFromBuffer(io: std.Io, file: *std.Io.File, buf: []u8) !bool {
 
 fn scanFileStreaming(io: std.Io, file: *std.Io.File) !bool {
     var file_reader = file.reader(io, &.{});
-    var carry: [marker_overlap]u8 = undefined;
+    var carry: [MARKER_OVERLAP]u8 = undefined;
     var carry_len: usize = 0;
 
     while (true) {
-        var chunk: [chunk_size]u8 = undefined;
+        var chunk: [CHUNK_SIZE]u8 = undefined;
         const n = try file_reader.interface.readSliceShort(&chunk);
         if (n == 0) break;
 
         const body = chunk[0..n];
         if (carry_len > 0) {
-            var window: [marker_overlap + chunk_size]u8 = undefined;
+            var window: [MARKER_OVERLAP + CHUNK_SIZE]u8 = undefined;
             @memcpy(window[0..carry_len], carry[0..carry_len]);
             @memcpy(window[carry_len..][0..body.len], body);
             if (containsPrivateKeyMarker(window[0 .. carry_len + body.len])) return true;
@@ -140,11 +140,11 @@ fn scanFileStreaming(io: std.Io, file: *std.Io.File) !bool {
             return true;
         }
 
-        if (body.len >= marker_overlap) {
-            @memcpy(carry[0..marker_overlap], body[body.len - marker_overlap ..]);
-            carry_len = marker_overlap;
+        if (body.len >= MARKER_OVERLAP) {
+            @memcpy(carry[0..MARKER_OVERLAP], body[body.len - MARKER_OVERLAP ..]);
+            carry_len = MARKER_OVERLAP;
         } else {
-            const keep = @min(carry_len, marker_overlap - body.len);
+            const keep = @min(carry_len, MARKER_OVERLAP - body.len);
             if (keep > 0) {
                 std.mem.copyForwards(u8, carry[0..keep], carry[carry_len - keep ..][0..keep]);
             }
@@ -166,7 +166,7 @@ test "containsPrivateKeyMarker rejects certificate-only PEM" {
 }
 
 test "containsPrivateKeyMarker detects private key markers" {
-    inline for (private_key_markers) |marker| {
+    inline for (PRIVATE_KEY_MARKERS) |marker| {
         try std.testing.expect(containsPrivateKeyMarker(marker));
     }
 }
@@ -179,14 +179,14 @@ test "shouldScan matches expected extensions only" {
 }
 
 test "streaming overlap window catches split marker" {
-    const marker = private_key_markers[1];
+    const marker = PRIVATE_KEY_MARKERS[1];
     const split_at = 11;
-    var carry: [marker_overlap]u8 = undefined;
+    var carry: [MARKER_OVERLAP]u8 = undefined;
     @memcpy(carry[0..split_at], marker[0..split_at]);
     const carry_len = split_at;
     const rest = marker[split_at..];
 
-    var window: [marker_overlap + chunk_size]u8 = undefined;
+    var window: [MARKER_OVERLAP + CHUNK_SIZE]u8 = undefined;
     @memcpy(window[0..carry_len], carry[0..carry_len]);
     @memcpy(window[carry_len..][0..rest.len], rest);
     try std.testing.expect(containsPrivateKeyMarker(window[0 .. carry_len + rest.len]));

@@ -203,9 +203,9 @@ pub const ManifestOutcome = union(enum) {
     failure: ResolveError,
 };
 
-const max_child_manifest_depth: usize = 4;
+const MAX_CHILD_MANIFEST_DEPTH: usize = 4;
 
-const manifest_accept_values = [_][]const u8{
+const MANIFEST_ACCEPT_VALUES = [_][]const u8{
     MediaType.oci_manifest_v1.toString(),
     MediaType.docker_manifest_v2.toString(),
     MediaType.oci_index_v1.toString(),
@@ -527,7 +527,7 @@ fn validateWithExchangers(
     defer engine.deinit();
 
     const ref_view = referenceView(ref);
-    const ctx = resolver.ResolverContext.initWithTransportHooks(
+    const ctx = resolver.ResolverParams.initWithTransportHooks(
         allocator,
         client,
         config,
@@ -740,11 +740,11 @@ fn fetchResolvedManifestWithExchangers(
     depth: usize,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ResolvedManifestOutcome {
-    if (depth > max_child_manifest_depth) {
+    if (depth > MAX_CHILD_MANIFEST_DEPTH) {
         return .{ .failure = try depthLimitExceededErrorAlloc(allocator, ref_view) };
     }
 
-    const ctx = resolver.ResolverContext.initWithTransportHooks(
+    const ctx = resolver.ResolverParams.initWithTransportHooks(
         allocator,
         client,
         config,
@@ -916,7 +916,7 @@ fn recurseIntoMultiArchDocument(
 }
 
 fn manifestAcceptValues() []const []const u8 {
-    return &manifest_accept_values;
+    return &MANIFEST_ACCEPT_VALUES;
 }
 
 fn buildResolveResultAlloc(
@@ -3191,7 +3191,7 @@ test "getManifestWithExchangers resolves nested index to leaf manifest" {
 }
 
 test "resolveWithExchangers returns depth_limit_exceeded for nested indexes beyond limit" {
-    const depth = max_child_manifest_depth + 1;
+    const depth = MAX_CHILD_MANIFEST_DEPTH + 1;
     const State = struct {
         var bodies: [depth][]u8 = undefined;
         var digests: [depth][]u8 = undefined;

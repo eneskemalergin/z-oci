@@ -21,9 +21,9 @@
 const std = @import("std");
 const Digest = @import("Digest.zig");
 
-const docker_hub_library_prefix = "library/";
-const docker_hub_registry = "registry-1.docker.io";
-const docker_hub_aliases = [_][]const u8{ "docker.io", "index.docker.io", docker_hub_registry };
+const DOCKER_HUB_LIBRARY_PREFIX = "library/";
+const DOCKER_HUB_REGISTRY = "registry-1.docker.io";
+const DOCKER_HUB_ALIASES = [_][]const u8{ "docker.io", "index.docker.io", DOCKER_HUB_REGISTRY };
 
 /// Owned registry hostname.
 registry: []const u8,
@@ -72,7 +72,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     errdefer if (digest_raw) |dr| allocator.free(dr);
 
     // Step 2: identify registry vs Docker Hub path.
-    var registry_str: []const u8 = docker_hub_registry;
+    var registry_str: []const u8 = DOCKER_HUB_REGISTRY;
     var path_str: []const u8 = rest;
 
     if (std.mem.indexOfScalar(u8, rest, '/')) |slash_pos| {
@@ -85,9 +85,9 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     }
 
     // Normalize Docker Hub aliases to the canonical pull endpoint.
-    for (docker_hub_aliases) |alias| {
+    for (DOCKER_HUB_ALIASES) |alias| {
         if (std.ascii.eqlIgnoreCase(registry_str, alias)) {
-            registry_str = docker_hub_registry;
+            registry_str = DOCKER_HUB_REGISTRY;
             break;
         }
     }
@@ -115,7 +115,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     // Step 4: Docker Hub single-component names get "library/" prefix.
     // "ubuntu" becomes "library/ubuntu"; "myorg/ubuntu" stays as-is.
     const needs_library_prefix =
-        std.ascii.eqlIgnoreCase(registry_str, docker_hub_registry) and
+        std.ascii.eqlIgnoreCase(registry_str, DOCKER_HUB_REGISTRY) and
         std.mem.indexOfScalar(u8, repo_str, '/') == null;
 
     // Step 5: default tag "latest" when no tag and no digest.
@@ -149,9 +149,9 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
 }
 
 fn duplicateLibraryRepositoryPath(allocator: std.mem.Allocator, repository: []const u8) ![]const u8 {
-    const owned = try allocator.alloc(u8, docker_hub_library_prefix.len + repository.len);
-    @memcpy(owned[0..docker_hub_library_prefix.len], docker_hub_library_prefix);
-    @memcpy(owned[docker_hub_library_prefix.len..], repository);
+    const owned = try allocator.alloc(u8, DOCKER_HUB_LIBRARY_PREFIX.len + repository.len);
+    @memcpy(owned[0..DOCKER_HUB_LIBRARY_PREFIX.len], DOCKER_HUB_LIBRARY_PREFIX);
+    @memcpy(owned[DOCKER_HUB_LIBRARY_PREFIX.len..], repository);
     return owned;
 }
 

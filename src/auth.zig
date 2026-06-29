@@ -79,7 +79,7 @@ pub const TokenHttpRequest = struct {
     authorization: ?[]u8 = null,
     content_type: ?[]const u8 = null,
     body: ?[]u8 = null,
-    max_response_body_bytes: usize = ConfigModule.default_max_token_response_bytes,
+    max_response_body_bytes: usize = ConfigModule.DEFAULT_MAX_TOKEN_RESPONSE_BYTES,
 
     /// Releases owned URL, authorization, and POST body buffers.
     /// Authorization and body slices are `secureZero`ed before `free` via `freeOwnedOptionalSecretSlice`.
@@ -118,17 +118,17 @@ pub const TokenHttpExchanger = *const fn (
     request: TokenHttpRequest,
 ) AuthError!TokenExchangeResponse;
 
-pub const env_registry_host_var = "Z_OCI_REGISTRY_HOST";
-pub const env_registry_user_var = "Z_OCI_REGISTRY_USER";
-pub const env_registry_token_var = "Z_OCI_REGISTRY_TOKEN";
-pub const docker_config_dir_var = "DOCKER_CONFIG";
-pub const home_dir_var = "HOME";
-pub const userprofile_dir_var = "USERPROFILE";
-pub const docker_hub_auth_key = "https://index.docker.io/v1/";
+pub const ENV_REGISTRY_HOST = "Z_OCI_REGISTRY_HOST";
+pub const ENV_REGISTRY_USER = "Z_OCI_REGISTRY_USER";
+pub const ENV_REGISTRY_TOKEN = "Z_OCI_REGISTRY_TOKEN";
+pub const DOCKER_CONFIG_DIR_VAR = "DOCKER_CONFIG";
+pub const HOME_DIR_VAR = "HOME";
+pub const USERPROFILE_DIR_VAR = "USERPROFILE";
+pub const DOCKER_HUB_AUTH_KEY = "https://index.docker.io/v1/";
 
-const docker_config_file_size_limit = 1024 * 1024;
-const docker_helper_stdout_limit = 64 * 1024;
-const docker_helper_stderr_limit = 64 * 1024;
+const DOCKER_CONFIG_FILE_SIZE_LIMIT = 1024 * 1024;
+const DOCKER_HELPER_STDOUT_LIMIT = 64 * 1024;
+const DOCKER_HELPER_STDERR_LIMIT = 64 * 1024;
 
 pub const DockerCredentialHelperRunner = *const fn (
     allocator: std.mem.Allocator,
@@ -369,8 +369,8 @@ pub const Token = struct {
     expires_in_seconds: ?u64 = null,
 };
 
-pub const token_refresh_window_seconds: u64 = 5;
-pub const default_token_cache_ttl_seconds: u64 = 60;
+pub const TOKEN_REFRESH_WINDOW_SECONDS: u64 = 5;
+pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: u64 = 60;
 
 pub const TokenResponse = struct {
     /// Owned token-response payload.
@@ -514,15 +514,15 @@ const NowUnixSecondsFn = *const fn (client: *std.http.Client) u64;
 /// (`max_retries`), transport retry budgets on token HTTP (via resilience), and
 /// `ca_bundle_path` via `Config.applyToClient` at the public API boundary.
 /// Pre-emptive rate limiting (`rate_limit_enabled`) applies on manifest transport
-/// via `AuthEngine.manifest_rate_limit_state`.
-pub const Phase2ConfigView = struct {
+/// via `AuthEngine.manifest_throttle`.
+pub const AuthConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,
     read_timeout_ms: u32,
     ca_bundle_path: ?[]const u8,
-    env_registry_host_var: []const u8 = env_registry_host_var,
-    env_registry_user_var: []const u8 = env_registry_user_var,
-    env_registry_token_var: []const u8 = env_registry_token_var,
+    env_registry_host: []const u8 = ENV_REGISTRY_HOST,
+    env_registry_user: []const u8 = ENV_REGISTRY_USER,
+    env_registry_token: []const u8 = ENV_REGISTRY_TOKEN,
 };
 
 /// Borrowed view of the normalized reference data auth consumes.
@@ -603,7 +603,7 @@ pub const ProbeHttpResponse = struct {
 /// `child.wait`, and `child.kill` need an explicit `std.Io` boundary. Keeping
 /// that context separate lets `authenticate()` stay provisional without forcing
 /// `io` through every auth call immediately.
-pub const HelperProcessContext = struct {
+pub const DockerHelperConfig = struct {
     io: std.Io,
     runner: DockerCredentialHelperRunner = runDockerCredentialHelperBySuffix,
 };
@@ -611,11 +611,11 @@ pub const HelperProcessContext = struct {
 /// Phase 2 auth engine.
 ///
 /// HTTP requests carry `io` through `std.http.Client`. Helper execution
-/// passes an explicit `std.Io` boundary through `HelperProcessContext`.
+/// passes an explicit `std.Io` boundary through `DockerHelperConfig`.
 pub const AuthEngine = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    helper_process_context: ?HelperProcessContext = null,
+    docker_helper_config: ?DockerHelperConfig = null,
     token_http_exchanger: ?TokenHttpExchanger = null,
     transport_hooks: resilience.TransportHooks = .{},
     now_unix_seconds_fn: NowUnixSecondsFn = currentUnixSeconds,
@@ -630,7 +630,7 @@ pub const AuthEngine = struct {
     token_cache: TokenCacheMap = .empty,
     preferred_token_method_by_realm: std.StringHashMapUnmanaged(TokenRequestMethod) = .{},
     /// Last trustworthy registry `RateLimit-*` snapshot for manifest pre-emption.
-    manifest_rate_limit_state: resilience.ManifestRateLimitState = .{},
+    manifest_throttle: resilience.ManifestThrottle = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
         return .{
@@ -640,15 +640,15 @@ pub const AuthEngine = struct {
         };
     }
 
-    pub fn initWithHelperProcessContext(
+    pub fn initWithDockerHelperConfig(
         allocator: std.mem.Allocator,
         config: Config,
-        helper_process_context: HelperProcessContext,
+        docker_helper_config: DockerHelperConfig,
     ) AuthEngine {
         return .{
             .allocator = allocator,
             .config = config,
-            .helper_process_context = helper_process_context,
+            .docker_helper_config = docker_helper_config,
             .now_unix_seconds_fn = currentUnixSeconds,
         };
     }
@@ -661,7 +661,7 @@ pub const AuthEngine = struct {
         return initWithTokenHttpExchangerAndHooks(allocator, config, token_http_exchanger, .{});
     }
 
-    /// `config` must match `ResolverContext.config` on the same public API call.
+    /// `config` must match `ResolverParams.config` on the same public API call.
     pub fn initWithTokenHttpExchangerAndHooks(
         allocator: std.mem.Allocator,
         config: Config,
@@ -751,7 +751,7 @@ pub const AuthEngine = struct {
             io,
             config_path,
             self.allocator,
-            .limited(docker_config_file_size_limit),
+            .limited(DOCKER_CONFIG_FILE_SIZE_LIMIT),
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return false,
@@ -765,12 +765,12 @@ pub const AuthEngine = struct {
         return true;
     }
 
-    pub fn helperProcessContext(self: AuthEngine) ?HelperProcessContext {
-        return self.helper_process_context;
+    pub fn dockerHelperConfig(self: AuthEngine) ?DockerHelperConfig {
+        return self.docker_helper_config;
     }
 
-    pub fn phase2Config(self: AuthEngine) Phase2ConfigView {
-        return phase2ConfigView(self.config);
+    pub fn configView(self: AuthEngine) AuthConfigView {
+        return authConfigView(self.config);
     }
 
     /// Exchange a bearer token for a single normalized registry/challenge pair.
@@ -903,7 +903,7 @@ pub const AuthEngine = struct {
         if (self.token_http_exchanger == null) return error.NotYetImplemented;
         var policy = resilience.retryPolicyFromConfig(self.config, self.transport_hooks);
 
-        var loop_ctx = TokenExchangeLoopContext{
+        var loop_ctx = TokenExchangeLoop{
             .engine = self,
             .client = client,
             .request = request,
@@ -963,7 +963,7 @@ pub const AuthEngine = struct {
         }
 
         const now = self.now_unix_seconds_fn(client);
-        gop.value_ptr.* = cachedTokenFromResponse(token_response, now, default_token_cache_ttl_seconds);
+        gop.value_ptr.* = cachedTokenFromResponse(token_response, now, DEFAULT_TOKEN_CACHE_TTL_SECONDS);
         self.evictLruTokenCacheEntriesUntilWithinLimit();
     }
 
@@ -1052,7 +1052,7 @@ pub const AuthEngine = struct {
         const docker_config = &self.docker_config.?;
         const helper_timeout = dockerCredentialHelperTimeout(self.config);
 
-        if (self.helper_process_context) |context| {
+        if (self.docker_helper_config) |context| {
             if (try docker_config.registrySpecificHelperLookupForRegistry(self.allocator, registry)) |helper_lookup| {
                 const helper_server = try canonicalDockerCredentialHelperServerAlloc(self.allocator, helper_lookup.server_url);
                 defer self.allocator.free(helper_server);
@@ -1064,7 +1064,7 @@ pub const AuthEngine = struct {
             return .{ .credential = credential };
         }
 
-        if (self.helper_process_context) |context| {
+        if (self.docker_helper_config) |context| {
             if (try docker_config.globalHelperLookupForRegistry(self.allocator, registry)) |helper_lookup| {
                 const helper_server = try canonicalDockerCredentialHelperServerAlloc(self.allocator, helper_lookup.server_url);
                 defer self.allocator.free(helper_server);
@@ -1076,7 +1076,7 @@ pub const AuthEngine = struct {
     }
 };
 
-pub fn phase2ConfigView(config: Config) Phase2ConfigView {
+pub fn authConfigView(config: Config) AuthConfigView {
     return .{
         .credential_provider = config.credential_provider,
         .connect_timeout_ms = config.connect_timeout_ms,
@@ -1093,11 +1093,11 @@ pub fn envCredentialForRegistry(
     environ_map: *const std.process.Environ.Map,
     registry: []const u8,
 ) AuthError!?CredentialHandle {
-    const host = environ_map.get(env_registry_host_var) orelse return null;
+    const host = environ_map.get(ENV_REGISTRY_HOST) orelse return null;
     if (!registryHostMatches(host, registry)) return null;
 
-    const username = environ_map.get(env_registry_user_var) orelse return null;
-    const token = environ_map.get(env_registry_token_var) orelse return null;
+    const username = environ_map.get(ENV_REGISTRY_USER) orelse return null;
+    const token = environ_map.get(ENV_REGISTRY_TOKEN) orelse return null;
     if (username.len == 0 or token.len == 0) return null;
 
     return try ownedCredentialHandle(allocator, username, token);
@@ -1115,7 +1115,7 @@ fn dockerConfigScannerNext(scanner: *std.json.Scanner) AuthError!std.json.Scanne
 }
 
 fn dockerConfigScannerNextAllocMax(scanner: *std.json.Scanner) AuthError!std.json.Scanner.Token {
-    return scanner.nextAllocMax(std.heap.page_allocator, .alloc_if_needed, docker_config_file_size_limit) catch |err| return mapDockerConfigJsonError(err);
+    return scanner.nextAllocMax(std.heap.page_allocator, .alloc_if_needed, DOCKER_CONFIG_FILE_SIZE_LIMIT) catch |err| return mapDockerConfigJsonError(err);
 }
 
 fn dockerConfigScannerSkipValue(scanner: *std.json.Scanner) AuthError!void {
@@ -1412,19 +1412,19 @@ fn dockerConfigPathFromEnvironmentAlloc(
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
 ) AuthError!?[]u8 {
-    if (environ_map.get(docker_config_dir_var)) |docker_config_dir| {
+    if (environ_map.get(DOCKER_CONFIG_DIR_VAR)) |docker_config_dir| {
         if (docker_config_dir.len != 0) {
             return try std.fs.path.join(allocator, &.{ docker_config_dir, "config.json" });
         }
     }
 
-    if (environ_map.get(home_dir_var)) |home_dir| {
+    if (environ_map.get(HOME_DIR_VAR)) |home_dir| {
         if (home_dir.len != 0) {
             return try std.fs.path.join(allocator, &.{ home_dir, ".docker", "config.json" });
         }
     }
 
-    if (environ_map.get(userprofile_dir_var)) |userprofile_dir| {
+    if (environ_map.get(USERPROFILE_DIR_VAR)) |userprofile_dir| {
         if (userprofile_dir.len != 0) {
             return try std.fs.path.join(allocator, &.{ userprofile_dir, ".docker", "config.json" });
         }
@@ -1434,7 +1434,7 @@ fn dockerConfigPathFromEnvironmentAlloc(
 }
 
 fn dockerCredentialHelperServer(registry: []const u8) []const u8 {
-    if (std.mem.eql(u8, registry, "registry-1.docker.io")) return docker_hub_auth_key;
+    if (std.mem.eql(u8, registry, "registry-1.docker.io")) return DOCKER_HUB_AUTH_KEY;
     return registry;
 }
 
@@ -1517,8 +1517,8 @@ fn runDockerCredentialHelperCommand(
     defer multi_reader.deinit();
 
     while (multi_reader.fill(1, timeout)) |_| {
-        if (multi_reader.reader(0).buffered().len > docker_helper_stdout_limit) return error.HelperFailed;
-        if (multi_reader.reader(1).buffered().len > docker_helper_stderr_limit) return error.HelperFailed;
+        if (multi_reader.reader(0).buffered().len > DOCKER_HELPER_STDOUT_LIMIT) return error.HelperFailed;
+        if (multi_reader.reader(1).buffered().len > DOCKER_HELPER_STDERR_LIMIT) return error.HelperFailed;
     } else |err| switch (err) {
         error.EndOfStream => {},
         error.Timeout => {
@@ -1700,7 +1700,7 @@ fn cachedTokenFromResponse(
     default_ttl_seconds: u64,
 ) CachedToken {
     const ttl_seconds = token_response.access_token.expires_in_seconds orelse default_ttl_seconds;
-    const usable_lifetime = ttl_seconds -| token_refresh_window_seconds;
+    const usable_lifetime = ttl_seconds -| TOKEN_REFRESH_WINDOW_SECONDS;
     const stolen_value = token_response.access_token.value;
     token_response.access_token.value = &.{};
     token_response.owns_access_token = false;
@@ -1719,7 +1719,7 @@ fn dockerConfigRegistryKeyMatches(config_key: []const u8, registry: []const u8) 
     if (std.ascii.eqlIgnoreCase(config_key, registry)) return true;
     if (!isDockerHubRegistryAlias(registry)) return false;
 
-    return std.ascii.eqlIgnoreCase(config_key, docker_hub_auth_key) or
+    return std.ascii.eqlIgnoreCase(config_key, DOCKER_HUB_AUTH_KEY) or
         std.ascii.eqlIgnoreCase(config_key, "https://index.docker.io/v1") or
         isDockerHubRegistryAlias(config_key);
 }
@@ -1743,7 +1743,7 @@ pub fn referenceView(ref: Reference) AuthReferenceView {
     };
 }
 
-const TokenExchangeLoopContext = struct {
+const TokenExchangeLoop = struct {
     engine: *AuthEngine,
     client: *std.http.Client,
     request: AuthenticateRequest,
@@ -1757,7 +1757,7 @@ const TokenExchangeLoopContext = struct {
 };
 
 fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse {
-    const loop_ctx: *TokenExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    const loop_ctx: *TokenExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
     const allocator = loop_ctx.engine.allocator;
     const exchanger = loop_ctx.engine.token_http_exchanger orelse return error.NotYetImplemented;
     loop_ctx.exchange_attempt += 1;
@@ -2247,14 +2247,14 @@ test "auth scaffolding: types compile with representative values" {
         .scope = bearer.scope.?,
     };
     const cached = CachedToken{ .token = token, .valid_until_unix_seconds = 1_700_000_000 };
-    const helper_process_context = HelperProcessContext{ .io = std.testing.io };
+    const docker_helper_config = DockerHelperConfig{ .io = std.testing.io };
 
     try std.testing.expect(probe == .auth_required);
     try std.testing.expectEqualStrings("https://auth.example.test/token", bearer.realm);
     try std.testing.expectEqualStrings("opaque-token", response.access_token.value);
     try std.testing.expectEqualStrings("repository:owner/image:pull", key.scope.?);
     try std.testing.expectEqual(@as(?u64, 1_700_000_000), cached.valid_until_unix_seconds);
-    _ = helper_process_context;
+    _ = docker_helper_config;
 }
 
 test "auth scaffolding: engine authenticate remains a stub without exchanger" {
@@ -2270,16 +2270,16 @@ test "auth scaffolding: engine authenticate remains a stub without exchanger" {
 }
 
 test "auth scaffolding: explicit helper process context is optional" {
-    const engine = AuthEngine.initWithHelperProcessContext(
+    const engine = AuthEngine.initWithDockerHelperConfig(
         std.testing.allocator,
         Config{},
         .{ .io = std.testing.io },
     );
 
-    try std.testing.expect(engine.helperProcessContext() != null);
+    try std.testing.expect(engine.dockerHelperConfig() != null);
 }
 
-test "auth scaffolding: phase2 config review keeps only v0.1.1-relevant fields" {
+test "auth scaffolding: authConfigView keeps only auth-relevant fields" {
     const provider = CredentialProvider{
         .getCredentialFn = struct {
             fn get(_: []const u8) ?CredentialHandle {
@@ -2295,7 +2295,7 @@ test "auth scaffolding: phase2 config review keeps only v0.1.1-relevant fields" 
         .ca_bundle_path = "/tmp/custom-ca.pem",
         .rate_limit_enabled = false,
     };
-    const view = phase2ConfigView(config);
+    const view = authConfigView(config);
 
     try std.testing.expect(view.credential_provider == &provider);
     try std.testing.expectEqual(@as(u32, 5_000), view.connect_timeout_ms);
@@ -2344,12 +2344,12 @@ test "auth scaffolding: engine can request credential handle" {
     try std.testing.expectEqualStrings("token", handle.credential.secret);
 }
 
-test "auth scaffolding: phase2 config view records env credential variable names" {
-    const view = phase2ConfigView(Config{});
+test "auth scaffolding: authConfigView records env credential variable names" {
+    const view = authConfigView(Config{});
 
-    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_HOST", view.env_registry_host_var);
-    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_USER", view.env_registry_user_var);
-    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_TOKEN", view.env_registry_token_var);
+    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_HOST", view.env_registry_host);
+    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_USER", view.env_registry_user);
+    try std.testing.expectEqualStrings("Z_OCI_REGISTRY_TOKEN", view.env_registry_token);
 }
 
 test "AuthEngine.credentialForRegistry: explicit config provider wins before env" {
@@ -2362,9 +2362,9 @@ test "AuthEngine.credentialForRegistry: explicit config provider wins before env
 
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "ghcr.io");
-    try environ_map.put(env_registry_user_var, "env-user");
-    try environ_map.put(env_registry_token_var, "env-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
     const provider = CredentialProvider{ .getCredentialFn = State.get };
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
@@ -2377,9 +2377,9 @@ test "AuthEngine.credentialForRegistry: explicit config provider wins before env
 test "AuthEngine.credentialForRegistry: env provider supplies fallback credentials" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "ghcr.io");
-    try environ_map.put(env_registry_user_var, "env-user");
-    try environ_map.put(env_registry_token_var, "env-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     const handle = (try engine.credentialForRegistry("ghcr.io")).?;
@@ -2392,16 +2392,16 @@ test "AuthEngine.credentialForRegistry: env provider supplies fallback credentia
 test "envCredentialForRegistry: returns owned copies independent of environ map" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "ghcr.io");
-    try environ_map.put(env_registry_user_var, "env-user");
-    try environ_map.put(env_registry_token_var, "env-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
     const handle = (try envCredentialForRegistry(std.testing.allocator, &environ_map, "ghcr.io")).?;
     defer handle.release();
 
     try std.testing.expect(handle.release_fn != null);
-    try environ_map.put(env_registry_user_var, "mutated-user");
-    try environ_map.put(env_registry_token_var, "mutated-token");
+    try environ_map.put(ENV_REGISTRY_USER, "mutated-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "mutated-token");
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
     try std.testing.expectEqualStrings("env-token", handle.credential.secret);
 }
@@ -2420,9 +2420,9 @@ test "ownedCredentialHandle: allocation failures do not leak username or secret"
 test "envCredentialForRegistry: allocation failures do not leak" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "ghcr.io");
-    try environ_map.put(env_registry_user_var, "env-user");
-    try environ_map.put(env_registry_token_var, "env-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
     const State = struct {
         fn run(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) !void {
@@ -2440,9 +2440,9 @@ test "AuthEngine.credentialForRegistry: env allocation failures propagate withou
         fn run(allocator: std.mem.Allocator) !void {
             var environ_map = std.process.Environ.Map.init(allocator);
             defer environ_map.deinit();
-            try environ_map.put(env_registry_host_var, "ghcr.io");
-            try environ_map.put(env_registry_user_var, "env-user");
-            try environ_map.put(env_registry_token_var, "env-token");
+            try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+            try environ_map.put(ENV_REGISTRY_USER, "env-user");
+            try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
             var engine = AuthEngine.initWithEnvironmentMap(allocator, Config{}, &environ_map);
             defer engine.deinit();
@@ -2466,9 +2466,9 @@ test "ownedCredentialHandle: release_allocator matches dup allocator" {
 test "AuthEngine.credentialForRegistry: env provider normalizes Docker Hub aliases" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "docker.io");
-    try environ_map.put(env_registry_user_var, "env-user");
-    try environ_map.put(env_registry_token_var, "env-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "docker.io");
+    try environ_map.put(ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     const handle = (try engine.credentialForRegistry("registry-1.docker.io")).?;
@@ -2481,9 +2481,9 @@ test "AuthEngine.credentialForRegistry: env provider normalizes Docker Hub alias
 test "AuthEngine.credentialForRegistry: env provider treats GHCR host case-insensitively" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "ghcr.io");
-    try environ_map.put(env_registry_user_var, "env-user");
-    try environ_map.put(env_registry_token_var, "env-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     const handle = (try engine.credentialForRegistry("GHCR.IO")).?;
@@ -2496,8 +2496,8 @@ test "AuthEngine.credentialForRegistry: env provider treats GHCR host case-insen
 test "AuthEngine.credentialForRegistry: env provider ignores registry mismatch and partial env" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "ghcr.io");
-    try environ_map.put(env_registry_user_var, "env-user");
+    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(ENV_REGISTRY_USER, "env-user");
 
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     try std.testing.expect((try engine.credentialForRegistry("registry-1.docker.io")) == null);
@@ -2705,7 +2705,7 @@ test "parseDockerConfig: rejects malformed auth entries" {
 }
 
 test "dockerConfigRegistryKeyMatches: recognizes Docker Hub historical key" {
-    try std.testing.expect(dockerConfigRegistryKeyMatches(docker_hub_auth_key, "registry-1.docker.io"));
+    try std.testing.expect(dockerConfigRegistryKeyMatches(DOCKER_HUB_AUTH_KEY, "registry-1.docker.io"));
     try std.testing.expect(dockerConfigRegistryKeyMatches("docker.io", "registry-1.docker.io"));
     try std.testing.expect(!dockerConfigRegistryKeyMatches("https://index.docker.io/v1/", "ghcr.io"));
 }
@@ -2843,9 +2843,9 @@ test "AuthEngine.credentialForRegistry: Docker Hub lookup normalizes to historic
 test "AuthEngine.credentialForRegistry: env remains ahead of docker config" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "ghcr.io");
-    try environ_map.put(env_registry_user_var, "env-user");
-    try environ_map.put(env_registry_token_var, "env-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
     var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
         \\{
@@ -2926,7 +2926,7 @@ test "DockerConfig.credentialSourceForRegistry: Docker Hub helper uses historica
     const source = (try docker_config.credentialSourceForRegistry(std.testing.allocator, "registry-1.docker.io")).?;
     switch (source) {
         .helper => |helper| {
-            try std.testing.expectEqualStrings(docker_hub_auth_key, helper.server_url);
+            try std.testing.expectEqualStrings(DOCKER_HUB_AUTH_KEY, helper.server_url);
             try std.testing.expectEqualStrings("secretservice", helper.helper_suffix);
         },
         else => return error.TestUnexpectedResult,
@@ -2973,7 +2973,7 @@ test "AuthEngine.loadDockerConfigFromEnvironment: loads HOME docker config" {
 
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(home_dir_var, home_dir);
+    try environ_map.put(HOME_DIR_VAR, home_dir);
 
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     defer engine.deinit();
@@ -3032,8 +3032,8 @@ test "AuthEngine.loadDockerConfigFromEnvironment: DOCKER_CONFIG overrides HOME" 
 
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(home_dir_var, home_dir);
-    try environ_map.put(docker_config_dir_var, docker_config_path);
+    try environ_map.put(HOME_DIR_VAR, home_dir);
+    try environ_map.put(DOCKER_CONFIG_DIR_VAR, docker_config_path);
 
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     defer engine.deinit();
@@ -3056,7 +3056,7 @@ test "AuthEngine.loadDockerConfigFromEnvironment: missing file is a clean miss" 
 
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(home_dir_var, home_dir);
+    try environ_map.put(HOME_DIR_VAR, home_dir);
 
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
     defer engine.deinit();
@@ -3106,7 +3106,7 @@ test "runDockerCredentialHelperCommand: writes stdin and parses stdout" {
             "docker-credential-secretservice",
             "get",
         },
-        docker_hub_auth_key,
+        DOCKER_HUB_AUTH_KEY,
         .none,
     );
     defer handle.release();
@@ -3269,7 +3269,7 @@ test "AuthEngine.dockerCredentialForRegistry: helper path beats inline auth when
         \\}
     );
     defer engine.deinit();
-    engine.helper_process_context = .{
+    engine.docker_helper_config = .{
         .io = std.testing.io,
         .runner = State.runner,
     };
@@ -3300,7 +3300,7 @@ test "AuthEngine.dockerCredentialForRegistry: Quay global helper canonicalizes m
         \\}
     );
     defer engine.deinit();
-    engine.helper_process_context = .{ .io = std.testing.io, .runner = State.runner };
+    engine.docker_helper_config = .{ .io = std.testing.io, .runner = State.runner };
 
     const handle = (try engine.dockerCredentialForRegistry("QuAy.IO")).?;
     defer handle.release();
@@ -3362,7 +3362,7 @@ test "AuthEngine.authenticate: helper-backed Docker credentials feed optional ba
         \\}
     );
     defer engine.deinit();
-    engine.helper_process_context = .{ .io = std.testing.io, .runner = HelperState.runner };
+    engine.docker_helper_config = .{ .io = std.testing.io, .runner = HelperState.runner };
     engine.token_http_exchanger = ExchangeState.exchange;
 
     var client: std.http.Client = undefined;
@@ -3397,7 +3397,7 @@ test "AuthEngine.authenticate: helper failure stays terminal when helper is conf
         \\}
     );
     defer engine.deinit();
-    engine.helper_process_context = .{ .io = std.testing.io, .runner = HelperState.runner };
+    engine.docker_helper_config = .{ .io = std.testing.io, .runner = HelperState.runner };
     engine.token_http_exchanger = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
             defer request.deinit(std.testing.allocator);
@@ -3434,7 +3434,7 @@ test "AuthEngine.authenticate: helper timeout stays terminal when helper is conf
         \\}
     );
     defer engine.deinit();
-    engine.helper_process_context = .{ .io = std.testing.io, .runner = HelperState.runner };
+    engine.docker_helper_config = .{ .io = std.testing.io, .runner = HelperState.runner };
     engine.token_http_exchanger = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
             defer request.deinit(std.testing.allocator);
@@ -4166,7 +4166,7 @@ test "AuthEngine.authenticate: token without expires_in expires after default ca
     try std.testing.expectEqual(@as(usize, 1), State.calls);
     try std.testing.expectEqualStrings("no-expiry-token", first.access_token.value);
 
-    State.fake_now = 1_000 + default_token_cache_ttl_seconds - token_refresh_window_seconds - 1;
+    State.fake_now = 1_000 + DEFAULT_TOKEN_CACHE_TTL_SECONDS - TOKEN_REFRESH_WINDOW_SECONDS - 1;
     var second = (try engine.authenticate(&client, request)).?;
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), State.calls);
@@ -4717,9 +4717,9 @@ test "AuthEngine.authenticate: Docker Hub normalized reference uses env credenti
 
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "docker.io");
-    try environ_map.put(env_registry_user_var, "docker-user");
-    try environ_map.put(env_registry_token_var, "docker-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "docker.io");
+    try environ_map.put(ENV_REGISTRY_USER, "docker-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "docker-token");
 
     var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:latest");
     defer ref.deinit(std.testing.allocator);
@@ -4766,9 +4766,9 @@ test "AuthEngine.authenticate: env-owned credentials stay leak-free under DebugA
 
     var environ_map = std.process.Environ.Map.init(allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "docker.io");
-    try environ_map.put(env_registry_user_var, "docker-user");
-    try environ_map.put(env_registry_token_var, "docker-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "docker.io");
+    try environ_map.put(ENV_REGISTRY_USER, "docker-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "docker-token");
 
     for (0..4) |_| {
         var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, ExchangeState.exchange);
@@ -4852,9 +4852,9 @@ test "AuthEngine.authenticate: GHCR mixed-case registry still uses env credentia
 
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put(env_registry_host_var, "ghcr.io");
-    try environ_map.put(env_registry_user_var, "ghcr-user");
-    try environ_map.put(env_registry_token_var, "ghrs-token");
+    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(ENV_REGISTRY_USER, "ghcr-user");
+    try environ_map.put(ENV_REGISTRY_TOKEN, "ghrs-token");
 
     var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, ExchangeState.exchange);
     defer engine.deinit();
@@ -4932,7 +4932,7 @@ test "AuthEngine.authenticate: repeated success and failure runs stay leak-free"
 }
 
 test "token response: refresh window policy is fixed for short-lived cli use" {
-    try std.testing.expectEqual(@as(u64, 5), token_refresh_window_seconds);
+    try std.testing.expectEqual(@as(u64, 5), TOKEN_REFRESH_WINDOW_SECONDS);
 }
 
 test "auth scaffolding: cached token owns duplicated secret bytes" {

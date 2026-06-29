@@ -12,9 +12,9 @@ const std = @import("std");
 const Io = std.Io;
 const z_oci = @import("z_oci");
 
-const default_manifest_path = "fixtures/manifests/busybox-amd64-live-oci-manifest.json";
+const DEFAULT_MANIFEST_PATH = "fixtures/manifests/busybox-amd64-live-oci-manifest.json";
 
-const usage_text =
+const USAGE_TEXT =
     \\usage: inspect-manifest [manifest-json-path]
     \\
     \\Default path:
@@ -36,11 +36,11 @@ pub fn main(init: std.process.Init) !void {
     const stderr = &stderr_writer.interface;
 
     if (args.len > 2) {
-        try stderr.writeAll(usage_text);
+        try stderr.writeAll(USAGE_TEXT);
         return error.InvalidArguments;
     }
 
-    const manifest_path = if (args.len == 2) args[1] else default_manifest_path;
+    const manifest_path = if (args.len == 2) args[1] else DEFAULT_MANIFEST_PATH;
     var bytes_buffer: [32 * 1024 + 1]u8 = undefined;
     const bytes = try Io.Dir.cwd().readFile(init.io, manifest_path, &bytes_buffer);
     if (bytes.len > 32 * 1024) return error.StreamTooLong;

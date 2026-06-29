@@ -43,9 +43,9 @@
 
 const std = @import("std");
 
-pub const default_max_manifest_bytes = 8 * 1024 * 1024;
-pub const default_max_token_response_bytes = 64 * 1024;
-pub const default_max_token_cache_entries: u32 = 128;
+pub const DEFAULT_MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
+pub const DEFAULT_MAX_TOKEN_CACHE_ENTRIES: u32 = 128;
 
 /// A username/secret pair for HTTP Basic authentication.
 pub const Credential = struct {
@@ -145,13 +145,13 @@ pub const Config = struct {
     rate_limit_enabled: bool = false,
 
     /// Maximum manifest or index GET body size for live HTTP transport.
-    max_manifest_bytes: usize = default_max_manifest_bytes,
+    max_manifest_bytes: usize = DEFAULT_MAX_MANIFEST_BYTES,
 
     /// Maximum token endpoint response body size for live HTTP transport.
-    max_token_response_bytes: usize = default_max_token_response_bytes,
+    max_token_response_bytes: usize = DEFAULT_MAX_TOKEN_RESPONSE_BYTES,
 
     /// Maximum cached bearer tokens per `AuthEngine`. `0` means unbounded.
-    max_token_cache_entries: u32 = default_max_token_cache_entries,
+    max_token_cache_entries: u32 = DEFAULT_MAX_TOKEN_CACHE_ENTRIES,
 
     /// Returns the `std.Io.Timeout` value for caller-owned `connectTcpOptions`.
     ///
@@ -261,11 +261,11 @@ fn caBundleApplyCacheRemember(
     ca_bundle_apply_cache.mtime_nsec = mtime_nsec;
 }
 
-const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
-const max_ca_bundle_bytes: u64 = 10 * 1024 * 1024;
+const BASE64_DECODER = std.base64.standard.decoderWithIgnore(" \t\r\n");
+const MAX_CA_BUNDLE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// PEM blocks that belong in a key file, not in a CA trust bundle (`ca_bundle_path`).
-const private_key_pem_markers = [_][]const u8{
+const PRIVATE_KEY_PEM_MARKERS = [_][]const u8{
     "-----BEGIN PRIVATE KEY-----",
     "-----BEGIN RSA PRIVATE KEY-----",
     "-----BEGIN EC PRIVATE KEY-----",
@@ -274,7 +274,7 @@ const private_key_pem_markers = [_][]const u8{
 };
 
 fn validateCaBundleFileStat(stat: std.Io.File.Stat) Config.ApplyError!void {
-    if (stat.size > max_ca_bundle_bytes) return error.CaBundleInvalid;
+    if (stat.size > MAX_CA_BUNDLE_BYTES) return error.CaBundleInvalid;
     if (@hasDecl(std.Io.File.Permissions, "toMode")) {
         if (stat.permissions.toMode() & 0o002 != 0) return error.CaBundleInsecurePermissions;
     }
@@ -282,7 +282,7 @@ fn validateCaBundleFileStat(stat: std.Io.File.Stat) Config.ApplyError!void {
 
 fn caBundlePemContainsPrivateKey(pem_bytes: []const u8) bool {
     if (!std.mem.containsAtLeast(u8, pem_bytes, 1, "BEGIN")) return false;
-    inline for (private_key_pem_markers) |marker| {
+    inline for (PRIVATE_KEY_PEM_MARKERS) |marker| {
         if (std.mem.indexOf(u8, pem_bytes, marker) != null) return true;
     }
     return false;
@@ -316,7 +316,7 @@ fn addCertsFromPemBytes(
         const decoded_upper = encoded_cert.len / 4 * 3 + 4;
         try cb.bytes.ensureUnusedCapacity(gpa, decoded_upper);
         const dest_buf = cb.bytes.allocatedSlice()[decoded_start..];
-        cb.bytes.items.len += try base64_decoder.decode(dest_buf, encoded_cert);
+        cb.bytes.items.len += try BASE64_DECODER.decode(dest_buf, encoded_cert);
         try cb.parseCert(gpa, decoded_start, now_sec);
     }
 }
@@ -454,9 +454,9 @@ test "Config: max_network_retries and max_rate_limit_retries accept custom value
 
 test "Config: max_manifest_bytes and max_token_response_bytes use safe defaults" {
     const c = Config{};
-    try std.testing.expectEqual(default_max_manifest_bytes, c.max_manifest_bytes);
-    try std.testing.expectEqual(default_max_token_response_bytes, c.max_token_response_bytes);
-    try std.testing.expectEqual(default_max_token_cache_entries, c.max_token_cache_entries);
+    try std.testing.expectEqual(DEFAULT_MAX_MANIFEST_BYTES, c.max_manifest_bytes);
+    try std.testing.expectEqual(DEFAULT_MAX_TOKEN_RESPONSE_BYTES, c.max_token_response_bytes);
+    try std.testing.expectEqual(DEFAULT_MAX_TOKEN_CACHE_ENTRIES, c.max_token_cache_entries);
 }
 
 test "Config: max_retries zero disables retries" {
@@ -689,7 +689,7 @@ test "Config: applyToClient rejects world-writable ca bundle file on POSIX" {
         std.testing.io,
         "fixtures/tls/enterprise-test-ca.pem",
         std.testing.allocator,
-        std.Io.Limit.limited64(max_ca_bundle_bytes),
+        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
     );
     defer std.testing.allocator.free(enterprise);
     {
@@ -724,7 +724,7 @@ test "Config: applyToClient rejects pem files containing private key blocks" {
         std.testing.io,
         "fixtures/tls/enterprise-test-ca.pem",
         std.testing.allocator,
-        std.Io.Limit.limited64(max_ca_bundle_bytes),
+        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
     );
     defer std.testing.allocator.free(enterprise);
     {

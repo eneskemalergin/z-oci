@@ -20,7 +20,7 @@
 //! - Caller recipe via `Config.connectIoTimeout`; live manifest/token `client.request`
 //!   paths do not enforce connect timeout (zig#31305).
 //! - Live on public API boundary: `ca_bundle_path` via `Config.applyToClient`.
-//! - Live on manifest transport when `rate_limit_enabled`: `ManifestRateLimitState`
+//! - Live on manifest transport when `rate_limit_enabled`: `ManifestThrottle`
 //!   and `parseRateLimitHeaders` for opt-in pre-emptive throttling.
 //!
 //! Parser liveness:
@@ -52,7 +52,7 @@ const json = @import("json.zig");
 /// Parsed rate-limit snapshot from response headers.
 ///
 /// Populated by the rate-limit header parsers. Manifest transport records the
-/// last trustworthy registry snapshot via `ManifestRateLimitState` for opt-in
+/// last trustworthy registry snapshot via `ManifestThrottle` for opt-in
 /// pre-emptive throttling when `Config.rate_limit_enabled` is true.
 pub const RateLimitInfo = struct {
     pub const Source = enum {
@@ -116,7 +116,7 @@ pub const RetryBudgetConfig = struct {
 
 /// Narrow view of `Config` fields reserved for upcoming resilience milestones.
 ///
-/// `resilienceConfigView` projects the full struct for callers that need one
+/// `configView` projects the full struct for callers that need one
 /// snapshot. Only `max_network_retries` and `max_rate_limit_retries` feed
 /// `RetryPolicy` today via `retryBudgetConfig`.
 pub const ResilienceConfigView = struct {
@@ -286,7 +286,7 @@ pub const TransportSleeper = *const fn (delay_ms: u32) void;
 pub const TransportHooks = struct {
     sleeper: TransportSleeper = noopTransportSleeper,
     random_u64: RetryRandomSource = systemRetryRandomU64,
-    clock: RetryClock = systemRetryClock,
+    clock: RetryClock = SYSTEM_RETRY_CLOCK,
     /// When true, resolver/auth sleep through `std.http.Client.io` instead of `sleeper`.
     use_live_sleep: bool = false,
 };
@@ -314,7 +314,7 @@ fn systemRetryRandomU64() u64 {
     return transport_prng.random().int(u64);
 }
 
-pub const systemRetryClock: RetryClock = .{ .now_unix_seconds = systemNowUnixSeconds };
+pub const SYSTEM_RETRY_CLOCK: RetryClock = .{ .now_unix_seconds = systemNowUnixSeconds };
 
 pub fn retryPolicyConfig(config: Config) RetryPolicyConfig {
     return .{ .budget = retryBudgetConfig(config) };
@@ -514,7 +514,7 @@ pub fn retryBudgetConfig(config: Config) RetryBudgetConfig {
     };
 }
 
-pub fn resilienceConfigView(config: Config) ResilienceConfigView {
+pub fn configView(config: Config) ResilienceConfigView {
     return .{
         .connect_timeout_ms = config.connect_timeout_ms,
         .read_timeout_ms = config.read_timeout_ms,
@@ -588,7 +588,7 @@ pub const ResilienceParseError = error{
 /// Numeric `Retry-After` values at or above this are treated as Unix epoch
 /// seconds. Docker Hub sends epoch timestamps in `Retry-After` instead of a
 /// delay in seconds.
-const retry_after_unix_epoch_threshold: u64 = 1_000_000_000;
+const RETRY_AFTER_UNIX_EPOCH_THRESHOLD: u64 = 1_000_000_000;
 
 const epoch = std.time.epoch;
 
@@ -649,7 +649,7 @@ pub fn parseApiRateLimitHeaders(headers: []const HttpHeader) ResilienceParseErro
 /// Parse rate-limit headers, preferring registry `RateLimit-*` over API
 /// `X-RateLimit-*` when both families are present.
 ///
-/// Live on manifest transport via `ManifestRateLimitState` when pre-emptive
+/// Live on manifest transport via `ManifestThrottle` when pre-emptive
 /// throttling is enabled. Reactive transport retry uses `retryAfterFromHeaders`.
 pub fn parseRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!RateLimitInfo {
     const registry = try parseRegistryRateLimitHeaders(headers);
@@ -690,10 +690,10 @@ pub fn preemptiveRateLimitDelayMs(
 
 /// Carries the last trustworthy registry rate-limit snapshot across manifest HTTP
 /// calls within one resolve/validate/get operation (via `AuthEngine`).
-pub const ManifestRateLimitState = struct {
+pub const ManifestThrottle = struct {
     prior: ?RateLimitInfo = null,
 
-    pub fn recordManifestResponseHeaders(self: *ManifestRateLimitState, headers: []const HttpHeader) void {
+    pub fn recordManifestResponseHeaders(self: *ManifestThrottle, headers: []const HttpHeader) void {
         const parsed = parseRateLimitHeaders(headers) catch {
             self.prior = null;
             return;
@@ -706,7 +706,7 @@ pub const ManifestRateLimitState = struct {
     }
 
     pub fn sleepBeforeManifestRequestIfNeeded(
-        self: *const ManifestRateLimitState,
+        self: *const ManifestThrottle,
         config: Config,
         client: *std.http.Client,
         hooks: TransportHooks,
@@ -764,7 +764,7 @@ fn parseRetryAfterValueWithContext(
     if (!digits_only) return error.InvalidRetryAfterHeader;
 
     const parsed = std.fmt.parseInt(u64, trimmed, 10) catch return error.InvalidRetryAfterHeader;
-    if (parsed >= retry_after_unix_epoch_threshold) {
+    if (parsed >= RETRY_AFTER_UNIX_EPOCH_THRESHOLD) {
         return .{ .retry_at_unix_seconds = @intCast(parsed) };
     }
 
@@ -962,7 +962,7 @@ test "retryBudgetConfig projects only transport retry limits" {
     try std.testing.expectEqual(@as(u8, 9), config.max_retries);
 }
 
-test "resilienceConfigView projects reserved fields without implying they drive RetryPolicy" {
+test "configView projects reserved fields without implying they drive RetryPolicy" {
     const config = Config{
         .connect_timeout_ms = 5_000,
         .read_timeout_ms = 60_000,
@@ -973,7 +973,7 @@ test "resilienceConfigView projects reserved fields without implying they drive 
         .rate_limit_enabled = false,
     };
 
-    const view = resilienceConfigView(config);
+    const view = configView(config);
 
     try std.testing.expectEqual(@as(u32, 5_000), view.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 60_000), view.read_timeout_ms);
@@ -1429,8 +1429,8 @@ test "preemptiveRateLimitDelayMs ignores remaining above threshold" {
     try std.testing.expect(preemptiveRateLimitDelayMs(true, info, 1_700_000_000, 0) == null);
 }
 
-test "ManifestRateLimitState records trustworthy headers and rejects partial API headers" {
-    var state: ManifestRateLimitState = .{};
+test "ManifestThrottle records trustworthy headers and rejects partial API headers" {
+    var state: ManifestThrottle = .{};
     const registry_headers = [_]HttpHeader{
         .{ .name = "RateLimit-Limit", .value = "100;w=21600" },
         .{ .name = "RateLimit-Remaining", .value = "0" },
@@ -1449,7 +1449,7 @@ test "ManifestRateLimitState records trustworthy headers and rejects partial API
     try std.testing.expect(state.prior == null);
 }
 
-test "ManifestRateLimitState sleepBeforeManifestRequestIfNeeded uses transport hooks" {
+test "ManifestThrottle sleepBeforeManifestRequestIfNeeded uses transport hooks" {
     const State = struct {
         var slept_ms: u32 = 0;
 
@@ -1460,7 +1460,7 @@ test "ManifestRateLimitState sleepBeforeManifestRequestIfNeeded uses transport h
     defer State.slept_ms = 0;
 
     test_policy_now_unix_seconds = 1_700_000_000;
-    var state: ManifestRateLimitState = .{
+    var state: ManifestThrottle = .{
         .prior = .{
             .source = .registry_rate_limit,
             .limit = 100,

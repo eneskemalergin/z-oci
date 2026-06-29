@@ -18,9 +18,9 @@ const Platform = @import("Platform.zig");
 const ResolveError = @import("ResolveError.zig").ResolveError;
 const json = @import("json.zig");
 
-const max_www_authenticate_headers = 8;
-const max_resilience_headers = 16;
-const max_manifest_header_value_bytes = 8 * 1024;
+const MAX_WWW_AUTHENTICATE_HEADERS = 8;
+const MAX_RESILIENCE_HEADERS = 16;
+const MAX_MANIFEST_HEADER_VALUE_BYTES = 8 * 1024;
 
 pub const ManifestRequestMethod = enum {
     head,
@@ -39,7 +39,7 @@ pub const ResolverOperation = enum {
 /// `config` must match the `Config` snapshot passed to `AuthEngine` on the same
 /// resolve/validate/get call so transport retry budgets stay aligned across
 /// manifest and token traffic.
-pub const ResolverContext = struct {
+pub const ResolverParams = struct {
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     config: Config,
@@ -55,7 +55,7 @@ pub const ResolverContext = struct {
         reference: auth.AuthReferenceView,
         platform: ?Platform,
         operation: ResolverOperation,
-    ) ResolverContext {
+    ) ResolverParams {
         return initWithTransportHooks(allocator, client, config, reference, platform, operation, .{});
     }
 
@@ -67,7 +67,7 @@ pub const ResolverContext = struct {
         platform: ?Platform,
         operation: ResolverOperation,
         transport_hooks: resilience.TransportHooks,
-    ) ResolverContext {
+    ) ResolverParams {
         return .{
             .allocator = allocator,
             .client = client,
@@ -86,7 +86,7 @@ pub const ResolverContext = struct {
         reference: auth.AuthReferenceView,
         platform: ?Platform,
         operation: ResolverOperation,
-    ) ResolverContext {
+    ) ResolverParams {
         return initWithTransportHooks(
             allocator,
             client,
@@ -123,7 +123,7 @@ pub const ManifestHttpRequest = struct {
     url: []u8,
     authorization: ?[]u8 = null,
     accept: []const []const u8 = &.{},
-    max_response_body_bytes: usize = config_module.default_max_manifest_bytes,
+    max_response_body_bytes: usize = config_module.DEFAULT_MAX_MANIFEST_BYTES,
 
     pub fn deinit(self: ManifestHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
@@ -662,7 +662,7 @@ test "shouldKeepAuthorizationOnRedirect rejects port changes" {
 }
 
 fn manifestHeaderValueWithinLimit(value: []const u8) bool {
-    return value.len <= max_manifest_header_value_bytes;
+    return value.len <= MAX_MANIFEST_HEADER_VALUE_BYTES;
 }
 
 fn wwwAuthenticateHeadersSufficient(headers: []const []const u8) bool {
@@ -759,7 +759,7 @@ fn ownedManifestResponseMetadataFromHead(
 
         if (std.ascii.eqlIgnoreCase(header.name, "www-authenticate")) {
             if (!collect_auth_headers or www_authenticate_complete) continue;
-            if (www_authenticate_headers.items.len >= max_www_authenticate_headers) {
+            if (www_authenticate_headers.items.len >= MAX_WWW_AUTHENTICATE_HEADERS) {
                 return error.ResponseHeadersTooLarge;
             }
             try www_authenticate_headers.append(allocator, try dupeManifestHeaderValueAlloc(allocator, header.value));
@@ -772,7 +772,7 @@ fn ownedManifestResponseMetadataFromHead(
         if (resilience.isTrackedResilienceHeaderName(header.name)) {
             if (!shouldCollectManifestResilienceHeader(head.status, header.name)) continue;
             if (resilienceHeaderAlreadyCollected(resilience_headers.items, header.name)) continue;
-            if (resilience_headers.items.len >= max_resilience_headers) {
+            if (resilience_headers.items.len >= MAX_RESILIENCE_HEADERS) {
                 return error.ResponseHeadersTooLarge;
             }
             try resilience_headers.append(allocator, .{
@@ -868,7 +868,7 @@ fn rateLimitedError(registry: []const u8, reference: []const u8, http_status: ?u
 
 fn mapExhaustedManifestTransportError(
     comptime Outcome: type,
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     err: ManifestExchangeError,
     budget: resilience.RetryBudget,
 ) error{OutOfMemory}!Outcome {
@@ -907,7 +907,7 @@ fn unsupportedAlgorithmError(registry: []const u8, reference: []const u8, http_s
 
 /// Execute the internal HEAD path through a mockable transport seam.
 pub fn performManifestHead(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     accept: []const []const u8,
@@ -934,7 +934,7 @@ pub fn performManifestHead(
 
 /// Execute the internal GET path through the resolver transport seam.
 pub fn performManifestGet(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     accept: []const []const u8,
@@ -956,8 +956,8 @@ pub fn performManifestGet(
     }
 }
 
-const ManifestExchangeLoopContext = struct {
-    resolver_ctx: ResolverContext,
+const ManifestExchangeLoop = struct {
+    resolver_ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
@@ -967,7 +967,7 @@ const ManifestExchangeLoopContext = struct {
 };
 
 fn exchangeManifestRequestOnce(
-    loop_ctx: *ManifestExchangeLoopContext,
+    loop_ctx: *ManifestExchangeLoop,
     exchanger: ManifestHttpExchanger,
 ) ManifestExchangeError!ManifestHttpResponse {
     const allocator = loop_ctx.resolver_ctx.allocator;
@@ -998,7 +998,7 @@ fn exchangeManifestRequestOnce(
 }
 
 fn exchangeManifestRequest(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
@@ -1006,7 +1006,7 @@ fn exchangeManifestRequest(
 ) resilience.HttpRetryLoopResult(ManifestHttpResponse, ManifestExchangeError) {
     var policy = resilience.retryPolicyFromConfig(ctx.config, ctx.transport_hooks);
 
-    var loop_ctx = ManifestExchangeLoopContext{
+    var loop_ctx = ManifestExchangeLoop{
         .resolver_ctx = ctx,
         .engine = engine,
         .exchanger = exchanger,
@@ -1040,8 +1040,8 @@ fn exchangeManifestRequest(
 }
 
 fn beforeManifestExchangeAttempt(ctx_ptr: *anyopaque) void {
-    const loop_ctx: *const ManifestExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
-    loop_ctx.engine.manifest_rate_limit_state.sleepBeforeManifestRequestIfNeeded(
+    const loop_ctx: *const ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
+    loop_ctx.engine.manifest_throttle.sleepBeforeManifestRequestIfNeeded(
         loop_ctx.resolver_ctx.config,
         loop_ctx.resolver_ctx.client,
         loop_ctx.resolver_ctx.transport_hooks,
@@ -1049,12 +1049,12 @@ fn beforeManifestExchangeAttempt(ctx_ptr: *anyopaque) void {
 }
 
 fn afterManifestExchangeAttempt(ctx_ptr: *anyopaque, _: std.http.Status, headers: []const resilience.HttpHeader) void {
-    const loop_ctx: *const ManifestExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
-    loop_ctx.engine.manifest_rate_limit_state.recordManifestResponseHeaders(headers);
+    const loop_ctx: *const ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
+    loop_ctx.engine.manifest_throttle.recordManifestResponseHeaders(headers);
 }
 
 fn manifestExchangeOnceOpaque(ctx_ptr: *anyopaque) ManifestExchangeError!ManifestHttpResponse {
-    const loop_ctx: *ManifestExchangeLoopContext = @ptrCast(@alignCast(ctx_ptr));
+    const loop_ctx: *ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
     return exchangeManifestRequestOnce(loop_ctx, loop_ctx.exchanger);
 }
 
@@ -1073,7 +1073,7 @@ fn deinitManifestHttpResponse(allocator: std.mem.Allocator, response: ManifestHt
 
 fn mapRetryableManifestStatusFailure(
     comptime Outcome: type,
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     http_status: ?u16,
     status: std.http.Status,
     budget: resilience.RetryBudget,
@@ -1102,7 +1102,7 @@ fn mapRetryableManifestStatusFailure(
 }
 
 fn classifyHeadResponse(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
@@ -1138,7 +1138,7 @@ fn classifyHeadResponse(
 }
 
 fn authenticateHeadRequest(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
@@ -1156,7 +1156,7 @@ fn authenticateHeadRequest(
 }
 
 fn classifyGetResponse(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
@@ -1201,7 +1201,7 @@ fn classifyGetResponse(
 }
 
 fn authenticateGetRequest(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
@@ -1220,12 +1220,12 @@ fn authenticateGetRequest(
 
 fn authenticateManifestRequest(
     comptime Outcome: type,
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
     challenge: auth.AuthChallenge,
-    comptime classify_authenticated_response_fn: fn (ResolverContext, *auth.AuthEngine, ManifestHttpExchanger, ManifestRequest, ManifestHttpResponse, resilience.RetryBudget) error{OutOfMemory}!Outcome,
+    comptime classify_authenticated_response_fn: fn (ResolverParams, *auth.AuthEngine, ManifestHttpExchanger, ManifestRequest, ManifestHttpResponse, resilience.RetryBudget) error{OutOfMemory}!Outcome,
 ) error{OutOfMemory}!Outcome {
     const unauthorized_status = @intFromEnum(std.http.Status.unauthorized);
     const bearer_challenge = switch (challenge) {
@@ -1287,7 +1287,7 @@ fn authenticateManifestRequest(
 }
 
 fn classifyAuthenticatedHeadResponse(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
@@ -1299,7 +1299,7 @@ fn classifyAuthenticatedHeadResponse(
 }
 
 fn classifyAuthenticatedGetResponse(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     engine: *auth.AuthEngine,
     exchanger: ManifestHttpExchanger,
     request: ManifestRequest,
@@ -1310,7 +1310,7 @@ fn classifyAuthenticatedGetResponse(
 }
 
 fn classifyUsableHeadMetadata(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     request: ManifestRequest,
     metadata: ManifestResponseMetadata,
 ) error{OutOfMemory}!HeadRequestOutcome {
@@ -1349,7 +1349,7 @@ fn classifyUsableHeadMetadata(
 }
 
 fn classifyUsableGetResponse(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     request: ManifestRequest,
     metadata: ManifestResponseMetadata,
     body: ?[]u8,
@@ -1474,7 +1474,7 @@ const VerifiedManifestDigest = struct {
 };
 
 fn verifyManifestBodyIntegrityAlloc(
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     metadata: ManifestResponseMetadata,
     body: []const u8,
 ) ManifestIntegrityError!VerifiedManifestDigest {
@@ -1538,7 +1538,7 @@ fn failureOutcome(comptime Outcome: type, failure: ResolveError) Outcome {
 
 fn mappedFailureOutcome(
     comptime Outcome: type,
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     http_status: ?u16,
     comptime failure_factory: *const fn ([]const u8, []const u8, ?u16) ResolveError,
 ) error{OutOfMemory}!Outcome {
@@ -1548,7 +1548,7 @@ fn mappedFailureOutcome(
 
 fn mappedRetryFailureOutcome(
     comptime Outcome: type,
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     http_status: ?u16,
     comptime failure_factory: *const fn ([]const u8, []const u8, ?u16, bool) ResolveError,
     transport_retries_exhausted: bool,
@@ -1559,7 +1559,7 @@ fn mappedRetryFailureOutcome(
 
 fn authFailureOutcome(
     comptime Outcome: type,
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     http_status: ?u16,
 ) error{OutOfMemory}!Outcome {
     const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
@@ -1572,7 +1572,7 @@ fn authFailureOutcome(
 
 fn mappedAuthFailureOutcome(
     comptime Outcome: type,
-    ctx: ResolverContext,
+    ctx: ResolverParams,
     err: auth.AuthError,
     http_status: ?u16,
 ) error{OutOfMemory}!Outcome {
@@ -1615,7 +1615,7 @@ fn freeHeaderSlices(allocator: std.mem.Allocator, headers: []const []const u8) v
     allocator.free(headers);
 }
 
-test "ResolverContext init preserves normalized reference and operation" {
+test "ResolverParams init preserves normalized reference and operation" {
     var client: std.http.Client = undefined;
     const view = auth.AuthReferenceView{
         .registry = "registry-1.docker.io",
@@ -1623,7 +1623,7 @@ test "ResolverContext init preserves normalized reference and operation" {
         .ref_string = "latest",
     };
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -1807,7 +1807,7 @@ test "ownedManifestResponseMetadataFromHead: keeps unsupported schemes until bea
 }
 
 test "ownedManifestResponseMetadataFromHead: rejects oversize header values" {
-    const oversized = try std.testing.allocator.alloc(u8, max_manifest_header_value_bytes + 1);
+    const oversized = try std.testing.allocator.alloc(u8, MAX_MANIFEST_HEADER_VALUE_BYTES + 1);
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'a');
 
@@ -2025,7 +2025,7 @@ test "performManifestHead retries transient 503 then succeeds" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 1 },
@@ -2101,7 +2101,7 @@ test "performManifestGet repeated GET runs leave no residual allocations under D
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{}, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         allocator,
         &client,
         Config{},
@@ -2163,7 +2163,7 @@ test "performManifestGet retry path leaves no residual allocations under DebugAl
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         allocator,
         &client,
         .{ .max_network_retries = 1 },
@@ -2220,7 +2220,7 @@ test "performManifestHead retry path leaves no residual allocations under DebugA
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         allocator,
         &client,
         .{ .max_network_retries = 1 },
@@ -2264,7 +2264,7 @@ test "performManifestHead maps exhausted 429 to rate_limited" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_rate_limit_retries = 0 },
@@ -2313,7 +2313,7 @@ test "performManifestHead marks transport_retries_exhausted after rate-limit ret
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_rate_limit_retries = 1 },
@@ -2353,7 +2353,7 @@ test "performManifestHead maps exhausted transport timeout to timeout failure" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 0 },
@@ -2422,14 +2422,14 @@ test "performManifestGet preemptive sleep before request when engine carries exh
     }, State.tokenExchange, hooks);
     defer engine.deinit();
 
-    engine.manifest_rate_limit_state.prior = .{
+    engine.manifest_throttle.prior = .{
         .source = .registry_rate_limit,
         .limit = 100,
         .remaining = 0,
         .reset_unix_seconds = 1_700_000_030,
     };
 
-    const ctx = ResolverContext.initWithTransportHooks(
+    const ctx = ResolverParams.initWithTransportHooks(
         std.testing.allocator,
         &client,
         .{ .rate_limit_enabled = true },
@@ -2480,7 +2480,7 @@ test "performManifestHead retries connection reset then succeeds" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 1 },
@@ -2525,7 +2525,7 @@ test "performManifestHead does not retry not found" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 2 },
@@ -2572,7 +2572,7 @@ test "performManifestHead exhausts repeated 429 on rate limit budget" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_rate_limit_retries = 1 },
@@ -2645,7 +2645,7 @@ test "performManifestHead returns validate_single_arch_ok for validate operation
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -2683,7 +2683,7 @@ test "performManifestHead rejects mismatched pinned digest on validate" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -2726,7 +2726,7 @@ test "performManifestHead returns success for anonymous usable HEAD metadata" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -2768,7 +2768,7 @@ test "performManifestHead falls back to GET when usable HEAD metadata is incompl
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -2804,7 +2804,7 @@ test "performManifestHead returns redirect outcome for redirect metadata with lo
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -2840,7 +2840,7 @@ test "performManifestHead maps redirect without location into network error" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -2873,7 +2873,7 @@ test "performManifestHead returns not_found for missing manifest" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -2927,7 +2927,7 @@ test "performManifestHead authenticates on challenge and retries HEAD with beare
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -2968,7 +2968,7 @@ test "performManifestHead maps malformed authenticate header into auth failure" 
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3041,7 +3041,7 @@ test "performManifestHead retries once after cached unauthorized response" {
         .max_rate_limit_retries = 2,
     }, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 2, .max_rate_limit_retries = 2 },
@@ -3080,7 +3080,7 @@ test "performManifestHead maps transport failures into resolver failures" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3120,7 +3120,7 @@ test "performManifestHead rejects unsupported content type on HEAD success" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3160,7 +3160,7 @@ test "performManifestHead rejects known non-manifest content type on HEAD succes
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3200,7 +3200,7 @@ test "performManifestHead rejects recognized media type outside Accept list" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3243,7 +3243,7 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -3302,7 +3302,7 @@ test "performManifestGet parses Docker manifest fixture" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -3348,7 +3348,7 @@ test "performManifestGet parses OCI index fixture" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -3394,7 +3394,7 @@ test "performManifestGet parses Docker manifest list fixture" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -3437,7 +3437,7 @@ test "performManifestGet returns redirect outcome for redirect metadata with loc
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -3473,7 +3473,7 @@ test "performManifestGet maps redirect without location into network error" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3512,7 +3512,7 @@ test "performManifestGet maps missing body into manifest parse error" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3554,7 +3554,7 @@ test "performManifestGet maps empty body into manifest parse error" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3597,7 +3597,7 @@ test "performManifestGet maps unsupported content type into resolver failure" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3640,7 +3640,7 @@ test "performManifestGet rejects body whose declared mediaType disagrees with Co
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3683,7 +3683,7 @@ test "performManifestGet rejects recognized media type outside Accept list" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -3739,7 +3739,7 @@ test "performManifestGet authenticates on challenge and retries GET with bearer 
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -3794,7 +3794,7 @@ test "performManifestGet retries transient 503 then succeeds" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 1 },
@@ -3837,7 +3837,7 @@ test "performManifestGet maps exhausted 429 to rate_limited" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_rate_limit_retries = 0 },
@@ -3887,7 +3887,7 @@ test "performManifestGet retries connection reset then succeeds" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 1 },
@@ -3925,7 +3925,7 @@ test "performManifestGet maps exhausted transport timeout to timeout failure" {
     }, State.tokenExchange);
     defer engine.deinit();
 
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 0 },
@@ -3966,7 +3966,7 @@ test "performManifestGet maps malformed authenticate header into auth failure" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -4037,7 +4037,7 @@ test "performManifestGet retries once after cached unauthorized response" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -4084,7 +4084,7 @@ test "performManifestGet verifies matching pinned digest reference" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -4127,7 +4127,7 @@ test "performManifestGet rejects mismatched response digest header" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -4169,7 +4169,7 @@ test "performManifestGet rejects mismatched pinned digest reference" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -4212,7 +4212,7 @@ test "performManifestGet rejects unsupported digest algorithm in response header
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         arena.allocator(),
         &client,
         Config{},
@@ -4246,7 +4246,7 @@ test "performManifestGet maps oversize transport body to manifest_parse_error" {
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -4281,7 +4281,7 @@ test "performManifestGet maps oversize response headers to manifest_parse_error"
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{},
@@ -4326,7 +4326,7 @@ test "performManifestGet maps oversize token response to auth_failed" {
         .max_token_response_bytes = custom_cap,
     }, State.tokenExchange);
     defer engine.deinit();
-    const ctx = ResolverContext.init(
+    const ctx = ResolverParams.init(
         std.testing.allocator,
         &client,
         Config{ .max_token_response_bytes = custom_cap },

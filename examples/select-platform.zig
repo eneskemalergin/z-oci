@@ -12,9 +12,9 @@ const std = @import("std");
 const Io = std.Io;
 const z_oci = @import("z_oci");
 
-const default_index_path = "fixtures/indexes/busybox-latest-live-oci-index.json";
+const DEFAULT_INDEX_PATH = "fixtures/indexes/busybox-latest-live-oci-index.json";
 
-const usage_text =
+const USAGE_TEXT =
     \\usage:
     \\  select-platform
     \\  select-platform <os> <arch>
@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     defer stderr_writer.end() catch {};
     const stderr = &stderr_writer.interface;
 
-    var index_path: []const u8 = default_index_path;
+    var index_path: []const u8 = DEFAULT_INDEX_PATH;
     var filter = z_oci.Platform{ .os = "linux", .architecture = "amd64" };
 
     switch (args.len) {
@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
             filter.variant = args[4];
         },
         else => {
-            try stderr.writeAll(usage_text);
+            try stderr.writeAll(USAGE_TEXT);
             return error.InvalidArguments;
         },
     }

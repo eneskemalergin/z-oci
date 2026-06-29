@@ -11,7 +11,7 @@ const std = @import("std");
 const Io = std.Io;
 const z_oci = @import("z_oci");
 
-const usage_text =
+const USAGE_TEXT =
     \\usage: resolve-reference <image-reference> [os/arch[/variant]]
     \\
     \\Examples:
@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
     const stderr = &stderr_writer.interface;
 
     if (args.len < 2 or args.len > 3) {
-        try stderr.writeAll(usage_text);
+        try stderr.writeAll(USAGE_TEXT);
         return error.InvalidArguments;
     }
 

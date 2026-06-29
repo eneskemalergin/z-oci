@@ -32,7 +32,7 @@ const WorkflowResponsePlan = struct {
     malformed_auth_header: bool = false,
 };
 
-const workflow_public_resolve_failure_scenarios = [_]WorkflowFailureScenario{
+const WORKFLOW_PUBLIC_RESOLVE_FAILURE_SCENARIOS = [_]WorkflowFailureScenario{
     .network_error,
     .auth_failed,
     .content_type_mismatch,
@@ -460,7 +460,7 @@ test "workflow smoke: public resolve failure matrix preserves full error context
         .digest_raw = null,
     };
 
-    for (workflow_public_resolve_failure_scenarios) |scenario| {
+    for (WORKFLOW_PUBLIC_RESOLVE_FAILURE_SCENARIOS) |scenario| {
         State.scenario = scenario;
 
         const outcome = try z_oci.testing.resolveWithExchangers(
