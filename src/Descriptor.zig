@@ -9,11 +9,12 @@
 //! annotations stores the raw JSON value from the OCI spec annotations map.
 //! The value is a std.json.Value.object when present.
 
+const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;
 const Digest = @import("Digest.zig");
 const Platform = @import("Platform.zig");
 const json = @import("json.zig");
-const std = @import("std");
+const test_support = @import("test_support.zig");
 
 /// OCI spec field: mediaType
 media_type: MediaType,
@@ -294,8 +295,6 @@ test "Descriptor JSON: stringify/reparse preserves optional fields leak-free" {
     try std.testing.expect(reparsed.value.annotations != null);
     try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", reparsed.value.artifact_type.?);
 }
-
-const test_support = @import("test_support.zig");
 
 test "Descriptor JSON: parses upstream OCI descriptor fixture" {
     const parsed = try test_support.parseFixture(

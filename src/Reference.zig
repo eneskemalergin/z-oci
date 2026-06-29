@@ -222,6 +222,14 @@ fn isRepositoryAlphaNum(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
 }
 
+const ReferenceCorpusCase = struct {
+    input: []const u8,
+    registry: []const u8,
+    repository: []const u8,
+    repository_path: []const u8,
+    ref_string: []const u8,
+};
+
 // Tests
 //
 // parse: Docker Hub bare names ------------------------------------------------
@@ -446,14 +454,6 @@ test "parse: rejects repository component with colon with error.InvalidReference
 }
 
 // repositoryPath and refString ------------------------------------------------
-
-const ReferenceCorpusCase = struct {
-    input: []const u8,
-    registry: []const u8,
-    repository: []const u8,
-    repository_path: []const u8,
-    ref_string: []const u8,
-};
 
 test "real-world corpus: common registry references normalize to expected repositoryPath and refString values" {
     const cases = [_]ReferenceCorpusCase{

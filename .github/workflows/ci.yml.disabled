@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, phase2-auth]
+    branches: [main]
   pull_request:
     branches: [main]
 

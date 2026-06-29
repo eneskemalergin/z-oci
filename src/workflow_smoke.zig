@@ -41,6 +41,119 @@ const WORKFLOW_PUBLIC_RESOLVE_FAILURE_SCENARIOS = [_]WorkflowFailureScenario{
     .unsupported_algorithm,
 };
 
+// Kept local on purpose: workflow_smoke builds as its own root module under
+// `zig build test`, so importing test_support.zig here would make that file
+// belong to two modules at once.
+fn parseWorkflowFixture(comptime T: type, path: []const u8, comptime max_bytes: usize) !std.json.Parsed(T) {
+    var bytes_buffer: [max_bytes + 1]u8 = undefined;
+    const bytes = try std.Io.Dir.cwd().readFile(std.testing.io, path, &bytes_buffer);
+    if (bytes.len > max_bytes) return error.StreamTooLong;
+
+    return z_oci.json.parse(T, std.testing.allocator, bytes);
+}
+
+fn readWorkflowFixtureAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(max_bytes));
+}
+
+fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var digest_bytes: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest_bytes, .{});
+    const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
+}
+
+fn workflowResponsePlan(scenario: WorkflowFailureScenario) WorkflowResponsePlan {
+    return switch (scenario) {
+        .network_error => .{
+            .status = .temporary_redirect,
+        },
+        .auth_failed => .{
+            .status = .unauthorized,
+            .malformed_auth_header = true,
+        },
+        .content_type_mismatch => .{
+            .status = .ok,
+            .content_type = "application/vnd.oci.image.config.v1+json",
+            .body_kind = .manifest_fixture,
+        },
+        .manifest_parse_error => .{
+            .status = .ok,
+            .content_type = "application/vnd.oci.image.manifest.v1+json",
+            .body_kind = .malformed_manifest_fixture,
+        },
+        .digest_mismatch => .{
+            .status = .ok,
+            .content_type = "application/vnd.oci.image.manifest.v1+json",
+            .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .body_kind = .manifest_fixture,
+        },
+        .unsupported_algorithm => .{
+            .status = .ok,
+            .content_type = "application/vnd.oci.image.manifest.v1+json",
+            .docker_content_digest = "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .body_kind = .manifest_fixture,
+        },
+    };
+}
+
+fn workflowExpectedTagName(scenario: WorkflowFailureScenario) []const u8 {
+    return @tagName(scenario);
+}
+
+fn workflowExpectedHttpStatus(scenario: WorkflowFailureScenario) ?u16 {
+    return @intCast(@intFromEnum(workflowResponsePlan(scenario).status));
+}
+
+fn expectWorkflowResolveFailure(
+    failure: z_oci.ResolveError,
+    expected_tag_name: []const u8,
+    expected_registry: []const u8,
+    expected_reference: []const u8,
+    expected_http_status: ?u16,
+) !void {
+    try std.testing.expectEqualStrings(expected_tag_name, @tagName(std.meta.activeTag(failure)));
+    switch (failure) {
+        inline else => |value| {
+            try std.testing.expectEqualSlices(u8, expected_registry, value.registry);
+            try std.testing.expectEqualSlices(u8, expected_reference, value.reference);
+            try std.testing.expectEqual(expected_http_status, value.http_status);
+        },
+    }
+}
+
+fn buildIndexBodyAlloc(
+    allocator: std.mem.Allocator,
+    index_media_type: []const u8,
+    child_media_type: []const u8,
+    child_digest: []const u8,
+    os: []const u8,
+    architecture: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "{s}",
+        \\  "manifests": [
+        \\    {{
+        \\      "mediaType": "{s}",
+        \\      "digest": "{s}",
+        \\      "size": 610,
+        \\      "platform": {{
+        \\        "os": "{s}",
+        \\        "architecture": "{s}"
+        \\      }}
+        \\    }}
+        \\  ]
+        \\}}
+    ,
+        .{ index_media_type, child_media_type, child_digest, os, architecture },
+    );
+}
+
+// --- Tests ---
+
 test "workflow smoke: parse manifest fixture and stringify summary fields" {
     const parsed = try parseWorkflowFixture(
         z_oci.Manifest,
@@ -642,115 +755,4 @@ test "workflow smoke: public resolve returns CaBundleFileNotFound for missing ca
     );
 
     try std.testing.expectError(error.CaBundleFileNotFound, outcome);
-}
-
-// Kept local on purpose: workflow_smoke builds as its own root module under
-// `zig build test`, so importing test_support.zig here would make that file
-// belong to two modules at once.
-fn parseWorkflowFixture(comptime T: type, path: []const u8, comptime max_bytes: usize) !std.json.Parsed(T) {
-    var bytes_buffer: [max_bytes + 1]u8 = undefined;
-    const bytes = try std.Io.Dir.cwd().readFile(std.testing.io, path, &bytes_buffer);
-    if (bytes.len > max_bytes) return error.StreamTooLong;
-
-    return z_oci.json.parse(T, std.testing.allocator, bytes);
-}
-
-fn readWorkflowFixtureAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(max_bytes));
-}
-
-fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    var digest_bytes: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(body, &digest_bytes, .{});
-    const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
-}
-
-fn workflowResponsePlan(scenario: WorkflowFailureScenario) WorkflowResponsePlan {
-    return switch (scenario) {
-        .network_error => .{
-            .status = .temporary_redirect,
-        },
-        .auth_failed => .{
-            .status = .unauthorized,
-            .malformed_auth_header = true,
-        },
-        .content_type_mismatch => .{
-            .status = .ok,
-            .content_type = "application/vnd.oci.image.config.v1+json",
-            .body_kind = .manifest_fixture,
-        },
-        .manifest_parse_error => .{
-            .status = .ok,
-            .content_type = "application/vnd.oci.image.manifest.v1+json",
-            .body_kind = .malformed_manifest_fixture,
-        },
-        .digest_mismatch => .{
-            .status = .ok,
-            .content_type = "application/vnd.oci.image.manifest.v1+json",
-            .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            .body_kind = .manifest_fixture,
-        },
-        .unsupported_algorithm => .{
-            .status = .ok,
-            .content_type = "application/vnd.oci.image.manifest.v1+json",
-            .docker_content_digest = "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            .body_kind = .manifest_fixture,
-        },
-    };
-}
-
-fn workflowExpectedTagName(scenario: WorkflowFailureScenario) []const u8 {
-    return @tagName(scenario);
-}
-
-fn workflowExpectedHttpStatus(scenario: WorkflowFailureScenario) ?u16 {
-    return @intCast(@intFromEnum(workflowResponsePlan(scenario).status));
-}
-
-fn expectWorkflowResolveFailure(
-    failure: z_oci.ResolveError,
-    expected_tag_name: []const u8,
-    expected_registry: []const u8,
-    expected_reference: []const u8,
-    expected_http_status: ?u16,
-) !void {
-    try std.testing.expectEqualStrings(expected_tag_name, @tagName(std.meta.activeTag(failure)));
-    switch (failure) {
-        inline else => |value| {
-            try std.testing.expectEqualSlices(u8, expected_registry, value.registry);
-            try std.testing.expectEqualSlices(u8, expected_reference, value.reference);
-            try std.testing.expectEqual(expected_http_status, value.http_status);
-        },
-    }
-}
-
-fn buildIndexBodyAlloc(
-    allocator: std.mem.Allocator,
-    index_media_type: []const u8,
-    child_media_type: []const u8,
-    child_digest: []const u8,
-    os: []const u8,
-    architecture: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        \\{{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "{s}",
-        \\  "manifests": [
-        \\    {{
-        \\      "mediaType": "{s}",
-        \\      "digest": "{s}",
-        \\      "size": 610,
-        \\      "platform": {{
-        \\        "os": "{s}",
-        \\        "architecture": "{s}"
-        \\      }}
-        \\    }}
-        \\  ]
-        \\}}
-    ,
-        .{ index_media_type, child_media_type, child_digest, os, architecture },
-    );
 }

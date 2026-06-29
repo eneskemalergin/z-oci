@@ -3,7 +3,6 @@
 //! This module keeps request intent, transport metadata, and error-mapping
 //! rules local to the resolver layer so auth and manifest fetch
 //! do not collapse into one large implementation.
-
 const std = @import("std");
 const auth = @import("auth.zig");
 const config_module = @import("Config.zig");
@@ -18,22 +17,16 @@ const Platform = @import("Platform.zig");
 const ResolveError = @import("ResolveError.zig").ResolveError;
 const json = @import("json.zig");
 
-const MAX_WWW_AUTHENTICATE_HEADERS = 8;
-const MAX_RESILIENCE_HEADERS = 16;
-const MAX_MANIFEST_HEADER_VALUE_BYTES = 8 * 1024;
-
 pub const ManifestRequestMethod = enum {
     head,
     get,
 };
-
 pub const ResolverOperation = enum {
     resolve,
     validate,
     get_manifest,
     resolve_child_manifest,
 };
-
 /// Internal resolver context built once at the public API boundary.
 ///
 /// `config` must match the `Config` snapshot passed to `AuthEngine` on the same
@@ -98,7 +91,6 @@ pub const ResolverParams = struct {
         );
     }
 };
-
 /// Manifest request shape for resolver transport operations.
 pub const ManifestRequest = struct {
     method: ManifestRequestMethod,
@@ -116,7 +108,6 @@ pub const ManifestRequest = struct {
         );
     }
 };
-
 /// Concrete HTTP request shape for the resolver transport seam.
 pub const ManifestHttpRequest = struct {
     method: ManifestRequestMethod,
@@ -133,7 +124,6 @@ pub const ManifestHttpRequest = struct {
         }
     }
 };
-
 /// Concrete HTTP response shape for the resolver transport seam.
 ///
 /// GET responses may carry an owned body buffer. Callers must release it with
@@ -176,7 +166,6 @@ pub const ManifestHttpResponse = struct {
         };
     }
 };
-
 pub const ManifestExchangeError = error{
     OutOfMemory,
     ResponseBodyTooLarge,
@@ -188,20 +177,6 @@ pub const ManifestExchangeError = error{
     ConnectionRefused,
     UnknownHostName,
 };
-
-fn mapLiveManifestTransportError(err: anyerror) ManifestExchangeError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.BodyTooLarge => error.ResponseBodyTooLarge,
-        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
-        error.Timeout => error.Timeout,
-        error.NetworkUnreachable => error.NetworkUnreachable,
-        error.ConnectionRefused => error.ConnectionRefused,
-        error.UnknownHostName => error.UnknownHostName,
-        else => error.TransportFailed,
-    };
-}
-
 /// Exchanges a resolver HTTP request for response metadata.
 ///
 /// The exchanger owns request teardown and must call `request.deinit(allocator)`
@@ -316,7 +291,6 @@ pub const ManifestResponseMetadata = struct {
         owned.releaseOwned(allocator);
     }
 };
-
 pub const OwnedManifestResponseMetadata = struct {
     content_type: ?[]u8 = null,
     docker_content_digest: ?[]u8 = null,
@@ -373,7 +347,6 @@ pub const OwnedManifestResponseMetadata = struct {
         };
     }
 };
-
 /// Parsed manifest document owned by a JSON arena, or a resolve-depth media type tag.
 pub const ParsedManifestDocument = union(enum) {
     manifest: std.json.Parsed(Manifest),
@@ -399,7 +372,6 @@ pub const ParsedManifestDocument = union(enum) {
         };
     }
 };
-
 /// Success payload for the internal GET path.
 pub const ManifestGetSuccess = struct {
     request: ManifestRequest,
@@ -415,7 +387,6 @@ pub const ManifestGetSuccess = struct {
         if (self.backing_body) |body| allocator.free(body);
     }
 };
-
 /// Resolver-visible outcome for the GET path.
 pub const GetRequestOutcome = union(enum) {
     success: ManifestGetSuccess,
@@ -432,7 +403,6 @@ pub const GetRequestOutcome = union(enum) {
         }
     }
 };
-
 /// Resolver-visible outcome for the HEAD path.
 pub const HeadRequestOutcome = union(enum) {
     success: ManifestResponseMetadata,
@@ -453,7 +423,6 @@ pub const HeadRequestOutcome = union(enum) {
         }
     }
 };
-
 pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.AuthReferenceView) ![]u8 {
     const separator: []const u8 = if (Digest.parse(reference.ref_string)) |_| "@" else |_| ":";
     return std.fmt.allocPrint(
@@ -462,7 +431,6 @@ pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.Aut
         .{ reference.registry, reference.repository_path, separator, reference.ref_string },
     );
 }
-
 /// Build a concrete transport request from resolver intent and an optional bearer token.
 pub fn buildManifestHttpRequestAlloc(
     allocator: std.mem.Allocator,
@@ -485,7 +453,6 @@ pub fn buildManifestHttpRequestAlloc(
         .accept = request.accept,
     };
 }
-
 /// Live HTTP exchanger for manifest HEAD and GET requests.
 pub fn liveManifestHttpExchanger(
     allocator: std.mem.Allocator,
@@ -561,7 +528,76 @@ pub fn liveManifestHttpExchanger(
         };
     }
 }
+// --- Manifest HEAD/GET paths ---
 
+/// Execute the internal HEAD path through a mockable transport seam.
+pub fn performManifestHead(
+    ctx: ResolverParams,
+    engine: *auth.AuthEngine,
+    exchanger: ManifestHttpExchanger,
+    accept: []const []const u8,
+) error{OutOfMemory}!HeadRequestOutcome {
+    const request = ManifestRequest{
+        .method = .head,
+        .operation = ctx.operation,
+        .reference = ctx.reference,
+        .platform = ctx.platform,
+        .accept = accept,
+    };
+
+    const exchange_outcome = exchangeManifestRequest(ctx, engine, exchanger, request, null);
+    switch (exchange_outcome) {
+        .ok => |ok| {
+            defer ok.response.deinit(ctx.allocator);
+            return classifyHeadResponse(ctx, engine, exchanger, request, ok.response.metadata, true, ok.budget);
+        },
+        .transport_failed => |failure| {
+            return mapExhaustedManifestTransportError(HeadRequestOutcome, ctx, failure.err, failure.budget);
+        },
+    }
+}
+/// Execute the internal GET path through the resolver transport seam.
+pub fn performManifestGet(
+    ctx: ResolverParams,
+    engine: *auth.AuthEngine,
+    exchanger: ManifestHttpExchanger,
+    accept: []const []const u8,
+) error{OutOfMemory}!GetRequestOutcome {
+    const request = ManifestRequest{
+        .method = .get,
+        .operation = ctx.operation,
+        .reference = ctx.reference,
+        .platform = ctx.platform,
+        .accept = accept,
+    };
+
+    const exchange_outcome = exchangeManifestRequest(ctx, engine, exchanger, request, null);
+    switch (exchange_outcome) {
+        .ok => |ok| return classifyGetResponse(ctx, engine, exchanger, request, ok.response, true, ok.budget),
+        .transport_failed => |failure| {
+            return mapExhaustedManifestTransportError(GetRequestOutcome, ctx, failure.err, failure.budget);
+        },
+    }
+}
+
+// --- Private helpers ---
+
+const MAX_WWW_AUTHENTICATE_HEADERS = 8;
+const MAX_RESILIENCE_HEADERS = 16;
+const MAX_MANIFEST_HEADER_VALUE_BYTES = 8 * 1024;
+
+fn mapLiveManifestTransportError(err: anyerror) ManifestExchangeError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BodyTooLarge => error.ResponseBodyTooLarge,
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.Timeout => error.Timeout,
+        error.NetworkUnreachable => error.NetworkUnreachable,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.UnknownHostName => error.UnknownHostName,
+        else => error.TransportFailed,
+    };
+}
 fn resolveRedirectUrlAlloc(
     allocator: std.mem.Allocator,
     base_url: []const u8,
@@ -581,7 +617,6 @@ fn resolveRedirectUrlAlloc(
         error.OutOfMemory => return error.OutOfMemory,
     };
 }
-
 fn shouldKeepAuthorizationOnRedirect(base_uri: std.Uri, next_url: []const u8) !bool {
     const next_uri = std.Uri.parse(next_url) catch return false;
     if (!std.ascii.eqlIgnoreCase(base_uri.scheme, next_uri.scheme)) return false;
@@ -594,7 +629,6 @@ fn shouldKeepAuthorizationOnRedirect(base_uri: std.Uri, next_url: []const u8) !b
 
     return base_host.eql(next_host) and effectiveUriPort(base_uri) == effectiveUriPort(next_uri);
 }
-
 fn effectiveUriPort(uri: std.Uri) ?u16 {
     return uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https"))
         443
@@ -603,68 +637,9 @@ fn effectiveUriPort(uri: std.Uri) ?u16 {
     else
         null;
 }
-
-test "resolveRedirectUrlAlloc resolves relative redirect against manifest URL" {
-    const base_url = "https://registry.example.test/v2/library/ubuntu/manifests/latest";
-    const base_uri = try std.Uri.parse(base_url);
-
-    const resolved = try resolveRedirectUrlAlloc(
-        std.testing.allocator,
-        base_url,
-        base_uri,
-        "../blobs/sha256:abc123",
-    );
-    defer std.testing.allocator.free(resolved);
-
-    try std.testing.expectEqualStrings(
-        "https://registry.example.test/v2/library/ubuntu/blobs/sha256:abc123",
-        resolved,
-    );
-}
-
-test "shouldKeepAuthorizationOnRedirect only keeps same-origin authorization" {
-    const base_uri = try std.Uri.parse("https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04");
-
-    try std.testing.expect(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04",
-    ));
-    try std.testing.expect(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://registry-1.docker.io:443/v2/library/ubuntu/manifests/22.04",
-    ));
-    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/abc/data",
-    )));
-    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "http://registry-1.docker.io/v2/library/ubuntu/manifests/22.04",
-    )));
-}
-
-test "shouldKeepAuthorizationOnRedirect rejects subdomain redirects" {
-    const base_uri = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
-
-    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://cdn.registry.example.test/v2/owner/repo/manifests/latest",
-    )));
-}
-
-test "shouldKeepAuthorizationOnRedirect rejects port changes" {
-    const base_uri = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
-
-    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://registry.example.test:8443/v2/owner/repo/manifests/latest",
-    )));
-}
-
 fn manifestHeaderValueWithinLimit(value: []const u8) bool {
     return value.len <= MAX_MANIFEST_HEADER_VALUE_BYTES;
 }
-
 fn wwwAuthenticateHeadersSufficient(headers: []const []const u8) bool {
     const challenge = auth.parseAuthenticateHeaders(headers) catch return false;
     return switch (challenge) {
@@ -672,19 +647,16 @@ fn wwwAuthenticateHeadersSufficient(headers: []const []const u8) bool {
         else => false,
     };
 }
-
 fn resilienceHeaderAlreadyCollected(headers: []const resilience.HttpHeader, name: []const u8) bool {
     for (headers) |existing| {
         if (std.ascii.eqlIgnoreCase(existing.name, name)) return true;
     }
     return false;
 }
-
 fn dupeManifestHeaderValueAlloc(allocator: std.mem.Allocator, value: []const u8) ManifestExchangeError![]u8 {
     if (!manifestHeaderValueWithinLimit(value)) return error.ResponseHeadersTooLarge;
     return allocator.dupe(u8, value) catch error.OutOfMemory;
 }
-
 fn buildAcceptHeadersAlloc(
     allocator: std.mem.Allocator,
     accept: []const []const u8,
@@ -698,11 +670,9 @@ fn buildAcceptHeadersAlloc(
     }
     return headers;
 }
-
 fn shouldCollectManifestAuthHeaders(status: std.http.Status) bool {
     return status == .unauthorized;
 }
-
 fn shouldCollectManifestResilienceHeader(status: std.http.Status, header_name: []const u8) bool {
     if (status == .too_many_requests or resilience.classifyHttpStatus(status) != .none) {
         return resilience.isTrackedResilienceHeaderName(header_name);
@@ -713,7 +683,6 @@ fn shouldCollectManifestResilienceHeader(status: std.http.Status, header_name: [
     }
     return false;
 }
-
 fn ownedManifestResponseMetadataFromHead(
     allocator: std.mem.Allocator,
     head: std.http.Client.Response.Head,
@@ -790,7 +759,6 @@ fn ownedManifestResponseMetadataFromHead(
         .resilience_headers = try resilience_headers.toOwnedSlice(allocator),
     };
 }
-
 fn resolveErrorFromAuthError(
     err: auth.AuthError,
     registry: []const u8,
@@ -830,7 +798,6 @@ fn resolveErrorFromAuthError(
         } },
     };
 }
-
 fn manifestParseError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .manifest_parse_error = .{
         .registry = registry,
@@ -838,7 +805,6 @@ fn manifestParseError(registry: []const u8, reference: []const u8, http_status: 
         .http_status = http_status,
     } };
 }
-
 fn networkError(registry: []const u8, reference: []const u8, http_status: ?u16, transport_retries_exhausted: bool) ResolveError {
     return .{ .network_error = .{
         .registry = registry,
@@ -847,7 +813,6 @@ fn networkError(registry: []const u8, reference: []const u8, http_status: ?u16, 
         .transport_retries_exhausted = transport_retries_exhausted,
     } };
 }
-
 fn timeoutError(registry: []const u8, reference: []const u8, http_status: ?u16, transport_retries_exhausted: bool) ResolveError {
     return .{ .timeout = .{
         .registry = registry,
@@ -856,7 +821,6 @@ fn timeoutError(registry: []const u8, reference: []const u8, http_status: ?u16, 
         .transport_retries_exhausted = transport_retries_exhausted,
     } };
 }
-
 fn rateLimitedError(registry: []const u8, reference: []const u8, http_status: ?u16, transport_retries_exhausted: bool) ResolveError {
     return .{ .rate_limited = .{
         .registry = registry,
@@ -865,7 +829,6 @@ fn rateLimitedError(registry: []const u8, reference: []const u8, http_status: ?u
         .transport_retries_exhausted = transport_retries_exhausted,
     } };
 }
-
 fn mapExhaustedManifestTransportError(
     comptime Outcome: type,
     ctx: ResolverParams,
@@ -880,7 +843,6 @@ fn mapExhaustedManifestTransportError(
         else => mappedRetryFailureOutcome(Outcome, ctx, null, networkError, transport_retries_exhausted),
     };
 }
-
 fn contentTypeMismatchError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .content_type_mismatch = .{
         .registry = registry,
@@ -888,7 +850,6 @@ fn contentTypeMismatchError(registry: []const u8, reference: []const u8, http_st
         .http_status = http_status,
     } };
 }
-
 fn digestMismatchError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .digest_mismatch = .{
         .registry = registry,
@@ -896,7 +857,6 @@ fn digestMismatchError(registry: []const u8, reference: []const u8, http_status:
         .http_status = http_status,
     } };
 }
-
 fn unsupportedAlgorithmError(registry: []const u8, reference: []const u8, http_status: ?u16) ResolveError {
     return .{ .unsupported_algorithm = .{
         .registry = registry,
@@ -904,58 +864,6 @@ fn unsupportedAlgorithmError(registry: []const u8, reference: []const u8, http_s
         .http_status = http_status,
     } };
 }
-
-/// Execute the internal HEAD path through a mockable transport seam.
-pub fn performManifestHead(
-    ctx: ResolverParams,
-    engine: *auth.AuthEngine,
-    exchanger: ManifestHttpExchanger,
-    accept: []const []const u8,
-) error{OutOfMemory}!HeadRequestOutcome {
-    const request = ManifestRequest{
-        .method = .head,
-        .operation = ctx.operation,
-        .reference = ctx.reference,
-        .platform = ctx.platform,
-        .accept = accept,
-    };
-
-    const exchange_outcome = exchangeManifestRequest(ctx, engine, exchanger, request, null);
-    switch (exchange_outcome) {
-        .ok => |ok| {
-            defer ok.response.deinit(ctx.allocator);
-            return classifyHeadResponse(ctx, engine, exchanger, request, ok.response.metadata, true, ok.budget);
-        },
-        .transport_failed => |failure| {
-            return mapExhaustedManifestTransportError(HeadRequestOutcome, ctx, failure.err, failure.budget);
-        },
-    }
-}
-
-/// Execute the internal GET path through the resolver transport seam.
-pub fn performManifestGet(
-    ctx: ResolverParams,
-    engine: *auth.AuthEngine,
-    exchanger: ManifestHttpExchanger,
-    accept: []const []const u8,
-) error{OutOfMemory}!GetRequestOutcome {
-    const request = ManifestRequest{
-        .method = .get,
-        .operation = ctx.operation,
-        .reference = ctx.reference,
-        .platform = ctx.platform,
-        .accept = accept,
-    };
-
-    const exchange_outcome = exchangeManifestRequest(ctx, engine, exchanger, request, null);
-    switch (exchange_outcome) {
-        .ok => |ok| return classifyGetResponse(ctx, engine, exchanger, request, ok.response, true, ok.budget),
-        .transport_failed => |failure| {
-            return mapExhaustedManifestTransportError(GetRequestOutcome, ctx, failure.err, failure.budget);
-        },
-    }
-}
-
 const ManifestExchangeLoop = struct {
     resolver_ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -965,7 +873,6 @@ const ManifestExchangeLoop = struct {
     cached_url: ?[]u8 = null,
     exchange_attempt: usize = 0,
 };
-
 fn exchangeManifestRequestOnce(
     loop_ctx: *ManifestExchangeLoop,
     exchanger: ManifestHttpExchanger,
@@ -996,7 +903,6 @@ fn exchangeManifestRequestOnce(
     };
     return exchanger(allocator, loop_ctx.resolver_ctx.client, http_request);
 }
-
 fn exchangeManifestRequest(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -1038,7 +944,6 @@ fn exchangeManifestRequest(
         ctx.allocator,
     );
 }
-
 fn beforeManifestExchangeAttempt(ctx_ptr: *anyopaque) void {
     const loop_ctx: *const ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
     loop_ctx.engine.manifest_throttle.sleepBeforeManifestRequestIfNeeded(
@@ -1047,30 +952,24 @@ fn beforeManifestExchangeAttempt(ctx_ptr: *anyopaque) void {
         loop_ctx.resolver_ctx.transport_hooks,
     );
 }
-
 fn afterManifestExchangeAttempt(ctx_ptr: *anyopaque, _: std.http.Status, headers: []const resilience.HttpHeader) void {
     const loop_ctx: *const ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
     loop_ctx.engine.manifest_throttle.recordManifestResponseHeaders(headers);
 }
-
 fn manifestExchangeOnceOpaque(ctx_ptr: *anyopaque) ManifestExchangeError!ManifestHttpResponse {
     const loop_ctx: *ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
     return exchangeManifestRequestOnce(loop_ctx, loop_ctx.exchanger);
 }
-
 fn manifestResponseStatus(response: ManifestHttpResponse) std.http.Status {
     return response.metadata.status;
 }
-
 fn manifestResponseResilienceHeaders(response: ManifestHttpResponse) []const resilience.HttpHeader {
     return response.metadata.resilience_headers;
 }
-
 fn deinitManifestHttpResponse(allocator: std.mem.Allocator, response: ManifestHttpResponse) void {
     var owned = response;
     owned.deinit(allocator);
 }
-
 fn mapRetryableManifestStatusFailure(
     comptime Outcome: type,
     ctx: ResolverParams,
@@ -1100,7 +999,6 @@ fn mapRetryableManifestStatusFailure(
 
     return null;
 }
-
 fn classifyHeadResponse(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -1136,7 +1034,6 @@ fn classifyHeadResponse(
             authFailureOutcome(HeadRequestOutcome, ctx, metadata.httpStatus()),
     };
 }
-
 fn authenticateHeadRequest(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -1154,7 +1051,6 @@ fn authenticateHeadRequest(
         classifyAuthenticatedHeadResponse,
     );
 }
-
 fn classifyGetResponse(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -1199,7 +1095,6 @@ fn classifyGetResponse(
             authFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus()),
     };
 }
-
 fn authenticateGetRequest(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -1217,7 +1112,6 @@ fn authenticateGetRequest(
         classifyAuthenticatedGetResponse,
     );
 }
-
 fn authenticateManifestRequest(
     comptime Outcome: type,
     ctx: ResolverParams,
@@ -1285,7 +1179,6 @@ fn authenticateManifestRequest(
 
     return classify_authenticated_response_fn(ctx, engine, exchanger, retried_request, refreshed_response.response, refreshed_response.budget);
 }
-
 fn classifyAuthenticatedHeadResponse(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -1297,7 +1190,6 @@ fn classifyAuthenticatedHeadResponse(
     defer response.deinit(ctx.allocator);
     return classifyHeadResponse(ctx, engine, exchanger, request, response.metadata, false, retry_budget);
 }
-
 fn classifyAuthenticatedGetResponse(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -1308,7 +1200,6 @@ fn classifyAuthenticatedGetResponse(
 ) error{OutOfMemory}!GetRequestOutcome {
     return classifyGetResponse(ctx, engine, exchanger, request, response, false, retry_budget);
 }
-
 fn classifyUsableHeadMetadata(
     ctx: ResolverParams,
     request: ManifestRequest,
@@ -1347,7 +1238,6 @@ fn classifyUsableHeadMetadata(
 
     return .{ .success = try metadata.cloneAllocHeadSuccess(ctx.allocator) };
 }
-
 fn classifyUsableGetResponse(
     ctx: ResolverParams,
     request: ManifestRequest,
@@ -1411,7 +1301,6 @@ fn classifyUsableGetResponse(
         .backing_body = null,
     } };
 }
-
 fn manifestDocumentMediaType(content_type: []const u8) ?MediaType {
     const normalized = normalizeContentType(content_type);
     const media_type = MediaType.fromString(normalized) orelse return null;
@@ -1424,12 +1313,10 @@ fn manifestDocumentMediaType(content_type: []const u8) ?MediaType {
         else => null,
     };
 }
-
 fn normalizeContentType(content_type: []const u8) []const u8 {
     const without_parameters = content_type[0..(std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len)];
     return std.mem.trim(u8, without_parameters, " \t\r\n");
 }
-
 fn acceptsManifestMediaType(accept: []const []const u8, media_type: MediaType) bool {
     if (accept.len == 0) return true;
 
@@ -1443,7 +1330,6 @@ fn acceptsManifestMediaType(accept: []const []const u8, media_type: MediaType) b
 
     return false;
 }
-
 fn parseManifestDocument(
     allocator: std.mem.Allocator,
     operation: ResolverOperation,
@@ -1461,18 +1347,15 @@ fn parseManifestDocument(
         else => error.UnexpectedToken,
     };
 }
-
 const ManifestIntegrityError = error{
     OutOfMemory,
     DigestMismatch,
     UnsupportedAlgorithm,
 };
-
 const VerifiedManifestDigest = struct {
     digest: Digest,
     raw: []u8,
 };
-
 fn verifyManifestBodyIntegrityAlloc(
     ctx: ResolverParams,
     metadata: ManifestResponseMetadata,
@@ -1504,7 +1387,6 @@ fn verifyManifestBodyIntegrityAlloc(
         .raw = body_digest_raw,
     };
 }
-
 fn expectedReferenceDigest(ref_string: []const u8) ManifestIntegrityError!?Digest {
     return Digest.parse(ref_string) catch |err| switch (err) {
         error.MissingColon => null,
@@ -1512,30 +1394,24 @@ fn expectedReferenceDigest(ref_string: []const u8) ManifestIntegrityError!?Diges
         else => error.DigestMismatch,
     };
 }
-
 fn parseExpectedDigest(text: []const u8) Digest.ParseError!Digest {
     return Digest.parse(text);
 }
-
 fn bodySha256DigestHex(body: []const u8) [Digest.Algorithm.sha256.hexLen()]u8 {
     var digest_bytes: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest_bytes, .{});
     return std.fmt.bytesToHex(digest_bytes, .lower);
 }
-
 fn digestMatchesSha256Hex(expected_digest: Digest, actual_hex: []const u8) bool {
     return expected_digest.algorithm == .sha256 and std.ascii.eqlIgnoreCase(expected_digest.hex, actual_hex);
 }
-
 fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     const digest_hex = bodySha256DigestHex(body);
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
 }
-
 fn failureOutcome(comptime Outcome: type, failure: ResolveError) Outcome {
     return .{ .failure = failure };
 }
-
 fn mappedFailureOutcome(
     comptime Outcome: type,
     ctx: ResolverParams,
@@ -1545,7 +1421,6 @@ fn mappedFailureOutcome(
     const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
     return failureOutcome(Outcome, failure_factory(ctx.reference.registry, reference, http_status));
 }
-
 fn mappedRetryFailureOutcome(
     comptime Outcome: type,
     ctx: ResolverParams,
@@ -1556,7 +1431,6 @@ fn mappedRetryFailureOutcome(
     const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
     return failureOutcome(Outcome, failure_factory(ctx.reference.registry, reference, http_status, transport_retries_exhausted));
 }
-
 fn authFailureOutcome(
     comptime Outcome: type,
     ctx: ResolverParams,
@@ -1569,7 +1443,6 @@ fn authFailureOutcome(
         .http_status = http_status,
     } });
 }
-
 fn mappedAuthFailureOutcome(
     comptime Outcome: type,
     ctx: ResolverParams,
@@ -1579,12 +1452,10 @@ fn mappedAuthFailureOutcome(
     const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
     return failureOutcome(Outcome, try resolveErrorFromAuthError(err, ctx.reference.registry, reference, http_status));
 }
-
 fn isRedirectStatus(status: std.http.Status) bool {
     const code = @intFromEnum(status);
     return code >= 300 and code < 400;
 }
-
 fn fixtureBodyAlloc(allocator: std.mem.Allocator, path: []const u8, comptime max_bytes: usize) ManifestExchangeError![]u8 {
     var buffer: [max_bytes + 1]u8 = undefined;
     const bytes = std.Io.Dir.cwd().readFile(std.testing.io, path, &buffer) catch |err| switch (err) {
@@ -1592,7 +1463,6 @@ fn fixtureBodyAlloc(allocator: std.mem.Allocator, path: []const u8, comptime max
     };
     return allocator.dupe(u8, bytes);
 }
-
 fn duplicateHeaderSlicesAlloc(allocator: std.mem.Allocator, headers: []const []const u8) ![]const []const u8 {
     const owned_headers = try allocator.alloc([]const u8, headers.len);
     errdefer allocator.free(owned_headers);
@@ -1609,12 +1479,80 @@ fn duplicateHeaderSlicesAlloc(allocator: std.mem.Allocator, headers: []const []c
 
     return owned_headers;
 }
-
 fn freeHeaderSlices(allocator: std.mem.Allocator, headers: []const []const u8) void {
     for (headers) |header| allocator.free(header);
     allocator.free(headers);
 }
+fn testHttpHeadFromLines(allocator: std.mem.Allocator, status_line: []const u8, header_lines: []const []const u8) !std.http.Client.Response.Head {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, status_line);
+    try buf.appendSlice(allocator, "\r\n");
+    for (header_lines) |line| {
+        try buf.appendSlice(allocator, line);
+        try buf.appendSlice(allocator, "\r\n");
+    }
+    try buf.appendSlice(allocator, "\r\n");
+    const raw = try allocator.dupe(u8, buf.items);
+    errdefer allocator.free(raw);
+    return try std.http.Client.Response.Head.parse(raw);
+}
 
+// --- Tests ---
+
+test "resolveRedirectUrlAlloc resolves relative redirect against manifest URL" {
+    const base_url = "https://registry.example.test/v2/library/ubuntu/manifests/latest";
+    const base_uri = try std.Uri.parse(base_url);
+
+    const resolved = try resolveRedirectUrlAlloc(
+        std.testing.allocator,
+        base_url,
+        base_uri,
+        "../blobs/sha256:abc123",
+    );
+    defer std.testing.allocator.free(resolved);
+
+    try std.testing.expectEqualStrings(
+        "https://registry.example.test/v2/library/ubuntu/blobs/sha256:abc123",
+        resolved,
+    );
+}
+test "shouldKeepAuthorizationOnRedirect only keeps same-origin authorization" {
+    const base_uri = try std.Uri.parse("https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04");
+
+    try std.testing.expect(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04",
+    ));
+    try std.testing.expect(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://registry-1.docker.io:443/v2/library/ubuntu/manifests/22.04",
+    ));
+    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/abc/data",
+    )));
+    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "http://registry-1.docker.io/v2/library/ubuntu/manifests/22.04",
+    )));
+}
+test "shouldKeepAuthorizationOnRedirect rejects subdomain redirects" {
+    const base_uri = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
+
+    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://cdn.registry.example.test/v2/owner/repo/manifests/latest",
+    )));
+}
+test "shouldKeepAuthorizationOnRedirect rejects port changes" {
+    const base_uri = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
+
+    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
+        base_uri,
+        "https://registry.example.test:8443/v2/owner/repo/manifests/latest",
+    )));
+}
 test "ResolverParams init preserves normalized reference and operation" {
     var client: std.http.Client = undefined;
     const view = auth.AuthReferenceView{
@@ -1638,7 +1576,6 @@ test "ResolverParams init preserves normalized reference and operation" {
     try std.testing.expectEqual(ResolverOperation.resolve, ctx.operation);
     try std.testing.expect(ctx.platform != null);
 }
-
 test "ManifestRequest uriAlloc uses normalized repository path and ref" {
     const request = ManifestRequest{
         .method = .head,
@@ -1655,7 +1592,6 @@ test "ManifestRequest uriAlloc uses normalized repository path and ref" {
 
     try std.testing.expectEqualStrings("https://ghcr.io/v2/owner/repo/manifests/v1.2.3", uri);
 }
-
 test "canonicalReferenceAlloc uses digest separator for pinned references" {
     const reference = auth.AuthReferenceView{
         .registry = "registry-1.docker.io",
@@ -1671,7 +1607,6 @@ test "canonicalReferenceAlloc uses digest separator for pinned references" {
         text,
     );
 }
-
 test "canonicalReferenceAlloc uses tag separator for tag references" {
     const reference = auth.AuthReferenceView{
         .registry = "registry-1.docker.io",
@@ -1684,7 +1619,6 @@ test "canonicalReferenceAlloc uses tag separator for tag references" {
 
     try std.testing.expectEqualStrings("registry-1.docker.io/library/ubuntu:22.04", text);
 }
-
 test "ManifestResponseMetadata probeClassification reuses auth probe rules" {
     const metadata = ManifestResponseMetadata{
         .status = .unauthorized,
@@ -1703,7 +1637,6 @@ test "ManifestResponseMetadata probeClassification reuses auth probe rules" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "ManifestResponseMetadata probeClassification selects bearer from repeated headers" {
     const metadata = ManifestResponseMetadata{
         .status = .unauthorized,
@@ -1725,22 +1658,6 @@ test "ManifestResponseMetadata probeClassification selects bearer from repeated 
         else => return error.TestUnexpectedResult,
     }
 }
-
-fn testHttpHeadFromLines(allocator: std.mem.Allocator, status_line: []const u8, header_lines: []const []const u8) !std.http.Client.Response.Head {
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, status_line);
-    try buf.appendSlice(allocator, "\r\n");
-    for (header_lines) |line| {
-        try buf.appendSlice(allocator, line);
-        try buf.appendSlice(allocator, "\r\n");
-    }
-    try buf.appendSlice(allocator, "\r\n");
-    const raw = try allocator.dupe(u8, buf.items);
-    errdefer allocator.free(raw);
-    return try std.http.Client.Response.Head.parse(raw);
-}
-
 test "ownedManifestResponseMetadataFromHead: www-authenticate flood is bounded" {
     var header_lines: [100][]const u8 = undefined;
     for (&header_lines, 0..) |*line, index| {
@@ -1764,7 +1681,6 @@ test "ownedManifestResponseMetadataFromHead: www-authenticate flood is bounded" 
         ownedManifestResponseMetadataFromHead(std.testing.allocator, head),
     );
 }
-
 test "ownedManifestResponseMetadataFromHead: stops copying www-authenticate after bearer" {
     const bearer = "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\",scope=\"repository:owner/repo:pull\"";
     var trailing: [20][]const u8 = undefined;
@@ -1793,7 +1709,6 @@ test "ownedManifestResponseMetadataFromHead: stops copying www-authenticate afte
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), owned.www_authenticate_headers.len);
 }
-
 test "ownedManifestResponseMetadataFromHead: keeps unsupported schemes until bearer" {
     const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
         "WWW-Authenticate: Basic realm=\"example\"",
@@ -1805,7 +1720,6 @@ test "ownedManifestResponseMetadataFromHead: keeps unsupported schemes until bea
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), owned.www_authenticate_headers.len);
 }
-
 test "ownedManifestResponseMetadataFromHead: rejects oversize header values" {
     const oversized = try std.testing.allocator.alloc(u8, MAX_MANIFEST_HEADER_VALUE_BYTES + 1);
     defer std.testing.allocator.free(oversized);
@@ -1826,7 +1740,6 @@ test "ownedManifestResponseMetadataFromHead: rejects oversize header values" {
         ownedManifestResponseMetadataFromHead(std.testing.allocator, head),
     );
 }
-
 test "ownedManifestResponseMetadataFromHead: deduplicates resilience headers" {
     const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 429 Too Many Requests", &.{
         "Retry-After: 30",
@@ -1842,7 +1755,6 @@ test "ownedManifestResponseMetadataFromHead: deduplicates resilience headers" {
     try std.testing.expectEqualStrings("30", owned.resilience_headers[0].value);
     try std.testing.expectEqualStrings("Date", owned.resilience_headers[1].name);
 }
-
 test "ownedManifestResponseMetadataFromHead: ok responses keep rate-limit headers only" {
     const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
@@ -1860,7 +1772,6 @@ test "ownedManifestResponseMetadataFromHead: ok responses keep rate-limit header
     try std.testing.expectEqual(@as(usize, 3), owned.resilience_headers.len);
     try std.testing.expect(std.mem.startsWith(u8, owned.resilience_headers[0].name, "RateLimit-"));
 }
-
 test "ownedManifestResponseMetadataFromHead: ok responses omit Retry-After and Date" {
     const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
         "Retry-After: 30",
@@ -1874,7 +1785,6 @@ test "ownedManifestResponseMetadataFromHead: ok responses omit Retry-After and D
     try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
     try std.testing.expectEqual(@as(usize, 0), owned.resilience_headers.len);
 }
-
 test "ownedManifestResponseMetadataFromHead: forbidden and not_found omit auth headers" {
     const forbidden = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 403 Forbidden", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
@@ -1894,7 +1804,6 @@ test "ownedManifestResponseMetadataFromHead: forbidden and not_found omit auth h
     defer not_found_owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), not_found_owned.www_authenticate_headers.len);
 }
-
 test "ownedManifestResponseMetadataFromHead: retryable 502 keeps resilience not auth" {
     const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 502 Bad Gateway", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
@@ -1909,7 +1818,6 @@ test "ownedManifestResponseMetadataFromHead: retryable 502 keeps resilience not 
     try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
     try std.testing.expectEqual(@as(usize, 2), owned.resilience_headers.len);
 }
-
 test "ownedManifestResponseMetadataFromHead: unauthorized still collects auth headers" {
     const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
@@ -1926,7 +1834,6 @@ test "ownedManifestResponseMetadataFromHead: unauthorized still collects auth he
     const probe = try metadata.probeClassification();
     try std.testing.expect(probe == .auth_required);
 }
-
 test "ownedManifestResponseMetadataFromHead: forbidden probe classification unchanged without stored auth headers" {
     const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 403 Forbidden", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
@@ -1939,7 +1846,6 @@ test "ownedManifestResponseMetadataFromHead: forbidden probe classification unch
     try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
     try std.testing.expectError(error.UnsupportedProbeStatus, owned.view(.forbidden).probeClassification());
 }
-
 test "ManifestResponseMetadata cloneAllocHeadSuccess omits auth and retry headers" {
     const metadata = ManifestResponseMetadata{
         .status = .ok,
@@ -1956,7 +1862,6 @@ test "ManifestResponseMetadata cloneAllocHeadSuccess omits auth and retry header
     try std.testing.expect(cloned.resilience_headers.len == 0);
     try std.testing.expectEqualStrings("sha256:abc", cloned.docker_content_digest.?);
 }
-
 test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible variants" {
     try std.testing.expectError(
         error.OutOfMemory,
@@ -1978,7 +1883,6 @@ test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible 
     const reset = try resolveErrorFromAuthError(error.ConnectionResetByPeer, "r", "ref", null);
     try std.testing.expectEqualStrings("network_error", @tagName(reset));
 }
-
 test "resolver error helpers keep registry, reference, and status" {
     const parse_err = manifestParseError("ghcr.io", "ghcr.io/owner/repo:v1", 200);
     const network_err = networkError("ghcr.io", "ghcr.io/owner/repo:v1", 503, false);
@@ -1992,7 +1896,6 @@ test "resolver error helpers keep registry, reference, and status" {
     try std.testing.expectEqualStrings("digest_mismatch", @tagName(digest_mismatch_err));
     try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(unsupported_algorithm_err));
 }
-
 test "performManifestHead retries transient 503 then succeeds" {
     const State = struct {
         var attempts: usize = 0;
@@ -2046,7 +1949,6 @@ test "performManifestHead retries transient 503 then succeeds" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "ManifestResponseMetadata.releaseOwned: clears owned slices in place" {
     const content_type = try std.testing.allocator.dupe(u8, "application/vnd.oci.image.manifest.v1+json");
     const digest = try std.testing.allocator.dupe(u8, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
@@ -2067,7 +1969,6 @@ test "ManifestResponseMetadata.releaseOwned: clears owned slices in place" {
     try std.testing.expect(metadata.www_authenticate_headers.len == 0);
     try std.testing.expect(metadata.resilience_headers.len == 0);
 }
-
 test "performManifestGet repeated GET runs leave no residual allocations under DebugAllocator" {
     const State = struct {
         var body: []u8 = undefined;
@@ -2119,7 +2020,6 @@ test "performManifestGet repeated GET runs leave no residual allocations under D
         }
     }
 }
-
 test "performManifestGet retry path leaves no residual allocations under DebugAllocator" {
     const State = struct {
         var attempts: usize = 0;
@@ -2183,7 +2083,6 @@ test "performManifestGet retry path leaves no residual allocations under DebugAl
         try std.testing.expectEqual(@as(usize, 2), State.attempts);
     }
 }
-
 test "performManifestHead retry path leaves no residual allocations under DebugAllocator" {
     const State = struct {
         var attempts: usize = 0;
@@ -2239,7 +2138,6 @@ test "performManifestHead retry path leaves no residual allocations under DebugA
         }
     }
 }
-
 test "performManifestHead maps exhausted 429 to rate_limited" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2283,7 +2181,6 @@ test "performManifestHead maps exhausted 429 to rate_limited" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead marks transport_retries_exhausted after rate-limit retries" {
     const State = struct {
         var attempts: usize = 0;
@@ -2333,7 +2230,6 @@ test "performManifestHead marks transport_retries_exhausted after rate-limit ret
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead maps exhausted transport timeout to timeout failure" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2371,7 +2267,6 @@ test "performManifestHead maps exhausted transport timeout to timeout failure" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet preemptive sleep before request when engine carries exhausted registry rate limit" {
     const State = struct {
         var attempts: usize = 0;
@@ -2449,7 +2344,6 @@ test "performManifestGet preemptive sleep before request when engine carries exh
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead retries connection reset then succeeds" {
     const State = struct {
         var attempts: usize = 0;
@@ -2498,7 +2392,6 @@ test "performManifestHead retries connection reset then succeeds" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead does not retry not found" {
     const State = struct {
         var attempts: usize = 0;
@@ -2542,7 +2435,6 @@ test "performManifestHead does not retry not found" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead exhausts repeated 429 on rate limit budget" {
     const State = struct {
         var attempts: usize = 0;
@@ -2591,7 +2483,6 @@ test "performManifestHead exhausts repeated 429 on rate limit budget" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "buildManifestHttpRequestAlloc shapes HEAD request and optional bearer header" {
     const request = ManifestRequest{
         .method = .head,
@@ -2612,19 +2503,16 @@ test "buildManifestHttpRequestAlloc shapes HEAD request and optional bearer head
     try std.testing.expectEqualStrings("Bearer token-123", http_request.authorization.?);
     try std.testing.expectEqual(@as(usize, 1), http_request.accept.len);
 }
-
 test "manifestDocumentMediaType normalizes parameters and rejects non-manifest types" {
     try std.testing.expectEqual(MediaType.oci_manifest_v1, manifestDocumentMediaType(" application/vnd.oci.image.manifest.v1+json; charset=utf-8 ").?);
     try std.testing.expectEqual(@as(?MediaType, null), manifestDocumentMediaType("application/vnd.oci.image.config.v1+json"));
     try std.testing.expectEqual(@as(?MediaType, null), manifestDocumentMediaType("application/vnd.docker.distribution.manifest.v1+prettyjws"));
 }
-
 test "acceptsManifestMediaType matches normalized exact entries and wildcard" {
     try std.testing.expect(acceptsManifestMediaType(&.{" application/vnd.oci.image.manifest.v1+json; q=1.0 "}, .oci_manifest_v1));
     try std.testing.expect(acceptsManifestMediaType(&.{"*/*"}, .docker_manifest_list_v2));
     try std.testing.expect(!acceptsManifestMediaType(&.{"application/vnd.oci.image.index.v1+json"}, .docker_manifest_v2));
 }
-
 test "performManifestHead returns validate_single_arch_ok for validate operation" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2660,7 +2548,6 @@ test "performManifestHead returns validate_single_arch_ok for validate operation
         outcome,
     );
 }
-
 test "performManifestHead rejects mismatched pinned digest on validate" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2704,7 +2591,6 @@ test "performManifestHead rejects mismatched pinned digest on validate" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead returns success for anonymous usable HEAD metadata" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2748,7 +2634,6 @@ test "performManifestHead returns success for anonymous usable HEAD metadata" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead falls back to GET when usable HEAD metadata is incomplete" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2784,7 +2669,6 @@ test "performManifestHead falls back to GET when usable HEAD metadata is incompl
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead returns redirect outcome for redirect metadata with location" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2820,7 +2704,6 @@ test "performManifestHead returns redirect outcome for redirect metadata with lo
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead maps redirect without location into network error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2856,7 +2739,6 @@ test "performManifestHead maps redirect without location into network error" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead returns not_found for missing manifest" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2889,7 +2771,6 @@ test "performManifestHead returns not_found for missing manifest" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead authenticates on challenge and retries HEAD with bearer token" {
     const State = struct {
         var manifest_call_count: usize = 0;
@@ -2945,7 +2826,6 @@ test "performManifestHead authenticates on challenge and retries HEAD with beare
 
     try std.testing.expectEqual(@as(usize, 2), State.manifest_call_count);
 }
-
 test "performManifestHead maps malformed authenticate header into auth failure" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2984,7 +2864,6 @@ test "performManifestHead maps malformed authenticate header into auth failure" 
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead retries once after cached unauthorized response" {
     const State = struct {
         var manifest_call_count: usize = 0;
@@ -3060,7 +2939,6 @@ test "performManifestHead retries once after cached unauthorized response" {
     try std.testing.expectEqual(@as(usize, 3), State.manifest_call_count);
     try std.testing.expectEqual(@as(usize, 2), State.token_call_count);
 }
-
 test "performManifestHead maps transport failures into resolver failures" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3096,7 +2974,6 @@ test "performManifestHead maps transport failures into resolver failures" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead rejects unsupported content type on HEAD success" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3136,7 +3013,6 @@ test "performManifestHead rejects unsupported content type on HEAD success" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead rejects known non-manifest content type on HEAD success" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3176,7 +3052,6 @@ test "performManifestHead rejects known non-manifest content type on HEAD succes
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestHead rejects recognized media type outside Accept list" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3216,7 +3091,6 @@ test "performManifestHead rejects recognized media type outside Accept list" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet parses OCI manifest fixture with normalized content type" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3279,7 +3153,6 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet parses Docker manifest fixture" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3325,7 +3198,6 @@ test "performManifestGet parses Docker manifest fixture" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet parses OCI index fixture" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3371,7 +3243,6 @@ test "performManifestGet parses OCI index fixture" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet parses Docker manifest list fixture" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3417,7 +3288,6 @@ test "performManifestGet parses Docker manifest list fixture" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet returns redirect outcome for redirect metadata with location" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3453,7 +3323,6 @@ test "performManifestGet returns redirect outcome for redirect metadata with loc
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps redirect without location into network error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3489,7 +3358,6 @@ test "performManifestGet maps redirect without location into network error" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps missing body into manifest parse error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3529,7 +3397,6 @@ test "performManifestGet maps missing body into manifest parse error" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps empty body into manifest parse error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3571,7 +3438,6 @@ test "performManifestGet maps empty body into manifest parse error" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps unsupported content type into resolver failure" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3614,7 +3480,6 @@ test "performManifestGet maps unsupported content type into resolver failure" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet rejects body whose declared mediaType disagrees with Content-Type" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3657,7 +3522,6 @@ test "performManifestGet rejects body whose declared mediaType disagrees with Co
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet rejects recognized media type outside Accept list" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3700,7 +3564,6 @@ test "performManifestGet rejects recognized media type outside Accept list" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet authenticates on challenge and retries GET with bearer token" {
     const State = struct {
         var manifest_call_count: usize = 0;
@@ -3758,7 +3621,6 @@ test "performManifestGet authenticates on challenge and retries GET with bearer 
 
     try std.testing.expectEqual(@as(usize, 2), State.manifest_call_count);
 }
-
 test "performManifestGet retries transient 503 then succeeds" {
     const State = struct {
         var attempts: usize = 0;
@@ -3812,7 +3674,6 @@ test "performManifestGet retries transient 503 then succeeds" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps exhausted 429 to rate_limited" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3855,7 +3716,6 @@ test "performManifestGet maps exhausted 429 to rate_limited" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet retries connection reset then succeeds" {
     const State = struct {
         var attempts: usize = 0;
@@ -3905,7 +3765,6 @@ test "performManifestGet retries connection reset then succeeds" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps exhausted transport timeout to timeout failure" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3943,7 +3802,6 @@ test "performManifestGet maps exhausted transport timeout to timeout failure" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps malformed authenticate header into auth failure" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3982,7 +3840,6 @@ test "performManifestGet maps malformed authenticate header into auth failure" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet retries once after cached unauthorized response" {
     const State = struct {
         var manifest_call_count: usize = 0;
@@ -4057,7 +3914,6 @@ test "performManifestGet retries once after cached unauthorized response" {
     try std.testing.expectEqual(@as(usize, 3), State.manifest_call_count);
     try std.testing.expectEqual(@as(usize, 2), State.token_call_count);
 }
-
 test "performManifestGet verifies matching pinned digest reference" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -4101,7 +3957,6 @@ test "performManifestGet verifies matching pinned digest reference" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet rejects mismatched response digest header" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4144,7 +3999,6 @@ test "performManifestGet rejects mismatched response digest header" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet rejects mismatched pinned digest reference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4186,7 +4040,6 @@ test "performManifestGet rejects mismatched pinned digest reference" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet rejects unsupported digest algorithm in response header" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4229,7 +4082,6 @@ test "performManifestGet rejects unsupported digest algorithm in response header
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps oversize transport body to manifest_parse_error" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -4264,7 +4116,6 @@ test "performManifestGet maps oversize transport body to manifest_parse_error" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps oversize response headers to manifest_parse_error" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -4299,7 +4150,6 @@ test "performManifestGet maps oversize response headers to manifest_parse_error"
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "performManifestGet maps oversize token response to auth_failed" {
     const custom_cap: usize = 4096;
     const State = struct {

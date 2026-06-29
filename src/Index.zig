@@ -15,6 +15,10 @@ const MediaType = @import("MediaType.zig").MediaType;
 const Descriptor = @import("Descriptor.zig");
 const Platform = @import("Platform.zig");
 const json = @import("json.zig");
+const Digest = @import("Digest.zig");
+const test_support = @import("test_support.zig");
+
+// --- Index types ---
 
 /// OCI Image Index (application/vnd.oci.image.index.v1+json).
 pub const OciImageIndex = struct {
@@ -199,10 +203,7 @@ fn isResolvableChildMediaType(media_type: MediaType) bool {
     };
 }
 
-// Tests
-
-const Digest = @import("Digest.zig");
-const test_support = @import("test_support.zig");
+// --- Private helpers ---
 
 const TestDescriptor = struct {
     descriptor: Descriptor,
@@ -231,7 +232,7 @@ fn makeDescriptor(hex_char: u8, os: []const u8, arch: []const u8) !TestDescripto
     };
 }
 
-// descriptors() ---------------------------------------------------------------
+// --- Tests ---
 
 test "descriptors: OciImageIndex returns all entries" {
     // Arrange

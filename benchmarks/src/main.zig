@@ -1,3 +1,8 @@
+//! z-oci-bench: throughput harness for parser, auth, and public resolve paths.
+//!
+//! Uses an optional counting allocator and mock transport fixtures for
+//! authenticate/resolve operations that need injected exchangers.
+
 const std = @import("std");
 const Io = std.Io;
 const z_oci = @import("z_oci");
@@ -107,6 +112,8 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+// --- CLI and reporting ---
+
 fn nanoTime() i128 {
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
@@ -131,6 +138,8 @@ fn printReport(name: []const u8, detail: []const u8, io: Io, iterations: usize, 
         out.print("  alloc_bytes {d}\n", .{alloc_bytes}) catch {};
     }
 }
+
+// --- Allocator harness ---
 
 const CountingAllocator = struct {
     inner: std.mem.Allocator,
@@ -223,6 +232,8 @@ const CountingAllocator = struct {
     }
 };
 
+// --- Shared fixtures ---
+
 const OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json";
 const OCI_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json";
 const BUSYBOX_MANIFEST_DIGEST = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65";
@@ -232,6 +243,8 @@ const BENCH_BUSYBOX_REF = "registry-1.docker.io/library/busybox:latest";
 fn parseBusyboxBenchRef(alloc: std.mem.Allocator) !z_oci.Reference {
     return z_oci.Reference.parse(alloc, BENCH_BUSYBOX_REF);
 }
+
+// --- Parser benchmarks ---
 
 fn benchReferenceParse(io: Io, iterations: usize, counting: bool) !void {
     var ca = CountingAllocator{ .inner = std.heap.page_allocator };
@@ -328,6 +341,8 @@ fn benchPlatformMatch(io: Io, iterations: usize, counting: bool) !void {
 
     printReport("platform-match", "candidate linux/arm64/v8 vs filter linux/arm64", io, iterations, elapsed, 0, 0);
 }
+
+// --- Auth benchmarks ---
 
 fn benchAuthenticateMiss(io: Io, iterations: usize, counting: bool) !void {
     var ca = CountingAllocator{ .inner = std.heap.page_allocator };
@@ -482,6 +497,8 @@ fn benchAuthenticateRateLimit(io: Io, iterations: usize, counting: bool) !void {
     printReport("authenticate-rate-limit", "429 then success via injected token transport", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
 }
 
+// --- Resolver fixtures ---
+
 const ResolverBenchFixture = struct {
     index_body: []u8,
     index_digest: []u8,
@@ -619,6 +636,8 @@ const ValidateBenchFixture = struct {
         } };
     }
 };
+
+// --- Public API benchmarks ---
 
 fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
     var ca = CountingAllocator{ .inner = std.heap.page_allocator };
@@ -881,6 +900,8 @@ fn benchGetManifest(io: Io, iterations: usize, counting: bool) !void {
 
     printReport("get-manifest", "single-arch getManifest via injected manifest fixture", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
 }
+
+// --- Outcome helpers ---
 
 fn deinitResolveSuccess(outcome: z_oci.ResolveOutcome, allocator: std.mem.Allocator) !void {
     switch (outcome) {

@@ -234,6 +234,8 @@ pub const Config = struct {
     }
 };
 
+// --- CA bundle helpers ---
+
 const CaBundleApplyCache = struct {
     client: ?*std.http.Client = null,
     path: [std.fs.max_path_bytes]u8 = undefined,
@@ -264,7 +266,7 @@ fn caBundleApplyCacheRemember(
 const BASE64_DECODER = std.base64.standard.decoderWithIgnore(" \t\r\n");
 const MAX_CA_BUNDLE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// PEM blocks that belong in a key file, not in a CA trust bundle (`ca_bundle_path`).
+// PEM blocks that belong in a key file, not in a CA trust bundle (`ca_bundle_path`).
 const PRIVATE_KEY_PEM_MARKERS = [_][]const u8{
     "-----BEGIN PRIVATE KEY-----",
     "-----BEGIN RSA PRIVATE KEY-----",
@@ -293,9 +295,9 @@ const AddCertsFromPemBytesError = std.mem.Allocator.Error ||
     std.base64.Error ||
     error{MissingEndCertificateMarker};
 
-/// Parses `BEGIN CERTIFICATE` blocks from an in-memory PEM buffer.
-/// Vendored from `std.crypto.Certificate.Bundle.addCertsFromFile` so
-/// `loadCaBundleFromOpenFile` can read the file once and scan before parse.
+// Parses `BEGIN CERTIFICATE` blocks from an in-memory PEM buffer.
+// Vendored from `std.crypto.Certificate.Bundle.addCertsFromFile` so
+// `loadCaBundleFromOpenFile` can read the file once and scan before parse.
 fn addCertsFromPemBytes(
     cb: *std.crypto.Certificate.Bundle,
     gpa: std.mem.Allocator,
@@ -346,11 +348,11 @@ fn loadCaBundleFromOpenFile(
     };
 }
 
-// Tests
-
 fn fixtureAbsPath(allocator: std.mem.Allocator, rel_path: []const u8) ![:0]u8 {
     return try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, rel_path, allocator);
 }
+
+// --- Tests ---
 
 test "Config: bare Config{} compiles with all defaults" {
     // A caller using Config{} for anonymous access must not need to set anything.

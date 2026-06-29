@@ -46,7 +46,6 @@ const resilience = @import("resilience.zig");
 pub const Digest = @import("Digest.zig");
 pub const MediaType = @import("MediaType.zig").MediaType;
 pub const Platform = @import("Platform.zig");
-
 pub const Descriptor = @import("Descriptor.zig");
 pub const Manifest = @import("Manifest.zig");
 pub const Index = @import("Index.zig");
@@ -55,7 +54,6 @@ pub const DockerManifestList = Index.DockerManifestList;
 pub const MultiArchManifest = Index.MultiArchManifest;
 pub const Reference = @import("Reference.zig");
 pub const auth = @import("auth.zig");
-
 pub const json = @import("json.zig");
 pub const AuthEngine = auth.AuthEngine;
 pub const AuthError = auth.AuthError;
@@ -76,10 +74,7 @@ pub const Config = @import("Config.zig").Config;
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
 pub const CredentialHandle = @import("Config.zig").CredentialHandle;
-
 pub const PublicApiError = Config.ApplyError;
-const root = @This();
-
 /// Narrow testing seam for repository smoke tests.
 ///
 /// This keeps workflow-level coverage on the same public resolver logic while
@@ -186,34 +181,133 @@ pub const testing = struct {
         root.deinitOwnedResolveError(failure, allocator);
     }
 };
-
 pub const ResolveOutcome = union(enum) {
     success: ResolveResult,
     failure: ResolveError,
 };
-
 pub const ValidateOutcome = union(enum) {
     valid,
     not_found,
     failure: ResolveError,
 };
-
 pub const ManifestOutcome = union(enum) {
     success: std.json.Parsed(Manifest),
     failure: ResolveError,
 };
+// --- Public resolve API ---
 
+/// Resolve an image reference to a pinned manifest digest.
+///
+/// Ownership contract:
+/// - The returned ResolveResult is owned through the caller-provided allocator.
+/// - On success, `registry`, `repository`, and `tag` from the input `ref` are moved into
+///   `result.reference`; do not call `ref.deinit()` after a successful resolve.
+/// - Call `result.deinit(allocator)` when using a non-arena allocator.
+/// - If the allocator is an arena, tearing the arena down is also sufficient.
+/// - `ResolveResult.clone()` is only needed when moving the result into a different allocator.
+///
+/// Auth handoff contract:
+/// - derive `AuthReferenceView` from the normalized `Reference` with `referenceView(ref)`
+/// - manifest HEAD/GET is the live probe path today; a `401` with `WWW-Authenticate`
+///   triggers auth via `ProbeHttpResponse.classify()` on response metadata
+/// - turn that bearer challenge into `AuthenticateRequest.init(view.registry, challenge)` and call
+///   `AuthEngine.authenticate(...)`
+/// - attach the returned bearer token to the retried HEAD/GET request; if that retry comes back
+///   `401`, call `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)` once for the same
+///   request and surface failure after that single retry
+pub fn resolve(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+) PublicApiError!ResolveOutcome {
+    return resolveWithExchangers(
+        allocator,
+        client,
+        config,
+        ref,
+        platform,
+        auth.liveTokenHttpExchanger,
+        resolver.liveManifestHttpExchanger,
+        resilience.liveTransportHooks(),
+    );
+}
+/// Validate that a manifest reference still exists and is fetchable.
+///
+/// Ownership contract:
+/// - No owned data is returned from this API.
+/// - The caller still owns `allocator`; the resolver uses it for transient request shaping,
+///   parsing, and any structured failure context that must outlive internal temporaries.
+///
+/// Auth handoff contract:
+/// - validation follows the same manifest HEAD/GET -> classify -> authenticate -> retry-once flow as `resolve`
+/// - validation must treat `.not_found` as terminal and must not attempt auth in that case
+/// - multi-arch validation follows the selected child manifest when `platform` is provided
+/// - multi-arch validation returns `ResolveError.platform_required` instead of guessing a child when
+///   `platform` is null
+pub fn validate(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+) PublicApiError!ValidateOutcome {
+    return validateWithExchangers(
+        allocator,
+        client,
+        config,
+        ref,
+        platform,
+        auth.liveTokenHttpExchanger,
+        resolver.liveManifestHttpExchanger,
+        resilience.liveTransportHooks(),
+    );
+}
+/// Fetch and parse a manifest payload.
+///
+/// Ownership contract:
+/// - The returned std.json.Parsed(Manifest) owns an arena.
+/// - Call parsed.deinit() when finished.
+/// - Do not free the allocator backing that arena while the parsed value is still in use.
+///
+/// Auth handoff contract:
+/// - manifest GET uses the same `AuthReferenceView` and `AuthenticateRequest` boundary as `resolve`
+/// - auth owns token exchange and cache invalidation; manifest fetch owns Accept negotiation,
+///   response status handling, and JSON parsing
+/// - multi-arch GET returns `ResolveError.platform_required` instead of guessing a child when
+///   `platform` is null
+pub fn getManifest(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+) PublicApiError!ManifestOutcome {
+    return getManifestWithExchangers(
+        allocator,
+        client,
+        config,
+        ref,
+        platform,
+        auth.liveTokenHttpExchanger,
+        resolver.liveManifestHttpExchanger,
+        resilience.liveTransportHooks(),
+    );
+}
+
+// --- Private helpers ---
+
+const root = @This();
 const MAX_CHILD_MANIFEST_DEPTH: usize = 4;
-
 const MANIFEST_ACCEPT_VALUES = [_][]const u8{
     MediaType.oci_manifest_v1.toString(),
     MediaType.docker_manifest_v2.toString(),
     MediaType.oci_index_v1.toString(),
     MediaType.docker_manifest_list_v2.toString(),
 };
-
 const ResolvedManifestSuccess = struct {
-    /// New fields must be torn down in `deinit` and handled in both detach helpers.
+    // New fields must be torn down in `deinit` and handled in both detach helpers.
     resolved_digest: Digest,
     resolved_digest_raw: []u8,
     document: resolver.ParsedManifestDocument,
@@ -263,10 +357,10 @@ const ResolvedManifestSuccess = struct {
         self.releasePlatform(allocator);
     }
 
-    /// Move `Parsed(Manifest)` to `caller_allocator` and leave a `deinit`-safe shell.
-    /// On error the manifest document is restored; on success digest fields are
-    /// cleared so `deinit` cannot free `resolved_digest_raw` while `digest.hex`
-    /// still aliases it.
+    // Move `Parsed(Manifest)` to `caller_allocator` and leave a `deinit`-safe shell.
+    // On error the manifest document is restored; on success digest fields are
+    // cleared so `deinit` cannot free `resolved_digest_raw` while `digest.hex`
+    // still aliases it.
     fn detachManifestForPromotion(
         self: *ResolvedManifestSuccess,
         caller_allocator: std.mem.Allocator,
@@ -290,9 +384,9 @@ const ResolvedManifestSuccess = struct {
         platform: ?Platform,
     };
 
-    /// Move caller-promoted resolve fields out and clear digest/document/platform
-    /// so `deinit` cannot free `resolved_digest_raw` while `resolved_digest.hex`
-    /// still aliases it.
+    // Move caller-promoted resolve fields out and clear digest/document/platform
+    // so `deinit` cannot free `resolved_digest_raw` while `resolved_digest.hex`
+    // still aliases it.
     fn detachForResolvePromotion(self: *ResolvedManifestSuccess) ResolvePromotionDetach {
         const media_type = switch (self.document) {
             .manifest => |parsed| parsed.value.media_type,
@@ -313,118 +407,13 @@ const ResolvedManifestSuccess = struct {
         };
     }
 };
-
 const ResolvedManifestOutcome = union(enum) {
     success: ResolvedManifestSuccess,
     failure: ResolveError,
 };
-
-/// Resolve an image reference to a pinned manifest digest.
-///
-/// Ownership contract:
-/// - The returned ResolveResult is owned through the caller-provided allocator.
-/// - On success, `registry`, `repository`, and `tag` from the input `ref` are moved into
-///   `result.reference`; do not call `ref.deinit()` after a successful resolve.
-/// - Call `result.deinit(allocator)` when using a non-arena allocator.
-/// - If the allocator is an arena, tearing the arena down is also sufficient.
-/// - `ResolveResult.clone()` is only needed when moving the result into a different allocator.
-///
-/// Auth handoff contract:
-/// - derive `AuthReferenceView` from the normalized `Reference` with `referenceView(ref)`
-/// - manifest HEAD/GET is the live probe path today; a `401` with `WWW-Authenticate`
-///   triggers auth via `ProbeHttpResponse.classify()` on response metadata
-/// - turn that bearer challenge into `AuthenticateRequest.init(view.registry, challenge)` and call
-///   `AuthEngine.authenticate(...)`
-/// - attach the returned bearer token to the retried HEAD/GET request; if that retry comes back
-///   `401`, call `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)` once for the same
-///   request and surface failure after that single retry
-pub fn resolve(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    config: Config,
-    ref: Reference,
-    platform: ?Platform,
-) PublicApiError!ResolveOutcome {
-    return resolveWithExchangers(
-        allocator,
-        client,
-        config,
-        ref,
-        platform,
-        auth.liveTokenHttpExchanger,
-        resolver.liveManifestHttpExchanger,
-        resilience.liveTransportHooks(),
-    );
-}
-
-/// Validate that a manifest reference still exists and is fetchable.
-///
-/// Ownership contract:
-/// - No owned data is returned from this API.
-/// - The caller still owns `allocator`; the resolver uses it for transient request shaping,
-///   parsing, and any structured failure context that must outlive internal temporaries.
-///
-/// Auth handoff contract:
-/// - validation follows the same manifest HEAD/GET -> classify -> authenticate -> retry-once flow as `resolve`
-/// - validation must treat `.not_found` as terminal and must not attempt auth in that case
-/// - multi-arch validation follows the selected child manifest when `platform` is provided
-/// - multi-arch validation returns `ResolveError.platform_required` instead of guessing a child when
-///   `platform` is null
-pub fn validate(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    config: Config,
-    ref: Reference,
-    platform: ?Platform,
-) PublicApiError!ValidateOutcome {
-    return validateWithExchangers(
-        allocator,
-        client,
-        config,
-        ref,
-        platform,
-        auth.liveTokenHttpExchanger,
-        resolver.liveManifestHttpExchanger,
-        resilience.liveTransportHooks(),
-    );
-}
-
-/// Fetch and parse a manifest payload.
-///
-/// Ownership contract:
-/// - The returned std.json.Parsed(Manifest) owns an arena.
-/// - Call parsed.deinit() when finished.
-/// - Do not free the allocator backing that arena while the parsed value is still in use.
-///
-/// Auth handoff contract:
-/// - manifest GET uses the same `AuthReferenceView` and `AuthenticateRequest` boundary as `resolve`
-/// - auth owns token exchange and cache invalidation; manifest fetch owns Accept negotiation,
-///   response status handling, and JSON parsing
-/// - multi-arch GET returns `ResolveError.platform_required` instead of guessing a child when
-///   `platform` is null
-pub fn getManifest(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    config: Config,
-    ref: Reference,
-    platform: ?Platform,
-) PublicApiError!ManifestOutcome {
-    return getManifestWithExchangers(
-        allocator,
-        client,
-        config,
-        ref,
-        platform,
-        auth.liveTokenHttpExchanger,
-        resolver.liveManifestHttpExchanger,
-        resilience.liveTransportHooks(),
-    );
-}
-
 fn ensureClientConfigured(config: Config, client: *std.http.Client) PublicApiError!void {
     return config.applyToClient(client);
 }
-
 fn resolveWithExchangers(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -452,7 +441,6 @@ fn resolveWithExchangers(
         transport_hooks,
     );
 }
-
 fn resolveWithEngine(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -510,7 +498,6 @@ fn resolveWithEngine(
         },
     }
 }
-
 fn validateWithExchangers(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -574,7 +561,6 @@ fn validateWithExchangers(
     );
     return try validateOutcomeFromResolvedManifestOutcome(allocator, transient, &outcome);
 }
-
 fn promoteResolvedManifestFailure(
     caller_allocator: std.mem.Allocator,
     outcome_allocator: std.mem.Allocator,
@@ -584,7 +570,6 @@ fn promoteResolvedManifestFailure(
     outcome.failure.releaseOwnedReference(outcome_allocator);
     return promoted;
 }
-
 fn validateOutcomeFromResolvedManifestOutcome(
     caller_allocator: std.mem.Allocator,
     outcome_allocator: std.mem.Allocator,
@@ -611,7 +596,6 @@ fn validateOutcomeFromResolvedManifestOutcome(
         },
     }
 }
-
 fn validateOutcomeFromHeadMetadata(
     allocator: std.mem.Allocator,
     ref_view: AuthReferenceView,
@@ -628,12 +612,10 @@ fn validateOutcomeFromHeadMetadata(
 
     return null;
 }
-
 fn manifestResponseMediaType(content_type: []const u8) ?MediaType {
     const without_parameters = content_type[0..(std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len)];
     return MediaType.fromString(std.mem.trim(u8, without_parameters, " \t\r\n"));
 }
-
 fn getManifestWithExchangers(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -677,7 +659,6 @@ fn getManifestWithExchangers(
         },
     }
 }
-
 fn validateResolvedManifestFromChildHead(
     allocator: std.mem.Allocator,
     ref_view: AuthReferenceView,
@@ -714,19 +695,15 @@ fn validateResolvedManifestFromChildHead(
         },
     }
 }
-
 fn digestMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .digest_mismatch, null);
 }
-
 fn contentTypeMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .content_type_mismatch, null);
 }
-
 fn manifestParseErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .manifest_parse_error, null);
 }
-
 fn fetchResolvedManifestWithExchangers(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -825,7 +802,6 @@ fn fetchResolvedManifestWithExchangers(
         .failure => |failure| return .{ .failure = failure },
     }
 }
-
 fn recurseIntoMultiArchDocument(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -914,11 +890,9 @@ fn recurseIntoMultiArchDocument(
 
     return child_outcome;
 }
-
 fn manifestAcceptValues() []const []const u8 {
     return &MANIFEST_ACCEPT_VALUES;
 }
-
 fn buildResolveResultAlloc(
     allocator: std.mem.Allocator,
     ref: Reference,
@@ -936,7 +910,6 @@ fn buildResolveResultAlloc(
         .reference = resolved_reference,
     };
 }
-
 fn buildResolvedReferenceAlloc(
     allocator: std.mem.Allocator,
     ref: Reference,
@@ -949,27 +922,21 @@ fn buildResolvedReferenceAlloc(
     resolved.digest = Digest.parse(resolved_digest_raw) catch unreachable;
     return resolved;
 }
-
 fn notFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .not_found, null);
 }
-
 fn networkErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView, http_status: ?u16) !ResolveError {
     return allocatedResolveError(allocator, ref, .network_error, http_status);
 }
-
 fn platformNotFoundErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .platform_not_found, null);
 }
-
 fn platformRequiredErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .platform_required, null);
 }
-
 fn depthLimitExceededErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .depth_limit_exceeded, null);
 }
-
 fn allocatedResolveError(
     allocator: std.mem.Allocator,
     ref: AuthReferenceView,
@@ -983,7 +950,6 @@ fn allocatedResolveError(
         .http_status = http_status,
     });
 }
-
 fn clonePlatformAlloc(allocator: std.mem.Allocator, platform: Platform) !Platform {
     const os = try allocator.dupe(u8, platform.os);
     errdefer allocator.free(os);
@@ -1017,7 +983,6 @@ fn clonePlatformAlloc(allocator: std.mem.Allocator, platform: Platform) !Platfor
         .os_features = os_features,
     };
 }
-
 fn clonePlatformFeaturesAlloc(allocator: std.mem.Allocator, features: []const []const u8) ![]const []const u8 {
     const owned = try allocator.alloc([]const u8, features.len);
     errdefer allocator.free(owned);
@@ -1033,12 +998,10 @@ fn clonePlatformFeaturesAlloc(allocator: std.mem.Allocator, features: []const []
     }
     return owned;
 }
-
 fn freePlatformFeatures(features: []const []const u8, allocator: std.mem.Allocator) void {
     for (features) |feature| allocator.free(feature);
     allocator.free(features);
 }
-
 fn deinitOwnedPlatform(platform: Platform, allocator: std.mem.Allocator) void {
     allocator.free(platform.os);
     allocator.free(platform.architecture);
@@ -1046,11 +1009,9 @@ fn deinitOwnedPlatform(platform: Platform, allocator: std.mem.Allocator) void {
     if (platform.os_version) |os_version| allocator.free(os_version);
     if (platform.os_features) |features| freePlatformFeatures(features, allocator);
 }
-
 fn deinitOwnedResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
     failure.deinitOwned(allocator);
 }
-
 fn promoteManifestParsedAlloc(
     allocator: std.mem.Allocator,
     parsed: std.json.Parsed(Manifest),
@@ -1060,7 +1021,6 @@ fn promoteManifestParsedAlloc(
         else => error.OutOfMemory,
     };
 }
-
 fn promoteResolveErrorAlloc(allocator: std.mem.Allocator, failure: ResolveError) !ResolveError {
     const owned_reference = try allocator.dupe(u8, switch (failure) {
         inline else => |value| value.reference,
@@ -1068,7 +1028,6 @@ fn promoteResolveErrorAlloc(allocator: std.mem.Allocator, failure: ResolveError)
     errdefer allocator.free(owned_reference);
     return failure.withOwnedReference(owned_reference);
 }
-
 fn expectResolveFailure(
     failure: ResolveError,
     expected_tag_name: []const u8,
@@ -1085,7 +1044,6 @@ fn expectResolveFailure(
         },
     }
 }
-
 fn readFixtureAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -1094,14 +1052,12 @@ fn readFixtureAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: u
         .limited(max_bytes),
     );
 }
-
 fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     var digest_bytes: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body, &digest_bytes, .{});
     const digest_hex = std.fmt.bytesToHex(digest_bytes, .lower);
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
 }
-
 fn buildIndexBodyAlloc(
     allocator: std.mem.Allocator,
     index_media_type: []const u8,
@@ -1131,11 +1087,13 @@ fn buildIndexBodyAlloc(
         .{ index_media_type, child_media_type, child_digest, os, architecture },
     );
 }
-
 // Pulling every sub-module into the test build.
 // zig test only includes tests from the root file unless sub-modules are
 // referenced here. Each @import forces the compiler to compile that file in
 // test mode, which makes its test blocks visible to the test runner.
+
+// --- Tests ---
+
 test {
     _ = @import("Digest.zig");
     _ = @import("MediaType.zig");
@@ -1153,7 +1111,6 @@ test {
     _ = @import("resilience.zig");
     _ = @import("test_support.zig");
 }
-
 test "resolveWithExchangers returns pinned single-arch result for tag reference" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1219,7 +1176,6 @@ test "resolveWithExchangers returns pinned single-arch result for tag reference"
         .failure => return error.TestUnexpectedResult,
     }
 }
-
 test "resolveWithExchangers moves input reference strings into result without re-duping" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1278,7 +1234,6 @@ test "resolveWithExchangers moves input reference strings into result without re
         .failure => return error.TestUnexpectedResult,
     }
 }
-
 test "resolveWithExchangers repeated single-arch runs leave no residual allocations under DebugAllocator" {
     const State = struct {
         var body: []u8 = undefined;
@@ -1332,7 +1287,6 @@ test "resolveWithExchangers repeated single-arch runs leave no residual allocati
         }
     }
 }
-
 test "getManifestWithExchangers returns parsed single-arch manifest" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1388,7 +1342,6 @@ test "getManifestWithExchangers returns parsed single-arch manifest" {
         .failure => return error.TestUnexpectedResult,
     }
 }
-
 test "getManifestWithExchangers per-resolve arena promotes manifest without leaking" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1446,7 +1399,6 @@ test "getManifestWithExchangers per-resolve arena promotes manifest without leak
         }
     }
 }
-
 test "ResolvedManifestSuccess: detachForResolvePromotion clears digest alias before deinit" {
     const hex = "a" ** 64;
     const raw = try std.fmt.allocPrint(std.testing.allocator, "sha256:{s}", .{hex});
@@ -1465,7 +1417,6 @@ test "ResolvedManifestSuccess: detachForResolvePromotion clears digest alias bef
     try std.testing.expect(success.resolved_digest.hex.len == 0);
     success.deinit(std.testing.allocator);
 }
-
 test "validateOutcomeFromResolvedManifestOutcome: failure release clears stored reference" {
     const owned_reference = try std.testing.allocator.dupe(u8, "registry.example.test/library/busybox:latest");
     var outcome = ResolvedManifestOutcome{ .failure = .{ .platform_required = .{
@@ -1489,7 +1440,6 @@ test "validateOutcomeFromResolvedManifestOutcome: failure release clears stored 
 
     try std.testing.expect(outcome.failure.platform_required.reference.len == 0);
 }
-
 test "ResolvedManifestSuccess: deinit clears every owned field" {
     const json_bytes =
         \\{
@@ -1536,7 +1486,6 @@ test "ResolvedManifestSuccess: deinit clears every owned field" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "ResolvedManifestSuccess: detachManifestForPromotion OOM leaves shell deinit-safe" {
     const json_bytes =
         \\{
@@ -1574,7 +1523,6 @@ test "ResolvedManifestSuccess: detachManifestForPromotion OOM leaves shell deini
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{json_bytes});
 }
-
 test "ResolvedManifestSuccess: detachManifestForPromotion clears digest fields on success" {
     const json_bytes =
         \\{
@@ -1609,7 +1557,6 @@ test "ResolvedManifestSuccess: detachManifestForPromotion clears digest fields o
     try std.testing.expect(success_local.resolved_digest.hex.len == 0);
     try std.testing.expectEqual(.manifest_media_type, std.meta.activeTag(success_local.document));
 }
-
 test "getManifestWithExchangers matches direct parse of live busybox fixture" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1682,7 +1629,6 @@ test "getManifestWithExchangers matches direct parse of live busybox fixture" {
         .failure => return error.TestUnexpectedResult,
     }
 }
-
 test "getManifestWithExchangers failure promotes caller-owned reference" {
     const State = struct {
         var index_body: []u8 = undefined;
@@ -1751,7 +1697,6 @@ test "getManifestWithExchangers failure promotes caller-owned reference" {
     try std.testing.expect(std.mem.endsWith(u8, reference_copy, "busybox:latest"));
     try std.testing.expect(std.mem.indexOf(u8, reference_copy, "registry-1.docker.io") != null);
 }
-
 test "validateWithExchangers returns not_found for missing manifest" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1788,7 +1733,6 @@ test "validateWithExchangers returns not_found for missing manifest" {
 
     try std.testing.expectEqual(ValidateOutcome.not_found, outcome);
 }
-
 test "validateWithExchangers returns valid from HEAD for single-arch manifest" {
     const State = struct {
         var saw_head = false;
@@ -1834,7 +1778,6 @@ test "validateWithExchangers returns valid from HEAD for single-arch manifest" {
     try std.testing.expect(State.saw_head);
     try std.testing.expectEqual(ValidateOutcome.valid, outcome);
 }
-
 test "validateWithExchangers single-arch HEAD avoids metadata clone allocations" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1879,7 +1822,6 @@ test "validateWithExchangers single-arch HEAD avoids metadata clone allocations"
         try std.testing.expectEqual(ValidateOutcome.valid, outcome);
     }
 }
-
 test "validateWithExchangers HEAD to GET fallback stays leak-free under DebugAllocator" {
     const State = struct {
         var saw_get = false;
@@ -1944,7 +1886,6 @@ test "validateWithExchangers HEAD to GET fallback stays leak-free under DebugAll
         try std.testing.expectEqual(ValidateOutcome.valid, outcome);
     }
 }
-
 test "validateWithExchangers returns platform_required from HEAD for multi-arch request without platform" {
     const State = struct {
         var calls: usize = 0;
@@ -1999,7 +1940,6 @@ test "validateWithExchangers returns platform_required from HEAD for multi-arch 
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "resolveWithExchangers propagates resolver failure matrix with full context" {
     const Matrix = struct {
         const Scenario = enum {
@@ -2163,7 +2103,6 @@ test "resolveWithExchangers propagates resolver failure matrix with full context
         }
     }
 }
-
 test "resolveWithExchangers maps exhausted manifest 429 to rate_limited" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2216,7 +2155,6 @@ test "resolveWithExchangers maps exhausted manifest 429 to rate_limited" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "resolveWithExchangers maps exhausted transport timeout to timeout" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2264,7 +2202,6 @@ test "resolveWithExchangers maps exhausted transport timeout to timeout" {
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "resolveWithExchangers returns CaBundleFileNotFound when ca_bundle_path is missing" {
     if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
 
@@ -2304,7 +2241,6 @@ test "resolveWithExchangers returns CaBundleFileNotFound when ca_bundle_path is 
 
     try std.testing.expectError(error.CaBundleFileNotFound, outcome);
 }
-
 test "resolveWithExchangers applies fixture ca_bundle_path without breaking mock resolve" {
     if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
 
@@ -2372,7 +2308,6 @@ test "resolveWithExchangers applies fixture ca_bundle_path without breaking mock
     defer client.ca_bundle_lock.unlockShared(std.testing.io);
     try std.testing.expect(client.ca_bundle.bytes.items.len > 0);
 }
-
 test "validateWithExchangers returns CaBundleFileNotFound when ca_bundle_path is missing" {
     if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
 
@@ -2412,7 +2347,6 @@ test "validateWithExchangers returns CaBundleFileNotFound when ca_bundle_path is
 
     try std.testing.expectError(error.CaBundleFileNotFound, outcome);
 }
-
 test "getManifestWithExchangers returns CaBundleFileNotFound when ca_bundle_path is missing" {
     if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
 
@@ -2452,7 +2386,6 @@ test "getManifestWithExchangers returns CaBundleFileNotFound when ca_bundle_path
 
     try std.testing.expectError(error.CaBundleFileNotFound, outcome);
 }
-
 test "resolveWithExchangers returns platform_required when multi-arch request omits platform" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2511,7 +2444,6 @@ test "resolveWithExchangers returns platform_required when multi-arch request om
         },
     }
 }
-
 test "resolveWithEngine per-resolve arena promotes failures without leaking" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -2571,7 +2503,6 @@ test "resolveWithEngine per-resolve arena promotes failures without leaking" {
         }
     }
 }
-
 test "validateWithExchangers returns valid for selected multi-arch child manifest" {
     const State = struct {
         var index_body: []u8 = undefined;
@@ -2671,7 +2602,6 @@ test "validateWithExchangers returns valid for selected multi-arch child manifes
     try std.testing.expectEqual(@as(usize, 1), State.child_head_calls);
     try std.testing.expectEqual(@as(usize, 0), State.child_get_calls);
 }
-
 test "validateWithExchangers returns platform_required when multi-arch request omits platform" {
     const State = struct {
         var index_body: []u8 = undefined;
@@ -2738,7 +2668,6 @@ test "validateWithExchangers returns platform_required when multi-arch request o
         },
     }
 }
-
 test "getManifestWithExchangers returns platform_required when multi-arch request omits platform" {
     const State = struct {
         var index_body: []u8 = undefined;
@@ -2808,7 +2737,6 @@ test "getManifestWithExchangers returns platform_required when multi-arch reques
         },
     }
 }
-
 test "resolveWithExchangers resolves multi-arch index to selected child manifest" {
     const State = struct {
         var index_body: []u8 = undefined;
@@ -2909,7 +2837,6 @@ test "resolveWithExchangers resolves multi-arch index to selected child manifest
         .failure => return error.TestUnexpectedResult,
     }
 }
-
 test "resolveWithExchangers repeated multi-arch runs leave no residual allocations under DebugAllocator" {
     const State = struct {
         var index_body: []u8 = undefined;
@@ -3004,7 +2931,6 @@ test "resolveWithExchangers repeated multi-arch runs leave no residual allocatio
         }
     }
 }
-
 test "resolveWithExchangers returns platform_not_found when multi-arch platform is missing" {
     const State = struct {
         var index_body: []u8 = undefined;
@@ -3071,7 +2997,6 @@ test "resolveWithExchangers returns platform_not_found when multi-arch platform 
         }),
     }
 }
-
 test "getManifestWithExchangers resolves nested index to leaf manifest" {
     const State = struct {
         var outer_body: []u8 = undefined;
@@ -3189,7 +3114,6 @@ test "getManifestWithExchangers resolves nested index to leaf manifest" {
         },
     }
 }
-
 test "resolveWithExchangers returns depth_limit_exceeded for nested indexes beyond limit" {
     const depth = MAX_CHILD_MANIFEST_DEPTH + 1;
     const State = struct {

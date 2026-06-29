@@ -44,7 +44,6 @@
 //! - `Config.max_retries` stays auth-only (cached-401 invalidation).
 //! - `Config.max_network_retries` and `Config.max_rate_limit_retries` own
 //!   transport retry budgets separately.
-
 const std = @import("std");
 const Config = @import("Config.zig").Config;
 const json = @import("json.zig");
@@ -71,7 +70,6 @@ pub const RateLimitInfo = struct {
         return self.source != .none;
     }
 };
-
 /// Parsed retry delay instruction.
 ///
 /// Registries mix seconds, HTTP-date, and (on Docker Hub) Unix timestamps in
@@ -91,20 +89,17 @@ pub const RetryAfter = union(enum) {
     delay_seconds: u32,
     retry_at_unix_seconds: i64,
 };
-
 /// Which reactive retry bucket a failure belongs to.
 pub const RetryKind = enum {
     none,
     rate_limit,
     network,
 };
-
 /// Borrowed HTTP header pair for parser tests and live response metadata.
 pub const HttpHeader = struct {
     name: []const u8,
     value: []const u8,
 };
-
 /// Fields that actually drive `RetryBudget` on the live transport path.
 ///
 /// Kept separate from `ResilienceConfigView` so reserved config slots do not
@@ -113,7 +108,6 @@ pub const RetryBudgetConfig = struct {
     max_network_retries: u8,
     max_rate_limit_retries: u8,
 };
-
 /// Narrow view of `Config` fields reserved for upcoming resilience milestones.
 ///
 /// `configView` projects the full struct for callers that need one
@@ -137,7 +131,6 @@ pub const ResilienceConfigView = struct {
     /// headers with `remaining` at zero. Reactive `429` backoff ignores this.
     rate_limit_enabled: bool,
 };
-
 /// Tracks transport retry attempts against separate budgets.
 pub const RetryBudget = struct {
     network_attempts_used: u8 = 0,
@@ -178,7 +171,6 @@ pub const RetryBudget = struct {
         return self.network_attempts_used > 0;
     }
 };
-
 /// Exponential backoff parameters for reactive transport retries.
 ///
 /// Fixed defaults today. `Config` does not tune these yet; callers cannot mistake
@@ -187,15 +179,12 @@ pub const RetryBackoffConfig = struct {
     base_delay_ms: u32 = 1_000,
     max_delay_ms: u32 = 30_000,
 };
-
 /// Injectable Unix clock for `RetryAfter` math and policy tests.
 pub const RetryClock = struct {
     now_unix_seconds: *const fn () i64,
 };
-
 /// Injectable jitter source. Transport wrappers pass a real RNG; tests pin values.
 pub const RetryRandomSource = *const fn () u64;
-
 /// Outcome of a single reactive retry policy evaluation.
 pub const RetryDecision = struct {
     pub const Action = enum {
@@ -207,7 +196,6 @@ pub const RetryDecision = struct {
     kind: RetryKind = .none,
     delay_ms: u32 = 0,
 };
-
 /// Pure reactive retry policy shared by manifest and token transport wrappers.
 ///
 /// Evaluates one retry decision at a time. Transport wrappers own the sleep/retry
@@ -269,7 +257,6 @@ pub const RetryPolicy = struct {
         }
     }
 };
-
 /// Inputs that actually drive `RetryPolicy` today.
 ///
 /// `Config` only supplies the budget half via `retryPolicyConfig`. Backoff stays
@@ -278,10 +265,8 @@ pub const RetryPolicyConfig = struct {
     budget: RetryBudgetConfig,
     backoff: RetryBackoffConfig = .{},
 };
-
 /// Injectable sleep hook so unit tests avoid real delays.
 pub const TransportSleeper = *const fn (delay_ms: u32) void;
-
 /// Hooks transport wrappers inject for clock, jitter, and sleep.
 pub const TransportHooks = struct {
     sleeper: TransportSleeper = noopTransportSleeper,
@@ -290,40 +275,18 @@ pub const TransportHooks = struct {
     /// When true, resolver/auth sleep through `std.http.Client.io` instead of `sleeper`.
     use_live_sleep: bool = false,
 };
-
 pub fn noopTransportSleeper(_: u32) void {}
 
 pub fn liveTransportHooks() TransportHooks {
     return .{ .use_live_sleep = true };
 }
-
-fn systemNowUnixSeconds() i64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
-    return @intCast(ts.sec);
-}
-
-threadlocal var transport_prng_initialized = false;
-threadlocal var transport_prng: std.Random.DefaultPrng = undefined;
-
-fn systemRetryRandomU64() u64 {
-    if (!transport_prng_initialized) {
-        transport_prng = std.Random.DefaultPrng.init(@bitCast(systemNowUnixSeconds()));
-        transport_prng_initialized = true;
-    }
-    return transport_prng.random().int(u64);
-}
-
 pub const SYSTEM_RETRY_CLOCK: RetryClock = .{ .now_unix_seconds = systemNowUnixSeconds };
-
 pub fn retryPolicyConfig(config: Config) RetryPolicyConfig {
     return .{ .budget = retryBudgetConfig(config) };
 }
-
 pub fn retryPolicyFromConfig(config: Config, hooks: TransportHooks) RetryPolicy {
     return RetryPolicy.init(retryPolicyConfig(config), hooks.random_u64, hooks.clock);
 }
-
 pub fn sleepForTransportRetry(
     client: *std.http.Client,
     hooks: TransportHooks,
@@ -343,13 +306,11 @@ pub fn sleepForTransportRetry(
     }
     hooks.sleeper(delay_ms);
 }
-
 /// Optional hooks for the shared manifest/token transport retry loop.
 pub const HttpRetryLoopHooks = struct {
     before_first_attempt: ?*const fn (*anyopaque) void = null,
     after_successful_exchange: ?*const fn (*anyopaque, std.http.Status, []const HttpHeader) void = null,
 };
-
 /// Outcome of `runHttpRetryLoop` for manifest and token transport wrappers.
 pub fn HttpRetryLoopResult(comptime Response: type, comptime ExchangeError: type) type {
     return union(enum) {
@@ -363,7 +324,6 @@ pub fn HttpRetryLoopResult(comptime Response: type, comptime ExchangeError: type
         },
     };
 }
-
 /// Shared reactive retry loop for manifest and token HTTP exchangers.
 ///
 /// Transport wrappers pass exchange-specific callbacks; manifest transport uses
@@ -409,7 +369,6 @@ pub fn runHttpRetryLoop(
         sleepForTransportRetry(client, transport_hooks, decision.delay_ms);
     }
 }
-
 /// Returns true for rate-limit and retry-after header names the transport layer keeps.
 pub fn isTrackedResilienceHeaderName(name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "RateLimit-")) return true;
@@ -419,19 +378,16 @@ pub fn isTrackedResilienceHeaderName(name: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, "Date")) return true;
     return false;
 }
-
 pub fn retryAfterFromHeaders(
     headers: []const HttpHeader,
 ) ResilienceParseError!?RetryAfter {
     return parseRetryAfterFromHeaders(headers, null);
 }
-
 /// Parse the response `Date` header into Unix seconds when present.
 pub fn responseDateUnixSecondsFromHeaders(headers: []const HttpHeader) ResilienceParseError!?i64 {
     const raw = findHeaderValue(headers, "Date") orelse return null;
     return try parseImfFixdateHttpDate(std.mem.trim(u8, raw, " \t\r\n"));
 }
-
 pub fn deinitOwnedHttpHeaders(allocator: std.mem.Allocator, headers: []HttpHeader) void {
     for (headers) |header| {
         allocator.free(header.name);
@@ -439,7 +395,6 @@ pub fn deinitOwnedHttpHeaders(allocator: std.mem.Allocator, headers: []HttpHeade
     }
     allocator.free(headers);
 }
-
 pub fn duplicateHttpHeadersAlloc(
     allocator: std.mem.Allocator,
     headers: []const HttpHeader,
@@ -456,7 +411,6 @@ pub fn duplicateHttpHeadersAlloc(
 
     return owned;
 }
-
 /// Convert a parsed `Retry-After` value into milliseconds to sleep from `now`.
 pub fn retryAfterDelayMs(retry_after: RetryAfter, now_unix_seconds: i64) u32 {
     switch (retry_after) {
@@ -470,50 +424,12 @@ pub fn retryAfterDelayMs(retry_after: RetryAfter, now_unix_seconds: i64) u32 {
         },
     }
 }
-
-fn computeRateLimitDelayMs(
-    policy: *const RetryPolicy,
-    retry_after: ?RetryAfter,
-    now_unix_seconds: i64,
-) u32 {
-    if (retry_after) |header| {
-        return retryAfterDelayMs(header, now_unix_seconds);
-    }
-    return exponentialBackoffDelayMs(
-        policy.backoff,
-        policy.budget.rate_limit_attempts_used,
-        policy.random_u64(),
-    );
-}
-
-fn computeNetworkDelayMs(policy: *const RetryPolicy) u32 {
-    return exponentialBackoffDelayMs(
-        policy.backoff,
-        policy.budget.network_attempts_used,
-        policy.random_u64(),
-    );
-}
-
-fn exponentialBackoffDelayMs(
-    config: RetryBackoffConfig,
-    attempt_index: u8,
-    random_u64: u64,
-) u32 {
-    const shift: u4 = @intCast(@min(attempt_index, 15));
-    const multiplier: u32 = @as(u32, 1) << shift;
-    const uncapped = config.base_delay_ms *% multiplier;
-    const capped = @min(uncapped, config.max_delay_ms);
-    if (capped == 0) return 0;
-    return @intCast(random_u64 % (@as(u64, capped) + 1));
-}
-
 pub fn retryBudgetConfig(config: Config) RetryBudgetConfig {
     return .{
         .max_network_retries = config.max_network_retries,
         .max_rate_limit_retries = config.max_rate_limit_retries,
     };
 }
-
 pub fn configView(config: Config) ResilienceConfigView {
     return .{
         .connect_timeout_ms = config.connect_timeout_ms,
@@ -524,7 +440,6 @@ pub fn configView(config: Config) ResilienceConfigView {
         .rate_limit_enabled = config.rate_limit_enabled,
     };
 }
-
 /// Case-insensitive header lookup for parser entry points.
 pub fn findHeaderValue(headers: []const HttpHeader, name: []const u8) ?[]const u8 {
     for (headers) |header| {
@@ -532,7 +447,6 @@ pub fn findHeaderValue(headers: []const HttpHeader, name: []const u8) ?[]const u
     }
     return null;
 }
-
 pub fn classifyHttpStatus(status: std.http.Status) RetryKind {
     return switch (status) {
         .too_many_requests => .rate_limit,
@@ -540,11 +454,9 @@ pub fn classifyHttpStatus(status: std.http.Status) RetryKind {
         else => .none,
     };
 }
-
 pub fn isRetryableHttpStatus(status: std.http.Status) bool {
     return classifyHttpStatus(status) != .none;
 }
-
 /// Classify transient transport failures that may succeed on idempotent retry.
 ///
 /// Hard auth, parse, and digest failures stay outside this helper. Opaque wrapper
@@ -561,12 +473,10 @@ pub fn classifyNetworkTransportError(err: anyerror) RetryKind {
         else => .none,
     };
 }
-
 pub const HttpBodyReadError = error{
     OutOfMemory,
     BodyTooLarge,
 } || std.Io.Reader.ShortError;
-
 pub fn readHttpResponseBodyAlloc(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -578,19 +488,12 @@ pub fn readHttpResponseBodyAlloc(
         else => |e| return e,
     };
 }
-
 pub const ResilienceParseError = error{
     InvalidRateLimitHeader,
     InvalidRetryAfterHeader,
     InvalidHttpDate,
 };
-
-/// Numeric `Retry-After` values at or above this are treated as Unix epoch
-/// seconds. Docker Hub sends epoch timestamps in `Retry-After` instead of a
-/// delay in seconds.
-const RETRY_AFTER_UNIX_EPOCH_THRESHOLD: u64 = 1_000_000_000;
-
-const epoch = std.time.epoch;
+// --- Resilience header parsers ---
 
 /// Parse registry pull rate-limit headers (`RateLimit-*`).
 ///
@@ -624,7 +527,6 @@ pub fn parseRegistryRateLimitHeaders(headers: []const HttpHeader) ResiliencePars
 
     return info;
 }
-
 /// Parse API rate-limit headers (`X-RateLimit-*`).
 ///
 /// Returns `.source == .none` when no API rate-limit headers are present.
@@ -645,7 +547,6 @@ pub fn parseApiRateLimitHeaders(headers: []const HttpHeader) ResilienceParseErro
 
     return info;
 }
-
 /// Parse rate-limit headers, preferring registry `RateLimit-*` over API
 /// `X-RateLimit-*` when both families are present.
 ///
@@ -656,7 +557,6 @@ pub fn parseRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!R
     if (registry.isSet()) return registry;
     return parseApiRateLimitHeaders(headers);
 }
-
 /// Returns true when registry pull `RateLimit-*` headers are complete enough for
 /// Docker Hub-style pre-emptive throttling. Partial sets and API-only headers are
 /// rejected so registries with unreliable metadata are not slowed down.
@@ -666,7 +566,6 @@ pub fn isTrustworthyPreemptiveRateLimit(info: RateLimitInfo) bool {
     if (info.reset_unix_seconds == null) return false;
     return true;
 }
-
 /// Milliseconds to sleep before the next manifest request when pre-emptive mode is
 /// enabled and the prior response shows the registry pull bucket is exhausted.
 ///
@@ -687,7 +586,6 @@ pub fn preemptiveRateLimitDelayMs(
     if (delay == 0) return null;
     return delay;
 }
-
 /// Carries the last trustworthy registry rate-limit snapshot across manifest HTTP
 /// calls within one resolve/validate/get operation (via `AuthEngine`).
 pub const ManifestThrottle = struct {
@@ -721,7 +619,6 @@ pub const ManifestThrottle = struct {
         sleepForTransportRetry(client, hooks, delay);
     }
 };
-
 /// Parse `Retry-After` or `X-Retry-After` when either header is present.
 ///
 /// Returns `null` when neither header exists. When `response_date_unix_seconds`
@@ -744,11 +641,62 @@ pub fn parseRetryAfterFromHeaders(
     }
     return null;
 }
-
 pub fn parseRetryAfterValue(raw: []const u8) ResilienceParseError!RetryAfter {
     return parseRetryAfterValueWithContext(raw, null);
 }
 
+// --- Private helpers ---
+
+fn systemNowUnixSeconds() i64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+    return @intCast(ts.sec);
+}
+threadlocal var transport_prng_initialized = false;
+threadlocal var transport_prng: std.Random.DefaultPrng = undefined;
+fn systemRetryRandomU64() u64 {
+    if (!transport_prng_initialized) {
+        transport_prng = std.Random.DefaultPrng.init(@bitCast(systemNowUnixSeconds()));
+        transport_prng_initialized = true;
+    }
+    return transport_prng.random().int(u64);
+}
+fn computeRateLimitDelayMs(
+    policy: *const RetryPolicy,
+    retry_after: ?RetryAfter,
+    now_unix_seconds: i64,
+) u32 {
+    if (retry_after) |header| {
+        return retryAfterDelayMs(header, now_unix_seconds);
+    }
+    return exponentialBackoffDelayMs(
+        policy.backoff,
+        policy.budget.rate_limit_attempts_used,
+        policy.random_u64(),
+    );
+}
+fn computeNetworkDelayMs(policy: *const RetryPolicy) u32 {
+    return exponentialBackoffDelayMs(
+        policy.backoff,
+        policy.budget.network_attempts_used,
+        policy.random_u64(),
+    );
+}
+fn exponentialBackoffDelayMs(
+    config: RetryBackoffConfig,
+    attempt_index: u8,
+    random_u64: u64,
+) u32 {
+    const shift: u4 = @intCast(@min(attempt_index, 15));
+    const multiplier: u32 = @as(u32, 1) << shift;
+    const uncapped = config.base_delay_ms *% multiplier;
+    const capped = @min(uncapped, config.max_delay_ms);
+    if (capped == 0) return 0;
+    return @intCast(random_u64 % (@as(u64, capped) + 1));
+}
+// Numeric `Retry-After` values at or above this are treated as Unix epoch seconds.
+const RETRY_AFTER_UNIX_EPOCH_THRESHOLD: u64 = 1_000_000_000;
+const epoch = std.time.epoch;
 fn parseRetryAfterValueWithContext(
     raw: []const u8,
     response_date_unix_seconds: ?i64,
@@ -777,12 +725,10 @@ fn parseRetryAfterValueWithContext(
 
     return .{ .delay_seconds = delay_seconds };
 }
-
 const RegistryRateLimitQuantity = struct {
     limit: u32,
     window_seconds: ?u32 = null,
 };
-
 fn parseRegistryRateLimitQuantity(raw: []const u8) ResilienceParseError!RegistryRateLimitQuantity {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return error.InvalidRateLimitHeader;
@@ -807,19 +753,16 @@ fn parseRegistryRateLimitQuantity(raw: []const u8) ResilienceParseError!Registry
 
     return quantity;
 }
-
 fn parseU32Decimal(raw: []const u8, invalid: ResilienceParseError) ResilienceParseError!u32 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return invalid;
     return std.fmt.parseInt(u32, trimmed, 10) catch invalid;
 }
-
 fn parseU64Decimal(raw: []const u8, invalid: ResilienceParseError) ResilienceParseError!u64 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return invalid;
     return std.fmt.parseInt(u64, trimmed, 10) catch invalid;
 }
-
 fn allAsciiDigits(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value) |byte| {
@@ -827,11 +770,9 @@ fn allAsciiDigits(value: []const u8) bool {
     }
     return true;
 }
-
 fn looksLikeHttpDate(value: []const u8) bool {
     return std.mem.indexOfScalar(u8, value, ',') != null and std.mem.indexOfScalar(u8, value, ':') != null;
 }
-
 fn parseImfFixdateHttpDate(raw: []const u8) ResilienceParseError!i64 {
     var value = std.mem.trim(u8, raw, " \t\r\n");
     if (value.len < 20) return error.InvalidHttpDate;
@@ -888,7 +829,6 @@ fn parseImfFixdateHttpDate(raw: []const u8) ResilienceParseError!i64 {
         .second = second,
     });
 }
-
 const UtcDateTime = struct {
     year: u16,
     month: epoch.Month,
@@ -897,7 +837,6 @@ const UtcDateTime = struct {
     minute: u6,
     second: u6,
 };
-
 fn unixSecondsFromUtc(date_time: UtcDateTime) ResilienceParseError!i64 {
     if (date_time.year < epoch.epoch_year) return error.InvalidHttpDate;
 
@@ -922,7 +861,6 @@ fn unixSecondsFromUtc(date_time: UtcDateTime) ResilienceParseError!i64 {
 
     return @intCast(seconds);
 }
-
 fn parseHttpMonthAbbrev(token: []const u8) ?epoch.Month {
     if (token.len < 3) return null;
     const abbrev = token[0..3];
@@ -940,11 +878,47 @@ fn parseHttpMonthAbbrev(token: []const u8) ?epoch.Month {
     if (std.ascii.eqlIgnoreCase(abbrev, "Dec")) return .dec;
     return null;
 }
+const ResilienceHeaderFixture = struct {
+    headers: []const struct {
+        name: []const u8,
+        value: []const u8,
+    },
+};
+const MalformedResilienceHeaderFixture = struct {
+    cases: []const struct {
+        headers: []const struct {
+            name: []const u8,
+            value: []const u8,
+        },
+        expected_error: []const u8,
+    },
+};
+const ConflictingRetryAfterFixture = struct {
+    headers: []const struct {
+        name: []const u8,
+        value: []const u8,
+    },
+    expected_delay_seconds: u32,
+};
+var test_policy_now_unix_seconds: i64 = 1_700_000_000;
+var test_policy_random_u64: u64 = 7;
+fn testPolicyNowUnixSeconds() i64 {
+    return test_policy_now_unix_seconds;
+}
+fn testPolicyRandomU64() u64 {
+    return test_policy_random_u64;
+}
+fn testRetryPolicy(budget_config: RetryBudgetConfig) RetryPolicy {
+    return RetryPolicy.init(.{ .budget = budget_config }, testPolicyRandomU64, .{
+        .now_unix_seconds = testPolicyNowUnixSeconds,
+    });
+}
+
+// --- Tests ---
 
 test {
     std.testing.refAllDecls(@This());
 }
-
 test "retryBudgetConfig projects only transport retry limits" {
     const config = Config{
         .connect_timeout_ms = 5_000,
@@ -961,7 +935,6 @@ test "retryBudgetConfig projects only transport retry limits" {
     try std.testing.expectEqual(@as(u8, 3), budget_config.max_rate_limit_retries);
     try std.testing.expectEqual(@as(u8, 9), config.max_retries);
 }
-
 test "configView projects reserved fields without implying they drive RetryPolicy" {
     const config = Config{
         .connect_timeout_ms = 5_000,
@@ -983,7 +956,6 @@ test "configView projects reserved fields without implying they drive RetryPolic
     try std.testing.expect(!view.rate_limit_enabled);
     try std.testing.expectEqual(@as(u8, 9), config.max_retries);
 }
-
 test "classifyHttpStatus maps 429 to rate_limit and 5xx gateway errors to network" {
     try std.testing.expectEqual(RetryKind.rate_limit, classifyHttpStatus(.too_many_requests));
     try std.testing.expectEqual(RetryKind.network, classifyHttpStatus(.bad_gateway));
@@ -992,20 +964,17 @@ test "classifyHttpStatus maps 429 to rate_limit and 5xx gateway errors to networ
     try std.testing.expectEqual(RetryKind.none, classifyHttpStatus(.not_found));
     try std.testing.expectEqual(RetryKind.none, classifyHttpStatus(.unauthorized));
 }
-
 test "classifyNetworkTransportError maps transient socket failures to network" {
     try std.testing.expectEqual(RetryKind.network, classifyNetworkTransportError(error.ConnectionResetByPeer));
     try std.testing.expectEqual(RetryKind.network, classifyNetworkTransportError(error.Timeout));
     try std.testing.expectEqual(RetryKind.network, classifyNetworkTransportError(error.UnknownHostName));
     try std.testing.expectEqual(RetryKind.none, classifyNetworkTransportError(error.OutOfMemory));
 }
-
 test "classifyNetworkTransportError ignores opaque collapsed transport errors" {
     // Manifest/token wrappers often collapse socket failures to a single opaque
     // error before policy sees them. Those stay non-retryable here by design.
     try std.testing.expectEqual(RetryKind.none, classifyNetworkTransportError(error.UnexpectedEndOfInput));
 }
-
 test "RetryBudget tracks separate network and rate-limit attempt limits" {
     const budget_config = retryBudgetConfig(.{
         .max_network_retries = 1,
@@ -1024,7 +993,6 @@ test "RetryBudget tracks separate network and rate-limit attempt limits" {
     budget.recordRateLimitAttempt();
     try std.testing.expect(!budget.canRetryRateLimit());
 }
-
 test "findHeaderValue matches registry rate-limit headers case-insensitively" {
     const headers = [_]HttpHeader{
         .{ .name = "RateLimit-Limit", .value = "100;w=21600" },
@@ -1036,7 +1004,6 @@ test "findHeaderValue matches registry rate-limit headers case-insensitively" {
     try std.testing.expectEqualStrings("87", findHeaderValue(&headers, "RATELIMIT-REMAINING").?);
     try std.testing.expect(findHeaderValue(&headers, "RateLimit-Reset") == null);
 }
-
 test "findHeaderValue matches Docker Hub API x-ratelimit headers from fixture bytes" {
     const headers = [_]HttpHeader{
         .{ .name = "x-ratelimit-limit", .value = "180" },
@@ -1049,14 +1016,12 @@ test "findHeaderValue matches Docker Hub API x-ratelimit headers from fixture by
     try std.testing.expectEqualStrings("0", findHeaderValue(&headers, "X-RateLimit-Remaining").?);
     try std.testing.expectEqualStrings("1746136938", findHeaderValue(&headers, "Retry-After").?);
 }
-
 test "RateLimitInfo defaults to unset source" {
     const info: RateLimitInfo = .{};
     try std.testing.expect(!info.isSet());
     try std.testing.expect(info.limit == null);
     try std.testing.expect(info.remaining == null);
 }
-
 test "RetryAfter union stores delay and absolute retry instants separately" {
     const delay: RetryAfter = .{ .delay_seconds = 120 };
     const absolute: RetryAfter = .{ .retry_at_unix_seconds = 1_746_136_938 };
@@ -1064,7 +1029,6 @@ test "RetryAfter union stores delay and absolute retry instants separately" {
     try std.testing.expectEqual(@as(u32, 120), delay.delay_seconds);
     try std.testing.expectEqual(@as(i64, 1_746_136_938), absolute.retry_at_unix_seconds);
 }
-
 test "parseRegistryRateLimitHeaders parses RateLimit-Reset on registry path" {
     const headers = [_]HttpHeader{
         .{ .name = "RateLimit-Limit", .value = "200" },
@@ -1078,7 +1042,6 @@ test "parseRegistryRateLimitHeaders parses RateLimit-Reset on registry path" {
     try std.testing.expectEqual(@as(u32, 5), info.remaining.?);
     try std.testing.expectEqual(@as(u64, 1_746_136_938), info.reset_unix_seconds.?);
 }
-
 test "parseRegistryRateLimitHeaders parses docker registry pull headers with window" {
     const headers = [_]HttpHeader{
         .{ .name = "RateLimit-Limit", .value = "100;w=21600" },
@@ -1092,7 +1055,6 @@ test "parseRegistryRateLimitHeaders parses docker registry pull headers with win
     try std.testing.expectEqual(@as(u32, 87), info.remaining.?);
     try std.testing.expectEqual(@as(u32, 21600), info.window_seconds.?);
 }
-
 test "parseApiRateLimitHeaders parses docker hub API x-ratelimit headers" {
     const headers = [_]HttpHeader{
         .{ .name = "X-RateLimit-Limit", .value = "180" },
@@ -1106,7 +1068,6 @@ test "parseApiRateLimitHeaders parses docker hub API x-ratelimit headers" {
     try std.testing.expectEqual(@as(u32, 0), info.remaining.?);
     try std.testing.expectEqual(@as(u64, 1_746_136_938), info.reset_unix_seconds.?);
 }
-
 test "parseRateLimitHeaders prefers registry headers over API headers" {
     const headers = [_]HttpHeader{
         .{ .name = "RateLimit-Remaining", .value = "12" },
@@ -1117,7 +1078,6 @@ test "parseRateLimitHeaders prefers registry headers over API headers" {
     try std.testing.expectEqual(RateLimitInfo.Source.registry_rate_limit, info.source);
     try std.testing.expectEqual(@as(u32, 12), info.remaining.?);
 }
-
 test "parseRateLimitHeaders returns unset info when no rate-limit headers exist" {
     const headers = [_]HttpHeader{
         .{ .name = "Content-Type", .value = "application/json" },
@@ -1126,22 +1086,18 @@ test "parseRateLimitHeaders returns unset info when no rate-limit headers exist"
     const info = try parseRateLimitHeaders(&headers);
     try std.testing.expect(!info.isSet());
 }
-
 test "parseRetryAfterValue treats small integers as delay seconds" {
     const parsed = try parseRetryAfterValue("120");
     try std.testing.expectEqual(@as(u32, 120), parsed.delay_seconds);
 }
-
 test "parseRetryAfterValue treats docker hub epoch values as absolute retry time" {
     const parsed = try parseRetryAfterValue("1746136938");
     try std.testing.expectEqual(@as(i64, 1_746_136_938), parsed.retry_at_unix_seconds);
 }
-
 test "parseRetryAfterValue parses IMF-fixdate HTTP-date values" {
     const parsed = try parseRetryAfterValue("Thu, 01 May 2025 22:02:18 GMT");
     try std.testing.expectEqual(@as(i64, 1_746_136_938), parsed.retry_at_unix_seconds);
 }
-
 test "parseRetryAfterFromHeaders anchors integer delays to response Date" {
     const headers = [_]HttpHeader{
         .{ .name = "Date", .value = "Thu, 01 May 2025 22:02:18 GMT" },
@@ -1159,7 +1115,6 @@ test "parseRetryAfterFromHeaders anchors integer delays to response Date" {
         retryAfterDelayMs(parsed, response_date + 30),
     );
 }
-
 test "parseRetryAfterFromHeaders prefers Retry-After over X-Retry-After" {
     const headers = [_]HttpHeader{
         .{ .name = "Retry-After", .value = "30" },
@@ -1169,7 +1124,6 @@ test "parseRetryAfterFromHeaders prefers Retry-After over X-Retry-After" {
     const parsed = (try parseRetryAfterFromHeaders(&headers, null)).?;
     try std.testing.expectEqual(@as(u32, 30), parsed.delay_seconds);
 }
-
 test "parseRetryAfterFromHeaders falls back to X-Retry-After" {
     const headers = [_]HttpHeader{
         .{ .name = "X-Retry-After", .value = "45" },
@@ -1178,7 +1132,6 @@ test "parseRetryAfterFromHeaders falls back to X-Retry-After" {
     const parsed = (try parseRetryAfterFromHeaders(&headers, null)).?;
     try std.testing.expectEqual(@as(u32, 45), parsed.delay_seconds);
 }
-
 test "parseRetryAfterFromHeaders returns null when retry headers are absent" {
     const headers = [_]HttpHeader{
         .{ .name = "Content-Type", .value = "application/json" },
@@ -1186,7 +1139,6 @@ test "parseRetryAfterFromHeaders returns null when retry headers are absent" {
 
     try std.testing.expect(try parseRetryAfterFromHeaders(&headers, null) == null);
 }
-
 test "rate-limit and retry-after parsers reject malformed header values" {
     const bad_registry = [_]HttpHeader{
         .{ .name = "RateLimit-Limit", .value = "not-a-number" },
@@ -1202,7 +1154,6 @@ test "rate-limit and retry-after parsers reject malformed header values" {
     try std.testing.expectError(error.InvalidRetryAfterHeader, parseRetryAfterValue("soon"));
     try std.testing.expectError(error.InvalidHttpDate, parseRetryAfterValue("Thu, 99 Foo 2025 99:99:99 GMT"));
 }
-
 test "rate-limit header fragments parse deterministically across table cases" {
     const cases = [_]struct {
         headers: []const HttpHeader,
@@ -1243,7 +1194,6 @@ test "rate-limit header fragments parse deterministically across table cases" {
         }
     }
 }
-
 test "parser liveness: transport retry uses retry-after parsers only" {
     const headers = [_]HttpHeader{
         .{ .name = "Retry-After", .value = "30" },
@@ -1256,14 +1206,6 @@ test "parser liveness: transport retry uses retry-after parsers only" {
     const rate_limit = try parseRateLimitHeaders(&headers);
     try std.testing.expect(rate_limit.isSet());
 }
-
-const ResilienceHeaderFixture = struct {
-    headers: []const struct {
-        name: []const u8,
-        value: []const u8,
-    },
-};
-
 test "parseRateLimitHeaders parses checked-in docker hub 429 fixture" {
     var bytes_buffer: [4 * 1024]u8 = undefined;
     const bytes = try std.Io.Dir.cwd().readFile(
@@ -1293,17 +1235,6 @@ test "parseRateLimitHeaders parses checked-in docker hub 429 fixture" {
     const response_date = (try responseDateUnixSecondsFromHeaders(header_slice)).?;
     try std.testing.expectEqual(response_date + 60, retry_after.retry_at_unix_seconds);
 }
-
-const MalformedResilienceHeaderFixture = struct {
-    cases: []const struct {
-        headers: []const struct {
-            name: []const u8,
-            value: []const u8,
-        },
-        expected_error: []const u8,
-    },
-};
-
 test "malformed resilience header fixture rejects invalid rate-limit and retry-after values" {
     var bytes_buffer: [8 * 1024]u8 = undefined;
     const bytes = try std.Io.Dir.cwd().readFile(
@@ -1334,15 +1265,6 @@ test "malformed resilience header fixture rejects invalid rate-limit and retry-a
         return error.TestUnexpectedResult;
     }
 }
-
-const ConflictingRetryAfterFixture = struct {
-    headers: []const struct {
-        name: []const u8,
-        value: []const u8,
-    },
-    expected_delay_seconds: u32,
-};
-
 test "conflicting retry-after fixture prefers Retry-After over X-Retry-After" {
     var bytes_buffer: [4 * 1024]u8 = undefined;
     const bytes = try std.Io.Dir.cwd().readFile(
@@ -1365,7 +1287,6 @@ test "conflicting retry-after fixture prefers Retry-After over X-Retry-After" {
     const response_date = (try responseDateUnixSecondsFromHeaders(header_slice)).?;
     try std.testing.expectEqual(response_date + parsed.value.expected_delay_seconds, retry_after.retry_at_unix_seconds);
 }
-
 test "findHeaderValue returns the first match when duplicate headers exist" {
     const headers = [_]HttpHeader{
         .{ .name = "Retry-After", .value = "30" },
@@ -1374,13 +1295,11 @@ test "findHeaderValue returns the first match when duplicate headers exist" {
 
     try std.testing.expectEqualStrings("30", findHeaderValue(&headers, "Retry-After").?);
 }
-
 test "retryAfterDelayMs converts delay seconds and absolute retry instants" {
     try std.testing.expectEqual(@as(u32, 120_000), retryAfterDelayMs(.{ .delay_seconds = 120 }, 1_700_000_000));
     try std.testing.expectEqual(@as(u32, 45_000), retryAfterDelayMs(.{ .retry_at_unix_seconds = 1_700_000_045 }, 1_700_000_000));
     try std.testing.expectEqual(@as(u32, 0), retryAfterDelayMs(.{ .retry_at_unix_seconds = 1_699_999_999 }, 1_700_000_000));
 }
-
 test "isTrustworthyPreemptiveRateLimit requires registry RateLimit family with limit remaining reset" {
     const trusted: RateLimitInfo = .{
         .source = .registry_rate_limit,
@@ -1405,7 +1324,6 @@ test "isTrustworthyPreemptiveRateLimit requires registry RateLimit family with l
     };
     try std.testing.expect(!isTrustworthyPreemptiveRateLimit(partial));
 }
-
 test "preemptiveRateLimitDelayMs sleeps until reset when remaining is zero" {
     test_policy_now_unix_seconds = 1_700_000_000;
     const info: RateLimitInfo = .{
@@ -1418,7 +1336,6 @@ test "preemptiveRateLimitDelayMs sleeps until reset when remaining is zero" {
     try std.testing.expect(preemptiveRateLimitDelayMs(false, info, 1_700_000_000, 0) == null);
     try std.testing.expect(preemptiveRateLimitDelayMs(true, info, 1_700_000_100, 0) == null);
 }
-
 test "preemptiveRateLimitDelayMs ignores remaining above threshold" {
     const info: RateLimitInfo = .{
         .source = .registry_rate_limit,
@@ -1428,7 +1345,6 @@ test "preemptiveRateLimitDelayMs ignores remaining above threshold" {
     };
     try std.testing.expect(preemptiveRateLimitDelayMs(true, info, 1_700_000_000, 0) == null);
 }
-
 test "ManifestThrottle records trustworthy headers and rejects partial API headers" {
     var state: ManifestThrottle = .{};
     const registry_headers = [_]HttpHeader{
@@ -1448,7 +1364,6 @@ test "ManifestThrottle records trustworthy headers and rejects partial API heade
     state.recordManifestResponseHeaders(&api_headers);
     try std.testing.expect(state.prior == null);
 }
-
 test "ManifestThrottle sleepBeforeManifestRequestIfNeeded uses transport hooks" {
     const State = struct {
         var slept_ms: u32 = 0;
@@ -1483,24 +1398,6 @@ test "ManifestThrottle sleepBeforeManifestRequestIfNeeded uses transport hooks" 
     });
     try std.testing.expectEqual(@as(u32, 30_000), State.slept_ms);
 }
-
-var test_policy_now_unix_seconds: i64 = 1_700_000_000;
-var test_policy_random_u64: u64 = 7;
-
-fn testPolicyNowUnixSeconds() i64 {
-    return test_policy_now_unix_seconds;
-}
-
-fn testPolicyRandomU64() u64 {
-    return test_policy_random_u64;
-}
-
-fn testRetryPolicy(budget_config: RetryBudgetConfig) RetryPolicy {
-    return RetryPolicy.init(.{ .budget = budget_config }, testPolicyRandomU64, .{
-        .now_unix_seconds = testPolicyNowUnixSeconds,
-    });
-}
-
 test "retryPolicyConfig projects only budget fields from Config" {
     const config = Config{
         .max_network_retries = 4,
@@ -1515,7 +1412,6 @@ test "retryPolicyConfig projects only budget fields from Config" {
     try std.testing.expectEqual(@as(u32, 1_000), policy_config.backoff.base_delay_ms);
     try std.testing.expectEqual(@as(u32, 30_000), policy_config.backoff.max_delay_ms);
 }
-
 test "retryPolicyFromConfig uses injected clock and random hooks" {
     test_policy_now_unix_seconds = 1_700_000_000;
     test_policy_random_u64 = 0;
@@ -1533,7 +1429,6 @@ test "retryPolicyFromConfig uses injected clock and random hooks" {
     try std.testing.expectEqual(RetryDecision.Action.retry, decision.action);
     try std.testing.expectEqual(@as(u32, 120_000), decision.delay_ms);
 }
-
 test "RetryPolicy keeps network and rate-limit budgets independent" {
     test_policy_random_u64 = 0;
 
@@ -1552,7 +1447,6 @@ test "RetryPolicy keeps network and rate-limit budgets independent" {
     try std.testing.expectEqual(@as(u8, 1), policy.budget.rate_limit_attempts_used);
     try std.testing.expectEqual(@as(u8, 1), policy.budget.network_attempts_used);
 }
-
 test "RetryPolicy uses jitter backoff for 429 without Retry-After" {
     test_policy_random_u64 = 999;
 
@@ -1565,7 +1459,6 @@ test "RetryPolicy uses jitter backoff for 429 without Retry-After" {
     try std.testing.expectEqual(RetryKind.rate_limit, decision.kind);
     try std.testing.expectEqual(@as(u32, 999), decision.delay_ms);
 }
-
 test "RetryPolicy classifies 502 and 504 as network retries" {
     var policy = testRetryPolicy(retryBudgetConfig(.{
         .max_network_retries = 2,
@@ -1581,7 +1474,6 @@ test "RetryPolicy classifies 502 and 504 as network retries" {
 
     try std.testing.expectEqual(@as(u8, 2), policy.budget.network_attempts_used);
 }
-
 test "RetryPolicy ignores reserved config fields when budgets are built from Config" {
     var tight = testRetryPolicy(retryBudgetConfig(.{
         .max_network_retries = 0,
@@ -1604,7 +1496,6 @@ test "RetryPolicy ignores reserved config fields when budgets are built from Con
     _ = loose.decideHttpRetry(.too_many_requests, null);
     try std.testing.expectEqual(@as(u8, 1), loose.budget.rate_limit_attempts_used);
 }
-
 test "RetryPolicy retries 429 using Retry-After delay and separate rate-limit budget" {
     test_policy_now_unix_seconds = 1_700_000_000;
     test_policy_random_u64 = 0;
@@ -1629,7 +1520,6 @@ test "RetryPolicy retries 429 using Retry-After delay and separate rate-limit bu
     const exhausted = policy.decideHttpRetry(.too_many_requests, null);
     try std.testing.expectEqual(RetryDecision.Action.give_up, exhausted.action);
 }
-
 test "RetryPolicy retries transient 5xx and transport errors on the network budget" {
     test_policy_random_u64 = 4;
 
@@ -1651,7 +1541,6 @@ test "RetryPolicy retries transient 5xx and transport errors on the network budg
     const exhausted = policy.decideTransportRetry(error.Timeout);
     try std.testing.expectEqual(RetryDecision.Action.give_up, exhausted.action);
 }
-
 test "RetryPolicy gives up on non-retryable HTTP statuses and transport errors" {
     var policy = testRetryPolicy(retryBudgetConfig(.{
         .max_network_retries = 3,
@@ -1667,7 +1556,6 @@ test "RetryPolicy gives up on non-retryable HTTP statuses and transport errors" 
     try std.testing.expectEqual(RetryDecision.Action.give_up, opaque_transport.action);
     try std.testing.expectEqual(@as(u8, 0), policy.budget.network_attempts_used);
 }
-
 test "exponential backoff caps delay and applies full jitter deterministically" {
     const delay = exponentialBackoffDelayMs(.{
         .base_delay_ms = 1_000,
@@ -1684,7 +1572,6 @@ test "exponential backoff caps delay and applies full jitter deterministically" 
     const first_attempt = exponentialBackoffDelayMs(.{}, 0, 0);
     try std.testing.expectEqual(@as(u32, 0), first_attempt);
 }
-
 test "sleepForTransportRetry invokes injected sleeper with delay" {
     const State = struct {
         var recorded_ms: u32 = 0;
@@ -1699,7 +1586,6 @@ test "sleepForTransportRetry invokes injected sleeper with delay" {
     sleepForTransportRetry(&client, .{ .sleeper = State.sleeper }, 250);
     try std.testing.expectEqual(@as(u32, 250), State.recorded_ms);
 }
-
 test "readHttpResponseBodyAlloc accepts bodies below the limit" {
     const payload = "abc";
     var reader = std.Io.Reader.fixed(payload);
@@ -1708,14 +1594,12 @@ test "readHttpResponseBodyAlloc accepts bodies below the limit" {
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings(payload, body);
 }
-
 test "readHttpResponseBodyAlloc rejects bodies above the limit" {
     const payload = "abcd";
     var reader = std.Io.Reader.fixed(payload);
 
     try std.testing.expectError(error.BodyTooLarge, readHttpResponseBodyAlloc(std.testing.allocator, &reader, 3));
 }
-
 test "runHttpRetryLoop: transport and HTTP retries stay leak-free under DebugAllocator" {
     const ExchangeError = error{
         ConnectionResetByPeer,

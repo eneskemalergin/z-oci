@@ -9,6 +9,9 @@
 
 const std = @import("std");
 
+const Manifest = @import("Manifest.zig");
+const Descriptor = @import("Descriptor.zig");
+
 /// Parse JSON bytes into T. Unknown fields are silently ignored so
 /// the caller handles spec extensions without error.
 ///
@@ -66,12 +69,47 @@ pub fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
     return aw;
 }
 
-// Tests
+// --- Private helpers ---
 
-const Manifest = @import("Manifest.zig");
-const Descriptor = @import("Descriptor.zig");
+fn expectManifestFieldsMatch(expected: Manifest, actual: Manifest) !void {
+    try std.testing.expectEqual(expected.schema_version, actual.schema_version);
+    try std.testing.expectEqual(expected.media_type, actual.media_type);
+    try std.testing.expectEqual(expected.config.media_type, actual.config.media_type);
+    try std.testing.expectEqual(expected.config.size, actual.config.size);
+    try std.testing.expectEqualSlices(u8, expected.config.digest.hex, actual.config.digest.hex);
+    try std.testing.expectEqual(expected.layers.len, actual.layers.len);
+    for (expected.layers, actual.layers) |expected_layer, actual_layer| {
+        try std.testing.expectEqual(expected_layer.media_type, actual_layer.media_type);
+        try std.testing.expectEqual(expected_layer.size, actual_layer.size);
+        try std.testing.expectEqualSlices(u8, expected_layer.digest.hex, actual_layer.digest.hex);
+    }
+    try std.testing.expectEqual(expected.annotations != null, actual.annotations != null);
+    if (expected.annotations) |expected_annotations| {
+        const actual_annotations = actual.annotations.?;
+        try std.testing.expectEqual(expected_annotations.object.count(), actual_annotations.object.count());
+        var it = expected_annotations.object.iterator();
+        while (it.next()) |entry| {
+            const actual_value = actual_annotations.object.get(entry.key_ptr.*) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(std.meta.activeTag(entry.value_ptr.*), std.meta.activeTag(actual_value));
+            switch (entry.value_ptr.*) {
+                .string => |expected_string| try std.testing.expectEqualStrings(expected_string, actual_value.string),
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+}
 
-// Lifecycle: Parsed(T).deinit frees all memory
+fn readBusyboxManifestFixtureAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var buffer: [16 * 1024 + 1]u8 = undefined;
+    const bytes = std.Io.Dir.cwd().readFile(
+        std.testing.io,
+        "fixtures/manifests/busybox-amd64-live-oci-manifest.json",
+        &buffer,
+    ) catch return error.TestUnexpectedResult;
+    return try allocator.dupe(u8, bytes);
+}
+
+// --- Tests ---
 
 test "json: parseBorrowing requires input bytes to outlive parsed value" {
     const json_bytes = try std.testing.allocator.dupe(u8,
@@ -112,44 +150,6 @@ test "json: promoteParsed copies parsed value onto caller allocator" {
 
     try std.testing.expectEqual(@as(u32, 2), promoted.value.schema_version);
     try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", promoted.value.media_type.toString());
-}
-
-fn expectManifestFieldsMatch(expected: Manifest, actual: Manifest) !void {
-    try std.testing.expectEqual(expected.schema_version, actual.schema_version);
-    try std.testing.expectEqual(expected.media_type, actual.media_type);
-    try std.testing.expectEqual(expected.config.media_type, actual.config.media_type);
-    try std.testing.expectEqual(expected.config.size, actual.config.size);
-    try std.testing.expectEqualSlices(u8, expected.config.digest.hex, actual.config.digest.hex);
-    try std.testing.expectEqual(expected.layers.len, actual.layers.len);
-    for (expected.layers, actual.layers) |expected_layer, actual_layer| {
-        try std.testing.expectEqual(expected_layer.media_type, actual_layer.media_type);
-        try std.testing.expectEqual(expected_layer.size, actual_layer.size);
-        try std.testing.expectEqualSlices(u8, expected_layer.digest.hex, actual_layer.digest.hex);
-    }
-    try std.testing.expectEqual(expected.annotations != null, actual.annotations != null);
-    if (expected.annotations) |expected_annotations| {
-        const actual_annotations = actual.annotations.?;
-        try std.testing.expectEqual(expected_annotations.object.count(), actual_annotations.object.count());
-        var it = expected_annotations.object.iterator();
-        while (it.next()) |entry| {
-            const actual_value = actual_annotations.object.get(entry.key_ptr.*) orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqual(std.meta.activeTag(entry.value_ptr.*), std.meta.activeTag(actual_value));
-            switch (entry.value_ptr.*) {
-                .string => |expected_string| try std.testing.expectEqualStrings(expected_string, actual_value.string),
-                else => return error.TestUnexpectedResult,
-            }
-        }
-    }
-}
-
-fn readBusyboxManifestFixtureAlloc(allocator: std.mem.Allocator) ![]u8 {
-    var buffer: [16 * 1024 + 1]u8 = undefined;
-    const bytes = std.Io.Dir.cwd().readFile(
-        std.testing.io,
-        "fixtures/manifests/busybox-amd64-live-oci-manifest.json",
-        &buffer,
-    ) catch return error.TestUnexpectedResult;
-    return try allocator.dupe(u8, bytes);
 }
 
 test "json: promoteParsed matches direct parse for live busybox fixture" {

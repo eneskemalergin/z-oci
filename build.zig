@@ -1,3 +1,7 @@
+//! Build graph for z-oci: library module, CLI scaffold, tests, examples, and bench.
+//!
+//! Primary steps: `test`, `run`, `workflow-smoke`, `example`, `bench`, `security-check`.
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -11,7 +15,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Current CLI scaffold. Real user-facing commands land in the later CLI phase.
+    // Current CLI scaffold. Real user-facing commands land in the later CLI implementation.
     const exe = b.addExecutable(.{
         .name = "z-oci",
         .root_module = b.createModule(.{

@@ -23,9 +23,8 @@
 //!   token POST bodies). No automated test proves zero at `free` time.
 //! - Docker config inline auth borrows from the engine `auth_cache` until `deinit()`;
 //!   `release()` is a no-op for those hits.
-
-const builtin = @import("builtin");
 const std = @import("std");
+const builtin = @import("builtin");
 const ConfigModule = @import("Config.zig");
 const Config = ConfigModule.Config;
 const CredentialHandle = ConfigModule.CredentialHandle;
@@ -58,21 +57,10 @@ pub const AuthError = error{
     ConnectionRefused,
     UnknownHostName,
 };
-
 pub const TokenRequestMethod = enum {
     get,
     post,
 };
-
-fn freeOwnedOptionalSecretSlice(allocator: std.mem.Allocator, bytes: ?[]u8) void {
-    const slice = bytes orelse return;
-    std.crypto.secureZero(u8, slice);
-    if (builtin.is_test) {
-        for (slice) |byte| std.debug.assert(byte == 0);
-    }
-    allocator.free(slice);
-}
-
 pub const TokenHttpRequest = struct {
     method: TokenRequestMethod,
     url: []u8,
@@ -89,7 +77,6 @@ pub const TokenHttpRequest = struct {
         freeOwnedOptionalSecretSlice(allocator, self.body);
     }
 };
-
 pub const TokenExchangeResponse = struct {
     status: std.http.Status,
     body: []const u8,
@@ -106,7 +93,6 @@ pub const TokenExchangeResponse = struct {
         allocator.free(owned_body);
     }
 };
-
 /// Exchanges a `TokenHttpRequest` for a token response.
 ///
 /// Ownership: the exchanger takes ownership of `request` and must call
@@ -117,7 +103,6 @@ pub const TokenHttpExchanger = *const fn (
     client: *std.http.Client,
     request: TokenHttpRequest,
 ) AuthError!TokenExchangeResponse;
-
 pub const ENV_REGISTRY_HOST = "Z_OCI_REGISTRY_HOST";
 pub const ENV_REGISTRY_USER = "Z_OCI_REGISTRY_USER";
 pub const ENV_REGISTRY_TOKEN = "Z_OCI_REGISTRY_TOKEN";
@@ -125,11 +110,6 @@ pub const DOCKER_CONFIG_DIR_VAR = "DOCKER_CONFIG";
 pub const HOME_DIR_VAR = "HOME";
 pub const USERPROFILE_DIR_VAR = "USERPROFILE";
 pub const DOCKER_HUB_AUTH_KEY = "https://index.docker.io/v1/";
-
-const DOCKER_CONFIG_FILE_SIZE_LIMIT = 1024 * 1024;
-const DOCKER_HELPER_STDOUT_LIMIT = 64 * 1024;
-const DOCKER_HELPER_STDERR_LIMIT = 64 * 1024;
-
 pub const DockerCredentialHelperRunner = *const fn (
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -137,206 +117,6 @@ pub const DockerCredentialHelperRunner = *const fn (
     server_url: []const u8,
     timeout: std.Io.Timeout,
 ) AuthError!CredentialHandle;
-
-const ParsedDockerCredentialHelperResponse = struct {
-    Username: ?[]const u8 = null,
-    Secret: ?[]const u8 = null,
-};
-
-const DockerCredentialHelperLookup = struct {
-    server_url: []const u8,
-    helper_suffix: []const u8,
-};
-
-const DockerCredentialSource = union(enum) {
-    auth: ConfigModule.Credential,
-    helper: DockerCredentialHelperLookup,
-};
-
-const DockerConfigSection = enum { auths, cred_helpers };
-
-const DockerConfigIndexedRegistry = struct {
-    section: DockerConfigSection,
-    config_key: []u8,
-    value_offset: usize,
-
-    fn deinit(self: DockerConfigIndexedRegistry, allocator: std.mem.Allocator) void {
-        allocator.free(self.config_key);
-    }
-};
-
-const DockerConfig = struct {
-    owned_json: []u8,
-    registry_entries: std.ArrayListUnmanaged(DockerConfigIndexedRegistry) = .empty,
-    exact_registry_entry: std.StringHashMapUnmanaged(usize) = .empty,
-    creds_store: ?[]const u8 = null,
-    creds_store_resolved: bool = false,
-    auth_cache: std.StringHashMapUnmanaged(ConfigModule.Credential) = .empty,
-    helper_suffix_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
-
-    fn deinit(self: *DockerConfig, allocator: std.mem.Allocator) void {
-        allocator.free(self.owned_json);
-
-        for (self.registry_entries.items) |entry| entry.deinit(allocator);
-        self.registry_entries.deinit(allocator);
-
-        var exact_it = self.exact_registry_entry.iterator();
-        while (exact_it.next()) |entry| allocator.free(entry.key_ptr.*);
-        self.exact_registry_entry.deinit(allocator);
-
-        var auth_it = self.auth_cache.iterator();
-        while (auth_it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.username);
-            std.crypto.secureZero(u8, @constCast(entry.value_ptr.secret));
-            allocator.free(entry.value_ptr.secret);
-        }
-        self.auth_cache.deinit(allocator);
-
-        var helper_it = self.helper_suffix_cache.iterator();
-        while (helper_it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        self.helper_suffix_cache.deinit(allocator);
-
-        if (self.creds_store) |creds_store| allocator.free(creds_store);
-    }
-
-    fn credentialForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?CredentialHandle {
-        const credential = self.authCredentialForRegistry(allocator, registry) catch |err| switch (err) {
-            error.InvalidDockerConfig => return null,
-            else => return err,
-        } orelse return null;
-        return .{ .credential = credential };
-    }
-
-    fn authCredentialForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?ConfigModule.Credential {
-        const cache_key = try dockerConfigRegistryCacheKeyAlloc(allocator, registry);
-        defer allocator.free(cache_key);
-
-        if (self.auth_cache.get(cache_key)) |cached| return cached;
-
-        const encoded_auth = try self.authEncodedForRegistry(allocator, registry) orelse return null;
-        defer allocator.free(encoded_auth);
-
-        const credential = try decodeDockerConfigAuthCredential(allocator, encoded_auth);
-        errdefer {
-            allocator.free(@constCast(credential.username));
-            std.crypto.secureZero(u8, @constCast(credential.secret));
-            allocator.free(@constCast(credential.secret));
-        }
-
-        const owned_key = try allocator.dupe(u8, cache_key);
-        errdefer allocator.free(owned_key);
-        try self.auth_cache.put(allocator, owned_key, credential);
-
-        return self.auth_cache.get(owned_key).?;
-    }
-
-    fn credentialSourceForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?DockerCredentialSource {
-        if (try self.registrySpecificHelperLookupForRegistry(allocator, registry)) |helper_lookup| {
-            return .{ .helper = helper_lookup };
-        }
-
-        if (try self.authCredentialForRegistry(allocator, registry)) |credential| {
-            return .{ .auth = credential };
-        }
-
-        if (try self.globalHelperLookupForRegistry(allocator, registry)) |helper_lookup| {
-            return .{ .helper = helper_lookup };
-        }
-
-        return null;
-    }
-
-    fn registrySpecificHelperLookupForRegistry(
-        self: *DockerConfig,
-        allocator: std.mem.Allocator,
-        registry: []const u8,
-    ) AuthError!?DockerCredentialHelperLookup {
-        const cache_key = try dockerConfigRegistryCacheKeyAlloc(allocator, registry);
-        defer allocator.free(cache_key);
-
-        const helper_suffix = if (self.helper_suffix_cache.get(cache_key)) |cached|
-            cached
-        else blk: {
-            const owned_suffix = try self.helperSuffixForRegistry(allocator, registry) orelse return null;
-            const owned_key = try allocator.dupe(u8, cache_key);
-            errdefer allocator.free(owned_key);
-            errdefer allocator.free(owned_suffix);
-            try self.helper_suffix_cache.put(allocator, owned_key, owned_suffix);
-            break :blk owned_suffix;
-        };
-
-        return .{
-            .server_url = dockerCredentialHelperServer(registry),
-            .helper_suffix = helper_suffix,
-        };
-    }
-
-    fn globalHelperLookupForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?DockerCredentialHelperLookup {
-        try self.resolveCredsStore(allocator);
-        const helper_suffix = self.creds_store orelse return null;
-        return .{
-            .server_url = dockerCredentialHelperServer(registry),
-            .helper_suffix = helper_suffix,
-        };
-    }
-
-    fn authEncodedForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?[]const u8 {
-        return self.indexedRegistrySectionValue(allocator, .auths, registry, "auth");
-    }
-
-    fn helperSuffixForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?[]const u8 {
-        return self.indexedRegistrySectionValue(allocator, .cred_helpers, registry, null);
-    }
-
-    fn indexedRegistrySectionValue(
-        self: *DockerConfig,
-        allocator: std.mem.Allocator,
-        section: DockerConfigSection,
-        registry: []const u8,
-        object_field: ?[]const u8,
-    ) AuthError!?[]const u8 {
-        const entry_index = self.findRegistryEntryIndex(registry, section) orelse return null;
-        const entry = self.registry_entries.items[entry_index];
-        return dockerConfigValueFromIndexEntry(allocator, self.owned_json, entry, object_field);
-    }
-
-    fn findRegistryEntryIndex(self: *DockerConfig, registry: []const u8, section: DockerConfigSection) ?usize {
-        if (self.registry_entries.items.len != 0) {
-            var cache_key_buffer: [256]u8 = undefined;
-            if (registry.len <= cache_key_buffer.len) {
-                for (registry, 0..) |char, index| cache_key_buffer[index] = std.ascii.toLower(char);
-                const cache_key = cache_key_buffer[0..registry.len];
-                if (self.exact_registry_entry.get(cache_key)) |entry_index| {
-                    const entry = self.registry_entries.items[entry_index];
-                    if (entry.section == section and dockerConfigRegistryKeyMatches(entry.config_key, registry)) {
-                        return entry_index;
-                    }
-                }
-            }
-        }
-
-        for (self.registry_entries.items, 0..) |entry, index| {
-            if (entry.section == section and dockerConfigRegistryKeyMatches(entry.config_key, registry)) {
-                return index;
-            }
-        }
-
-        return null;
-    }
-
-    fn resolveCredsStore(self: *DockerConfig, allocator: std.mem.Allocator) AuthError!void {
-        if (self.creds_store_resolved) return;
-        self.creds_store_resolved = true;
-        if (try dockerConfigRootStringField(allocator, self.owned_json, "credsStore")) |value| {
-            self.creds_store = value;
-        }
-    }
-};
-
 /// Borrowed Bearer challenge data parsed from the authenticate header.
 ///
 /// These slices borrow from the header input passed to the parser.
@@ -347,19 +127,16 @@ pub const BearerChallenge = struct {
     service: ?[]const u8 = null,
     scope: ?[]const u8 = null,
 };
-
 /// Borrowed auth challenge view. Parsed values borrow from the header input.
 pub const AuthChallenge = union(enum) {
     bearer: BearerChallenge,
     other: []const u8,
 };
-
 pub const ProbeResult = union(enum) {
     ok,
     auth_required: AuthChallenge,
     not_found,
 };
-
 pub const Token = struct {
     /// Borrowed token bytes for transient auth operations.
     ///
@@ -368,10 +145,8 @@ pub const Token = struct {
     value: []const u8,
     expires_in_seconds: ?u64 = null,
 };
-
 pub const TOKEN_REFRESH_WINDOW_SECONDS: u64 = 5;
 pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: u64 = 60;
-
 pub const TokenResponse = struct {
     /// Owned token-response payload.
     access_token: Token,
@@ -396,14 +171,6 @@ pub const TokenResponse = struct {
         }
     }
 };
-
-const ParsedTokenBody = struct {
-    access_token: ?[]const u8 = null,
-    token: ?[]const u8 = null,
-    expires_in: ?u64 = null,
-    refresh_token: ?[]const u8 = null,
-};
-
 /// Owned cache lookup key.
 ///
 /// `realm`, `service`, and `scope` are duplicated onto the caller-owned
@@ -454,7 +221,6 @@ pub const TokenCacheKey = struct {
         if (self.scope) |s| allocator.free(s);
     }
 };
-
 /// Owned cached token storage.
 ///
 /// Unlike `Token`, this storage owns its token bytes. `deinit()` zeroes the
@@ -483,31 +249,6 @@ pub const CachedToken = struct {
         allocator.free(self.token.value);
     }
 };
-
-const TokenCacheMap = std.HashMapUnmanaged(TokenCacheKey, CachedToken, TokenCacheKeyContext, 80);
-
-const TokenCacheKeyContext = struct {
-    pub fn hash(_: @This(), key: TokenCacheKey) u64 {
-        return hashTokenCacheFields(key.realm, key.service, key.scope);
-    }
-
-    pub fn eql(_: @This(), a: TokenCacheKey, b: TokenCacheKey) bool {
-        return tokenCacheKeysEqual(a, b);
-    }
-};
-
-const TokenCacheRequestContext = struct {
-    pub fn hash(_: @This(), request: AuthenticateRequest) u64 {
-        return hashTokenCacheFields(request.challenge.realm, request.service(), request.scope());
-    }
-
-    pub fn eql(_: @This(), request: AuthenticateRequest, key: TokenCacheKey) bool {
-        return tokenCacheKeyMatchesRequest(key, request);
-    }
-};
-
-const NowUnixSecondsFn = *const fn (client: *std.http.Client) u64;
-
 /// Narrow auth-facing view of `Config`.
 ///
 /// Live today: credentials, helper `read_timeout_ms`, cached-401 auth retry
@@ -524,7 +265,6 @@ pub const AuthConfigView = struct {
     env_registry_user: []const u8 = ENV_REGISTRY_USER,
     env_registry_token: []const u8 = ENV_REGISTRY_TOKEN,
 };
-
 /// Borrowed view of the normalized reference data auth consumes.
 ///
 /// This codifies the Phase 1/Phase 2 boundary: auth does not re-parse raw
@@ -548,7 +288,6 @@ pub const AuthReferenceView = struct {
         return std.fmt.allocPrint(allocator, "https://{s}/v2/", .{self.registry});
     }
 };
-
 pub const AuthenticateRequest = struct {
     registry: []const u8,
     challenge: BearerChallenge,
@@ -577,7 +316,6 @@ pub const AuthenticateRequest = struct {
         return self.challenge.service;
     }
 };
-
 pub const ProbeHttpResponse = struct {
     status: std.http.Status,
     www_authenticate_headers: []const []const u8 = &.{},
@@ -595,6 +333,7 @@ pub const ProbeHttpResponse = struct {
         return classifyProbeResponse(self.status, self.www_authenticate_headers);
     }
 };
+// --- Auth engine ---
 
 /// Explicit process boundary for helper execution.
 ///
@@ -607,7 +346,6 @@ pub const DockerHelperConfig = struct {
     io: std.Io,
     runner: DockerCredentialHelperRunner = runDockerCredentialHelperBySuffix,
 };
-
 /// Phase 2 auth engine.
 ///
 /// HTTP requests carry `io` through `std.http.Client`. Helper execution
@@ -1075,6 +813,7 @@ pub const AuthEngine = struct {
         return null;
     }
 };
+// --- Credential and token request helpers ---
 
 pub fn authConfigView(config: Config) AuthConfigView {
     return .{
@@ -1084,10 +823,6 @@ pub fn authConfigView(config: Config) AuthConfigView {
         .ca_bundle_path = config.ca_bundle_path,
     };
 }
-
-/// Dup env username/token onto `allocator`. Call `release()` when done.
-///
-/// Secret bytes are zeroed before `free` on `release()` (same helper as token POST bodies).
 pub fn envCredentialForRegistry(
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
@@ -1102,30 +837,493 @@ pub fn envCredentialForRegistry(
 
     return try ownedCredentialHandle(allocator, username, token);
 }
+pub fn referenceView(ref: Reference) AuthReferenceView {
+    return .{
+        .registry = ref.registry,
+        .repository_path = ref.repositoryPath(),
+        .ref_string = ref.refString(),
+    };
+}
+pub fn buildTokenHttpRequest(
+    allocator: std.mem.Allocator,
+    request: AuthenticateRequest,
+    method: TokenRequestMethod,
+    credential: ?ConfigModule.Credential,
+) AuthError!TokenHttpRequest {
+    try validateRealmUrl(request.challenge.realm);
 
+    const query = try buildTokenQueryAlloc(allocator, request);
+    defer allocator.free(query);
+
+    const url = switch (method) {
+        .get => if (query.len == 0)
+            try allocator.dupe(u8, request.challenge.realm)
+        else
+            try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.challenge.realm, query }),
+        .post => try allocator.dupe(u8, request.challenge.realm),
+    };
+    errdefer allocator.free(url);
+
+    const authorization = if (credential) |cred|
+        try buildBasicAuthorizationAlloc(allocator, cred)
+    else
+        null;
+    errdefer if (authorization) |header| allocator.free(header);
+
+    const body = switch (method) {
+        .get => null,
+        .post => try allocator.dupe(u8, query),
+    };
+
+    return .{
+        .method = method,
+        .url = url,
+        .authorization = authorization,
+        .content_type = if (method == .post) "application/x-www-form-urlencoded" else null,
+        .body = body,
+    };
+}
+pub fn buildTokenQueryAlloc(allocator: std.mem.Allocator, request: AuthenticateRequest) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+
+    var first = true;
+    if (request.service()) |service| {
+        writeFormField(&aw.writer, &first, "service", service) catch return error.OutOfMemory;
+    }
+    if (request.scope()) |scope| {
+        var scope_it = std.mem.tokenizeAny(u8, scope, " \t");
+        while (scope_it.next()) |scope_entry| {
+            writeFormField(&aw.writer, &first, "scope", scope_entry) catch return error.OutOfMemory;
+        }
+    }
+
+    return aw.toOwnedSlice() catch return error.OutOfMemory;
+}
+pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: ConfigModule.Credential) ![]u8 {
+    const joined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ credential.username, credential.secret });
+    defer {
+        std.crypto.secureZero(u8, joined);
+        allocator.free(joined);
+    }
+
+    const encoder = std.base64.standard.Encoder;
+    const encoded_len = encoder.calcSize(joined.len);
+    const buffer = try allocator.alloc(u8, "Basic ".len + encoded_len);
+    errdefer allocator.free(buffer);
+
+    @memcpy(buffer[0.."Basic ".len], "Basic ");
+    _ = encoder.encode(buffer["Basic ".len..], joined);
+    return buffer;
+}
+/// Live HTTP exchanger for token requests using Zig 0.16 `std.http.Client`.
+pub fn liveTokenHttpExchanger(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    request: TokenHttpRequest,
+) AuthError!TokenExchangeResponse {
+    defer request.deinit(allocator);
+
+    const uri = std.Uri.parse(request.url) catch return error.TokenExchangeFailed;
+
+    var http_request = client.request(
+        switch (request.method) {
+            .get => .GET,
+            .post => .POST,
+        },
+        uri,
+        .{
+            .headers = .{
+                .authorization = if (request.authorization) |authorization|
+                    .{ .override = authorization }
+                else
+                    .default,
+                .content_type = if (request.content_type) |content_type|
+                    .{ .override = content_type }
+                else
+                    .default,
+            },
+        },
+    ) catch |err| return mapLiveTokenTransportError(err);
+    defer http_request.deinit();
+
+    if (request.body) |body| {
+        http_request.transfer_encoding = .{ .content_length = body.len };
+        var req_body = http_request.sendBodyUnflushed(&.{}) catch |err| return mapLiveTokenTransportError(err);
+        req_body.writer.writeAll(body) catch |err| return mapLiveTokenTransportError(err);
+        req_body.end() catch |err| return mapLiveTokenTransportError(err);
+        http_request.connection.?.flush() catch |err| return mapLiveTokenTransportError(err);
+    } else {
+        http_request.sendBodiless() catch |err| return mapLiveTokenTransportError(err);
+    }
+
+    var head_buffer: [8 * 1024]u8 = undefined;
+    var response = http_request.receiveHead(&head_buffer) catch |err| return mapLiveTokenTransportError(err);
+
+    var resilience_headers = std.ArrayList(resilience.HttpHeader).empty;
+    errdefer {
+        resilience.deinitOwnedHttpHeaders(allocator, resilience_headers.items);
+        resilience_headers.deinit(allocator);
+    }
+
+    var header_it = response.head.iterateHeaders();
+    while (header_it.next()) |header| {
+        if (!resilience.isTrackedResilienceHeaderName(header.name)) continue;
+        try resilience_headers.append(allocator, .{
+            .name = try allocator.dupe(u8, header.name),
+            .value = try allocator.dupe(u8, header.value),
+        });
+    }
+
+    const owned_body = resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return mapLiveTokenTransportError(err);
+
+    const owned_headers = try resilience_headers.toOwnedSlice(allocator);
+    return .{
+        .status = response.head.status,
+        .body = owned_body,
+        .owned_body = owned_body,
+        .resilience_headers = owned_headers,
+        .owned_resilience_headers = owned_headers,
+    };
+}
+pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) AuthError!TokenResponse {
+    const parsed = json.parse(ParsedTokenBody, allocator, body) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidTokenResponse,
+    };
+    defer parsed.deinit();
+
+    const token_value = tokenValueFromParsedBody(parsed.value) orelse return error.InvalidTokenResponse;
+    if (token_value.len == 0) return error.InvalidTokenResponse;
+
+    const expires_in_seconds: ?u64 = if (parsed.value.expires_in) |expires_in| blk: {
+        if (expires_in == 0 or expires_in > std.math.maxInt(u32)) return error.InvalidTokenResponse;
+        break :blk expires_in;
+    } else null;
+
+    if (parsed.value.refresh_token) |refresh_token| {
+        if (refresh_token.len == 0) return error.InvalidTokenResponse;
+    }
+
+    const access_token_value = try allocator.dupe(u8, token_value);
+    errdefer {
+        std.crypto.secureZero(u8, access_token_value);
+        allocator.free(access_token_value);
+    }
+
+    const owned_refresh_token = if (parsed.value.refresh_token) |refresh_token|
+        try allocator.dupe(u8, refresh_token)
+    else
+        null;
+
+    return .{
+        .access_token = .{
+            .value = access_token_value,
+            .expires_in_seconds = expires_in_seconds,
+        },
+        .refresh_token = owned_refresh_token,
+    };
+}
+pub fn classifyProbeResponse(
+    status: std.http.Status,
+    www_authenticate_headers: []const []const u8,
+) AuthError!ProbeResult {
+    return switch (status) {
+        .ok => .ok,
+        .unauthorized => .{ .auth_required = try parseAuthenticateHeaders(www_authenticate_headers) },
+        .not_found => .not_found,
+        else => error.UnsupportedProbeStatus,
+    };
+}
+pub fn parseAuthenticateHeaders(raw_headers: []const []const u8) AuthError!AuthChallenge {
+    if (raw_headers.len == 0) return error.MissingAuthenticateHeader;
+
+    var saw_unsupported = false;
+    for (raw_headers) |raw| {
+        const challenge = parseAuthenticateHeader(raw) catch |err| switch (err) {
+            error.UnsupportedAuthenticateScheme => {
+                saw_unsupported = true;
+                continue;
+            },
+            else => |parse_err| return parse_err,
+        };
+
+        return challenge;
+    }
+
+    if (saw_unsupported) return error.UnsupportedAuthenticateScheme;
+    return error.MissingAuthenticateHeader;
+}
+pub fn parseAuthenticateHeader(raw: []const u8) AuthError!AuthChallenge {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (trimmed.len == 0) return error.MissingAuthenticateHeader;
+
+    var cursor: usize = 0;
+    while (cursor < trimmed.len) {
+        const next_challenge = try findNextChallengeStart(trimmed, cursor);
+        const end = next_challenge orelse trimmed.len;
+        const chunk = std.mem.trim(u8, trimmed[cursor..end], " \t,");
+        if (chunk.len == 0) return error.InvalidAuthenticateHeader;
+
+        const challenge = try parseChallengeChunk(chunk);
+        if (challenge == .bearer) return challenge;
+
+        cursor = next_challenge orelse break;
+    }
+
+    return error.UnsupportedAuthenticateScheme;
+}
+
+// --- Private helpers ---
+
+fn freeOwnedOptionalSecretSlice(allocator: std.mem.Allocator, bytes: ?[]u8) void {
+    const slice = bytes orelse return;
+    std.crypto.secureZero(u8, slice);
+    if (builtin.is_test) {
+        for (slice) |byte| std.debug.assert(byte == 0);
+    }
+    allocator.free(slice);
+}
+const DOCKER_CONFIG_FILE_SIZE_LIMIT = 1024 * 1024;
+const DOCKER_HELPER_STDOUT_LIMIT = 64 * 1024;
+const DOCKER_HELPER_STDERR_LIMIT = 64 * 1024;
+const ParsedDockerCredentialHelperResponse = struct {
+    Username: ?[]const u8 = null,
+    Secret: ?[]const u8 = null,
+};
+const DockerCredentialHelperLookup = struct {
+    server_url: []const u8,
+    helper_suffix: []const u8,
+};
+const DockerCredentialSource = union(enum) {
+    auth: ConfigModule.Credential,
+    helper: DockerCredentialHelperLookup,
+};
+const DockerConfigSection = enum { auths, cred_helpers };
+const DockerConfigIndexedRegistry = struct {
+    section: DockerConfigSection,
+    config_key: []u8,
+    value_offset: usize,
+
+    fn deinit(self: DockerConfigIndexedRegistry, allocator: std.mem.Allocator) void {
+        allocator.free(self.config_key);
+    }
+};
+const DockerConfig = struct {
+    owned_json: []u8,
+    registry_entries: std.ArrayListUnmanaged(DockerConfigIndexedRegistry) = .empty,
+    exact_registry_entry: std.StringHashMapUnmanaged(usize) = .empty,
+    creds_store: ?[]const u8 = null,
+    creds_store_resolved: bool = false,
+    auth_cache: std.StringHashMapUnmanaged(ConfigModule.Credential) = .empty,
+    helper_suffix_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *DockerConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.owned_json);
+
+        for (self.registry_entries.items) |entry| entry.deinit(allocator);
+        self.registry_entries.deinit(allocator);
+
+        var exact_it = self.exact_registry_entry.iterator();
+        while (exact_it.next()) |entry| allocator.free(entry.key_ptr.*);
+        self.exact_registry_entry.deinit(allocator);
+
+        var auth_it = self.auth_cache.iterator();
+        while (auth_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.username);
+            std.crypto.secureZero(u8, @constCast(entry.value_ptr.secret));
+            allocator.free(entry.value_ptr.secret);
+        }
+        self.auth_cache.deinit(allocator);
+
+        var helper_it = self.helper_suffix_cache.iterator();
+        while (helper_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.helper_suffix_cache.deinit(allocator);
+
+        if (self.creds_store) |creds_store| allocator.free(creds_store);
+    }
+
+    fn credentialForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?CredentialHandle {
+        const credential = self.authCredentialForRegistry(allocator, registry) catch |err| switch (err) {
+            error.InvalidDockerConfig => return null,
+            else => return err,
+        } orelse return null;
+        return .{ .credential = credential };
+    }
+
+    fn authCredentialForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?ConfigModule.Credential {
+        const cache_key = try dockerConfigRegistryCacheKeyAlloc(allocator, registry);
+        defer allocator.free(cache_key);
+
+        if (self.auth_cache.get(cache_key)) |cached| return cached;
+
+        const encoded_auth = try self.authEncodedForRegistry(allocator, registry) orelse return null;
+        defer allocator.free(encoded_auth);
+
+        const credential = try decodeDockerConfigAuthCredential(allocator, encoded_auth);
+        errdefer {
+            allocator.free(@constCast(credential.username));
+            std.crypto.secureZero(u8, @constCast(credential.secret));
+            allocator.free(@constCast(credential.secret));
+        }
+
+        const owned_key = try allocator.dupe(u8, cache_key);
+        errdefer allocator.free(owned_key);
+        try self.auth_cache.put(allocator, owned_key, credential);
+
+        return self.auth_cache.get(owned_key).?;
+    }
+
+    fn credentialSourceForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?DockerCredentialSource {
+        if (try self.registrySpecificHelperLookupForRegistry(allocator, registry)) |helper_lookup| {
+            return .{ .helper = helper_lookup };
+        }
+
+        if (try self.authCredentialForRegistry(allocator, registry)) |credential| {
+            return .{ .auth = credential };
+        }
+
+        if (try self.globalHelperLookupForRegistry(allocator, registry)) |helper_lookup| {
+            return .{ .helper = helper_lookup };
+        }
+
+        return null;
+    }
+
+    fn registrySpecificHelperLookupForRegistry(
+        self: *DockerConfig,
+        allocator: std.mem.Allocator,
+        registry: []const u8,
+    ) AuthError!?DockerCredentialHelperLookup {
+        const cache_key = try dockerConfigRegistryCacheKeyAlloc(allocator, registry);
+        defer allocator.free(cache_key);
+
+        const helper_suffix = if (self.helper_suffix_cache.get(cache_key)) |cached|
+            cached
+        else blk: {
+            const owned_suffix = try self.helperSuffixForRegistry(allocator, registry) orelse return null;
+            const owned_key = try allocator.dupe(u8, cache_key);
+            errdefer allocator.free(owned_key);
+            errdefer allocator.free(owned_suffix);
+            try self.helper_suffix_cache.put(allocator, owned_key, owned_suffix);
+            break :blk owned_suffix;
+        };
+
+        return .{
+            .server_url = dockerCredentialHelperServer(registry),
+            .helper_suffix = helper_suffix,
+        };
+    }
+
+    fn globalHelperLookupForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?DockerCredentialHelperLookup {
+        try self.resolveCredsStore(allocator);
+        const helper_suffix = self.creds_store orelse return null;
+        return .{
+            .server_url = dockerCredentialHelperServer(registry),
+            .helper_suffix = helper_suffix,
+        };
+    }
+
+    fn authEncodedForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?[]const u8 {
+        return self.indexedRegistrySectionValue(allocator, .auths, registry, "auth");
+    }
+
+    fn helperSuffixForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?[]const u8 {
+        return self.indexedRegistrySectionValue(allocator, .cred_helpers, registry, null);
+    }
+
+    fn indexedRegistrySectionValue(
+        self: *DockerConfig,
+        allocator: std.mem.Allocator,
+        section: DockerConfigSection,
+        registry: []const u8,
+        object_field: ?[]const u8,
+    ) AuthError!?[]const u8 {
+        const entry_index = self.findRegistryEntryIndex(registry, section) orelse return null;
+        const entry = self.registry_entries.items[entry_index];
+        return dockerConfigValueFromIndexEntry(allocator, self.owned_json, entry, object_field);
+    }
+
+    fn findRegistryEntryIndex(self: *DockerConfig, registry: []const u8, section: DockerConfigSection) ?usize {
+        if (self.registry_entries.items.len != 0) {
+            var cache_key_buffer: [256]u8 = undefined;
+            if (registry.len <= cache_key_buffer.len) {
+                for (registry, 0..) |char, index| cache_key_buffer[index] = std.ascii.toLower(char);
+                const cache_key = cache_key_buffer[0..registry.len];
+                if (self.exact_registry_entry.get(cache_key)) |entry_index| {
+                    const entry = self.registry_entries.items[entry_index];
+                    if (entry.section == section and dockerConfigRegistryKeyMatches(entry.config_key, registry)) {
+                        return entry_index;
+                    }
+                }
+            }
+        }
+
+        for (self.registry_entries.items, 0..) |entry, index| {
+            if (entry.section == section and dockerConfigRegistryKeyMatches(entry.config_key, registry)) {
+                return index;
+            }
+        }
+
+        return null;
+    }
+
+    fn resolveCredsStore(self: *DockerConfig, allocator: std.mem.Allocator) AuthError!void {
+        if (self.creds_store_resolved) return;
+        self.creds_store_resolved = true;
+        if (try dockerConfigRootStringField(allocator, self.owned_json, "credsStore")) |value| {
+            self.creds_store = value;
+        }
+    }
+};
+const ParsedTokenBody = struct {
+    access_token: ?[]const u8 = null,
+    token: ?[]const u8 = null,
+    expires_in: ?u64 = null,
+    refresh_token: ?[]const u8 = null,
+};
+const TokenCacheMap = std.HashMapUnmanaged(TokenCacheKey, CachedToken, TokenCacheKeyContext, 80);
+const TokenCacheKeyContext = struct {
+    pub fn hash(_: @This(), key: TokenCacheKey) u64 {
+        return hashTokenCacheFields(key.realm, key.service, key.scope);
+    }
+
+    pub fn eql(_: @This(), a: TokenCacheKey, b: TokenCacheKey) bool {
+        return tokenCacheKeysEqual(a, b);
+    }
+};
+const TokenCacheRequestContext = struct {
+    pub fn hash(_: @This(), request: AuthenticateRequest) u64 {
+        return hashTokenCacheFields(request.challenge.realm, request.service(), request.scope());
+    }
+
+    pub fn eql(_: @This(), request: AuthenticateRequest, key: TokenCacheKey) bool {
+        return tokenCacheKeyMatchesRequest(key, request);
+    }
+};
+const NowUnixSecondsFn = *const fn (client: *std.http.Client) u64;
 fn mapDockerConfigJsonError(err: anyerror) AuthError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidDockerConfig,
     };
 }
-
 fn dockerConfigScannerNext(scanner: *std.json.Scanner) AuthError!std.json.Scanner.Token {
     return scanner.next() catch |err| return mapDockerConfigJsonError(err);
 }
-
 fn dockerConfigScannerNextAllocMax(scanner: *std.json.Scanner) AuthError!std.json.Scanner.Token {
     return scanner.nextAllocMax(std.heap.page_allocator, .alloc_if_needed, DOCKER_CONFIG_FILE_SIZE_LIMIT) catch |err| return mapDockerConfigJsonError(err);
 }
-
 fn dockerConfigScannerSkipValue(scanner: *std.json.Scanner) AuthError!void {
     return scanner.skipValue() catch |err| return mapDockerConfigJsonError(err);
 }
-
 fn dockerConfigScannerPeekTokenType(scanner: *std.json.Scanner) AuthError!std.json.Scanner.TokenType {
     return scanner.peekNextTokenType() catch |err| return mapDockerConfigJsonError(err);
 }
-
 fn parseDockerConfig(allocator: std.mem.Allocator, docker_config_json: []const u8) AuthError!DockerConfig {
     var registry_entries: std.ArrayListUnmanaged(DockerConfigIndexedRegistry) = .empty;
     errdefer {
@@ -1153,7 +1351,6 @@ fn parseDockerConfig(allocator: std.mem.Allocator, docker_config_json: []const u
         .exact_registry_entry = exact_registry_entry,
     };
 }
-
 fn validateAndBuildDockerConfigIndex(
     allocator: std.mem.Allocator,
     docker_config_json: []const u8,
@@ -1244,7 +1441,6 @@ fn validateAndBuildDockerConfigIndex(
         else => return error.InvalidDockerConfig,
     }
 }
-
 fn validateDockerConfigJson(docker_config_json: []const u8) AuthError!void {
     var registry_entries: std.ArrayListUnmanaged(DockerConfigIndexedRegistry) = .empty;
     defer {
@@ -1266,7 +1462,6 @@ fn validateDockerConfigJson(docker_config_json: []const u8) AuthError!void {
         &exact_registry_entry,
     );
 }
-
 fn dockerConfigValueFromIndexEntry(
     allocator: std.mem.Allocator,
     docker_config_json: []const u8,
@@ -1289,7 +1484,6 @@ fn dockerConfigValueFromIndexEntry(
     const value_token = try dockerConfigScannerNextAllocMax(&scanner);
     return try dockerConfigStringFromScannerToken(allocator, value_token);
 }
-
 fn dockerConfigRegistryCacheKeyAlloc(allocator: std.mem.Allocator, registry: []const u8) AuthError![]u8 {
     const owned = try allocator.alloc(u8, registry.len);
     for (registry, 0..) |char, index| {
@@ -1297,14 +1491,12 @@ fn dockerConfigRegistryCacheKeyAlloc(allocator: std.mem.Allocator, registry: []c
     }
     return owned;
 }
-
 fn freeDockerConfigScannerToken(allocator: std.mem.Allocator, token: std.json.Scanner.Token) void {
     switch (token) {
         .allocated_string, .allocated_number => |owned| allocator.free(owned),
         else => {},
     }
 }
-
 fn dockerConfigStringFromScannerToken(allocator: std.mem.Allocator, token: std.json.Scanner.Token) AuthError![]const u8 {
     switch (token) {
         .string => |value| return try allocator.dupe(u8, value),
@@ -1318,7 +1510,6 @@ fn dockerConfigStringFromScannerToken(allocator: std.mem.Allocator, token: std.j
         },
     }
 }
-
 fn dockerConfigRootStringField(
     allocator: std.mem.Allocator,
     docker_config_json: []const u8,
@@ -1351,7 +1542,6 @@ fn dockerConfigRootStringField(
         }
     }
 }
-
 fn dockerConfigReadObjectStringField(
     allocator: std.mem.Allocator,
     scanner: *std.json.Scanner,
@@ -1376,7 +1566,6 @@ fn dockerConfigReadObjectStringField(
         }
     }
 }
-
 fn decodeDockerConfigAuthCredential(
     allocator: std.mem.Allocator,
     encoded_auth: []const u8,
@@ -1407,7 +1596,6 @@ fn decodeDockerConfigAuthCredential(
         .secret = secret,
     };
 }
-
 fn dockerConfigPathFromEnvironmentAlloc(
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
@@ -1432,12 +1620,10 @@ fn dockerConfigPathFromEnvironmentAlloc(
 
     return null;
 }
-
 fn dockerCredentialHelperServer(registry: []const u8) []const u8 {
     if (std.mem.eql(u8, registry, "registry-1.docker.io")) return DOCKER_HUB_AUTH_KEY;
     return registry;
 }
-
 fn canonicalDockerCredentialHelperServerAlloc(allocator: std.mem.Allocator, server_url: []const u8) AuthError![]u8 {
     const owned = try allocator.alloc(u8, server_url.len);
     for (server_url, 0..) |char, index| {
@@ -1445,7 +1631,6 @@ fn canonicalDockerCredentialHelperServerAlloc(allocator: std.mem.Allocator, serv
     }
     return owned;
 }
-
 fn dockerCredentialHelperCommandAlloc(
     allocator: std.mem.Allocator,
     helper_suffix: []const u8,
@@ -1453,7 +1638,6 @@ fn dockerCredentialHelperCommandAlloc(
     if (!isValidDockerHelperSuffix(helper_suffix)) return error.InvalidDockerConfig;
     return std.fmt.allocPrint(allocator, "docker-credential-{s}", .{helper_suffix});
 }
-
 fn isValidDockerHelperSuffix(helper_suffix: []const u8) bool {
     if (helper_suffix.len == 0) return false;
 
@@ -1463,7 +1647,6 @@ fn isValidDockerHelperSuffix(helper_suffix: []const u8) bool {
 
     return true;
 }
-
 fn runDockerCredentialHelperBySuffix(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1477,7 +1660,6 @@ fn runDockerCredentialHelperBySuffix(
     const argv = [_][]const u8{ command, "get" };
     return runDockerCredentialHelperCommand(allocator, io, &argv, server_url, timeout);
 }
-
 fn runDockerCredentialHelperCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1548,7 +1730,6 @@ fn runDockerCredentialHelperCommand(
 
     return parseDockerCredentialHelperResponse(allocator, stdout_contents);
 }
-
 fn parseDockerCredentialHelperResponse(
     allocator: std.mem.Allocator,
     helper_stdout: []const u8,
@@ -1562,7 +1743,6 @@ fn parseDockerCredentialHelperResponse(
 
     return ownedCredentialHandle(allocator, username, secret);
 }
-
 fn ownedCredentialHandle(
     allocator: std.mem.Allocator,
     username: []const u8,
@@ -1586,12 +1766,10 @@ fn ownedCredentialHandle(
         .release_allocator = allocator,
     };
 }
-
 fn releaseOwnedCredential(allocator: std.mem.Allocator, credential: ConfigModule.Credential) void {
     allocator.free(@constCast(credential.username));
     freeOwnedOptionalSecretSlice(allocator, @constCast(credential.secret));
 }
-
 fn dockerCredentialHelperTimeout(config: Config) std.Io.Timeout {
     if (config.read_timeout_ms == 0) return .none;
 
@@ -1600,7 +1778,6 @@ fn dockerCredentialHelperTimeout(config: Config) std.Io.Timeout {
         .clock = .awake,
     } };
 }
-
 fn currentUnixSeconds(_: *std.http.Client) u64 {
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
@@ -1608,7 +1785,6 @@ fn currentUnixSeconds(_: *std.http.Client) u64 {
         else => return 0,
     }
 }
-
 fn preferredTokenMethodsForRealm(engine: *const AuthEngine, realm: []const u8) [2]TokenRequestMethod {
     if (engine.preferred_token_method_by_realm.get(realm)) |method| {
         return switch (method) {
@@ -1618,7 +1794,6 @@ fn preferredTokenMethodsForRealm(engine: *const AuthEngine, realm: []const u8) [
     }
     return .{ .get, .post };
 }
-
 fn hashTokenCacheFields(realm: []const u8, service: ?[]const u8, scope: ?[]const u8) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(realm);
@@ -1628,7 +1803,6 @@ fn hashTokenCacheFields(realm: []const u8, service: ?[]const u8, scope: ?[]const
     if (scope) |value| hasher.update(value);
     return hasher.final();
 }
-
 fn tokenCacheKeysEqual(a: TokenCacheKey, b: TokenCacheKey) bool {
     if (!std.mem.eql(u8, a.realm, b.realm)) return false;
 
@@ -1644,7 +1818,6 @@ fn tokenCacheKeysEqual(a: TokenCacheKey, b: TokenCacheKey) bool {
 
     return true;
 }
-
 fn tokenCacheKeyMatchesRequest(key: TokenCacheKey, request: AuthenticateRequest) bool {
     return tokenCacheKeyMatchesBorrowed(
         key,
@@ -1653,7 +1826,6 @@ fn tokenCacheKeyMatchesRequest(key: TokenCacheKey, request: AuthenticateRequest)
         request.scope(),
     );
 }
-
 fn tokenCacheKeyMatchesBorrowed(
     key: TokenCacheKey,
     realm: []const u8,
@@ -1666,7 +1838,6 @@ fn tokenCacheKeyMatchesBorrowed(
         .scope = scope,
     });
 }
-
 fn putCachedTokenEntryForTest(
     engine: *AuthEngine,
     request: AuthenticateRequest,
@@ -1683,7 +1854,6 @@ fn putCachedTokenEntryForTest(
     }
     gop.value_ptr.* = cached_token;
 }
-
 fn borrowedCachedTokenResponse(cached_token: CachedToken) TokenResponse {
     return .{
         .access_token = .{
@@ -1693,7 +1863,6 @@ fn borrowedCachedTokenResponse(cached_token: CachedToken) TokenResponse {
         .owns_access_token = false,
     };
 }
-
 fn cachedTokenFromResponse(
     token_response: *TokenResponse,
     now_unix_seconds: u64,
@@ -1714,7 +1883,6 @@ fn cachedTokenFromResponse(
         .last_used_unix_seconds = now_unix_seconds,
     };
 }
-
 fn dockerConfigRegistryKeyMatches(config_key: []const u8, registry: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(config_key, registry)) return true;
     if (!isDockerHubRegistryAlias(registry)) return false;
@@ -1723,26 +1891,15 @@ fn dockerConfigRegistryKeyMatches(config_key: []const u8, registry: []const u8) 
         std.ascii.eqlIgnoreCase(config_key, "https://index.docker.io/v1") or
         isDockerHubRegistryAlias(config_key);
 }
-
 fn registryHostMatches(configured_host: []const u8, registry: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(configured_host, registry)) return true;
     return isDockerHubRegistryAlias(configured_host) and isDockerHubRegistryAlias(registry);
 }
-
 fn isDockerHubRegistryAlias(host: []const u8) bool {
     return std.ascii.eqlIgnoreCase(host, "docker.io") or
         std.ascii.eqlIgnoreCase(host, "index.docker.io") or
         std.ascii.eqlIgnoreCase(host, "registry-1.docker.io");
 }
-
-pub fn referenceView(ref: Reference) AuthReferenceView {
-    return .{
-        .registry = ref.registry,
-        .repository_path = ref.repositoryPath(),
-        .ref_string = ref.refString(),
-    };
-}
-
 const TokenExchangeLoop = struct {
     engine: *AuthEngine,
     client: *std.http.Client,
@@ -1755,7 +1912,6 @@ const TokenExchangeLoop = struct {
     cached_body: ?[]u8 = null,
     exchange_attempt: usize = 0,
 };
-
 fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse {
     const loop_ctx: *TokenExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
     const allocator = loop_ctx.engine.allocator;
@@ -1799,95 +1955,16 @@ fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse 
 
     return exchanger(allocator, loop_ctx.client, built);
 }
-
 fn tokenExchangeResponseStatus(response: TokenExchangeResponse) std.http.Status {
     return response.status;
 }
-
 fn tokenExchangeResponseHeaders(response: TokenExchangeResponse) []const resilience.HttpHeader {
     return response.resilience_headers;
 }
-
 fn deinitTokenExchangeResponse(allocator: std.mem.Allocator, response: TokenExchangeResponse) void {
     var owned = response;
     owned.deinit(allocator);
 }
-
-pub fn buildTokenHttpRequest(
-    allocator: std.mem.Allocator,
-    request: AuthenticateRequest,
-    method: TokenRequestMethod,
-    credential: ?ConfigModule.Credential,
-) AuthError!TokenHttpRequest {
-    try validateRealmUrl(request.challenge.realm);
-
-    const query = try buildTokenQueryAlloc(allocator, request);
-    defer allocator.free(query);
-
-    const url = switch (method) {
-        .get => if (query.len == 0)
-            try allocator.dupe(u8, request.challenge.realm)
-        else
-            try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.challenge.realm, query }),
-        .post => try allocator.dupe(u8, request.challenge.realm),
-    };
-    errdefer allocator.free(url);
-
-    const authorization = if (credential) |cred|
-        try buildBasicAuthorizationAlloc(allocator, cred)
-    else
-        null;
-    errdefer if (authorization) |header| allocator.free(header);
-
-    const body = switch (method) {
-        .get => null,
-        .post => try allocator.dupe(u8, query),
-    };
-
-    return .{
-        .method = method,
-        .url = url,
-        .authorization = authorization,
-        .content_type = if (method == .post) "application/x-www-form-urlencoded" else null,
-        .body = body,
-    };
-}
-
-pub fn buildTokenQueryAlloc(allocator: std.mem.Allocator, request: AuthenticateRequest) ![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-
-    var first = true;
-    if (request.service()) |service| {
-        writeFormField(&aw.writer, &first, "service", service) catch return error.OutOfMemory;
-    }
-    if (request.scope()) |scope| {
-        var scope_it = std.mem.tokenizeAny(u8, scope, " \t");
-        while (scope_it.next()) |scope_entry| {
-            writeFormField(&aw.writer, &first, "scope", scope_entry) catch return error.OutOfMemory;
-        }
-    }
-
-    return aw.toOwnedSlice() catch return error.OutOfMemory;
-}
-
-pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: ConfigModule.Credential) ![]u8 {
-    const joined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ credential.username, credential.secret });
-    defer {
-        std.crypto.secureZero(u8, joined);
-        allocator.free(joined);
-    }
-
-    const encoder = std.base64.standard.Encoder;
-    const encoded_len = encoder.calcSize(joined.len);
-    const buffer = try allocator.alloc(u8, "Basic ".len + encoded_len);
-    errdefer allocator.free(buffer);
-
-    @memcpy(buffer[0.."Basic ".len], "Basic ");
-    _ = encoder.encode(buffer["Basic ".len..], joined);
-    return buffer;
-}
-
 fn mapLiveTokenTransportError(err: anyerror) AuthError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -1900,117 +1977,6 @@ fn mapLiveTokenTransportError(err: anyerror) AuthError {
         else => error.TokenExchangeFailed,
     };
 }
-
-/// Live HTTP exchanger for token requests using Zig 0.16 `std.http.Client`.
-pub fn liveTokenHttpExchanger(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    request: TokenHttpRequest,
-) AuthError!TokenExchangeResponse {
-    defer request.deinit(allocator);
-
-    const uri = std.Uri.parse(request.url) catch return error.TokenExchangeFailed;
-
-    var http_request = client.request(
-        switch (request.method) {
-            .get => .GET,
-            .post => .POST,
-        },
-        uri,
-        .{
-            .headers = .{
-                .authorization = if (request.authorization) |authorization|
-                    .{ .override = authorization }
-                else
-                    .default,
-                .content_type = if (request.content_type) |content_type|
-                    .{ .override = content_type }
-                else
-                    .default,
-            },
-        },
-    ) catch |err| return mapLiveTokenTransportError(err);
-    defer http_request.deinit();
-
-    if (request.body) |body| {
-        http_request.transfer_encoding = .{ .content_length = body.len };
-        var req_body = http_request.sendBodyUnflushed(&.{}) catch |err| return mapLiveTokenTransportError(err);
-        req_body.writer.writeAll(body) catch |err| return mapLiveTokenTransportError(err);
-        req_body.end() catch |err| return mapLiveTokenTransportError(err);
-        http_request.connection.?.flush() catch |err| return mapLiveTokenTransportError(err);
-    } else {
-        http_request.sendBodiless() catch |err| return mapLiveTokenTransportError(err);
-    }
-
-    var head_buffer: [8 * 1024]u8 = undefined;
-    var response = http_request.receiveHead(&head_buffer) catch |err| return mapLiveTokenTransportError(err);
-
-    var resilience_headers = std.ArrayList(resilience.HttpHeader).empty;
-    errdefer {
-        resilience.deinitOwnedHttpHeaders(allocator, resilience_headers.items);
-        resilience_headers.deinit(allocator);
-    }
-
-    var header_it = response.head.iterateHeaders();
-    while (header_it.next()) |header| {
-        if (!resilience.isTrackedResilienceHeaderName(header.name)) continue;
-        try resilience_headers.append(allocator, .{
-            .name = try allocator.dupe(u8, header.name),
-            .value = try allocator.dupe(u8, header.value),
-        });
-    }
-
-    const owned_body = resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return mapLiveTokenTransportError(err);
-
-    const owned_headers = try resilience_headers.toOwnedSlice(allocator);
-    return .{
-        .status = response.head.status,
-        .body = owned_body,
-        .owned_body = owned_body,
-        .resilience_headers = owned_headers,
-        .owned_resilience_headers = owned_headers,
-    };
-}
-
-pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) AuthError!TokenResponse {
-    const parsed = json.parse(ParsedTokenBody, allocator, body) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidTokenResponse,
-    };
-    defer parsed.deinit();
-
-    const token_value = tokenValueFromParsedBody(parsed.value) orelse return error.InvalidTokenResponse;
-    if (token_value.len == 0) return error.InvalidTokenResponse;
-
-    const expires_in_seconds: ?u64 = if (parsed.value.expires_in) |expires_in| blk: {
-        if (expires_in == 0 or expires_in > std.math.maxInt(u32)) return error.InvalidTokenResponse;
-        break :blk expires_in;
-    } else null;
-
-    if (parsed.value.refresh_token) |refresh_token| {
-        if (refresh_token.len == 0) return error.InvalidTokenResponse;
-    }
-
-    const access_token_value = try allocator.dupe(u8, token_value);
-    errdefer {
-        std.crypto.secureZero(u8, access_token_value);
-        allocator.free(access_token_value);
-    }
-
-    const owned_refresh_token = if (parsed.value.refresh_token) |refresh_token|
-        try allocator.dupe(u8, refresh_token)
-    else
-        null;
-
-    return .{
-        .access_token = .{
-            .value = access_token_value,
-            .expires_in_seconds = expires_in_seconds,
-        },
-        .refresh_token = owned_refresh_token,
-    };
-}
-
 fn tokenValueFromParsedBody(parsed: ParsedTokenBody) ?[]const u8 {
     if (parsed.access_token) |access_token| {
         if (parsed.token) |token| {
@@ -2021,59 +1987,6 @@ fn tokenValueFromParsedBody(parsed: ParsedTokenBody) ?[]const u8 {
 
     return parsed.token;
 }
-
-pub fn classifyProbeResponse(
-    status: std.http.Status,
-    www_authenticate_headers: []const []const u8,
-) AuthError!ProbeResult {
-    return switch (status) {
-        .ok => .ok,
-        .unauthorized => .{ .auth_required = try parseAuthenticateHeaders(www_authenticate_headers) },
-        .not_found => .not_found,
-        else => error.UnsupportedProbeStatus,
-    };
-}
-
-pub fn parseAuthenticateHeaders(raw_headers: []const []const u8) AuthError!AuthChallenge {
-    if (raw_headers.len == 0) return error.MissingAuthenticateHeader;
-
-    var saw_unsupported = false;
-    for (raw_headers) |raw| {
-        const challenge = parseAuthenticateHeader(raw) catch |err| switch (err) {
-            error.UnsupportedAuthenticateScheme => {
-                saw_unsupported = true;
-                continue;
-            },
-            else => |parse_err| return parse_err,
-        };
-
-        return challenge;
-    }
-
-    if (saw_unsupported) return error.UnsupportedAuthenticateScheme;
-    return error.MissingAuthenticateHeader;
-}
-
-pub fn parseAuthenticateHeader(raw: []const u8) AuthError!AuthChallenge {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0) return error.MissingAuthenticateHeader;
-
-    var cursor: usize = 0;
-    while (cursor < trimmed.len) {
-        const next_challenge = try findNextChallengeStart(trimmed, cursor);
-        const end = next_challenge orelse trimmed.len;
-        const chunk = std.mem.trim(u8, trimmed[cursor..end], " \t,");
-        if (chunk.len == 0) return error.InvalidAuthenticateHeader;
-
-        const challenge = try parseChallengeChunk(chunk);
-        if (challenge == .bearer) return challenge;
-
-        cursor = next_challenge orelse break;
-    }
-
-    return error.UnsupportedAuthenticateScheme;
-}
-
 fn parseChallengeChunk(raw: []const u8) AuthError!AuthChallenge {
     const space_index = std.mem.indexOfAny(u8, raw, " \t") orelse raw.len;
     const scheme = raw[0..space_index];
@@ -2085,7 +1998,6 @@ fn parseChallengeChunk(raw: []const u8) AuthError!AuthChallenge {
 
     return .{ .other = scheme };
 }
-
 fn parseBearerChallenge(params: []const u8) AuthError!BearerChallenge {
     var challenge = BearerChallenge{ .realm = "" };
     var cursor: usize = 0;
@@ -2116,13 +2028,11 @@ fn parseBearerChallenge(params: []const u8) AuthError!BearerChallenge {
     try validateRealmUrl(challenge.realm);
     return challenge;
 }
-
 fn validateRealmUrl(realm: []const u8) AuthError!void {
     const parsed = std.Uri.parse(realm) catch return error.InsecureRealmUrl;
     if (!std.ascii.eqlIgnoreCase(parsed.scheme, "https")) return error.InsecureRealmUrl;
     if (parsed.host == null) return error.InsecureRealmUrl;
 }
-
 fn writeFormField(writer: *std.Io.Writer, first: *bool, key: []const u8, value: []const u8) std.Io.Writer.Error!void {
     if (!first.*) try writer.writeByte('&');
     first.* = false;
@@ -2130,11 +2040,9 @@ fn writeFormField(writer: *std.Io.Writer, first: *bool, key: []const u8, value: 
     try writer.writeByte('=');
     try std.Uri.Component.percentEncode(writer, value, isFormValueChar);
 }
-
 fn isFormValueChar(char: u8) bool {
     return std.ascii.isAlphanumeric(char) or char == '-' or char == '_' or char == '.' or char == '~';
 }
-
 fn parseAuthParamValue(raw: []const u8) AuthError![]const u8 {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return error.InvalidAuthenticateHeader;
@@ -2163,7 +2071,6 @@ fn parseAuthParamValue(raw: []const u8) AuthError![]const u8 {
 
     return trimmed;
 }
-
 fn nextCommaSeparatedChunk(raw: []const u8, cursor: *usize) AuthError!?[]const u8 {
     if (cursor.* >= raw.len) return null;
 
@@ -2188,7 +2095,6 @@ fn nextCommaSeparatedChunk(raw: []const u8, cursor: *usize) AuthError!?[]const u
     cursor.* = raw.len;
     return raw[start..];
 }
-
 fn findNextChallengeStart(raw: []const u8, start: usize) AuthError!?usize {
     var in_quotes = false;
     var i = start;
@@ -2211,7 +2117,6 @@ fn findNextChallengeStart(raw: []const u8, start: usize) AuthError!?usize {
     if (in_quotes) return error.InvalidAuthenticateHeader;
     return null;
 }
-
 fn isChallengeStart(raw: []const u8) bool {
     var token_end: usize = 0;
     while (token_end < raw.len and !isAuthWhitespace(raw[token_end]) and raw[token_end] != ',' and raw[token_end] != '=') : (token_end += 1) {}
@@ -2223,12 +2128,14 @@ fn isChallengeStart(raw: []const u8) bool {
     while (value_start < raw.len and isAuthWhitespace(raw[value_start])) : (value_start += 1) {}
     return value_start > token_end and (value_start == raw.len or raw[value_start] != '=');
 }
-
 fn isAuthWhitespace(char: u8) bool {
     return char == ' ' or char == '\t';
 }
-
 // Tests
+// Fuzz tests for the WWW-Authenticate parser ----------------------------------
+// Memory stress tests ---------------------------------------------------------
+
+// --- Tests ---
 
 test "auth scaffolding: types compile with representative values" {
     const bearer = BearerChallenge{
@@ -2256,7 +2163,6 @@ test "auth scaffolding: types compile with representative values" {
     try std.testing.expectEqual(@as(?u64, 1_700_000_000), cached.valid_until_unix_seconds);
     _ = docker_helper_config;
 }
-
 test "auth scaffolding: engine authenticate remains a stub without exchanger" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     defer engine.deinit();
@@ -2268,7 +2174,6 @@ test "auth scaffolding: engine authenticate remains a stub without exchanger" {
 
     try std.testing.expectError(error.NotYetImplemented, engine.authenticate(&client, request));
 }
-
 test "auth scaffolding: explicit helper process context is optional" {
     const engine = AuthEngine.initWithDockerHelperConfig(
         std.testing.allocator,
@@ -2278,7 +2183,6 @@ test "auth scaffolding: explicit helper process context is optional" {
 
     try std.testing.expect(engine.dockerHelperConfig() != null);
 }
-
 test "auth scaffolding: authConfigView keeps only auth-relevant fields" {
     const provider = CredentialProvider{
         .getCredentialFn = struct {
@@ -2302,7 +2206,6 @@ test "auth scaffolding: authConfigView keeps only auth-relevant fields" {
     try std.testing.expectEqual(@as(u32, 60_000), view.read_timeout_ms);
     try std.testing.expectEqualStrings("/tmp/custom-ca.pem", view.ca_bundle_path.?);
 }
-
 test "auth scaffolding: provider credentials borrow provider-owned storage" {
     const State = struct {
         var username = [_]u8{ 'u', 's', 'e', 'r' };
@@ -2327,7 +2230,6 @@ test "auth scaffolding: provider credentials borrow provider-owned storage" {
     try std.testing.expectEqual(@as(u8, 'T'), cred.secret[0]);
     State.secret[0] = 't';
 }
-
 test "auth scaffolding: engine can request credential handle" {
     const provider = CredentialProvider{
         .getCredentialFn = struct {
@@ -2343,7 +2245,6 @@ test "auth scaffolding: engine can request credential handle" {
     try std.testing.expectEqualStrings("user", handle.credential.username);
     try std.testing.expectEqualStrings("token", handle.credential.secret);
 }
-
 test "auth scaffolding: authConfigView records env credential variable names" {
     const view = authConfigView(Config{});
 
@@ -2351,7 +2252,6 @@ test "auth scaffolding: authConfigView records env credential variable names" {
     try std.testing.expectEqualStrings("Z_OCI_REGISTRY_USER", view.env_registry_user);
     try std.testing.expectEqualStrings("Z_OCI_REGISTRY_TOKEN", view.env_registry_token);
 }
-
 test "AuthEngine.credentialForRegistry: explicit config provider wins before env" {
     const State = struct {
         fn get(registry: []const u8) ?CredentialHandle {
@@ -2373,7 +2273,6 @@ test "AuthEngine.credentialForRegistry: explicit config provider wins before env
     try std.testing.expectEqualStrings("config-user", handle.credential.username);
     try std.testing.expectEqualStrings("config-token", handle.credential.secret);
 }
-
 test "AuthEngine.credentialForRegistry: env provider supplies fallback credentials" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
@@ -2388,7 +2287,6 @@ test "AuthEngine.credentialForRegistry: env provider supplies fallback credentia
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
     try std.testing.expectEqualStrings("env-token", handle.credential.secret);
 }
-
 test "envCredentialForRegistry: returns owned copies independent of environ map" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
@@ -2405,7 +2303,6 @@ test "envCredentialForRegistry: returns owned copies independent of environ map"
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
     try std.testing.expectEqualStrings("env-token", handle.credential.secret);
 }
-
 test "ownedCredentialHandle: allocation failures do not leak username or secret" {
     const State = struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -2416,7 +2313,6 @@ test "ownedCredentialHandle: allocation failures do not leak username or secret"
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "envCredentialForRegistry: allocation failures do not leak" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
@@ -2434,7 +2330,6 @@ test "envCredentialForRegistry: allocation failures do not leak" {
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{&environ_map});
 }
-
 test "AuthEngine.credentialForRegistry: env allocation failures propagate without leaking" {
     const State = struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -2454,7 +2349,6 @@ test "AuthEngine.credentialForRegistry: env allocation failures propagate withou
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "ownedCredentialHandle: release_allocator matches dup allocator" {
     const handle = try ownedCredentialHandle(std.testing.allocator, "user", "secret");
     defer handle.release();
@@ -2462,7 +2356,6 @@ test "ownedCredentialHandle: release_allocator matches dup allocator" {
     try std.testing.expect(handle.release_fn != null);
     try std.testing.expectEqual(std.testing.allocator.ptr, handle.release_allocator.ptr);
 }
-
 test "AuthEngine.credentialForRegistry: env provider normalizes Docker Hub aliases" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
@@ -2477,7 +2370,6 @@ test "AuthEngine.credentialForRegistry: env provider normalizes Docker Hub alias
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
     try std.testing.expectEqualStrings("env-token", handle.credential.secret);
 }
-
 test "AuthEngine.credentialForRegistry: env provider treats GHCR host case-insensitively" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
@@ -2492,7 +2384,6 @@ test "AuthEngine.credentialForRegistry: env provider treats GHCR host case-insen
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
     try std.testing.expectEqualStrings("env-token", handle.credential.secret);
 }
-
 test "AuthEngine.credentialForRegistry: env provider ignores registry mismatch and partial env" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
@@ -2503,7 +2394,6 @@ test "AuthEngine.credentialForRegistry: env provider ignores registry mismatch a
     try std.testing.expect((try engine.credentialForRegistry("registry-1.docker.io")) == null);
     try std.testing.expect((try engine.credentialForRegistry("ghcr.io")) == null);
 }
-
 test "AuthEngine.credentialForRegistry: anonymous fallback is explicit when no provider matches" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
@@ -2519,7 +2409,6 @@ test "AuthEngine.credentialForRegistry: anonymous fallback is explicit when no p
 
     try std.testing.expect((try engine.credentialForRegistry("registry-1.docker.io")) == null);
 }
-
 test "parseDockerConfig: decodes auths and records helper metadata" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2553,7 +2442,6 @@ test "parseDockerConfig: decodes auths and records helper metadata" {
     try docker_config.resolveCredsStore(std.testing.allocator);
     try std.testing.expectEqualStrings("pass", docker_config.creds_store.?);
 }
-
 test "AuthEngine.credentialForRegistry: malformed docker config auth returns null" {
     var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
         \\{
@@ -2568,7 +2456,6 @@ test "AuthEngine.credentialForRegistry: malformed docker config auth returns nul
 
     try std.testing.expect((try engine.credentialForRegistry("ghcr.io")) == null);
 }
-
 test "parseDockerConfig: rejects malformed auth entries at lookup time" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2596,7 +2483,6 @@ test "parseDockerConfig: rejects malformed auth entries at lookup time" {
 
     try std.testing.expectError(error.InvalidDockerConfig, valid_config.authCredentialForRegistry(std.testing.allocator, "ghcr.io"));
 }
-
 test "decodeDockerConfigAuthCredential: allocation failures do not leak username or secret" {
     const encoded_auth = "b2N0b2NhdDpnaHBfZXhhbXBsZQ==";
 
@@ -2616,7 +2502,6 @@ test "decodeDockerConfigAuthCredential: allocation failures do not leak username
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "parseDockerConfig: authCredentialForRegistry allocation failures do not leak on cache insert" {
     // Index is built with std.testing.allocator; only lookup/insert runs under failing allocator.
     const docker_config_json =
@@ -2643,7 +2528,6 @@ test "parseDockerConfig: authCredentialForRegistry allocation failures do not le
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "parseDockerConfig: parse and deinit stay safe under allocation failures" {
     const docker_config_json =
         \\{
@@ -2671,7 +2555,6 @@ test "parseDockerConfig: parse and deinit stay safe under allocation failures" {
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "parseDockerConfig: single-registry lookup ignores malformed auths for other registries" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2691,7 +2574,6 @@ test "parseDockerConfig: single-registry lookup ignores malformed auths for othe
     try std.testing.expectEqualStrings("octocat", ghcr_auth.username);
     try std.testing.expectEqualStrings("ghp_example", ghcr_auth.secret);
 }
-
 test "parseDockerConfig: rejects malformed auth entries" {
     try std.testing.expectError(error.InvalidDockerConfig, parseDockerConfig(std.testing.allocator,
         \\{ not json }
@@ -2703,18 +2585,15 @@ test "parseDockerConfig: rejects malformed auth entries" {
         \\}
     ));
 }
-
 test "dockerConfigRegistryKeyMatches: recognizes Docker Hub historical key" {
     try std.testing.expect(dockerConfigRegistryKeyMatches(DOCKER_HUB_AUTH_KEY, "registry-1.docker.io"));
     try std.testing.expect(dockerConfigRegistryKeyMatches("docker.io", "registry-1.docker.io"));
     try std.testing.expect(!dockerConfigRegistryKeyMatches("https://index.docker.io/v1/", "ghcr.io"));
 }
-
 test "dockerConfigRegistryKeyMatches: treats GHCR and Quay hosts case-insensitively" {
     try std.testing.expect(dockerConfigRegistryKeyMatches("ghcr.io", "GHCR.IO"));
     try std.testing.expect(dockerConfigRegistryKeyMatches("quay.io", "QuAy.IO"));
 }
-
 test "parseDockerConfig: indexed lookup uses case-insensitive exact-key hash" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2731,7 +2610,6 @@ test "parseDockerConfig: indexed lookup uses case-insensitive exact-key hash" {
     try std.testing.expectEqualStrings("octocat", credential.username);
     try std.testing.expectEqualStrings("ghp_example", credential.secret);
 }
-
 test "parseDockerConfig: Docker Hub alias resolves to first matching entry in JSON order" {
     var first_wins = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2769,7 +2647,6 @@ test "parseDockerConfig: Docker Hub alias resolves to first matching entry in JS
     try std.testing.expectEqualStrings("octocat", second_credential.username);
     try std.testing.expectEqualStrings("second", second_credential.secret);
 }
-
 test "parseDockerConfig: duplicate auths keys keep first entry for lookup" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2789,7 +2666,6 @@ test "parseDockerConfig: duplicate auths keys keep first entry for lookup" {
     try std.testing.expectEqualStrings("octocat", credential.username);
     try std.testing.expectEqualStrings("first", credential.secret);
 }
-
 test "parseDockerConfig: credHelpers indexed lookup preserves helper suffix" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2803,7 +2679,6 @@ test "parseDockerConfig: credHelpers indexed lookup preserves helper suffix" {
     const helper = (try docker_config.registrySpecificHelperLookupForRegistry(std.testing.allocator, "QUAY.IO")).?;
     try std.testing.expectEqualStrings("quay-helper", helper.helper_suffix);
 }
-
 test "AuthEngine.credentialForRegistry: docker config auth supplies fallback credentials" {
     var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
         \\{
@@ -2821,7 +2696,6 @@ test "AuthEngine.credentialForRegistry: docker config auth supplies fallback cre
     try std.testing.expectEqualStrings("octocat", handle.credential.username);
     try std.testing.expectEqualStrings("ghp_example", handle.credential.secret);
 }
-
 test "AuthEngine.credentialForRegistry: Docker Hub lookup normalizes to historical config key" {
     var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
         \\{
@@ -2839,7 +2713,6 @@ test "AuthEngine.credentialForRegistry: Docker Hub lookup normalizes to historic
     try std.testing.expectEqualStrings("dockeruser", handle.credential.username);
     try std.testing.expectEqualStrings("secret", handle.credential.secret);
 }
-
 test "AuthEngine.credentialForRegistry: env remains ahead of docker config" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
@@ -2865,7 +2738,6 @@ test "AuthEngine.credentialForRegistry: env remains ahead of docker config" {
     try std.testing.expectEqualStrings("env-user", handle.credential.username);
     try std.testing.expectEqualStrings("env-token", handle.credential.secret);
 }
-
 test "DockerConfig.credentialSourceForRegistry: registry helper beats auth and global store" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2912,7 +2784,6 @@ test "DockerConfig.credentialSourceForRegistry: registry helper beats auth and g
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "DockerConfig.credentialSourceForRegistry: Docker Hub helper uses historical server key" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
         \\{
@@ -2932,7 +2803,6 @@ test "DockerConfig.credentialSourceForRegistry: Docker Hub helper uses historica
         else => return error.TestUnexpectedResult,
     }
 }
-
 test "dockerCredentialHelperCommandAlloc: expands helper binary names and rejects invalid suffixes" {
     const command = try dockerCredentialHelperCommandAlloc(std.testing.allocator, "ecr-login");
     defer std.testing.allocator.free(command);
@@ -2942,7 +2812,6 @@ test "dockerCredentialHelperCommandAlloc: expands helper binary names and reject
     try std.testing.expectError(error.InvalidDockerConfig, dockerCredentialHelperCommandAlloc(std.testing.allocator, "bad helper"));
     try std.testing.expectError(error.InvalidDockerConfig, dockerCredentialHelperCommandAlloc(std.testing.allocator, "../pass"));
 }
-
 test "AuthEngine.loadDockerConfigFromEnvironment: loads HOME docker config" {
     const io = std.testing.io;
 
@@ -2984,7 +2853,6 @@ test "AuthEngine.loadDockerConfigFromEnvironment: loads HOME docker config" {
     try std.testing.expectEqualStrings("octocat", handle.credential.username);
     try std.testing.expectEqualStrings("ghp_example", handle.credential.secret);
 }
-
 test "AuthEngine.loadDockerConfigFromEnvironment: DOCKER_CONFIG overrides HOME" {
     const io = std.testing.io;
 
@@ -3044,7 +2912,6 @@ test "AuthEngine.loadDockerConfigFromEnvironment: DOCKER_CONFIG overrides HOME" 
     try std.testing.expectEqualStrings("docker-user", handle.credential.username);
     try std.testing.expectEqualStrings("docker-token", handle.credential.secret);
 }
-
 test "AuthEngine.loadDockerConfigFromEnvironment: missing file is a clean miss" {
     const io = std.testing.io;
 
@@ -3064,7 +2931,6 @@ test "AuthEngine.loadDockerConfigFromEnvironment: missing file is a clean miss" 
     try std.testing.expect(!(try engine.loadDockerConfigFromEnvironment(io)));
     try std.testing.expect((try engine.credentialForRegistry("ghcr.io")) == null);
 }
-
 test "parseDockerCredentialHelperResponse: accepts helper JSON and token-style usernames" {
     const handle = try parseDockerCredentialHelperResponse(std.testing.allocator,
         \\{
@@ -3077,7 +2943,6 @@ test "parseDockerCredentialHelperResponse: accepts helper JSON and token-style u
     try std.testing.expectEqualStrings("<token>", handle.credential.username);
     try std.testing.expectEqualStrings("eyJhbGciOi...", handle.credential.secret);
 }
-
 test "parseDockerCredentialHelperResponse: rejects malformed helper payloads" {
     try std.testing.expectError(error.HelperFailed, parseDockerCredentialHelperResponse(std.testing.allocator,
         \\{
@@ -3092,7 +2957,6 @@ test "parseDockerCredentialHelperResponse: rejects malformed helper payloads" {
     ));
     try std.testing.expectError(error.HelperFailed, parseDockerCredentialHelperResponse(std.testing.allocator, "not-json"));
 }
-
 test "runDockerCredentialHelperCommand: writes stdin and parses stdout" {
     if (builtin.os.tag == .windows) return;
 
@@ -3114,7 +2978,6 @@ test "runDockerCredentialHelperCommand: writes stdin and parses stdout" {
     try std.testing.expectEqualStrings("david", handle.credential.username);
     try std.testing.expectEqualStrings("passw0rd1", handle.credential.secret);
 }
-
 test "runDockerCredentialHelperCommand: rejects non-zero exit and malformed JSON" {
     if (builtin.os.tag == .windows) return;
 
@@ -3146,7 +3009,6 @@ test "runDockerCredentialHelperCommand: rejects non-zero exit and malformed JSON
         .none,
     ));
 }
-
 test "runDockerCredentialHelperCommand: timeout kills hung helper" {
     if (builtin.os.tag == .windows) return;
 
@@ -3164,7 +3026,6 @@ test "runDockerCredentialHelperCommand: timeout kills hung helper" {
         .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(10), .clock = .awake } },
     ));
 }
-
 test "runDockerCredentialHelperCommand: timeout does not poison the next helper run" {
     if (builtin.os.tag == .windows) return;
 
@@ -3200,7 +3061,6 @@ test "runDockerCredentialHelperCommand: timeout does not poison the next helper 
     try std.testing.expectEqualStrings("recovered", handle.credential.username);
     try std.testing.expectEqualStrings("secret", handle.credential.secret);
 }
-
 test "runDockerCredentialHelperCommand: failed helper does not poison the next helper run" {
     if (builtin.os.tag == .windows) return;
 
@@ -3236,7 +3096,6 @@ test "runDockerCredentialHelperCommand: failed helper does not poison the next h
     try std.testing.expectEqualStrings("recovered", handle.credential.username);
     try std.testing.expectEqualStrings("secret", handle.credential.secret);
 }
-
 test "AuthEngine.dockerCredentialForRegistry: helper path beats inline auth when helper context exists" {
     const State = struct {
         var calls: usize = 0;
@@ -3281,7 +3140,6 @@ test "AuthEngine.dockerCredentialForRegistry: helper path beats inline auth when
     try std.testing.expectEqualStrings("helper-user", handle.credential.username);
     try std.testing.expectEqualStrings("helper-secret", handle.credential.secret);
 }
-
 test "AuthEngine.dockerCredentialForRegistry: Quay global helper canonicalizes mixed-case registry host" {
     const State = struct {
         var calls: usize = 0;
@@ -3309,7 +3167,6 @@ test "AuthEngine.dockerCredentialForRegistry: Quay global helper canonicalizes m
     try std.testing.expectEqualStrings("quay-user", handle.credential.username);
     try std.testing.expectEqualStrings("quay-secret", handle.credential.secret);
 }
-
 test "AuthEngine.dockerCredentialForRegistry: inline auth remains available without helper context" {
     var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
         \\{
@@ -3330,7 +3187,6 @@ test "AuthEngine.dockerCredentialForRegistry: inline auth remains available with
     try std.testing.expectEqualStrings("octocat", handle.credential.username);
     try std.testing.expectEqualStrings("ghp_example", handle.credential.secret);
 }
-
 test "AuthEngine.authenticate: helper-backed Docker credentials feed optional basic auth" {
     const HelperState = struct {
         fn runner(allocator: std.mem.Allocator, _: std.Io, helper_suffix: []const u8, server_url: []const u8, _: std.Io.Timeout) AuthError!CredentialHandle {
@@ -3376,7 +3232,6 @@ test "AuthEngine.authenticate: helper-backed Docker credentials feed optional ba
 
     try std.testing.expectEqualStrings("helper-token", response.access_token.value);
 }
-
 test "AuthEngine.authenticate: helper failure stays terminal when helper is configured" {
     const HelperState = struct {
         fn runner(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8, _: std.Io.Timeout) AuthError!CredentialHandle {
@@ -3413,7 +3268,6 @@ test "AuthEngine.authenticate: helper failure stays terminal when helper is conf
 
     try std.testing.expectError(error.HelperFailed, engine.authenticate(&client, request));
 }
-
 test "AuthEngine.authenticate: helper timeout stays terminal when helper is configured" {
     const HelperState = struct {
         fn runner(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8, _: std.Io.Timeout) AuthError!CredentialHandle {
@@ -3450,7 +3304,6 @@ test "AuthEngine.authenticate: helper timeout stays terminal when helper is conf
 
     try std.testing.expectError(error.HelperTimedOut, engine.authenticate(&client, request));
 }
-
 test "AuthEngine.authenticate: generic self-hosted bearer registry path uses docker config auth" {
     const ExchangeState = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -3503,7 +3356,6 @@ test "AuthEngine.authenticate: generic self-hosted bearer registry path uses doc
 
     try std.testing.expectEqualStrings("self-hosted-token", response.access_token.value);
 }
-
 test "buildTokenHttpRequest: get request includes query parameters" {
     const request = try AuthenticateRequest.init(
         "registry-1.docker.io",
@@ -3525,7 +3377,6 @@ test "buildTokenHttpRequest: get request includes query parameters" {
     try std.testing.expect(http_request.authorization == null);
     try std.testing.expect(http_request.body == null);
 }
-
 test "buildTokenHttpRequest: get request omits empty query delimiter" {
     const request = try AuthenticateRequest.init(
         "registry.example.test",
@@ -3539,7 +3390,6 @@ test "buildTokenHttpRequest: get request omits empty query delimiter" {
     try std.testing.expect(http_request.authorization == null);
     try std.testing.expect(http_request.body == null);
 }
-
 test "buildTokenHttpRequest: post request includes body and optional basic auth" {
     const request = try AuthenticateRequest.init(
         "ghcr.io",
@@ -3564,7 +3414,6 @@ test "buildTokenHttpRequest: post request includes body and optional basic auth"
     try std.testing.expectEqualStrings("service=ghcr.io&scope=repository%3Aowner%2Fimage%3Apull", http_request.body.?);
     try std.testing.expectEqualStrings("Basic dXNlcjp0b2tlbg==", http_request.authorization.?);
 }
-
 test "freeOwnedOptionalSecretSlice: secureZero clears owned dupe" {
     // Documents the first step of freeOwnedOptionalSecretSlice; deinit uses that helper for auth/body.
     const secret = try std.testing.allocator.dupe(u8, "service=registry.example.test&scope=pull");
@@ -3575,12 +3424,10 @@ test "freeOwnedOptionalSecretSlice: secureZero clears owned dupe" {
     try std.testing.expectEqual(@as(u8, 0), secret[0]);
     try std.testing.expectEqual(@as(u8, 0), secret[secret.len - 1]);
 }
-
 test "ownedCredentialHandle.release: exercises secureZero-on-free path" {
     const handle = try ownedCredentialHandle(std.testing.allocator, "user", "secret-token");
     handle.release();
 }
-
 test "TokenHttpRequest.deinit: post teardown stays leak-free under allocation failure" {
     const State = struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -3609,7 +3456,6 @@ test "TokenHttpRequest.deinit: post teardown stays leak-free under allocation fa
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "buildTokenHttpRequest: docker token auth uses repeated scope query parameters" {
     const request = try AuthenticateRequest.init(
         "registry-1.docker.io",
@@ -3628,7 +3474,6 @@ test "buildTokenHttpRequest: docker token auth uses repeated scope query paramet
         http_request.url,
     );
 }
-
 test "buildTokenHttpRequest: quay realm and host service stay intact" {
     const request = try AuthenticateRequest.init(
         "quay.io",
@@ -3647,7 +3492,6 @@ test "buildTokenHttpRequest: quay realm and host service stay intact" {
         http_request.url,
     );
 }
-
 test "buildTokenHttpRequest: ghcr realm and service stay intact" {
     const request = try AuthenticateRequest.init(
         "ghcr.io",
@@ -3666,7 +3510,6 @@ test "buildTokenHttpRequest: ghcr realm and service stay intact" {
         http_request.url,
     );
 }
-
 test "parseTokenResponse: accepts matching duplicate token fields and preserves refresh token" {
     var response = try parseTokenResponse(std.testing.allocator,
         \\{
@@ -3682,7 +3525,6 @@ test "parseTokenResponse: accepts matching duplicate token fields and preserves 
     try std.testing.expectEqual(@as(?u64, 300), response.access_token.expires_in_seconds);
     try std.testing.expectEqualStrings("ignored-for-now", response.refresh_token.?);
 }
-
 test "parseTokenResponse: falls back to token without expires_in" {
     var response = try parseTokenResponse(std.testing.allocator,
         \\{
@@ -3695,7 +3537,6 @@ test "parseTokenResponse: falls back to token without expires_in" {
     try std.testing.expect(response.access_token.expires_in_seconds == null);
     try std.testing.expect(response.refresh_token == null);
 }
-
 test "parseTokenResponse: conflicting token fields are rejected" {
     try std.testing.expectError(error.InvalidTokenResponse, parseTokenResponse(std.testing.allocator,
         \\{
@@ -3704,7 +3545,6 @@ test "parseTokenResponse: conflicting token fields are rejected" {
         \\}
     ));
 }
-
 test "parseTokenResponse: malformed payloads are rejected" {
     const cases = [_][]const u8{
         "{\"expires_in\": 60}",
@@ -3720,7 +3560,6 @@ test "parseTokenResponse: malformed payloads are rejected" {
         try std.testing.expectError(error.InvalidTokenResponse, parseTokenResponse(std.testing.allocator, case));
     }
 }
-
 test "parseTokenResponse: allocation failures do not leak owned token fields" {
     const State = struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -3740,7 +3579,6 @@ test "parseTokenResponse: allocation failures do not leak owned token fields" {
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "buildTokenHttpRequest: allocation failures do not leak request-owned buffers" {
     const State = struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -3771,7 +3609,6 @@ test "buildTokenHttpRequest: allocation failures do not leak request-owned buffe
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "AuthEngine.authenticate: uses post fallback after get failure" {
     const State = struct {
         var calls: usize = 0;
@@ -3821,7 +3658,6 @@ test "AuthEngine.authenticate: uses post fallback after get failure" {
     try std.testing.expectEqualStrings("post-token", response.access_token.value);
     try std.testing.expectEqual(@as(?u64, 120), response.access_token.expires_in_seconds);
 }
-
 test "AuthEngine.authenticate: retries transient 503 on token exchange then succeeds" {
     const State = struct {
         var calls: usize = 0;
@@ -3862,7 +3698,6 @@ test "AuthEngine.authenticate: retries transient 503 on token exchange then succ
     try std.testing.expectEqual(@as(usize, 2), State.calls);
     try std.testing.expectEqualStrings("retry-token", response.access_token.value);
 }
-
 test "AuthEngine.authenticate: retries connection reset on token exchange then succeeds" {
     const State = struct {
         var calls: usize = 0;
@@ -3903,7 +3738,6 @@ test "AuthEngine.authenticate: retries connection reset on token exchange then s
     try std.testing.expectEqual(@as(usize, 2), State.calls);
     try std.testing.expectEqualStrings("reset-token", response.access_token.value);
 }
-
 test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
     const State = struct {
         var calls: usize = 0;
@@ -3939,7 +3773,6 @@ test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
     try std.testing.expectError(error.TokenExchangeFailed, engine.authenticate(&client, request));
     try std.testing.expectEqual(@as(usize, 2), State.calls);
 }
-
 test "AuthEngine.authenticate: oversize token transport body maps to InvalidTokenResponse" {
     const custom_cap: usize = 4096;
     const State = struct {
@@ -3971,7 +3804,6 @@ test "AuthEngine.authenticate: oversize token transport body maps to InvalidToke
     try std.testing.expectError(error.InvalidTokenResponse, engine.authenticate(&client, request));
     try std.testing.expectEqual(custom_cap, State.seen_cap.?);
 }
-
 test "AuthEngine.authenticate: rate-limit retry path stays leak-free under DebugAllocator" {
     const State = struct {
         var calls: usize = 0;
@@ -4024,7 +3856,6 @@ test "AuthEngine.authenticate: rate-limit retry path stays leak-free under Debug
         try std.testing.expectEqualStrings("retry-debug-token", response.access_token.value);
     }
 }
-
 test "AuthEngine.authenticate: cache hit reuses valid token response" {
     const State = struct {
         var calls: usize = 0;
@@ -4084,7 +3915,6 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
     try std.testing.expect(!third.owns_access_token);
     try std.testing.expectEqualStrings("cached-token", third.access_token.value);
 }
-
 test "AuthEngine.authenticate: cache miss borrows stored token without duplicate buffer" {
     const State = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4124,7 +3954,6 @@ test "AuthEngine.authenticate: cache miss borrows stored token without duplicate
         response.access_token.value.ptr,
     );
 }
-
 test "AuthEngine.authenticate: token without expires_in expires after default cache TTL" {
     const State = struct {
         var calls: usize = 0;
@@ -4177,7 +4006,6 @@ test "AuthEngine.authenticate: token without expires_in expires after default ca
     try std.testing.expectEqual(@as(usize, 2), State.calls);
     try std.testing.expectEqualStrings("no-expiry-token", third.access_token.value);
 }
-
 test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
     const State = struct {
         var calls: usize = 0;
@@ -4254,7 +4082,6 @@ test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
     try std.testing.expectEqual(@as(usize, 3), State.calls);
     try std.testing.expectEqualStrings("token-b", hit_b.access_token.value);
 }
-
 test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
     const State = struct {
         var calls: usize = 0;
@@ -4315,7 +4142,6 @@ test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
     try std.testing.expectEqualStrings("first-token", first_token_value);
     try std.testing.expectEqualStrings("second-token", second.access_token.value);
 }
-
 test "AuthEngine.cachedTokenResponseForRequest: expired entry is dropped before cache miss" {
     const State = struct {
         fn now(_: *std.http.Client) u64 {
@@ -4351,7 +4177,6 @@ test "AuthEngine.cachedTokenResponseForRequest: expired entry is dropped before 
     try std.testing.expect((try engine.cachedTokenResponseForRequest(&client, request)) == null);
     try std.testing.expectEqual(@as(usize, 0), engine.token_cache.count());
 }
-
 test "AuthEngine.cachedTokenResponseForRequest: missing valid_until is treated as expired" {
     const State = struct {
         fn now(_: *std.http.Client) u64 {
@@ -4386,7 +4211,6 @@ test "AuthEngine.cachedTokenResponseForRequest: missing valid_until is treated a
     try std.testing.expect((try engine.cachedTokenResponseForRequest(&client, request)) == null);
     try std.testing.expectEqual(@as(usize, 0), engine.token_cache.count());
 }
-
 test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: invalidates exact cached entry and refetches" {
     const State = struct {
         var calls: usize = 0;
@@ -4444,7 +4268,6 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: invalidates exact cac
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("retried-token", retried.access_token.value);
 }
-
 test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: max_retries zero disables retry" {
     const State = struct {
         var fake_now: u64 = 1_000;
@@ -4485,7 +4308,6 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: max_retries zero disa
     try std.testing.expectError(error.TokenExchangeFailed, engine.retryAuthenticateAfterCachedUnauthorized(&client, request));
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
 }
-
 test "AuthEngine.authenticate: different scopes keep separate cache entries" {
     const State = struct {
         var calls: usize = 0;
@@ -4551,7 +4373,6 @@ test "AuthEngine.authenticate: different scopes keep separate cache entries" {
     try std.testing.expectEqualStrings("scope-one-token", first.access_token.value);
     try std.testing.expectEqualStrings("scope-two-token", second.access_token.value);
 }
-
 test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: replacement keeps one exact entry" {
     const State = struct {
         var calls: usize = 0;
@@ -4607,7 +4428,6 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: replacement keeps one
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("replacement-token", engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value);
 }
-
 test "AuthEngine.authenticate: allocation failures do not leak during cache insertion" {
     const State = struct {
         fn now(_: *std.http.Client) u64 {
@@ -4643,7 +4463,6 @@ test "AuthEngine.authenticate: allocation failures do not leak during cache inse
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-
 test "AuthEngine.authenticate: uses credential handle for optional basic auth" {
     const ProviderState = struct {
         var released = false;
@@ -4695,7 +4514,6 @@ test "AuthEngine.authenticate: uses credential handle for optional basic auth" {
     try std.testing.expectEqualStrings("credential-token", response.access_token.value);
     try std.testing.expect(ProviderState.released);
 }
-
 test "AuthEngine.authenticate: Docker Hub normalized reference uses env credentials for optional basic auth" {
     const ExchangeState = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4744,7 +4562,6 @@ test "AuthEngine.authenticate: Docker Hub normalized reference uses env credenti
 
     try std.testing.expectEqualStrings("docker-hub-auth-token", response.access_token.value);
 }
-
 test "AuthEngine.authenticate: env-owned credentials stay leak-free under DebugAllocator" {
     const ExchangeState = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4790,7 +4607,6 @@ test "AuthEngine.authenticate: env-owned credentials stay leak-free under DebugA
         try std.testing.expectEqualStrings("env-debug-token", response.access_token.value);
     }
 }
-
 test "AuthEngine.authenticate: Docker Hub anonymous flow omits optional basic auth" {
     const ExchangeState = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4830,7 +4646,6 @@ test "AuthEngine.authenticate: Docker Hub anonymous flow omits optional basic au
 
     try std.testing.expectEqualStrings("docker-hub-anon-token", response.access_token.value);
 }
-
 test "AuthEngine.authenticate: GHCR mixed-case registry still uses env credentials for optional basic auth" {
     const ExchangeState = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4875,7 +4690,6 @@ test "AuthEngine.authenticate: GHCR mixed-case registry still uses env credentia
 
     try std.testing.expectEqualStrings("ghcr-token", response.access_token.value);
 }
-
 test "AuthEngine.authenticate: repeated success and failure runs stay leak-free" {
     const State = struct {
         var calls: usize = 0;
@@ -4930,11 +4744,9 @@ test "AuthEngine.authenticate: repeated success and failure runs stay leak-free"
         State.fake_now += 100;
     }
 }
-
 test "token response: refresh window policy is fixed for short-lived cli use" {
     try std.testing.expectEqual(@as(u64, 5), TOKEN_REFRESH_WINDOW_SECONDS);
 }
-
 test "auth scaffolding: cached token owns duplicated secret bytes" {
     var cached = try CachedToken.initOwned(
         std.testing.allocator,
@@ -4946,7 +4758,6 @@ test "auth scaffolding: cached token owns duplicated secret bytes" {
     try std.testing.expectEqualStrings("opaque-token", cached.token.value);
     try std.testing.expect(cached.token.value.ptr != "opaque-token".ptr);
 }
-
 test "auth scaffolding: token cache key owns duplicated lookup fields" {
     var key = try TokenCacheKey.initOwned(
         std.testing.allocator,
@@ -4960,7 +4771,6 @@ test "auth scaffolding: token cache key owns duplicated lookup fields" {
     try std.testing.expectEqualStrings("registry.example.test", key.service.?);
     try std.testing.expectEqualStrings("repository:owner/image:pull", key.scope.?);
 }
-
 test "auth scaffolding: token cache key supports nil service and scope" {
     var key = try TokenCacheKey.initOwned(
         std.testing.allocator,
@@ -4974,7 +4784,6 @@ test "auth scaffolding: token cache key supports nil service and scope" {
     try std.testing.expect(key.service == null);
     try std.testing.expect(key.scope == null);
 }
-
 test "auth scaffolding: token cache key can be built from auth request" {
     const request = try AuthenticateRequest.init(
         "registry.example.test",
@@ -4992,14 +4801,12 @@ test "auth scaffolding: token cache key can be built from auth request" {
     try std.testing.expectEqualStrings("registry.example.test", key.service.?);
     try std.testing.expectEqualStrings("repository:owner/image:pull", key.scope.?);
 }
-
 test "auth scaffolding: engine deinit handles empty token cache" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     defer engine.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), engine.token_cache.count());
 }
-
 test "auth scaffolding: engine owns cached token entries" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     defer engine.deinit();
@@ -5026,7 +4833,6 @@ test "auth scaffolding: engine owns cached token entries" {
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("cached-token", engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value);
 }
-
 test "auth scaffolding: reference view consumes normalized Reference outputs" {
     var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:22.04");
     defer ref.deinit(std.testing.allocator);
@@ -5037,7 +4843,6 @@ test "auth scaffolding: reference view consumes normalized Reference outputs" {
     try std.testing.expectEqualStrings("library/ubuntu", view.repository_path);
     try std.testing.expectEqualStrings("22.04", view.ref_string);
 }
-
 test "auth scaffolding: probe uri uses normalized registry from reference view" {
     var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:22.04");
     defer ref.deinit(std.testing.allocator);
@@ -5050,7 +4855,6 @@ test "auth scaffolding: probe uri uses normalized registry from reference view" 
     try std.testing.expectEqualStrings("library/ubuntu", view.repository_path);
     try std.testing.expectEqualStrings("22.04", view.ref_string);
 }
-
 test "parseAuthenticateHeader: parses bearer challenge" {
     const challenge = try parseAuthenticateHeader(
         "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\",scope=\"repository:owner/image:pull\"",
@@ -5061,14 +4865,12 @@ test "parseAuthenticateHeader: parses bearer challenge" {
     try std.testing.expectEqualStrings("registry.example.test", challenge.bearer.service.?);
     try std.testing.expectEqualStrings("repository:owner/image:pull", challenge.bearer.scope.?);
 }
-
 test "parseAuthenticateHeader: rejects insecure bearer realm url" {
     try std.testing.expectError(
         error.InsecureRealmUrl,
         parseAuthenticateHeader("Bearer realm=\"http://auth.example.test/token\""),
     );
 }
-
 test "parseAuthenticateHeader: table-driven bearer parsing matrix" {
     const cases = [_]struct {
         raw: []const u8,
@@ -5114,7 +4916,6 @@ test "parseAuthenticateHeader: table-driven bearer parsing matrix" {
         }
     }
 }
-
 test "parseAuthenticateHeader: bearer scheme is case-insensitive and ignores unknown params" {
     const challenge = try parseAuthenticateHeader(
         "bearer realm=\"https://auth.example.test/token\",foo=\"bar\",service=registry.example.test",
@@ -5125,7 +4926,6 @@ test "parseAuthenticateHeader: bearer scheme is case-insensitive and ignores unk
     try std.testing.expectEqualStrings("registry.example.test", challenge.bearer.service.?);
     try std.testing.expect(challenge.bearer.scope == null);
 }
-
 test "parseAuthenticateHeader: selects bearer from multiple challenges" {
     const challenge = try parseAuthenticateHeader(
         "Basic realm=\"registry.example.test\", Bearer realm=\"https://auth.example.test/token\", service=\"registry.example.test\", scope=\"repository:owner/image:pull,push\"",
@@ -5136,7 +4936,6 @@ test "parseAuthenticateHeader: selects bearer from multiple challenges" {
     try std.testing.expectEqualStrings("registry.example.test", challenge.bearer.service.?);
     try std.testing.expectEqualStrings("repository:owner/image:pull,push", challenge.bearer.scope.?);
 }
-
 test "parseAuthenticateHeader: duplicate bearer params are invalid" {
     try std.testing.expectError(
         error.InvalidAuthenticateHeader,
@@ -5145,14 +4944,12 @@ test "parseAuthenticateHeader: duplicate bearer params are invalid" {
         ),
     );
 }
-
 test "parseAuthenticateHeader: malformed quoted values are invalid" {
     try std.testing.expectError(
         error.InvalidAuthenticateHeader,
         parseAuthenticateHeader("Bearer realm=\"https://auth.example.test/token"),
     );
 }
-
 test "parseAuthenticateHeader: quoted escapes do not break bearer parsing" {
     const challenge = try parseAuthenticateHeader(
         "Bearer realm=\"https://auth.example.test/token\",service=\"registry\\\"quoted\\\".example.test\",scope=\"repository:owner/image:pull\"",
@@ -5163,7 +4960,6 @@ test "parseAuthenticateHeader: quoted escapes do not break bearer parsing" {
     try std.testing.expectEqualStrings("registry\\\"quoted\\\".example.test", challenge.bearer.service.?);
     try std.testing.expectEqualStrings("repository:owner/image:pull", challenge.bearer.scope.?);
 }
-
 test "parseAuthenticateHeader: empty optional bearer values are invalid" {
     try std.testing.expectError(
         error.InvalidAuthenticateHeader,
@@ -5175,21 +4971,18 @@ test "parseAuthenticateHeader: empty optional bearer values are invalid" {
         parseAuthenticateHeader("Bearer realm=\"https://auth.example.test/token\",scope=\"\""),
     );
 }
-
 test "parseAuthenticateHeader: missing realm is invalid" {
     try std.testing.expectError(
         error.InvalidAuthenticateHeader,
         parseAuthenticateHeader("Bearer service=registry.example.test"),
     );
 }
-
 test "parseAuthenticateHeader: unsupported scheme is rejected" {
     try std.testing.expectError(
         error.UnsupportedAuthenticateScheme,
         parseAuthenticateHeader("Basic realm=\"example\""),
     );
 }
-
 test "classifyProbeResponse: classifies ok unauthorized and not found" {
     try std.testing.expectEqual(ProbeResult.ok, try classifyProbeResponse(.ok, &.{}));
 
@@ -5202,14 +4995,12 @@ test "classifyProbeResponse: classifies ok unauthorized and not found" {
 
     try std.testing.expectEqual(ProbeResult.not_found, try classifyProbeResponse(.not_found, &.{}));
 }
-
 test "classifyProbeResponse: unauthorized without header fails explicitly" {
     try std.testing.expectError(
         error.MissingAuthenticateHeader,
         classifyProbeResponse(.unauthorized, &.{}),
     );
 }
-
 test "classifyProbeResponse: repeated headers select bearer across values" {
     const result = try classifyProbeResponse(
         .unauthorized,
@@ -5223,7 +5014,6 @@ test "classifyProbeResponse: repeated headers select bearer across values" {
     try std.testing.expectEqualStrings("https://auth.example.test/token", result.auth_required.bearer.realm);
     try std.testing.expectEqualStrings("registry.example.test", result.auth_required.bearer.service.?);
 }
-
 test "ProbeHttpResponse: mock probe cases classify deterministically" {
     const cases = [_]struct {
         response: ProbeHttpResponse,
@@ -5248,7 +5038,6 @@ test "ProbeHttpResponse: mock probe cases classify deterministically" {
         }
     }
 }
-
 test "AuthenticateRequest: carries parsed challenge data for token exchange" {
     const request = try AuthenticateRequest.init(
         "registry-1.docker.io",
@@ -5264,9 +5053,6 @@ test "AuthenticateRequest: carries parsed challenge data for token exchange" {
     try std.testing.expectEqualStrings("registry.example.test", request.service().?);
     try std.testing.expectEqualStrings("repository:library/ubuntu:pull", request.scope().?);
 }
-
-// Fuzz tests for the WWW-Authenticate parser ----------------------------------
-
 test "parseAuthenticateHeader: 10000 pseudo-random headers never panic" {
     var seed: u64 = 0xde_ad_be_ef;
     var buf: [256]u8 = undefined;
@@ -5284,7 +5070,6 @@ test "parseAuthenticateHeader: 10000 pseudo-random headers never panic" {
         _ = result catch {};
     }
 }
-
 test "parseAuthenticateHeaders: 10000 pseudo-random multi-header inputs never panic" {
     var seed: u64 = 0xc0_ff_ee_01;
     var buf: [128]u8 = undefined;
@@ -5303,7 +5088,6 @@ test "parseAuthenticateHeaders: 10000 pseudo-random multi-header inputs never pa
         _ = result catch {};
     }
 }
-
 test "parseChallengeChunk: 10000 pseudo-random challenge chunks never panic" {
     var seed: u64 = 0xca_fe_ba_be;
     var buf: [128]u8 = undefined;
@@ -5321,7 +5105,6 @@ test "parseChallengeChunk: 10000 pseudo-random challenge chunks never panic" {
         _ = result catch {};
     }
 }
-
 test "probe/authenticate: repeated success and failure runs leave no residual allocations under DebugAllocator" {
     const State = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -5357,32 +5140,27 @@ test "probe/authenticate: repeated success and failure runs leave no residual al
         try std.testing.expectEqualStrings("debug-check-token", response.access_token.value);
     }
 }
-
 test "tokenCacheKeysEqual: nil service vs non-nil service returns false" {
     const a = TokenCacheKey{ .realm = "https://example.test/token" };
     const b = TokenCacheKey{ .realm = "https://example.test/token", .service = "svc" };
     try std.testing.expect(!tokenCacheKeysEqual(a, b));
 }
-
 test "tokenCacheKeysEqual: nil scope vs non-nil scope returns false" {
     const a = TokenCacheKey{ .realm = "https://example.test/token" };
     const b = TokenCacheKey{ .realm = "https://example.test/token", .scope = "repository:image:pull" };
     try std.testing.expect(!tokenCacheKeysEqual(a, b));
 }
-
 test "tokenCacheKeysEqual: both nil service and scope returns true" {
     const a = TokenCacheKey{ .realm = "https://example.test/token" };
     const b = TokenCacheKey{ .realm = "https://example.test/token" };
     try std.testing.expect(tokenCacheKeysEqual(a, b));
 }
-
 test "parseAuthenticateHeader: bare challenge without scheme is UnsupportedAuthenticateScheme" {
     try std.testing.expectError(
         error.UnsupportedAuthenticateScheme,
         parseAuthenticateHeader("realm=\"https://example.test/token\""),
     );
 }
-
 test "parseAuthenticateHeader: multiple Bearer challenges selects first valid one" {
     const challenge = try parseAuthenticateHeader(
         "Bearer realm=\"https://first.test/token\", Bearer realm=\"https://second.test/token\"",
@@ -5390,7 +5168,6 @@ test "parseAuthenticateHeader: multiple Bearer challenges selects first valid on
     try std.testing.expect(challenge == .bearer);
     try std.testing.expectEqualStrings("https://first.test/token", challenge.bearer.realm);
 }
-
 test "buildTokenHttpRequest: empty scope request builds url without query when no service or scope" {
     const request = try AuthenticateRequest.init(
         "registry.example.test",
@@ -5403,7 +5180,6 @@ test "buildTokenHttpRequest: empty scope request builds url without query when n
     try std.testing.expectEqualStrings("https://auth.example.test/token", http_request.url);
     try std.testing.expect(http_request.body == null);
 }
-
 test "classifyProbeResponse: unsupported status code returns error" {
     try std.testing.expectError(
         error.UnsupportedProbeStatus,
@@ -5414,9 +5190,6 @@ test "classifyProbeResponse: unsupported status code returns error" {
         classifyProbeResponse(.bad_request, &.{}),
     );
 }
-
-// Memory stress tests ---------------------------------------------------------
-
 test "AuthEngine: 1000x repeated authenticate (cache miss then hit) under DebugAllocator" {
     const State = struct {
         var calls: usize = 0;
@@ -5467,7 +5240,6 @@ test "AuthEngine: 1000x repeated authenticate (cache miss then hit) under DebugA
     try std.testing.expect(State.calls >= 1);
     try std.testing.expect(engine.token_cache.count() >= 1);
 }
-
 test "AuthEngine: 1000x authenticate with short-lived tokens under DebugAllocator" {
     const State = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -5504,7 +5276,6 @@ test "AuthEngine: 1000x authenticate with short-lived tokens under DebugAllocato
         try std.testing.expectEqualStrings("steady-token", response.access_token.value);
     }
 }
-
 test "AuthEngine: 1000x fresh engine per authenticate stays leak-free under DebugAllocator" {
     const State = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -5535,7 +5306,6 @@ test "AuthEngine: 1000x fresh engine per authenticate stays leak-free under Debu
         try std.testing.expectEqualStrings("fresh-engine-token", response.access_token.value);
     }
 }
-
 test "parseDockerConfig: 1000x repeated parse/deinit under DebugAllocator" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");

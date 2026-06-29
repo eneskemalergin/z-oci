@@ -84,7 +84,7 @@ fn containsPrivateKeyMarker(body: []const u8) bool {
     return false;
 }
 
-/// Returns `true` when the file must be rejected.
+// Returns `true` when the file must be rejected.
 fn scanFile(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
     var file = try dir.openFile(io, name, .{});
     defer file.close(io);

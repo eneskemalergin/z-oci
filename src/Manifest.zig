@@ -11,6 +11,8 @@ const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;
 const Descriptor = @import("Descriptor.zig");
 const json = @import("json.zig");
+const Digest = @import("Digest.zig");
+const test_support = @import("test_support.zig");
 
 /// OCI spec field: schemaVersion. Always 2 for current formats.
 schema_version: u8,
@@ -140,9 +142,7 @@ pub fn jsonStringify(self: Manifest, jw: anytype) !void {
     try jw.endObject();
 }
 
-// Tests
-
-const Digest = @import("Digest.zig");
+// --- Tests ---
 
 test "Manifest: OCI image manifest stores all required fields" {
     // Arrange
@@ -369,8 +369,6 @@ test "Manifest JSON: rejects index mediaType for manifest payloads" {
 
     try std.testing.expectError(error.UnexpectedToken, json.parse(Manifest, std.testing.allocator, json_bytes));
 }
-
-const test_support = @import("test_support.zig");
 
 test "Manifest JSON: parses upstream OCI manifest fixture with real config and layer media types" {
     const parsed = try test_support.parseFixture(
