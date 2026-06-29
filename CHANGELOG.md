@@ -1,4 +1,4 @@
-<!-- markdownlint-disable MD024 -->
+<!-- markdownlint-disable MD024 MD036 -->
 # Changelog
 
 All notable changes to z-oci are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This project follows [Semantic Versioning](https://semver.org/).
@@ -7,40 +7,58 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
+Production resilience for live registry traffic: reactive retries and rate-limit handling, custom CA trust bundles, tighter HTTP and cache limits, resolver performance improvements, and memory-ownership hardening across `resolve`, `validate`, and `getManifest`.
+
 ### Added
 
-- Reactive transport retries on manifest `HEAD`/`GET` and token HTTP exchangers, with separate `max_network_retries` and `max_rate_limit_retries` budgets.
-- Opt-in pre-emptive manifest throttling when `Config.rate_limit_enabled` is true and registry `RateLimit-*` headers are trustworthy (`remaining == 0`).
-- `Config.ca_bundle_path` to load a PEM CA trust bundle at `resolve`, `validate`, and `getManifest` entry for enterprise and self-hosted registries.
-- `Config.max_manifest_bytes`, `max_token_response_bytes`, and `max_token_cache_entries` to cap live HTTP bodies and token-cache growth.
-- `ResolveError.rate_limited`, `network_error`, and `timeout` now expose `transport_retries_exhausted` to distinguish immediate hard failures from post-retry exhaustion.
-- `Manifest.parseMediaTypeShallow` for resolve workloads that need only manifest media type, not full document contents.
-- `json.parseBorrowing` and `json.promoteParsed` for borrowing input bytes or moving a parsed value onto the caller allocator.
-- Fixture-backed resilience header negative cases under `fixtures/resilience/`.
-- Build-time PEM private-key scan via `zig build security-check` (also runs as part of `zig build test`).
-- Deterministic benchmark ops in `z-oci-bench`: `resolve-single-retry`, `authenticate-rate-limit`, and `resolve-session` (reused `AuthEngine`).
-- DebugAllocator repeated-run checks for manifest HEAD and token-exchange retry wrappers.
-- Pre-release benchmark baseline at `benchmarks/baselines/v0.4.0.json`.
+- **Retries and rate limits**
+    - Reactive transport retries on manifest `HEAD`/`GET` and token HTTP exchangers, with separate `max_network_retries` and `max_rate_limit_retries` budgets.
+    - Opt-in pre-emptive manifest throttling when `Config.rate_limit_enabled` is true and registry `RateLimit-*` headers are trustworthy (`remaining == 0`).
+    - `ResolveError.rate_limited`, `network_error`, and `timeout` expose `transport_retries_exhausted` so callers can tell immediate failures from post-retry exhaustion.
+- **TLS and request limits**
+    - `Config.ca_bundle_path` to load a PEM CA trust bundle at `resolve`, `validate`, and `getManifest` for enterprise and self-hosted registries.
+    - `Config.max_manifest_bytes`, `max_token_response_bytes`, and `max_token_cache_entries` to cap live HTTP bodies and token-cache growth.
+- **Parsing helpers**
+    - `Manifest.parseMediaTypeShallow` for workloads that need only manifest media type, not a full document parse.
+    - `json.parseBorrowing` and `json.promoteParsed` to borrow input bytes or move a parsed value onto the caller allocator.
+- **Tooling**
+    - Build-time PEM private-key scan via `zig build security-check` (also runs as part of `zig build test`).
+    - New `z-oci-bench` operations: `resolve-single-retry`, `authenticate-rate-limit`, and `resolve-session` (reused `AuthEngine`).
 
 ### Changed
 
-- Manifest and token transport wrappers share one reactive retry loop in `resilience.zig` instead of duplicating sleep/retry branches in `auth.zig` and `resolver.zig`.
-- `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, rejects private-key PEM markers in CA bundles, and skips reload when path and mtime are unchanged for the same client.
-- Public docs (`README.md`, `Config.zig`, `resilience.zig`) now describe live retry budgets, CA bundle behavior, and registry header assumptions honestly.
-- Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; uses stack SHA-256 hex before digest string allocation; drops wasted GET metadata clones.
-- Manifest and token retry loops cache built request fields lazily (attempt 2+) so single-shot paths pay no cache overhead.
-- Token cache uses a bounded `HashMap` with LRU eviction, borrowed key lookup on hits, remembered GET/POST method per realm, default 60s TTL when `expires_in` is absent, and single-owner token storage on cache miss.
-- Docker config loading builds a registry index at parse time and decodes credentials lazily per registry instead of materializing the full auth tree up front.
-- `resolve`, `validate`, and `getManifest` run transient work in a per-call arena and promote caller-owned success values (`Parsed(Manifest)`, references, errors) onto the caller allocator.
-- Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
-- Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
+- **Transport**
+    - Manifest and token HTTP wrappers share one reactive retry loop in `resilience.zig` instead of duplicating sleep/retry logic in `auth.zig` and `resolver.zig`.
+    - Manifest and token retry loops cache built request fields lazily (attempt 2+) so single-shot paths pay no cache overhead.
+    - Single-attempt paths no longer allocate retry caches up front; retryable GET failures keep the downloaded body for the next attempt.
+- **TLS**
+    - `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, rejects private-key PEM markers in CA bundles, and skips reload when path and mtime are unchanged for the same client.
+- **Auth and credentials**
+    - Docker config loading builds a registry index at parse time and decodes credentials lazily per registry instead of materializing the full auth tree up front.
+    - Token cache uses a bounded `HashMap` with LRU eviction, borrowed key lookup on hits, remembered GET/POST method per realm, default 60s TTL when `expires_in` is absent, and single-owner token storage on cache miss.
+    - `AuthEngine.credentialForRegistry` returns `AuthError!?CredentialHandle`: allocation failures propagate as `OutOfMemory` instead of anonymous fallback; malformed docker-config auth for the requested registry still yields `null`.
+- **Resolver performance and memory model**
+    - `resolve`, `validate`, and `getManifest` run transient work in a per-call arena and promote caller-owned success values (`Parsed(Manifest)`, references, errors) onto the caller allocator.
+    - Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; uses stack SHA-256 hex before digest string allocation; drops wasted GET metadata clones.
+    - Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
+    - Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
+- **Documentation**
+    - Public docs (`README.md`, `Config.zig`, `resilience.zig`) describe live retry budgets, CA bundle behavior, and registry header assumptions.
 
 ### Fixed
 
-- Redirect-without-`Location` and exhausted reactive failures now preserve HTTP status and retry-budget context on the public resolver error path.
-- `recurseIntoMultiArchDocument` parent document lifecycle on `platform_required` / `platform_not_found` early returns (no DebugAllocator leaks).
-- Single-attempt manifest and token paths no longer pay extra retry-cache allocations; retryable GET failures no longer discard the downloaded body before the next attempt.
-- `getManifest` and related failure paths preserve owned reference strings after transient arena teardown.
+- **Credentials and secrets**
+    - Owned credential and token HTTP POST secret buffers are zeroed before release.
+    - Docker config parse and teardown under allocation failure no longer double-free registry index keys.
+- **Ownership and promotion**
+    - Resolve, validate, and getManifest preserve caller-owned reference strings on failure and clear transient storage after promotion.
+    - Manifest promotion detaches digest and parsed-document fields from the transient resolve shell before teardown, avoiding digest alias use-after-free.
+    - `json.promoteParsed` destroys the source parse tree only after a successful promotion onto the caller allocator.
+    - Validate manifest HEAD path releases owned response metadata through one outcome teardown (including GET-fallback and redirect arms).
+- **Transport errors**
+    - Redirect-without-`Location` and exhausted reactive failures preserve HTTP status and retry-budget context on the public resolver error path.
+- **Multi-arch**
+    - `recurseIntoMultiArchDocument` tears down the parent index document correctly on `platform_required` and `platform_not_found` early returns.
 
 ## [0.3.0] - 2026-05-24 - [Tagged]
 
