@@ -49,6 +49,7 @@ pub const AuthError = error{
     InsecureRealmUrl,
     InvalidTokenResponse,
     TokenExchangeFailed,
+    RateLimited,
     HelperFailed,
     HelperTimedOut,
     ConnectionResetByPeer,
@@ -255,7 +256,7 @@ pub const CachedToken = struct {
 /// (`max_retries`), transport retry budgets on token HTTP (via resilience), and
 /// `ca_bundle_path` via `Config.applyToClient` at the public API boundary.
 /// Pre-emptive rate limiting (`rate_limit_enabled`) applies on manifest transport
-/// via `AuthEngine.manifest_throttle`.
+/// via resolver `ResolverParams.manifest_throttle`.
 pub const AuthConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,
@@ -367,8 +368,6 @@ pub const AuthEngine = struct {
     /// are dropped on lookup.
     token_cache: TokenCacheMap = .empty,
     preferred_token_method_by_realm: std.StringHashMapUnmanaged(TokenRequestMethod) = .{},
-    /// Last trustworthy registry `RateLimit-*` snapshot for manifest pre-emption.
-    manifest_throttle: resilience.ManifestThrottle = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
         return .{
@@ -601,6 +600,8 @@ pub const AuthEngine = struct {
     ) AuthError!TokenResponse {
         const methods = preferredTokenMethodsForRealm(self, request.challenge.realm);
 
+        var saw_rate_limited = false;
+        var saw_non_rate_limited_failure = false;
         for (methods) |method| {
             const response = try exchangeTokenHttpRequestWithRetries(
                 self,
@@ -610,12 +611,20 @@ pub const AuthEngine = struct {
                 credential,
             );
             defer response.deinit(self.allocator);
-            if (response.status != .ok) continue;
+            if (response.status == .too_many_requests) {
+                saw_rate_limited = true;
+                continue;
+            }
+            if (response.status != .ok) {
+                saw_non_rate_limited_failure = true;
+                continue;
+            }
 
             try rememberPreferredTokenMethod(self, request.challenge.realm, method);
             return try parseTokenResponse(self.allocator, response.body);
         }
 
+        if (saw_rate_limited and !saw_non_rate_limited_failure) return error.RateLimited;
         return error.TokenExchangeFailed;
     }
 
@@ -3751,6 +3760,44 @@ test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
                 .resilience_headers = &.{
                     .{ .name = "Retry-After", .value = "1" },
                 },
+            };
+        }
+    };
+
+    defer State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_rate_limit_retries = 0,
+    }, State.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    try std.testing.expectError(error.RateLimited, engine.authenticate(&client, request));
+    try std.testing.expectEqual(@as(usize, 2), State.calls);
+}
+test "AuthEngine.authenticate: GET 429 then POST auth failure stays TokenExchangeFailed" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+            return switch (request.method) {
+                .get => .{
+                    .status = .too_many_requests,
+                    .body = "",
+                    .resilience_headers = &.{
+                        .{ .name = "Retry-After", .value = "1" },
+                    },
+                },
+                .post => .{ .status = .unauthorized, .body = "" },
             };
         }
     };

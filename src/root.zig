@@ -53,10 +53,10 @@ pub const OciImageIndex = Index.OciImageIndex;
 pub const DockerManifestList = Index.DockerManifestList;
 pub const MultiArchManifest = Index.MultiArchManifest;
 pub const Reference = @import("Reference.zig");
+/// Full auth module for integrators and mock exchanger authors (`z_oci.auth.*`).
 pub const auth = @import("auth.zig");
 pub const json = @import("json.zig");
 pub const AuthEngine = auth.AuthEngine;
-pub const AuthError = auth.AuthError;
 pub const AuthChallenge = auth.AuthChallenge;
 pub const AuthReferenceView = auth.AuthReferenceView;
 pub const BearerChallenge = auth.BearerChallenge;
@@ -66,14 +66,17 @@ pub const ProbeHttpResponse = auth.ProbeHttpResponse;
 pub const referenceView = auth.referenceView;
 pub const Token = auth.Token;
 pub const TokenResponse = auth.TokenResponse;
-pub const TokenCacheKey = auth.TokenCacheKey;
-pub const CachedToken = auth.CachedToken;
 pub const ResolveError = @import("ResolveError.zig").ResolveError;
 pub const ResolveResult = @import("ResolveResult.zig");
 pub const Config = @import("Config.zig").Config;
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
 pub const CredentialHandle = @import("Config.zig").CredentialHandle;
+/// Errors returned directly from public entry points before an outcome is produced.
+///
+/// Covers `Config.applyToClient` failures and `OutOfMemory` during outcome promotion.
+/// Structured resolve failures use `ResolveError` inside outcome `.failure` arms; release
+/// those with `deinitResolveFailure`.
 pub const PublicApiError = Config.ApplyError;
 /// Narrow testing seam for repository smoke tests.
 ///
@@ -155,6 +158,54 @@ pub const testing = struct {
         );
     }
 
+    pub fn validateWithEngine(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        config: Config,
+        engine: *auth.AuthEngine,
+        ref: Reference,
+        platform: ?Platform,
+        token_exchanger: TokenHttpExchanger,
+        manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
+    ) PublicApiError!ValidateOutcome {
+        return root.validateWithEngine(
+            allocator,
+            client,
+            config,
+            engine,
+            ref,
+            platform,
+            token_exchanger,
+            manifest_exchanger,
+            transport_hooks,
+        );
+    }
+
+    pub fn getManifestWithEngine(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        config: Config,
+        engine: *auth.AuthEngine,
+        ref: Reference,
+        platform: ?Platform,
+        token_exchanger: TokenHttpExchanger,
+        manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
+    ) PublicApiError!ManifestOutcome {
+        return root.getManifestWithEngine(
+            allocator,
+            client,
+            config,
+            engine,
+            ref,
+            platform,
+            token_exchanger,
+            manifest_exchanger,
+            transport_hooks,
+        );
+    }
+
     pub fn getManifestWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -178,22 +229,35 @@ pub const testing = struct {
     }
 
     pub fn deinitResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
-        root.deinitOwnedResolveError(failure, allocator);
+        root.deinitResolveFailure(failure, allocator);
     }
 };
+/// Outcome of `resolve`: owned success payload or owned failure context.
+///
+/// On `.failure`, call `deinitResolveFailure(failure, allocator)`.
 pub const ResolveOutcome = union(enum) {
     success: ResolveResult,
     failure: ResolveError,
 };
+/// Outcome of `validate`: terminal status or owned failure context.
+///
+/// On `.failure`, call `deinitResolveFailure(failure, allocator)`.
 pub const ValidateOutcome = union(enum) {
     valid,
     not_found,
     failure: ResolveError,
 };
+/// Outcome of `getManifest`: arena-owned parsed manifest or owned failure context.
+///
+/// On `.success`, call `parsed.deinit()`. On `.failure`, call `deinitResolveFailure`.
 pub const ManifestOutcome = union(enum) {
     success: std.json.Parsed(Manifest),
     failure: ResolveError,
 };
+/// Release caller-owned storage inside a `ResolveError` from a public outcome `.failure` arm.
+pub fn deinitResolveFailure(failure: ResolveError, allocator: std.mem.Allocator) void {
+    failure.deinitOwned(allocator);
+}
 // --- Public resolve API ---
 
 /// Resolve an image reference to a pinned manifest digest.
@@ -206,15 +270,8 @@ pub const ManifestOutcome = union(enum) {
 /// - If the allocator is an arena, tearing the arena down is also sufficient.
 /// - `ResolveResult.clone()` is only needed when moving the result into a different allocator.
 ///
-/// Auth handoff contract:
-/// - derive `AuthReferenceView` from the normalized `Reference` with `referenceView(ref)`
-/// - manifest HEAD/GET is the live probe path today; a `401` with `WWW-Authenticate`
-///   triggers auth via `ProbeHttpResponse.classify()` on response metadata
-/// - turn that bearer challenge into `AuthenticateRequest.init(view.registry, challenge)` and call
-///   `AuthEngine.authenticate(...)`
-/// - attach the returned bearer token to the retried HEAD/GET request; if that retry comes back
-///   `401`, call `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)` once for the same
-///   request and surface failure after that single retry
+/// Auth: manifest `HEAD`/`GET` drives registry probes; `401` bearer challenges, token
+/// exchange, and cached-401 retry are handled inside `resolver` + `auth` (see module filedocs).
 pub fn resolve(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -240,12 +297,9 @@ pub fn resolve(
 /// - The caller still owns `allocator`; the resolver uses it for transient request shaping,
 ///   parsing, and any structured failure context that must outlive internal temporaries.
 ///
-/// Auth handoff contract:
-/// - validation follows the same manifest HEAD/GET -> classify -> authenticate -> retry-once flow as `resolve`
-/// - validation must treat `.not_found` as terminal and must not attempt auth in that case
-/// - multi-arch validation follows the selected child manifest when `platform` is provided
-/// - multi-arch validation returns `ResolveError.platform_required` instead of guessing a child when
-///   `platform` is null
+/// Auth: same manifest/auth pipeline as `resolve` (internal to resolver/auth).
+/// Validation treats `.not_found` as terminal. Multi-arch without `platform` returns
+/// `ResolveError.platform_required`.
 pub fn validate(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -271,12 +325,8 @@ pub fn validate(
 /// - Call parsed.deinit() when finished.
 /// - Do not free the allocator backing that arena while the parsed value is still in use.
 ///
-/// Auth handoff contract:
-/// - manifest GET uses the same `AuthReferenceView` and `AuthenticateRequest` boundary as `resolve`
-/// - auth owns token exchange and cache invalidation; manifest fetch owns Accept negotiation,
-///   response status handling, and JSON parsing
-/// - multi-arch GET returns `ResolveError.platform_required` instead of guessing a child when
-///   `platform` is null
+/// Auth: same manifest/auth pipeline as `resolve` (internal to resolver/auth).
+/// Multi-arch without `platform` returns `ResolveError.platform_required`.
 pub fn getManifest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -448,7 +498,7 @@ fn resolveWithEngine(
     engine: *auth.AuthEngine,
     ref: Reference,
     platform: ?Platform,
-    token_exchanger: auth.TokenHttpExchanger,
+    _: auth.TokenHttpExchanger,
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ResolveOutcome {
@@ -456,6 +506,7 @@ fn resolveWithEngine(
     defer resolve_arena.deinit();
     const transient = resolve_arena.allocator();
 
+    var manifest_throttle: resilience.ManifestThrottle = .{};
     var outcome = try fetchResolvedManifestWithExchangers(
         transient,
         client,
@@ -463,11 +514,11 @@ fn resolveWithEngine(
         engine,
         referenceView(ref),
         platform,
-        token_exchanger,
         manifest_exchanger,
         .resolve,
         0,
         transport_hooks,
+        &manifest_throttle,
     );
     switch (outcome) {
         .success => |*success| {
@@ -508,12 +559,35 @@ fn validateWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ValidateOutcome {
-    try ensureClientConfigured(config, client);
-
     var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
+    return validateWithEngine(
+        allocator,
+        client,
+        config,
+        &engine,
+        ref,
+        platform,
+        token_exchanger,
+        manifest_exchanger,
+        transport_hooks,
+    );
+}
+fn validateWithEngine(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    ref: Reference,
+    platform: ?Platform,
+    _: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+) PublicApiError!ValidateOutcome {
+    try ensureClientConfigured(config, client);
 
     const ref_view = referenceView(ref);
+    var manifest_throttle: resilience.ManifestThrottle = .{};
     const ctx = resolver.ResolverParams.initWithTransportHooks(
         allocator,
         client,
@@ -522,24 +596,27 @@ fn validateWithExchangers(
         platform,
         .validate,
         transport_hooks,
-    );
+    ).withManifestThrottle(&manifest_throttle);
 
-    const head_outcome = try resolver.performManifestHead(ctx, &engine, manifest_exchanger, manifestAcceptValues());
+    const head_outcome = try resolver.performManifestHead(ctx, engine, manifest_exchanger, manifestAcceptValues());
     var owned_head_outcome = head_outcome;
     defer owned_head_outcome.deinit(allocator);
-    switch (owned_head_outcome) {
-        .validate_manifest_ok => return .valid,
-        .success => |metadata| {
+
+    const head_decision = try resolver.classifyValidateManifestHead(allocator, ref_view, &owned_head_outcome);
+    switch (head_decision) {
+        .valid => return .valid,
+        .not_found => return .not_found,
+        .owned_failure => |failure| return .{ .failure = try promoteResolveErrorAlloc(allocator, failure) },
+        .inspect_multi_arch_head => {
+            const metadata = switch (owned_head_outcome) {
+                .success => |value| value,
+                else => unreachable,
+            };
             if (try validateOutcomeFromHeadMetadata(allocator, ref_view, platform, metadata)) |outcome| {
                 return outcome;
             }
         },
-        .use_get_fallback => {},
-        .not_found => return .not_found,
-        .redirect => |metadata| {
-            return .{ .failure = try networkErrorAlloc(allocator, ref_view, metadata.httpStatus()) };
-        },
-        .failure => |failure| return .{ .failure = failure },
+        .proceed_with_get => {},
     }
 
     var validate_arena = std.heap.ArenaAllocator.init(allocator);
@@ -550,14 +627,14 @@ fn validateWithExchangers(
         transient,
         client,
         config,
-        &engine,
+        engine,
         ref_view,
         platform,
-        token_exchanger,
         manifest_exchanger,
         .validate,
         0,
         transport_hooks,
+        &manifest_throttle,
     );
     return try validateOutcomeFromResolvedManifestOutcome(allocator, transient, &outcome);
 }
@@ -626,27 +703,50 @@ fn getManifestWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ManifestOutcome {
+    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
+    defer engine.deinit();
+    return getManifestWithEngine(
+        allocator,
+        client,
+        config,
+        &engine,
+        ref,
+        platform,
+        token_exchanger,
+        manifest_exchanger,
+        transport_hooks,
+    );
+}
+fn getManifestWithEngine(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    ref: Reference,
+    platform: ?Platform,
+    _: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+) PublicApiError!ManifestOutcome {
     try ensureClientConfigured(config, client);
 
     var get_arena = std.heap.ArenaAllocator.init(allocator);
     defer get_arena.deinit();
     const transient = get_arena.allocator();
 
-    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
-    defer engine.deinit();
-
+    var manifest_throttle: resilience.ManifestThrottle = .{};
     var outcome = try fetchResolvedManifestWithExchangers(
         transient,
         client,
         config,
-        &engine,
+        engine,
         referenceView(ref),
         platform,
-        token_exchanger,
         manifest_exchanger,
         .get_manifest,
         0,
         transport_hooks,
+        &manifest_throttle,
     );
     switch (outcome) {
         .success => |*success| {
@@ -664,36 +764,27 @@ fn validateResolvedManifestFromChildHead(
     ref_view: AuthReferenceView,
     head_outcome: resolver.HeadRequestOutcome,
 ) PublicApiError!ResolvedManifestOutcome {
-    switch (head_outcome) {
-        .validate_manifest_ok => |media_type| {
+    var owned_head = head_outcome;
+    defer owned_head.deinit(allocator);
+    const mapped = try resolver.mapChildValidateHeadOutcome(allocator, ref_view, &owned_head);
+    return switch (mapped) {
+        .success_manifest_media_type => |media_type| blk: {
             const resolved_digest = Digest.parse(ref_view.ref_string) catch {
-                return .{ .failure = try digestMismatchErrorAlloc(allocator, ref_view) };
+                break :blk .{ .failure = try digestMismatchErrorAlloc(allocator, ref_view) };
             };
             const resolved_digest_raw = try allocator.dupe(u8, ref_view.ref_string);
             errdefer allocator.free(resolved_digest_raw);
 
-            return .{ .success = .{
+            break :blk .{ .success = .{
                 .resolved_digest = resolved_digest,
                 .resolved_digest_raw = resolved_digest_raw,
                 .document = .{ .manifest_media_type = media_type },
                 .platform = null,
             } };
         },
-        .not_found => return .{ .failure = try notFoundErrorAlloc(allocator, ref_view) },
-        .redirect => |metadata| {
-            defer metadata.deinitOwned(allocator);
-            return .{ .failure = try networkErrorAlloc(allocator, ref_view, metadata.httpStatus()) };
-        },
-        .failure => |failure| return .{ .failure = failure },
-        .success => |metadata| {
-            defer metadata.deinitOwned(allocator);
-            return .{ .failure = try contentTypeMismatchErrorAlloc(allocator, ref_view) };
-        },
-        .use_get_fallback => |metadata| {
-            metadata.deinitOwned(allocator);
-            return .{ .failure = try manifestParseErrorAlloc(allocator, ref_view) };
-        },
-    }
+        .not_found => .{ .failure = try notFoundErrorAlloc(allocator, ref_view) },
+        .owned_failure => |failure| .{ .failure = failure },
+    };
 }
 fn digestMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .digest_mismatch, null);
@@ -711,11 +802,11 @@ fn fetchResolvedManifestWithExchangers(
     engine: *auth.AuthEngine,
     ref_view: AuthReferenceView,
     platform: ?Platform,
-    _: auth.TokenHttpExchanger,
     manifest_exchanger: resolver.ManifestHttpExchanger,
     operation: resolver.ResolverOperation,
     depth: usize,
     transport_hooks: resilience.TransportHooks,
+    manifest_throttle: *resilience.ManifestThrottle,
 ) PublicApiError!ResolvedManifestOutcome {
     if (depth > MAX_CHILD_MANIFEST_DEPTH) {
         return .{ .failure = try depthLimitExceededErrorAlloc(allocator, ref_view) };
@@ -732,7 +823,7 @@ fn fetchResolvedManifestWithExchangers(
             else => .resolve_child_manifest,
         },
         transport_hooks,
-    );
+    ).withManifestThrottle(manifest_throttle);
 
     if (operation == .validate and depth > 0) {
         const head_outcome = try resolver.performManifestHead(ctx, engine, manifest_exchanger, manifestAcceptValues());
@@ -772,6 +863,8 @@ fn fetchResolvedManifestWithExchangers(
                         resolved_digest_raw,
                         document,
                         backing_body,
+                        transport_hooks,
+                        manifest_throttle,
                         .{ .oci = parsed.value },
                     );
                 },
@@ -789,6 +882,8 @@ fn fetchResolvedManifestWithExchangers(
                         resolved_digest_raw,
                         document,
                         backing_body,
+                        transport_hooks,
+                        manifest_throttle,
                         .{ .docker = parsed.value },
                     );
                 },
@@ -815,6 +910,8 @@ fn recurseIntoMultiArchDocument(
     parent_digest_raw: []u8,
     parent_document: resolver.ParsedManifestDocument,
     parent_backing_body: ?[]u8,
+    transport_hooks: resilience.TransportHooks,
+    manifest_throttle: *resilience.ManifestThrottle,
     multi_arch: MultiArchManifest,
 ) PublicApiError!ResolvedManifestOutcome {
     defer allocator.free(parent_digest_raw);
@@ -857,11 +954,11 @@ fn recurseIntoMultiArchDocument(
             .ref_string = child_ref_string,
         },
         platform,
-        auth.liveTokenHttpExchanger,
         manifest_exchanger,
         operation,
         depth + 1,
-        engine.transport_hooks,
+        transport_hooks,
+        manifest_throttle,
     );
 
     switch (child_outcome) {
@@ -943,12 +1040,7 @@ fn allocatedResolveError(
     comptime tag: std.meta.Tag(ResolveError),
     http_status: ?u16,
 ) !ResolveError {
-    const reference = try resolver.canonicalReferenceAlloc(allocator, ref);
-    return @unionInit(ResolveError, @tagName(tag), .{
-        .registry = ref.registry,
-        .reference = reference,
-        .http_status = http_status,
-    });
+    return resolver.ownedResolveErrorAlloc(allocator, ref, tag, http_status);
 }
 fn clonePlatformAlloc(allocator: std.mem.Allocator, platform: Platform) !Platform {
     const os = try allocator.dupe(u8, platform.os);
@@ -1010,7 +1102,7 @@ fn deinitOwnedPlatform(platform: Platform, allocator: std.mem.Allocator) void {
     if (platform.os_features) |features| freePlatformFeatures(features, allocator);
 }
 fn deinitOwnedResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
-    failure.deinitOwned(allocator);
+    deinitResolveFailure(failure, allocator);
 }
 fn promoteManifestParsedAlloc(
     allocator: std.mem.Allocator,

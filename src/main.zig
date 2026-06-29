@@ -7,5 +7,20 @@
 //! Today the packaged examples provide the practical command-line entrypoints
 //! for live resolver and offline fixture workflows.
 
-// Intentionally empty scaffold until the real CLI phase lands.
-pub fn main() void {}
+const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    var stderr_buffer: [512]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    defer stderr_writer.end() catch {};
+    try stderr_writer.interface.writeAll(
+        \\z-oci: CLI scaffold (Phase 7 deferred).
+        \\
+        \\Use packaged examples instead:
+        \\  zig build example-resolve-reference -- ubuntu:22.04
+        \\  zig build example-normalize-reference -- ubuntu:22.04
+        \\  zig build example-inspect-manifest
+        \\  zig build example-select-platform
+        \\
+    );
+}

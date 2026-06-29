@@ -941,6 +941,100 @@
       }
     },
     {
+      "command": "./zig-out/bin/z-oci-bench resolve-session --iterations 1000",
+      "sample_count": 83,
+      "argv": [
+        "./zig-out/bin/z-oci-bench",
+        "resolve-session",
+        "--iterations",
+        "1000"
+      ],
+      "wall_time": {
+        "mean": 48438821.61445783,
+        "std_dev": 1880464.7433711363,
+        "min": 46005350,
+        "max": 54641678,
+        "median": 47769878,
+        "q1": 47234206,
+        "q3": 48812553,
+        "outlier_count": 9,
+        "sample_count": 83,
+        "unit": "nanoseconds"
+      },
+      "peak_rss": {
+        "mean": 1089536,
+        "std_dev": 0,
+        "min": 1089536,
+        "max": 1089536,
+        "median": 1089536,
+        "q1": 1089536,
+        "q3": 1089536,
+        "outlier_count": 0,
+        "sample_count": 83,
+        "unit": "bytes"
+      },
+      "cpu_cycles": {
+        "mean": 764145129.8433735,
+        "std_dev": 437866009.82518464,
+        "min": 18043335,
+        "max": 1507391657,
+        "median": 764592346,
+        "q1": 383009721,
+        "q3": 1164852707,
+        "outlier_count": 0,
+        "sample_count": 83,
+        "unit": "count"
+      },
+      "instructions": {
+        "mean": 1237635392.0722892,
+        "std_dev": 710283035.2133774,
+        "min": 29467547,
+        "max": 2445803035,
+        "median": 1237635569,
+        "q1": 618817751,
+        "q3": 1885920443,
+        "outlier_count": 0,
+        "sample_count": 83,
+        "unit": "count"
+      },
+      "cache_references": {
+        "mean": 72336737.38554217,
+        "std_dev": 41465626.989793114,
+        "min": 1702913,
+        "max": 142770696,
+        "median": 72315752,
+        "q1": 36231127,
+        "q3": 110256602,
+        "outlier_count": 0,
+        "sample_count": 83,
+        "unit": "count"
+      },
+      "cache_misses": {
+        "mean": 4548843.469879518,
+        "std_dev": 2575273.943841795,
+        "min": 79195,
+        "max": 8769105,
+        "median": 4578055,
+        "q1": 2357394,
+        "q3": 7004235,
+        "outlier_count": 0,
+        "sample_count": 83,
+        "unit": "count"
+      },
+      "branch_misses": {
+        "mean": 3736270.4096385543,
+        "std_dev": 2140070.386323806,
+        "min": 90694,
+        "max": 7366104,
+        "median": 3728368,
+        "q1": 1867928,
+        "q3": 5696089,
+        "outlier_count": 0,
+        "sample_count": 83,
+        "unit": "count"
+      }
+    },
+    {
       "command": "./zig-out/bin/z-oci-bench resolve-multi --iterations 1000",
       "sample_count": 14,
       "argv": [

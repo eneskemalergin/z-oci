@@ -40,6 +40,8 @@ pub const ResolverParams = struct {
     platform: ?Platform,
     operation: ResolverOperation,
     transport_hooks: resilience.TransportHooks = .{},
+    /// Optional manifest pre-emptive throttle state shared across HEAD/GET in one resolve session.
+    manifest_throttle: ?*resilience.ManifestThrottle = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -89,6 +91,12 @@ pub const ResolverParams = struct {
             operation,
             resilience.liveTransportHooks(),
         );
+    }
+
+    pub fn withManifestThrottle(self: ResolverParams, throttle: *resilience.ManifestThrottle) ResolverParams {
+        var copy = self;
+        copy.manifest_throttle = throttle;
+        return copy;
     }
 };
 /// Manifest request shape for resolver transport operations.
@@ -423,6 +431,95 @@ pub const HeadRequestOutcome = union(enum) {
         }
     }
 };
+/// Resolver decision after the validate HEAD phase before optional GET fallback.
+pub const ValidateManifestHeadDecision = union(enum) {
+    valid,
+    not_found,
+    owned_failure: ResolveError,
+    inspect_multi_arch_head,
+    proceed_with_get,
+};
+/// Classify a validate HEAD outcome for the public validate API.
+///
+/// On `.owned_failure`, the failure reference is extracted from `head_outcome`
+/// so `head_outcome.deinit` does not double-free it.
+pub fn classifyValidateManifestHead(
+    allocator: std.mem.Allocator,
+    ref_view: auth.AuthReferenceView,
+    head_outcome: *HeadRequestOutcome,
+) error{OutOfMemory}!ValidateManifestHeadDecision {
+    switch (head_outcome.*) {
+        .validate_manifest_ok => return .valid,
+        .not_found => return .not_found,
+        .failure => |failure| {
+            const extracted = failure;
+            head_outcome.* = .not_found;
+            return .{ .owned_failure = extracted };
+        },
+        .redirect => |*metadata| {
+            const http_status = metadata.httpStatus();
+            metadata.releaseOwned(allocator);
+            head_outcome.* = .not_found;
+            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .network_error, http_status) };
+        },
+        .use_get_fallback => return .proceed_with_get,
+        .success => return .inspect_multi_arch_head,
+    }
+}
+/// Outcome of mapping a child-manifest validate HEAD before GET fallback.
+pub const ChildValidateHeadMappedOutcome = union(enum) {
+    success_manifest_media_type: MediaType,
+    not_found,
+    owned_failure: ResolveError,
+};
+/// Map child-manifest validate HEAD outcomes into resolver-owned failure context.
+pub fn mapChildValidateHeadOutcome(
+    allocator: std.mem.Allocator,
+    ref_view: auth.AuthReferenceView,
+    head_outcome: *HeadRequestOutcome,
+) error{OutOfMemory}!ChildValidateHeadMappedOutcome {
+    switch (head_outcome.*) {
+        .validate_manifest_ok => |media_type| return .{ .success_manifest_media_type = media_type },
+        .not_found => return .not_found,
+        .failure => |failure| {
+            const extracted = failure;
+            head_outcome.* = .not_found;
+            return .{ .owned_failure = extracted };
+        },
+        .redirect => |*metadata| {
+            const http_status = metadata.httpStatus();
+            metadata.releaseOwned(allocator);
+            head_outcome.* = .not_found;
+            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .network_error, http_status) };
+        },
+        .success => |*metadata| {
+            const http_status = metadata.httpStatus();
+            metadata.releaseOwned(allocator);
+            head_outcome.* = .not_found;
+            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .content_type_mismatch, http_status) };
+        },
+        .use_get_fallback => |*metadata| {
+            const http_status = metadata.httpStatus();
+            metadata.releaseOwned(allocator);
+            head_outcome.* = .not_found;
+            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .manifest_parse_error, http_status) };
+        },
+    }
+}
+/// Build a caller-owned `ResolveError` with canonical reference string.
+pub fn ownedResolveErrorAlloc(
+    allocator: std.mem.Allocator,
+    ref: auth.AuthReferenceView,
+    comptime tag: std.meta.Tag(ResolveError),
+    http_status: ?u16,
+) error{OutOfMemory}!ResolveError {
+    const reference = try canonicalReferenceAlloc(allocator, ref);
+    return @unionInit(ResolveError, @tagName(tag), .{
+        .registry = ref.registry,
+        .reference = reference,
+        .http_status = http_status,
+    });
+}
 pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.AuthReferenceView) ![]u8 {
     const separator: []const u8 = if (Digest.parse(reference.ref_string)) |_| "@" else |_| ":";
     return std.fmt.allocPrint(
@@ -791,6 +888,12 @@ fn resolveErrorFromAuthError(
             .reference = reference,
             .http_status = http_status,
         } },
+        error.RateLimited => .{ .rate_limited = .{
+            .registry = registry,
+            .reference = reference,
+            .http_status = http_status orelse @intFromEnum(std.http.Status.too_many_requests),
+            .transport_retries_exhausted = true,
+        } },
         else => .{ .auth_failed = .{
             .registry = registry,
             .reference = reference,
@@ -946,7 +1049,8 @@ fn exchangeManifestRequest(
 }
 fn beforeManifestExchangeAttempt(ctx_ptr: *anyopaque) void {
     const loop_ctx: *const ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
-    loop_ctx.engine.manifest_throttle.sleepBeforeManifestRequestIfNeeded(
+    const throttle = loop_ctx.resolver_ctx.manifest_throttle orelse return;
+    throttle.sleepBeforeManifestRequestIfNeeded(
         loop_ctx.resolver_ctx.config,
         loop_ctx.resolver_ctx.client,
         loop_ctx.resolver_ctx.transport_hooks,
@@ -954,7 +1058,8 @@ fn beforeManifestExchangeAttempt(ctx_ptr: *anyopaque) void {
 }
 fn afterManifestExchangeAttempt(ctx_ptr: *anyopaque, _: std.http.Status, headers: []const resilience.HttpHeader) void {
     const loop_ctx: *const ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
-    loop_ctx.engine.manifest_throttle.recordManifestResponseHeaders(headers);
+    const throttle = loop_ctx.resolver_ctx.manifest_throttle orelse return;
+    throttle.recordManifestResponseHeaders(headers);
 }
 fn manifestExchangeOnceOpaque(ctx_ptr: *anyopaque) ManifestExchangeError!ManifestHttpResponse {
     const loop_ctx: *ManifestExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
@@ -1874,6 +1979,10 @@ test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible 
     const auth_failed = try resolveErrorFromAuthError(error.TokenExchangeFailed, "r", "ref", 401);
     try std.testing.expectEqualStrings("auth_failed", @tagName(auth_failed));
 
+    const rate_limited = try resolveErrorFromAuthError(error.RateLimited, "r", "ref", 429);
+    try std.testing.expectEqualStrings("rate_limited", @tagName(rate_limited));
+    try std.testing.expect(rate_limited.rate_limited.transport_retries_exhausted);
+
     const transport_timeout = try resolveErrorFromAuthError(error.Timeout, "r", "ref", null);
     try std.testing.expectEqualStrings("timeout", @tagName(transport_timeout));
 
@@ -2312,17 +2421,18 @@ test "performManifestGet preemptive sleep before request when engine carries exh
     };
 
     var client: std.http.Client = undefined;
+    var manifest_throttle: resilience.ManifestThrottle = .{
+        .prior = .{
+            .source = .registry_rate_limit,
+            .limit = 100,
+            .remaining = 0,
+            .reset_unix_seconds = 1_700_000_030,
+        },
+    };
     var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(std.testing.allocator, .{
         .rate_limit_enabled = true,
     }, State.tokenExchange, hooks);
     defer engine.deinit();
-
-    engine.manifest_throttle.prior = .{
-        .source = .registry_rate_limit,
-        .limit = 100,
-        .remaining = 0,
-        .reset_unix_seconds = 1_700_000_030,
-    };
 
     const ctx = ResolverParams.initWithTransportHooks(
         std.testing.allocator,
@@ -2332,7 +2442,7 @@ test "performManifestGet preemptive sleep before request when engine carries exh
         null,
         .resolve,
         hooks,
-    );
+    ).withManifestThrottle(&manifest_throttle);
 
     var outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(std.testing.allocator);

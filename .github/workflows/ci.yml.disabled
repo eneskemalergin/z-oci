@@ -26,7 +26,7 @@ jobs:
           tar xf zig-linux-x86_64-0.16.0.tar.xz
 
       - name: zig build test
-        run: ./zig-0.16.0/zig build test --summary all
+        run: ./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib
 
       - name: zig fmt check
-        run: ./zig-0.16.0/zig fmt --check src/ examples/ build.zig benchmarks/
+        run: ./zig-0.16.0/zig fmt --check src/ examples/ build.zig benchmarks/ tools/

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.3.0-8B5CF6?style=flat-square" alt="v0.3.0">
+    <img src="https://img.shields.io/badge/version-v0.4.0-8B5CF6?style=flat-square" alt="v0.4.0">
         <img src="https://img.shields.io/badge/status-phase--3%20resolver-2D7D46?style=flat-square" alt="Status: Phase 3 resolver">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
@@ -93,7 +93,7 @@ Full zebrac baselines, parser microbenchmarks, and wall-time summaries live in `
 ### Add as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.3.0
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.4.0
 ```
 
 Then in `build.zig`, import the package:
@@ -110,8 +110,35 @@ exe.root_module.addImport("z_oci", z_oci.module("z_oci"));
 
 ```zig
 const outcome = try z_oci.resolve(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+switch (outcome) {
+    .success => |result| {
+        defer result.deinit(allocator);
+        // use result.digest, result.reference, ...
+    },
+    .failure => |failure| {
+        defer z_oci.deinitResolveFailure(failure, allocator);
+        // handle failure
+    },
+}
 const validity = try z_oci.validate(allocator, &client, config, ref, null);
-const manifest = try z_oci.getManifest(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+switch (validity) {
+    .valid, .not_found => {},
+    .failure => |failure| {
+        defer z_oci.deinitResolveFailure(failure, allocator);
+        // handle failure
+    },
+}
+const manifest_outcome = try z_oci.getManifest(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+switch (manifest_outcome) {
+    .success => |manifest| {
+        defer manifest.deinit();
+        // use manifest
+    },
+    .failure => |failure| {
+        defer z_oci.deinitResolveFailure(failure, allocator);
+        // handle failure
+    },
+}
 ```
 
 `resolve`, `validate`, and `getManifest` all use a caller-owned `std.http.Client` and the same auth-backed resolver flow.
@@ -162,8 +189,14 @@ pub fn main() !void {
 
 ## Build steps
 
+This repository vendors Zig 0.16 under `./zig-0.16.0/`. Prefer the bundled compiler and pass `--zig-lib-dir ./zig-0.16.0/lib` so builds match CI and sandboxed environments:
+
+```sh
+./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib
+```
+
 - `zig build`: build and install the current `z-oci` CLI scaffold and `z-oci-bench` executable
-- `zig build test`: run all unit tests and smoke checks
+- `zig build test`: run all unit tests, smoke checks, and the `security-check` PEM scan (`tools/check_repo_security.zig`)
 - `zig build examples`: build all packaged example programs
 - `zig build examples-smoke`: run a small smoke pass over the offline example programs
 - `zig build workflow-smoke`: run the offline workflow smoke-test matrix

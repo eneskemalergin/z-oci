@@ -349,7 +349,7 @@ fn benchAuthenticateMiss(io: Io, iterations: usize, counting: bool) !void {
     const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
 
     const ExchangeState = struct {
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
             defer request.deinit(allocator);
             return .{ .status = .ok, .body =
             \\{
@@ -397,7 +397,7 @@ fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
     const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
 
     const ExchangeState = struct {
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
             defer request.deinit(allocator);
             return .{ .status = .ok, .body =
             \\{
@@ -442,7 +442,7 @@ fn benchAuthenticateRateLimit(io: Io, iterations: usize, counting: bool) !void {
     const ExchangeState = struct {
         var calls: usize = 0;
 
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
             defer request.deinit(allocator);
             calls += 1;
             if (@rem(calls, 2) == 1) {
@@ -537,7 +537,7 @@ const ResolverBenchFixture = struct {
 const SingleManifestBenchFixture = struct {
     var body: []const u8 = undefined;
 
-    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
         request.deinit(allocator);
         return error.TokenExchangeFailed;
     }
@@ -560,7 +560,7 @@ const SingleManifestRetryBenchFixture = struct {
     var body: []const u8 = undefined;
     var attempts: usize = 0;
 
-    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
         request.deinit(allocator);
         return error.TokenExchangeFailed;
     }
@@ -589,7 +589,7 @@ const SingleManifestRetryBenchFixture = struct {
 const MultiManifestBenchFixture = struct {
     var fixture_ref: *const ResolverBenchFixture = undefined;
 
-    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
         request.deinit(allocator);
         return error.TokenExchangeFailed;
     }
@@ -618,7 +618,7 @@ const MultiManifestBenchFixture = struct {
 };
 
 const ValidateBenchFixture = struct {
-    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.AuthError!z_oci.auth.TokenExchangeResponse {
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
         request.deinit(allocator);
         return error.TokenExchangeFailed;
     }

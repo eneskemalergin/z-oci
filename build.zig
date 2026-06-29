@@ -1,6 +1,6 @@
 //! Build graph for z-oci: library module, CLI scaffold, tests, examples, and bench.
 //!
-//! Primary steps: `test`, `run`, `workflow-smoke`, `example`, `bench`, `security-check`.
+//! Primary steps: `test`, `run`, `workflow-smoke`, `examples`, `bench`, `security-check`.
 
 const std = @import("std");
 
@@ -67,9 +67,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_security_check = b.addRunArtifact(security_check);
+
+    const security_check_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/check_repo_security.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_security_check_tests = b.addRunArtifact(security_check_tests);
+
     const security_check_step = b.step("security-check", "Reject private keys in tracked PEM material");
     security_check_step.dependOn(&run_security_check.step);
     test_step.dependOn(security_check_step);
+    test_step.dependOn(&run_security_check_tests.step);
 
     const workflow_smoke_step = b.step("workflow-smoke", "Run offline workflow smoke tests");
     workflow_smoke_step.dependOn(&run_workflow_smoke_tests.step);

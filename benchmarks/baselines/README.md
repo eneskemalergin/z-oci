@@ -24,6 +24,7 @@ Captured with `zig build -Doptimize=ReleaseFast`, `zebrac -d 4000 -w 1`.
 | authenticate-rate-limit | 129.8 us           | 16.5 MB  | 31      |
 | resolve-single          | 91.4 us            | 0.77 MB  | 44      |
 | resolve-single-retry    | 98.6 us            | 0.77 MB  | 41      |
+| resolve-session         | 48.4 us            | 1.04 MB  | 83      |
 | resolve-multi           | 300.0 us           | 1.02 MB  | 14      |
 | validate-single         | 41.1 us            | 0.77 MB  | 98      |
 | get-manifest            | 79.6 us            | 0.77 MB  | 51      |
@@ -42,6 +43,7 @@ Captured with `zig build -Doptimize=ReleaseFast`, `zebrac -d 4000 -w 1`.
 | authenticate-rate-limit | 112.0 us           | 12              |
 | resolve-single          | 89.1 us            | 12              |
 | resolve-single-retry    | 94.7 us            | 13              |
+| resolve-session         | 47.6 us            | 6               |
 | resolve-multi           | 304.4 us           | 27              |
 | validate-single         | 42.7 us            | 5               |
 | get-manifest            | 76.1 us            | 10              |
@@ -50,7 +52,7 @@ Captured with `zig build -Doptimize=ReleaseFast`, `zebrac -d 4000 -w 1`.
 
 ```sh
 zig build -Doptimize=ReleaseFast
-./tools/zebrac -d 4000 -w 1 --json benchmarks/baselines/v0.4.0.json \
+zebrac -d 4000 -w 1 --json benchmarks/baselines/v0.4.0.json \
   './zig-out/bin/z-oci-bench reference-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench digest-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench manifest-parse --iterations 10000' \
@@ -61,6 +63,7 @@ zig build -Doptimize=ReleaseFast
   './zig-out/bin/z-oci-bench authenticate-rate-limit --iterations 1000' \
   './zig-out/bin/z-oci-bench resolve-single --iterations 1000' \
   './zig-out/bin/z-oci-bench resolve-single-retry --iterations 1000' \
+  './zig-out/bin/z-oci-bench resolve-session --iterations 1000' \
   './zig-out/bin/z-oci-bench resolve-multi --iterations 1000' \
   './zig-out/bin/z-oci-bench validate-single --iterations 1000' \
   './zig-out/bin/z-oci-bench get-manifest --iterations 1000'
