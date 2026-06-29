@@ -55,10 +55,14 @@ pub const Credential = struct {
 
 pub const CredentialHandle = struct {
     credential: Credential,
-    release_fn: ?*const fn (credential: Credential) void = null,
+    /// When set, `release_allocator` must be the allocator that owns `credential` slices.
+    /// `release_fn` must free through that allocator. Env/helper paths in `auth.zig`
+    /// zero secrets via `freeOwnedOptionalSecretSlice` before `free`.
+    release_fn: ?*const fn (allocator: std.mem.Allocator, credential: Credential) void = null,
+    release_allocator: std.mem.Allocator = undefined,
 
     pub fn release(self: CredentialHandle) void {
-        if (self.release_fn) |release_fn| release_fn(self.credential);
+        if (self.release_fn) |release_fn| release_fn(self.release_allocator, self.credential);
     }
 };
 
@@ -407,7 +411,7 @@ test "Config: credential handle release hook can tear down secrets" {
     const State = struct {
         var released = false;
 
-        fn release(_: Credential) void {
+        fn release(_: std.mem.Allocator, _: Credential) void {
             released = true;
         }
 
@@ -416,6 +420,7 @@ test "Config: credential handle release hook can tear down secrets" {
             return .{
                 .credential = .{ .username = "user", .secret = "token" },
                 .release_fn = release,
+                .release_allocator = std.testing.allocator,
             };
         }
     };
@@ -505,6 +510,28 @@ test "Config: applyToClient skips reload when path and mtime are unchanged" {
     try client.ca_bundle_lock.lockShared(std.testing.io);
     defer client.ca_bundle_lock.unlockShared(std.testing.io);
     try std.testing.expectEqual(first_len, client.ca_bundle.bytes.items.len);
+}
+
+test "Config: applyToClient repeated loads stay leak-free under DebugAllocator" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    const abs_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
+    defer std.testing.allocator.free(abs_path);
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+
+    for (0..32) |_| {
+        var client = std.http.Client{
+            .allocator = allocator,
+            .io = std.testing.io,
+        };
+        try config.applyToClient(&client);
+        client.deinit();
+    }
 }
 
 test "Config: applyToClient loads fixture PEM into client ca_bundle" {

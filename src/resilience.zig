@@ -1715,3 +1715,89 @@ test "readHttpResponseBodyAlloc rejects bodies above the limit" {
 
     try std.testing.expectError(error.BodyTooLarge, readHttpResponseBodyAlloc(std.testing.allocator, &reader, 3));
 }
+
+test "runHttpRetryLoop: transport and HTTP retries stay leak-free under DebugAllocator" {
+    const ExchangeError = error{
+        ConnectionResetByPeer,
+    };
+
+    const TestResponse = struct {
+        status: std.http.Status,
+        body: ?[]u8 = null,
+    };
+
+    const State = struct {
+        var attempts: usize = 0;
+
+        fn exchangeOnce(_: *anyopaque) ExchangeError!TestResponse {
+            attempts += 1;
+            if (attempts == 1) return error.ConnectionResetByPeer;
+            if (attempts == 2) return .{ .status = .service_unavailable };
+            return .{ .status = .ok };
+        }
+
+        fn responseStatus(response: TestResponse) std.http.Status {
+            return response.status;
+        }
+
+        fn responseHeaders(_: TestResponse) []const HttpHeader {
+            return &.{};
+        }
+
+        fn deinitResponse(allocator: std.mem.Allocator, response: TestResponse) void {
+            if (response.body) |body| allocator.free(body);
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var client: std.http.Client = undefined;
+    const transport_hooks = TransportHooks{ .sleeper = noopTransportSleeper };
+
+    for (0..16) |_| {
+        State.attempts = 0;
+        var policy = retryPolicyFromConfig(.{ .max_network_retries = 2 }, transport_hooks);
+        var loop_ctx: usize = 0;
+
+        const result = runHttpRetryLoop(
+            &client,
+            transport_hooks,
+            &policy,
+            .{},
+            ExchangeError,
+            TestResponse,
+            @ptrCast(&loop_ctx),
+            struct {
+                fn call(ctx_ptr: *anyopaque) ExchangeError!TestResponse {
+                    return State.exchangeOnce(ctx_ptr);
+                }
+            }.call,
+            struct {
+                fn call(response: TestResponse) std.http.Status {
+                    return State.responseStatus(response);
+                }
+            }.call,
+            struct {
+                fn call(response: TestResponse) []const HttpHeader {
+                    return State.responseHeaders(response);
+                }
+            }.call,
+            struct {
+                fn call(alloc: std.mem.Allocator, response: TestResponse) void {
+                    State.deinitResponse(alloc, response);
+                }
+            }.call,
+            allocator,
+        );
+
+        switch (result) {
+            .ok => |ok| {
+                try std.testing.expectEqual(std.http.Status.ok, State.responseStatus(ok.response));
+                try std.testing.expectEqual(@as(usize, 3), State.attempts);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}

@@ -274,14 +274,33 @@ pub const ManifestResponseMetadata = struct {
         return .{ .status = status };
     }
 
-    pub fn deinitOwned(self: ManifestResponseMetadata, allocator: std.mem.Allocator) void {
-        if (self.content_type) |content_type| allocator.free(content_type);
-        if (self.docker_content_digest) |digest| allocator.free(digest);
-        if (self.location) |location| allocator.free(location);
-        freeHeaderSlices(allocator, self.www_authenticate_headers);
+    /// Free owned slices and clear pointers so the value cannot retain dangling aliases.
+    pub fn releaseOwned(self: *ManifestResponseMetadata, allocator: std.mem.Allocator) void {
+        if (self.content_type) |content_type| {
+            allocator.free(content_type);
+            self.content_type = null;
+        }
+        if (self.docker_content_digest) |digest| {
+            allocator.free(digest);
+            self.docker_content_digest = null;
+        }
+        if (self.location) |location| {
+            allocator.free(location);
+            self.location = null;
+        }
+        if (self.www_authenticate_headers.len != 0) {
+            freeHeaderSlices(allocator, self.www_authenticate_headers);
+            self.www_authenticate_headers = &.{};
+        }
         if (self.resilience_headers.len != 0) {
             resilience.deinitOwnedHttpHeaders(allocator, @constCast(self.resilience_headers));
+            self.resilience_headers = &.{};
         }
+    }
+
+    pub fn deinitOwned(self: ManifestResponseMetadata, allocator: std.mem.Allocator) void {
+        var owned = self;
+        owned.releaseOwned(allocator);
     }
 };
 
@@ -394,8 +413,9 @@ pub const GetRequestOutcome = union(enum) {
     pub fn deinit(self: *GetRequestOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .success => |*success| success.deinit(allocator),
-            .redirect => |metadata| metadata.deinitOwned(allocator),
-            else => {},
+            .redirect => |*metadata| metadata.releaseOwned(allocator),
+            .failure => |*failure| failure.releaseOwnedReference(allocator),
+            .not_found => {},
         }
     }
 };
@@ -412,10 +432,11 @@ pub const HeadRequestOutcome = union(enum) {
 
     pub fn deinit(self: *HeadRequestOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .success => |metadata| metadata.deinitOwned(allocator),
-            .use_get_fallback => |metadata| metadata.deinitOwned(allocator),
-            .redirect => |metadata| metadata.deinitOwned(allocator),
-            else => {},
+            .success => |*metadata| metadata.releaseOwned(allocator),
+            .use_get_fallback => |*metadata| metadata.releaseOwned(allocator),
+            .redirect => |*metadata| metadata.releaseOwned(allocator),
+            .failure => |*failure| failure.releaseOwnedReference(allocator),
+            .validate_manifest_ok, .not_found => {},
         }
     }
 };
@@ -1864,6 +1885,85 @@ test "ownedManifestResponseMetadataFromHead: ok responses keep rate-limit header
     try std.testing.expect(std.mem.startsWith(u8, owned.resilience_headers[0].name, "RateLimit-"));
 }
 
+test "ownedManifestResponseMetadataFromHead: ok responses omit Retry-After and Date" {
+    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
+        "Retry-After: 30",
+        "Date: Sun, 06 Nov 1994 08:49:37 GMT",
+    });
+    defer std.testing.allocator.free(head.bytes);
+
+    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
+    try std.testing.expectEqual(@as(usize, 0), owned.resilience_headers.len);
+}
+
+test "ownedManifestResponseMetadataFromHead: forbidden and not_found omit auth headers" {
+    const forbidden = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 403 Forbidden", &.{
+        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
+    });
+    defer std.testing.allocator.free(forbidden.bytes);
+
+    var forbidden_owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, forbidden);
+    defer forbidden_owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), forbidden_owned.www_authenticate_headers.len);
+
+    const not_found = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 404 Not Found", &.{
+        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
+    });
+    defer std.testing.allocator.free(not_found.bytes);
+
+    var not_found_owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, not_found);
+    defer not_found_owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), not_found_owned.www_authenticate_headers.len);
+}
+
+test "ownedManifestResponseMetadataFromHead: retryable 502 keeps resilience not auth" {
+    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 502 Bad Gateway", &.{
+        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
+        "Retry-After: 15",
+        "Date: Sun, 06 Nov 1994 08:49:37 GMT",
+    });
+    defer std.testing.allocator.free(head.bytes);
+
+    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
+    try std.testing.expectEqual(@as(usize, 2), owned.resilience_headers.len);
+}
+
+test "ownedManifestResponseMetadataFromHead: unauthorized still collects auth headers" {
+    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
+        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
+    });
+    defer std.testing.allocator.free(head.bytes);
+
+    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.www_authenticate_headers.len);
+    try std.testing.expectEqual(@as(usize, 0), owned.resilience_headers.len);
+
+    const metadata = owned.view(.unauthorized);
+    const probe = try metadata.probeClassification();
+    try std.testing.expect(probe == .auth_required);
+}
+
+test "ownedManifestResponseMetadataFromHead: forbidden probe classification unchanged without stored auth headers" {
+    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 403 Forbidden", &.{
+        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
+    });
+    defer std.testing.allocator.free(head.bytes);
+
+    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
+    try std.testing.expectError(error.UnsupportedProbeStatus, owned.view(.forbidden).probeClassification());
+}
+
 test "ManifestResponseMetadata cloneAllocHeadSuccess omits auth and retry headers" {
     const metadata = ManifestResponseMetadata{
         .status = .ok,
@@ -1971,6 +2071,27 @@ test "performManifestHead retries transient 503 then succeeds" {
     }
 }
 
+test "ManifestResponseMetadata.releaseOwned: clears owned slices in place" {
+    const content_type = try std.testing.allocator.dupe(u8, "application/vnd.oci.image.manifest.v1+json");
+    const digest = try std.testing.allocator.dupe(u8, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const location = try std.testing.allocator.dupe(u8, "https://registry.example.test/v2/library/alpine/manifests/latest");
+
+    var metadata = ManifestResponseMetadata{
+        .status = .ok,
+        .content_type = content_type,
+        .docker_content_digest = digest,
+        .location = location,
+    };
+
+    metadata.releaseOwned(std.testing.allocator);
+
+    try std.testing.expect(metadata.content_type == null);
+    try std.testing.expect(metadata.docker_content_digest == null);
+    try std.testing.expect(metadata.location == null);
+    try std.testing.expect(metadata.www_authenticate_headers.len == 0);
+    try std.testing.expect(metadata.resilience_headers.len == 0);
+}
+
 test "performManifestGet repeated GET runs leave no residual allocations under DebugAllocator" {
     const State = struct {
         var body: []u8 = undefined;
@@ -2020,6 +2141,70 @@ test "performManifestGet repeated GET runs leave no residual allocations under D
             .success => |success| try std.testing.expect(success.backing_body == null),
             else => return error.TestUnexpectedResult,
         }
+    }
+}
+
+test "performManifestGet retry path leaves no residual allocations under DebugAllocator" {
+    const State = struct {
+        var attempts: usize = 0;
+        var body: []u8 = undefined;
+        var digest: []u8 = undefined;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(std.testing.allocator);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            attempts += 1;
+            if (@rem(attempts, 2) == 1) {
+                return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .service_unavailable,
+                }, null);
+            }
+
+            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    State.body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
+    defer std.testing.allocator.free(State.body);
+    State.digest = try sha256DigestStringAlloc(std.testing.allocator, State.body);
+    defer std.testing.allocator.free(State.digest);
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var client: std.http.Client = undefined;
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{
+        .max_network_retries = 1,
+    }, State.tokenExchange);
+    defer engine.deinit();
+
+    const ctx = ResolverContext.init(
+        allocator,
+        &client,
+        .{ .max_network_retries = 1 },
+        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
+        null,
+        .resolve,
+    );
+
+    for (0..16) |_| {
+        State.attempts = 0;
+        var outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        defer outcome.deinit(allocator);
+        switch (outcome) {
+            .success => |success| try std.testing.expect(success.backing_body == null),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(@as(usize, 2), State.attempts);
     }
 }
 

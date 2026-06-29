@@ -29,7 +29,9 @@
 //!   references, HTTP request URLs, redirect targets, response metadata clones,
 //!   interim digest buffers, platform clones during multi-arch selection) uses the
 //!   arena. Success returns caller-owned results; `getManifest` promotes
-//!   `std.json.Parsed(Manifest)` onto the caller allocator before arena teardown.
+//!   `std.json.Parsed(Manifest)` via `ResolvedManifestSuccess.detachManifestForPromotion`
+//!   before arena teardown; `resolve` uses `detachForResolvePromotion` so digest
+//!   buffers are not freed while `Digest.hex` still aliases them.
 //!   Failure promotes `ResolveError.reference` to the caller allocator before
 //!   arena teardown. `AuthEngine`, the input `Reference`, and persistent token
 //!   cache storage stay on the caller allocator.
@@ -211,17 +213,104 @@ const manifest_accept_values = [_][]const u8{
 };
 
 const ResolvedManifestSuccess = struct {
+    /// New fields must be torn down in `deinit` and handled in both detach helpers.
     resolved_digest: Digest,
     resolved_digest_raw: []u8,
     document: resolver.ParsedManifestDocument,
     platform: ?Platform,
     backing_body: ?[]u8 = null,
 
-    fn deinit(self: *ResolvedManifestSuccess, allocator: std.mem.Allocator) void {
-        if (self.resolved_digest_raw.len != 0) allocator.free(self.resolved_digest_raw);
+    fn clearDigestAlias(self: *ResolvedManifestSuccess) void {
+        self.resolved_digest_raw = "";
+        self.resolved_digest = .{ .algorithm = .sha256, .hex = "" };
+    }
+
+    fn releaseDigestRaw(self: *ResolvedManifestSuccess, allocator: std.mem.Allocator) void {
+        if (self.resolved_digest_raw.len != 0) {
+            allocator.free(self.resolved_digest_raw);
+            self.clearDigestAlias();
+        }
+    }
+
+    fn releaseDocument(self: *ResolvedManifestSuccess) void {
+        const media_type = switch (self.document) {
+            .manifest => |parsed| parsed.value.media_type,
+            .manifest_media_type => |value| value,
+            else => MediaType.docker_manifest_v2,
+        };
         self.document.deinit();
-        if (self.backing_body) |body| allocator.free(body);
-        if (self.platform) |platform| deinitOwnedPlatform(platform, allocator);
+        self.document = .{ .manifest_media_type = media_type };
+    }
+
+    fn releaseBackingBody(self: *ResolvedManifestSuccess, allocator: std.mem.Allocator) void {
+        if (self.backing_body) |body| {
+            allocator.free(body);
+            self.backing_body = null;
+        }
+    }
+
+    fn releasePlatform(self: *ResolvedManifestSuccess, allocator: std.mem.Allocator) void {
+        if (self.platform) |platform| {
+            deinitOwnedPlatform(platform, allocator);
+            self.platform = null;
+        }
+    }
+
+    fn deinit(self: *ResolvedManifestSuccess, allocator: std.mem.Allocator) void {
+        self.releaseDigestRaw(allocator);
+        self.releaseDocument();
+        self.releaseBackingBody(allocator);
+        self.releasePlatform(allocator);
+    }
+
+    /// Move `Parsed(Manifest)` to `caller_allocator` and leave a `deinit`-safe shell.
+    /// On error the manifest document is restored; on success digest fields are
+    /// cleared so `deinit` cannot free `resolved_digest_raw` while `digest.hex`
+    /// still aliases it.
+    fn detachManifestForPromotion(
+        self: *ResolvedManifestSuccess,
+        caller_allocator: std.mem.Allocator,
+    ) PublicApiError!std.json.Parsed(Manifest) {
+        const parsed = switch (self.document) {
+            .manifest => |parsed| parsed,
+            else => unreachable,
+        };
+        const media_type = parsed.value.media_type;
+        self.document = .{ .manifest_media_type = media_type };
+        errdefer self.document = .{ .manifest = parsed };
+
+        const promoted = try promoteManifestParsedAlloc(caller_allocator, parsed);
+        self.clearDigestAlias();
+        return promoted;
+    }
+
+    const ResolvePromotionDetach = struct {
+        resolved_digest_raw: []u8,
+        media_type: MediaType,
+        platform: ?Platform,
+    };
+
+    /// Move caller-promoted resolve fields out and clear digest/document/platform
+    /// so `deinit` cannot free `resolved_digest_raw` while `resolved_digest.hex`
+    /// still aliases it.
+    fn detachForResolvePromotion(self: *ResolvedManifestSuccess) ResolvePromotionDetach {
+        const media_type = switch (self.document) {
+            .manifest => |parsed| parsed.value.media_type,
+            .manifest_media_type => |value| value,
+            else => unreachable,
+        };
+        const resolved_digest_raw = self.resolved_digest_raw;
+        self.clearDigestAlias();
+        self.document = .{ .manifest_media_type = media_type };
+
+        const platform = self.platform;
+        self.platform = null;
+
+        return .{
+            .resolved_digest_raw = resolved_digest_raw,
+            .media_type = media_type,
+            .platform = platform,
+        };
     }
 };
 
@@ -394,22 +483,15 @@ fn resolveWithEngine(
     );
     switch (outcome) {
         .success => |*success| {
-            const selected_platform = success.platform;
-            success.platform = null;
-            const resolved_digest_raw = success.resolved_digest_raw;
-            success.resolved_digest_raw = "";
-
-            const media_type = switch (success.document) {
-                .manifest => |parsed| parsed.value.media_type,
-                .manifest_media_type => |value| value,
-                else => unreachable,
-            };
+            const detached = success.detachForResolvePromotion();
             defer success.deinit(transient);
+            errdefer allocator.free(detached.resolved_digest_raw);
+            errdefer if (detached.platform) |value| deinitOwnedPlatform(value, transient);
 
-            const caller_digest_raw = try allocator.dupe(u8, resolved_digest_raw);
+            const caller_digest_raw = try allocator.dupe(u8, detached.resolved_digest_raw);
             errdefer allocator.free(caller_digest_raw);
 
-            const caller_platform: ?Platform = if (selected_platform) |value|
+            const caller_platform: ?Platform = if (detached.platform) |value|
                 try clonePlatformAlloc(allocator, value)
             else
                 null;
@@ -419,12 +501,12 @@ fn resolveWithEngine(
                 allocator,
                 ref,
                 caller_digest_raw,
-                media_type,
+                detached.media_type,
                 caller_platform,
             ) };
         },
-        .failure => |failure| {
-            return .{ .failure = try promoteResolveErrorAlloc(allocator, failure) };
+        .failure => {
+            return .{ .failure = try promoteResolvedManifestFailure(allocator, transient, &outcome) };
         },
     }
 }
@@ -456,19 +538,18 @@ fn validateWithExchangers(
     );
 
     const head_outcome = try resolver.performManifestHead(ctx, &engine, manifest_exchanger, manifestAcceptValues());
-    switch (head_outcome) {
+    var owned_head_outcome = head_outcome;
+    defer owned_head_outcome.deinit(allocator);
+    switch (owned_head_outcome) {
         .validate_manifest_ok => return .valid,
         .success => |metadata| {
-            defer metadata.deinitOwned(allocator);
-
             if (try validateOutcomeFromHeadMetadata(allocator, ref_view, platform, metadata)) |outcome| {
                 return outcome;
             }
         },
-        .use_get_fallback => |metadata| metadata.deinitOwned(allocator),
+        .use_get_fallback => {},
         .not_found => return .not_found,
         .redirect => |metadata| {
-            defer metadata.deinitOwned(allocator);
             return .{ .failure = try networkErrorAlloc(allocator, ref_view, metadata.httpStatus()) };
         },
         .failure => |failure| return .{ .failure = failure },
@@ -494,6 +575,16 @@ fn validateWithExchangers(
     return try validateOutcomeFromResolvedManifestOutcome(allocator, transient, &outcome);
 }
 
+fn promoteResolvedManifestFailure(
+    caller_allocator: std.mem.Allocator,
+    outcome_allocator: std.mem.Allocator,
+    outcome: *ResolvedManifestOutcome,
+) !ResolveError {
+    const promoted = try promoteResolveErrorAlloc(caller_allocator, outcome.failure);
+    outcome.failure.releaseOwnedReference(outcome_allocator);
+    return promoted;
+}
+
 fn validateOutcomeFromResolvedManifestOutcome(
     caller_allocator: std.mem.Allocator,
     outcome_allocator: std.mem.Allocator,
@@ -507,14 +598,14 @@ fn validateOutcomeFromResolvedManifestOutcome(
                 else => unreachable,
             };
         },
-        .failure => |failure| switch (failure) {
+        .failure => |*failure| switch (failure.*) {
             .not_found => {
-                failure.deinitOwned(outcome_allocator);
+                failure.releaseOwnedReference(outcome_allocator);
                 return .not_found;
             },
             else => {
-                const promoted = try promoteResolveErrorAlloc(caller_allocator, failure);
-                failure.deinitOwned(outcome_allocator);
+                const promoted = try promoteResolveErrorAlloc(caller_allocator, failure.*);
+                failure.releaseOwnedReference(outcome_allocator);
                 return .{ .failure = promoted };
             },
         },
@@ -577,21 +668,13 @@ fn getManifestWithExchangers(
     );
     switch (outcome) {
         .success => |*success| {
-            const parsed_manifest = parsed: {
-                switch (success.document) {
-                    .manifest => |parsed| {
-                        success.document = .{ .manifest_media_type = parsed.value.media_type };
-                        break :parsed promoteManifestParsedAlloc(allocator, parsed) catch |err| return err;
-                    },
-                    else => unreachable,
-                }
-            };
-
-            if (success.platform) |selected_platform| deinitOwnedPlatform(selected_platform, transient);
-            success.deinit(transient);
+            const parsed_manifest = try success.detachManifestForPromotion(allocator);
+            defer success.deinit(transient);
             return .{ .success = parsed_manifest };
         },
-        .failure => |failure| return .{ .failure = try promoteResolveErrorAlloc(allocator, failure) },
+        .failure => {
+            return .{ .failure = try promoteResolvedManifestFailure(allocator, transient, &outcome) };
+        },
     }
 }
 
@@ -1364,6 +1447,311 @@ test "getManifestWithExchangers per-resolve arena promotes manifest without leak
     }
 }
 
+test "ResolvedManifestSuccess: detachForResolvePromotion clears digest alias before deinit" {
+    const hex = "a" ** 64;
+    const raw = try std.fmt.allocPrint(std.testing.allocator, "sha256:{s}", .{hex});
+
+    var success = ResolvedManifestSuccess{
+        .resolved_digest = try Digest.parse(raw),
+        .resolved_digest_raw = raw,
+        .document = .{ .manifest_media_type = .docker_manifest_v2 },
+        .platform = null,
+    };
+
+    const detached = success.detachForResolvePromotion();
+    defer std.testing.allocator.free(detached.resolved_digest_raw);
+
+    try std.testing.expect(success.resolved_digest_raw.len == 0);
+    try std.testing.expect(success.resolved_digest.hex.len == 0);
+    success.deinit(std.testing.allocator);
+}
+
+test "validateOutcomeFromResolvedManifestOutcome: failure release clears stored reference" {
+    const owned_reference = try std.testing.allocator.dupe(u8, "registry.example.test/library/busybox:latest");
+    var outcome = ResolvedManifestOutcome{ .failure = .{ .platform_required = .{
+        .registry = "registry.example.test",
+        .reference = owned_reference,
+        .http_status = null,
+    } } };
+
+    const result = try validateOutcomeFromResolvedManifestOutcome(
+        std.testing.allocator,
+        std.testing.allocator,
+        &outcome,
+    );
+    switch (result) {
+        .failure => |failure| {
+            defer failure.deinitOwned(std.testing.allocator);
+            try std.testing.expectEqualStrings("platform_required", @tagName(std.meta.activeTag(failure)));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(outcome.failure.platform_required.reference.len == 0);
+}
+
+test "ResolvedManifestSuccess: deinit clears every owned field" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "size": 1,
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    const parsed = try std.json.parseFromSlice(
+        Manifest,
+        std.testing.allocator,
+        json_bytes,
+        .{},
+    );
+    const hex = "b" ** 64;
+    const raw = try std.fmt.allocPrint(std.testing.allocator, "sha256:{s}", .{hex});
+    const platform = Platform{
+        .os = try std.testing.allocator.dupe(u8, "linux"),
+        .architecture = try std.testing.allocator.dupe(u8, "amd64"),
+    };
+
+    var success = ResolvedManifestSuccess{
+        .resolved_digest = try Digest.parse(raw),
+        .resolved_digest_raw = raw,
+        .document = .{ .manifest = parsed },
+        .platform = platform,
+        .backing_body = try std.testing.allocator.dupe(u8, json_bytes),
+    };
+
+    success.deinit(std.testing.allocator);
+
+    try std.testing.expect(success.resolved_digest_raw.len == 0);
+    try std.testing.expect(success.resolved_digest.hex.len == 0);
+    try std.testing.expect(success.backing_body == null);
+    try std.testing.expect(success.platform == null);
+    switch (success.document) {
+        .manifest_media_type => |media_type| try std.testing.expectEqual(MediaType.oci_manifest_v1, media_type),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ResolvedManifestSuccess: detachManifestForPromotion OOM leaves shell deinit-safe" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 1
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    const State = struct {
+        fn run(caller_allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer transient_arena.deinit();
+            const transient = transient_arena.allocator();
+
+            const parsed_local = try json.parse(Manifest, transient, bytes);
+            var success_local = ResolvedManifestSuccess{
+                .resolved_digest = try Digest.parse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+                .resolved_digest_raw = try transient.dupe(u8, "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+                .document = .{ .manifest = parsed_local },
+                .platform = null,
+            };
+            errdefer success_local.deinit(transient);
+
+            const promoted = try success_local.detachManifestForPromotion(caller_allocator);
+            promoted.deinit();
+            success_local.deinit(transient);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{json_bytes});
+}
+
+test "ResolvedManifestSuccess: detachManifestForPromotion clears digest fields on success" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 1
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer transient_arena.deinit();
+    const transient = transient_arena.allocator();
+
+    const parsed_local = try json.parse(Manifest, transient, json_bytes);
+    var success_local = ResolvedManifestSuccess{
+        .resolved_digest = try Digest.parse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+        .resolved_digest_raw = try transient.dupe(u8, "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+        .document = .{ .manifest = parsed_local },
+        .platform = null,
+    };
+    defer success_local.deinit(transient);
+
+    const promoted = try success_local.detachManifestForPromotion(std.testing.allocator);
+    defer promoted.deinit();
+
+    try std.testing.expect(success_local.resolved_digest_raw.len == 0);
+    try std.testing.expect(success_local.resolved_digest.hex.len == 0);
+    try std.testing.expectEqual(.manifest_media_type, std.meta.activeTag(success_local.document));
+}
+
+test "getManifestWithExchangers matches direct parse of live busybox fixture" {
+    const State = struct {
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
+
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    const fixture_bytes = try readFixtureAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
+    defer std.testing.allocator.free(fixture_bytes);
+
+    const direct = try json.parse(Manifest, std.testing.allocator, fixture_bytes);
+    defer direct.deinit();
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try getManifestWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+
+    switch (outcome) {
+        .success => |parsed| {
+            defer parsed.deinit();
+            try std.testing.expectEqual(direct.value.schema_version, parsed.value.schema_version);
+            try std.testing.expectEqual(direct.value.media_type, parsed.value.media_type);
+            try std.testing.expectEqual(direct.value.config.size, parsed.value.config.size);
+            try std.testing.expectEqualSlices(u8, direct.value.config.digest.hex, parsed.value.config.digest.hex);
+            try std.testing.expectEqual(direct.value.layers.len, parsed.value.layers.len);
+            try std.testing.expectEqual(direct.value.layers[0].size, parsed.value.layers[0].size);
+            try std.testing.expectEqualSlices(u8, direct.value.layers[0].digest.hex, parsed.value.layers[0].digest.hex);
+            try std.testing.expect(direct.value.annotations != null);
+            try std.testing.expect(parsed.value.annotations != null);
+            try std.testing.expectEqualStrings(
+                direct.value.annotations.?.object.get("org.opencontainers.image.version").?.string,
+                parsed.value.annotations.?.object.get("org.opencontainers.image.version").?.string,
+            );
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "getManifestWithExchangers failure promotes caller-owned reference" {
+    const State = struct {
+        var index_body: []u8 = undefined;
+        var index_digest: []u8 = undefined;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            if (!std.mem.endsWith(u8, request.url, "/manifests/latest")) return error.TransportFailed;
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_index_v1.toString(),
+                .docker_content_digest = index_digest,
+            }, index_body);
+        }
+    };
+
+    const child_digest = "sha256:9999999999999999999999999999999999999999999999999999999999999999";
+    State.index_body = try buildIndexBodyAlloc(
+        std.testing.allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        child_digest,
+        "linux",
+        "arm64",
+    );
+    defer std.testing.allocator.free(State.index_body);
+
+    State.index_digest = try sha256DigestStringAlloc(std.testing.allocator, State.index_body);
+    defer std.testing.allocator.free(State.index_digest);
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    const outcome = try getManifestWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        ref,
+        null,
+        State.tokenExchange,
+        State.manifestExchange,
+        .{},
+    );
+
+    const failure = switch (outcome) {
+        .failure => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const reference_copy = try std.testing.allocator.dupe(u8, failure.platform_required.reference);
+    defer std.testing.allocator.free(reference_copy);
+
+    var owned_failure = failure;
+    owned_failure.deinitOwned(std.testing.allocator);
+
+    try std.testing.expect(std.mem.endsWith(u8, reference_copy, "busybox:latest"));
+    try std.testing.expect(std.mem.indexOf(u8, reference_copy, "registry-1.docker.io") != null);
+}
+
 test "validateWithExchangers returns not_found for missing manifest" {
     const State = struct {
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -1488,6 +1876,71 @@ test "validateWithExchangers single-arch HEAD avoids metadata clone allocations"
             State.manifestExchange,
             .{},
         );
+        try std.testing.expectEqual(ValidateOutcome.valid, outcome);
+    }
+}
+
+test "validateWithExchangers HEAD to GET fallback stays leak-free under DebugAllocator" {
+    const State = struct {
+        var saw_get = false;
+
+        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, _: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (request.method == .head) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                }, null);
+            }
+
+            saw_get = true;
+            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
+
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+
+    var client: std.http.Client = undefined;
+    const ref = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = "latest",
+        .digest = null,
+        .digest_raw = null,
+    };
+
+    for (0..16) |_| {
+        State.saw_get = false;
+        const outcome = try validateWithExchangers(
+            allocator,
+            &client,
+            Config{},
+            ref,
+            .{ .os = "linux", .architecture = "amd64" },
+            State.tokenExchange,
+            State.manifestExchange,
+            .{},
+        );
+        try std.testing.expect(State.saw_get);
         try std.testing.expectEqual(ValidateOutcome.valid, outcome);
     }
 }

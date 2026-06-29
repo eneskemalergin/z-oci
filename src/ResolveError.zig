@@ -153,6 +153,19 @@ pub const ResolveError = union(enum) {
         }
     }
 
+    /// Free the owned `reference` and clear it in place so the error value cannot
+    /// retain a dangling pointer (for storage still live after release).
+    pub fn releaseOwnedReference(self: *ResolveError, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            inline else => |*value| {
+                if (value.reference.len != 0) {
+                    allocator.free(value.reference);
+                    value.reference = "";
+                }
+            },
+        }
+    }
+
     /// Rebuild the error with a caller-owned `reference` string.
     pub fn withOwnedReference(self: ResolveError, owned_reference: []const u8) ResolveError {
         return switch (self) {
@@ -373,6 +386,21 @@ test "ResolveError.deinitOwned: frees owned public-style reference context" {
     } };
 
     err.deinitOwned(alloc);
+}
+
+test "ResolveError.releaseOwnedReference: clears reference after free" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const owned_reference = try alloc.dupe(u8, "library/busybox:latest");
+    var err = ResolveError{ .platform_required = .{
+        .registry = "registry-1.docker.io",
+        .reference = owned_reference,
+    } };
+
+    err.releaseOwnedReference(alloc);
+    try std.testing.expect(err.platform_required.reference.len == 0);
 }
 
 test "ResolveError.format: very long registry and reference are not truncated" {

@@ -9,33 +9,38 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ### Added
 
-- Reactive transport retries on manifest `HEAD`/`GET` and token HTTP exchangers via shared `resilience.runHttpRetryLoop`, with separate `max_network_retries` and `max_rate_limit_retries` budgets.
+- Reactive transport retries on manifest `HEAD`/`GET` and token HTTP exchangers, with separate `max_network_retries` and `max_rate_limit_retries` budgets.
 - Opt-in pre-emptive manifest throttling when `Config.rate_limit_enabled` is true and registry `RateLimit-*` headers are trustworthy (`remaining == 0`).
+- `Config.ca_bundle_path` to load a PEM CA trust bundle at `resolve`, `validate`, and `getManifest` entry for enterprise and self-hosted registries.
+- `Config.max_manifest_bytes`, `max_token_response_bytes`, and `max_token_cache_entries` to cap live HTTP bodies and token-cache growth.
 - `ResolveError.rate_limited`, `network_error`, and `timeout` now expose `transport_retries_exhausted` to distinguish immediate hard failures from post-retry exhaustion.
-- Fixture-backed resilience header negative cases under `fixtures/resilience/` (malformed rate-limit values, conflicting `Retry-After` headers).
+- `Manifest.parseMediaTypeShallow` for resolve workloads that need only manifest media type, not full document contents.
+- `json.parseBorrowing` and `json.promoteParsed` for borrowing input bytes or moving a parsed value onto the caller allocator.
+- Fixture-backed resilience header negative cases under `fixtures/resilience/`.
 - Build-time PEM private-key scan via `zig build security-check` (also runs as part of `zig build test`).
-- Deterministic retry-path benchmark ops in `z-oci-bench`: `resolve-single-retry` (transient `503` then success) and `authenticate-rate-limit` (`429` then success) with noop transport sleep hooks.
+- Deterministic benchmark ops in `z-oci-bench`: `resolve-single-retry`, `authenticate-rate-limit`, and `resolve-session` (reused `AuthEngine`).
 - DebugAllocator repeated-run checks for manifest HEAD and token-exchange retry wrappers.
-- Phase 4 pre-release benchmark baseline at `benchmarks/baselines/v0.4.0.json` (includes retry ops plus existing resolver/auth operations; refreshed after v0.3.9 P hot-path work).
-- `Manifest.parseMediaTypeShallow` and resolve-depth `manifest_media_type` document variant for `resolve` workloads.
-- CA bundle mtime cache in `Config.applyToClient` when `ca_bundle_path` is set.
-- `benchmarks/tmp/` for on-the-fly zebrac comparison snapshots (gitignored).
+- Pre-release benchmark baseline at `benchmarks/baselines/v0.4.0.json`.
 
 ### Changed
 
 - Manifest and token transport wrappers share one reactive retry loop in `resilience.zig` instead of duplicating sleep/retry branches in `auth.zig` and `resolver.zig`.
 - `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, rejects private-key PEM markers in CA bundles, and skips reload when path and mtime are unchanged for the same client.
 - Public docs (`README.md`, `Config.zig`, `resilience.zig`) now describe live retry budgets, CA bundle behavior, and registry header assumptions honestly.
-- Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; drops wasted GET metadata clone; uses stack SHA-256 hex before digest string alloc.
+- Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; uses stack SHA-256 hex before digest string allocation; drops wasted GET metadata clones.
 - Manifest and token retry loops cache built request fields lazily (attempt 2+) so single-shot paths pay no cache overhead.
-- Token cache lookup uses borrowed keys (no `TokenCacheKey` alloc on hit); preferred GET/POST method remembered per realm.
+- Token cache uses a bounded `HashMap` with LRU eviction, borrowed key lookup on hits, remembered GET/POST method per realm, default 60s TTL when `expires_in` is absent, and single-owner token storage on cache miss.
+- Docker config loading builds a registry index at parse time and decodes credentials lazily per registry instead of materializing the full auth tree up front.
+- `resolve`, `validate`, and `getManifest` run transient work in a per-call arena and promote caller-owned success values (`Parsed(Manifest)`, references, errors) onto the caller allocator.
+- Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
 - Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
 
 ### Fixed
 
 - Redirect-without-`Location` and exhausted reactive failures now preserve HTTP status and retry-budget context on the public resolver error path.
 - `recurseIntoMultiArchDocument` parent document lifecycle on `platform_required` / `platform_not_found` early returns (no DebugAllocator leaks).
-- P4/P13 eager retry-cache no longer adds extra URL/token request allocations on single-attempt paths (fixes `get-manifest` regression).
+- Single-attempt manifest and token paths no longer pay extra retry-cache allocations; retryable GET failures no longer discard the downloaded body before the next attempt.
+- `getManifest` and related failure paths preserve owned reference strings after transient arena teardown.
 
 ## [0.3.0] - 2026-05-24 - [Tagged]
 
