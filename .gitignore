@@ -20,6 +20,7 @@ zig-*/
 *private*.pem
 
 # Ignored folders (dev only)
+temp/
 plan/
 benchmarks/tmp/
 # assets/

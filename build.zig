@@ -124,6 +124,10 @@ pub fn build(b: *std.Build) void {
     examples_step.dependOn(&inspect_manifest_example.step);
     examples_step.dependOn(&select_platform_example.step);
     examples_step.dependOn(&resolve_reference_example.step);
+    b.installArtifact(normalize_reference_example);
+    b.installArtifact(inspect_manifest_example);
+    b.installArtifact(select_platform_example);
+    b.installArtifact(resolve_reference_example);
 
     const run_normalize_reference_step = b.step("example-normalize-reference", "Run the normalize-reference example");
     const run_normalize_reference = b.addRunArtifact(normalize_reference_example);

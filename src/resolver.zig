@@ -189,6 +189,19 @@ pub const ManifestExchangeError = error{
     UnknownHostName,
 };
 
+fn mapLiveManifestTransportError(err: anyerror) ManifestExchangeError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BodyTooLarge => error.ResponseBodyTooLarge,
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.Timeout => error.Timeout,
+        error.NetworkUnreachable => error.NetworkUnreachable,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.UnknownHostName => error.UnknownHostName,
+        else => error.TransportFailed,
+    };
+}
+
 /// Exchanges a resolver HTTP request for response metadata.
 ///
 /// The exchanger owns request teardown and must call `request.deinit(allocator)`
@@ -509,40 +522,13 @@ pub fn liveManifestHttpExchanger(
                 },
                 .extra_headers = accept_headers,
             },
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ConnectionResetByPeer,
-            error.Timeout,
-            error.NetworkUnreachable,
-            error.ConnectionRefused,
-            error.UnknownHostName,
-            => return err,
-            else => return error.TransportFailed,
-        };
+        ) catch |err| return mapLiveManifestTransportError(err);
         defer http_request.deinit();
 
-        http_request.sendBodiless() catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ConnectionResetByPeer,
-            error.Timeout,
-            error.NetworkUnreachable,
-            error.ConnectionRefused,
-            error.UnknownHostName,
-            => return err,
-            else => return error.TransportFailed,
-        };
+        http_request.sendBodiless() catch |err| return mapLiveManifestTransportError(err);
 
         var redirect_buffer: [8 * 1024]u8 = undefined;
-        var response = http_request.receiveHead(&redirect_buffer) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ConnectionResetByPeer,
-            error.Timeout,
-            error.NetworkUnreachable,
-            error.ConnectionRefused,
-            error.UnknownHostName,
-            => return err,
-            else => return error.TransportFailed,
-        };
+        var response = http_request.receiveHead(&redirect_buffer) catch |err| return mapLiveManifestTransportError(err);
 
         if (isRedirectStatus(response.head.status) and response.head.location != null and redirect_hops_remaining > 0) {
             redirect_hops_remaining -= 1;
@@ -563,17 +549,7 @@ pub fn liveManifestHttpExchanger(
         errdefer owned_metadata.deinit(allocator);
 
         const body = if (request.method == .get and !resilience.isRetryableHttpStatus(response.head.status))
-            resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.BodyTooLarge => return error.ResponseBodyTooLarge,
-                error.ConnectionResetByPeer,
-                error.Timeout,
-                error.NetworkUnreachable,
-                error.ConnectionRefused,
-                error.UnknownHostName,
-                => return err,
-                else => return error.TransportFailed,
-            }
+            resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return mapLiveManifestTransportError(err)
         else
             null;
         errdefer if (body) |bytes| allocator.free(bytes);
