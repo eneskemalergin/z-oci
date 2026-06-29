@@ -6,7 +6,11 @@
 //! POST fallback), credential-provider chain, and per-scope token caching.
 //!
 //! Docker config (`setDockerConfigBytes`, `loadDockerConfigFromEnvironment`)
-//! stores raw JSON and decodes auth entries lazily per registry lookup.
+//! stores raw JSON and loads registry credentials lazily on first lookup.
+//! Parse time builds a registry index (`auths` / `credHelpers` keys and value
+//! offsets) so lookups avoid rescanning the full document. Auth decode stays
+//! lazy per registry. `validateDockerConfigJson` checks document shape only;
+//! per-entry auth validity is enforced at lookup.
 //!
 //! `AuthError` stays separate from `ResolveError`; the resolver maps auth failures
 //! into public `ResolveError` variants at the manifest boundary.
@@ -132,8 +136,22 @@ const DockerCredentialSource = union(enum) {
     helper: DockerCredentialHelperLookup,
 };
 
+const DockerConfigSection = enum { auths, cred_helpers };
+
+const DockerConfigIndexedRegistry = struct {
+    section: DockerConfigSection,
+    config_key: []u8,
+    value_offset: usize,
+
+    fn deinit(self: DockerConfigIndexedRegistry, allocator: std.mem.Allocator) void {
+        allocator.free(self.config_key);
+    }
+};
+
 const DockerConfig = struct {
     owned_json: []u8,
+    registry_entries: std.ArrayListUnmanaged(DockerConfigIndexedRegistry) = .empty,
+    exact_registry_entry: std.StringHashMapUnmanaged(usize) = .empty,
     creds_store: ?[]const u8 = null,
     creds_store_resolved: bool = false,
     auth_cache: std.StringHashMapUnmanaged(ConfigModule.Credential) = .empty,
@@ -141,6 +159,13 @@ const DockerConfig = struct {
 
     fn deinit(self: *DockerConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.owned_json);
+
+        for (self.registry_entries.items) |entry| entry.deinit(allocator);
+        self.registry_entries.deinit(allocator);
+
+        var exact_it = self.exact_registry_entry.iterator();
+        while (exact_it.next()) |entry| allocator.free(entry.key_ptr.*);
+        self.exact_registry_entry.deinit(allocator);
 
         var auth_it = self.auth_cache.iterator();
         while (auth_it.next()) |entry| {
@@ -172,7 +197,7 @@ const DockerConfig = struct {
 
         if (self.auth_cache.get(cache_key)) |cached| return cached;
 
-        const encoded_auth = try dockerConfigAuthEncodedForRegistry(allocator, self.owned_json, registry) orelse return null;
+        const encoded_auth = try self.authEncodedForRegistry(allocator, registry) orelse return null;
         defer allocator.free(encoded_auth);
 
         const credential = try decodeDockerConfigAuthCredential(allocator, encoded_auth);
@@ -211,7 +236,7 @@ const DockerConfig = struct {
         const helper_suffix = if (self.helper_suffix_cache.get(cache_key)) |cached|
             cached
         else blk: {
-            const owned_suffix = try dockerConfigHelperSuffixForRegistry(allocator, self.owned_json, registry) orelse return null;
+            const owned_suffix = try self.helperSuffixForRegistry(allocator, registry) orelse return null;
             const owned_key = try allocator.dupe(u8, cache_key);
             errdefer allocator.free(owned_key);
             errdefer allocator.free(owned_suffix);
@@ -232,6 +257,50 @@ const DockerConfig = struct {
             .server_url = dockerCredentialHelperServer(registry),
             .helper_suffix = helper_suffix,
         };
+    }
+
+    fn authEncodedForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?[]const u8 {
+        return self.indexedRegistrySectionValue(allocator, .auths, registry, "auth");
+    }
+
+    fn helperSuffixForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?[]const u8 {
+        return self.indexedRegistrySectionValue(allocator, .cred_helpers, registry, null);
+    }
+
+    fn indexedRegistrySectionValue(
+        self: *DockerConfig,
+        allocator: std.mem.Allocator,
+        section: DockerConfigSection,
+        registry: []const u8,
+        object_field: ?[]const u8,
+    ) AuthError!?[]const u8 {
+        const entry_index = self.findRegistryEntryIndex(registry, section) orelse return null;
+        const entry = self.registry_entries.items[entry_index];
+        return dockerConfigValueFromIndexEntry(allocator, self.owned_json, entry, object_field);
+    }
+
+    fn findRegistryEntryIndex(self: *DockerConfig, registry: []const u8, section: DockerConfigSection) ?usize {
+        if (self.registry_entries.items.len != 0) {
+            var cache_key_buffer: [256]u8 = undefined;
+            if (registry.len <= cache_key_buffer.len) {
+                for (registry, 0..) |char, index| cache_key_buffer[index] = std.ascii.toLower(char);
+                const cache_key = cache_key_buffer[0..registry.len];
+                if (self.exact_registry_entry.get(cache_key)) |entry_index| {
+                    const entry = self.registry_entries.items[entry_index];
+                    if (entry.section == section and dockerConfigRegistryKeyMatches(entry.config_key, registry)) {
+                        return entry_index;
+                    }
+                }
+            }
+        }
+
+        for (self.registry_entries.items, 0..) |entry, index| {
+            if (entry.section == section and dockerConfigRegistryKeyMatches(entry.config_key, registry)) {
+                return index;
+            }
+        }
+
+        return null;
     }
 
     fn resolveCredsStore(self: *DockerConfig, allocator: std.mem.Allocator) AuthError!void {
@@ -642,12 +711,10 @@ pub const AuthEngine = struct {
     }
 
     pub fn setDockerConfigBytes(self: *AuthEngine, docker_config_json: []const u8) AuthError!void {
-        try validateDockerConfigJson(docker_config_json);
-        const owned_json = try self.allocator.dupe(u8, docker_config_json);
-        errdefer self.allocator.free(owned_json);
+        const docker_config = try parseDockerConfig(self.allocator, docker_config_json);
 
-        if (self.docker_config) |*docker_config| docker_config.deinit(self.allocator);
-        self.docker_config = .{ .owned_json = owned_json };
+        if (self.docker_config) |*existing| existing.deinit(self.allocator);
+        self.docker_config = docker_config;
     }
 
     pub fn loadDockerConfigFromEnvironment(self: *AuthEngine, io: std.Io) AuthError!bool {
@@ -1030,11 +1097,39 @@ fn dockerConfigScannerPeekTokenType(scanner: *std.json.Scanner) AuthError!std.js
 }
 
 fn parseDockerConfig(allocator: std.mem.Allocator, docker_config_json: []const u8) AuthError!DockerConfig {
-    try validateDockerConfigJson(docker_config_json);
-    return .{ .owned_json = try allocator.dupe(u8, docker_config_json) };
+    var registry_entries: std.ArrayListUnmanaged(DockerConfigIndexedRegistry) = .empty;
+    errdefer {
+        for (registry_entries.items) |entry| entry.deinit(allocator);
+        registry_entries.deinit(allocator);
+    }
+
+    var exact_registry_entry: std.StringHashMapUnmanaged(usize) = .empty;
+    errdefer {
+        var it = exact_registry_entry.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        exact_registry_entry.deinit(allocator);
+    }
+
+    try validateAndBuildDockerConfigIndex(
+        allocator,
+        docker_config_json,
+        &registry_entries,
+        &exact_registry_entry,
+    );
+
+    return .{
+        .owned_json = try allocator.dupe(u8, docker_config_json),
+        .registry_entries = registry_entries,
+        .exact_registry_entry = exact_registry_entry,
+    };
 }
 
-fn validateDockerConfigJson(docker_config_json: []const u8) AuthError!void {
+fn validateAndBuildDockerConfigIndex(
+    allocator: std.mem.Allocator,
+    docker_config_json: []const u8,
+    registry_entries: *std.ArrayListUnmanaged(DockerConfigIndexedRegistry),
+    exact_registry_entry: *std.StringHashMapUnmanaged(usize),
+) AuthError!void {
     var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json);
     defer scanner.deinit();
 
@@ -1047,27 +1142,60 @@ fn validateDockerConfigJson(docker_config_json: []const u8) AuthError!void {
         const key_token = try dockerConfigScannerNextAllocMax(&scanner);
         switch (key_token) {
             .string, .allocated_string => |key| {
-                if (std.mem.eql(u8, key, "auths") or std.mem.eql(u8, key, "credHelpers")) {
-                    freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
-                    switch (try dockerConfigScannerPeekTokenType(&scanner)) {
-                        .object_begin => try dockerConfigScannerSkipValue(&scanner),
-                        else => return error.InvalidDockerConfig,
-                    }
-                    continue;
-                }
-
-                if (std.mem.eql(u8, key, "credsStore")) {
-                    freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
-                    const value_token = try dockerConfigScannerNextAllocMax(&scanner);
-                    defer freeDockerConfigScannerToken(std.heap.page_allocator, value_token);
-                    switch (value_token) {
-                        .string, .allocated_string => {},
-                        else => return error.InvalidDockerConfig,
-                    }
-                    continue;
-                }
+                const section: ?DockerConfigSection = if (std.mem.eql(u8, key, "auths"))
+                    .auths
+                else if (std.mem.eql(u8, key, "credHelpers"))
+                    .cred_helpers
+                else
+                    null;
 
                 freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+
+                if (section) |indexed_section| {
+                    switch (try dockerConfigScannerPeekTokenType(&scanner)) {
+                        .object_begin => {},
+                        else => return error.InvalidDockerConfig,
+                    }
+
+                    _ = try dockerConfigScannerNext(&scanner);
+                    while (true) {
+                        const entry_key_token = try dockerConfigScannerNextAllocMax(&scanner);
+                        switch (entry_key_token) {
+                            .string, .allocated_string => |entry_key| {
+                                _ = try dockerConfigScannerPeekTokenType(&scanner);
+                                const value_offset = scanner.cursor;
+                                try dockerConfigScannerSkipValue(&scanner);
+
+                                const owned_config_key = try allocator.dupe(u8, entry_key);
+                                errdefer allocator.free(owned_config_key);
+
+                                const entry_index = registry_entries.items.len;
+                                try registry_entries.append(allocator, .{
+                                    .section = indexed_section,
+                                    .config_key = owned_config_key,
+                                    .value_offset = value_offset,
+                                });
+
+                                const cache_key = try dockerConfigRegistryCacheKeyAlloc(allocator, entry_key);
+                                errdefer allocator.free(cache_key);
+                                if (!exact_registry_entry.contains(cache_key)) {
+                                    try exact_registry_entry.put(allocator, cache_key, entry_index);
+                                } else {
+                                    allocator.free(cache_key);
+                                }
+
+                                freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
+                            },
+                            .object_end => {
+                                freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
+                                break;
+                            },
+                            else => return error.InvalidDockerConfig,
+                        }
+                    }
+                    continue;
+                }
+
                 try dockerConfigScannerSkipValue(&scanner);
             },
             .object_end => break,
@@ -1079,6 +1207,51 @@ fn validateDockerConfigJson(docker_config_json: []const u8) AuthError!void {
         .end_of_document => {},
         else => return error.InvalidDockerConfig,
     }
+}
+
+fn validateDockerConfigJson(docker_config_json: []const u8) AuthError!void {
+    var registry_entries: std.ArrayListUnmanaged(DockerConfigIndexedRegistry) = .empty;
+    defer {
+        for (registry_entries.items) |entry| entry.deinit(std.heap.page_allocator);
+        registry_entries.deinit(std.heap.page_allocator);
+    }
+
+    var exact_registry_entry: std.StringHashMapUnmanaged(usize) = .empty;
+    defer {
+        var it = exact_registry_entry.iterator();
+        while (it.next()) |entry| std.heap.page_allocator.free(entry.key_ptr.*);
+        exact_registry_entry.deinit(std.heap.page_allocator);
+    }
+
+    try validateAndBuildDockerConfigIndex(
+        std.heap.page_allocator,
+        docker_config_json,
+        &registry_entries,
+        &exact_registry_entry,
+    );
+}
+
+fn dockerConfigValueFromIndexEntry(
+    allocator: std.mem.Allocator,
+    docker_config_json: []const u8,
+    entry: DockerConfigIndexedRegistry,
+    object_field: ?[]const u8,
+) AuthError!?[]const u8 {
+    if (entry.value_offset >= docker_config_json.len) return error.InvalidDockerConfig;
+
+    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json[entry.value_offset..]);
+    defer scanner.deinit();
+
+    if (object_field) |field_name| {
+        switch (try dockerConfigScannerNext(&scanner)) {
+            .object_begin => {},
+            else => return error.InvalidDockerConfig,
+        }
+        return dockerConfigReadObjectStringField(allocator, &scanner, field_name);
+    }
+
+    const value_token = try dockerConfigScannerNextAllocMax(&scanner);
+    return try dockerConfigStringFromScannerToken(allocator, value_token);
 }
 
 fn dockerConfigRegistryCacheKeyAlloc(allocator: std.mem.Allocator, registry: []const u8) AuthError![]u8 {
@@ -1136,94 +1309,6 @@ fn dockerConfigRootStringField(
 
                 const value_token = try dockerConfigScannerNextAllocMax(&scanner);
                 return try dockerConfigStringFromScannerToken(allocator, value_token);
-            },
-            .object_end => return null,
-            else => return error.InvalidDockerConfig,
-        }
-    }
-}
-
-fn dockerConfigAuthEncodedForRegistry(
-    allocator: std.mem.Allocator,
-    docker_config_json: []const u8,
-    registry: []const u8,
-) AuthError!?[]const u8 {
-    return dockerConfigRegistrySectionValue(allocator, docker_config_json, "auths", registry, "auth");
-}
-
-fn dockerConfigHelperSuffixForRegistry(
-    allocator: std.mem.Allocator,
-    docker_config_json: []const u8,
-    registry: []const u8,
-) AuthError!?[]const u8 {
-    return dockerConfigRegistrySectionValue(allocator, docker_config_json, "credHelpers", registry, null);
-}
-
-fn dockerConfigRegistrySectionValue(
-    allocator: std.mem.Allocator,
-    docker_config_json: []const u8,
-    section_name: []const u8,
-    registry: []const u8,
-    object_field: ?[]const u8,
-) AuthError!?[]const u8 {
-    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json);
-    defer scanner.deinit();
-
-    switch (try dockerConfigScannerNext(&scanner)) {
-        .object_begin => {},
-        else => return error.InvalidDockerConfig,
-    }
-
-    while (true) {
-        const root_key_token = try dockerConfigScannerNextAllocMax(&scanner);
-        switch (root_key_token) {
-            .string, .allocated_string => |root_key| {
-                if (!std.mem.eql(u8, root_key, section_name)) {
-                    freeDockerConfigScannerToken(std.heap.page_allocator, root_key_token);
-                    try dockerConfigScannerSkipValue(&scanner);
-                    continue;
-                }
-                freeDockerConfigScannerToken(std.heap.page_allocator, root_key_token);
-
-                switch (try dockerConfigScannerNext(&scanner)) {
-                    .object_begin => {},
-                    else => return error.InvalidDockerConfig,
-                }
-
-                while (true) {
-                    const entry_key_token = try dockerConfigScannerNextAllocMax(&scanner);
-                    switch (entry_key_token) {
-                        .string, .allocated_string => |entry_key| {
-                            const matches = dockerConfigRegistryKeyMatches(entry_key, registry);
-                            if (object_field) |field_name| {
-                                if (!matches) {
-                                    freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
-                                    try dockerConfigScannerSkipValue(&scanner);
-                                    continue;
-                                }
-                                freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
-
-                                switch (try dockerConfigScannerNext(&scanner)) {
-                                    .object_begin => {},
-                                    else => return error.InvalidDockerConfig,
-                                }
-                                return dockerConfigReadObjectStringField(allocator, &scanner, field_name);
-                            }
-
-                            if (!matches) {
-                                freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
-                                try dockerConfigScannerSkipValue(&scanner);
-                                continue;
-                            }
-                            freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
-
-                            const value_token = try dockerConfigScannerNextAllocMax(&scanner);
-                            return try dockerConfigStringFromScannerToken(allocator, value_token);
-                        },
-                        .object_end => return null,
-                        else => return error.InvalidDockerConfig,
-                    }
-                }
             },
             .object_end => return null,
             else => return error.InvalidDockerConfig,

@@ -153,6 +153,39 @@ pub const ResolveError = union(enum) {
         }
     }
 
+    /// Rebuild the error with a caller-owned `reference` string.
+    pub fn withOwnedReference(self: ResolveError, owned_reference: []const u8) ResolveError {
+        return switch (self) {
+            .auth_failed => |value| .{ .auth_failed = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .not_found => |value| .{ .not_found = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .rate_limited => |value| .{ .rate_limited = .{
+                .registry = value.registry,
+                .reference = owned_reference,
+                .http_status = value.http_status,
+                .transport_retries_exhausted = value.transport_retries_exhausted,
+            } },
+            .digest_mismatch => |value| .{ .digest_mismatch = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .platform_not_found => |value| .{ .platform_not_found = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .platform_required => |value| .{ .platform_required = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .manifest_parse_error => |value| .{ .manifest_parse_error = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .network_error => |value| .{ .network_error = .{
+                .registry = value.registry,
+                .reference = owned_reference,
+                .http_status = value.http_status,
+                .transport_retries_exhausted = value.transport_retries_exhausted,
+            } },
+            .unsupported_algorithm => |value| .{ .unsupported_algorithm = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .content_type_mismatch => |value| .{ .content_type_mismatch = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+            .timeout => |value| .{ .timeout = .{
+                .registry = value.registry,
+                .reference = owned_reference,
+                .http_status = value.http_status,
+                .transport_retries_exhausted = value.transport_retries_exhausted,
+            } },
+            .depth_limit_exceeded => |value| .{ .depth_limit_exceeded = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },
+        };
+    }
+
     // context returns the common context fields regardless of variant.
     // Using a shared struct avoids repeating the same switch in each method.
     fn context(self: ResolveError) struct {

@@ -148,6 +148,13 @@ pub const ManifestHttpResponse = struct {
         if (self.body) |body| allocator.free(body);
     }
 
+    /// Drops auth and retry header storage once classification no longer needs them.
+    pub fn clearEphemeralMetadataHeaders(self: *ManifestHttpResponse, allocator: std.mem.Allocator) void {
+        if (self.owned_metadata) |*owned_metadata| owned_metadata.dropEphemeralHeaders(allocator);
+        self.metadata.www_authenticate_headers = &.{};
+        self.metadata.resilience_headers = &.{};
+    }
+
     pub fn initOwnedAlloc(
         allocator: std.mem.Allocator,
         metadata: ManifestResponseMetadata,
@@ -311,6 +318,15 @@ pub const OwnedManifestResponseMetadata = struct {
         freeHeaderSlices(allocator, self.www_authenticate_headers);
         if (self.resilience_headers.len != 0) {
             resilience.deinitOwnedHttpHeaders(allocator, self.resilience_headers);
+        }
+    }
+
+    pub fn dropEphemeralHeaders(self: *OwnedManifestResponseMetadata, allocator: std.mem.Allocator) void {
+        freeHeaderSlices(allocator, self.www_authenticate_headers);
+        self.www_authenticate_headers = &.{};
+        if (self.resilience_headers.len != 0) {
+            resilience.deinitOwnedHttpHeaders(allocator, self.resilience_headers);
+            self.resilience_headers = &.{};
         }
     }
 
@@ -686,10 +702,27 @@ fn buildAcceptHeadersAlloc(
     return headers;
 }
 
+fn shouldCollectManifestAuthHeaders(status: std.http.Status) bool {
+    return status == .unauthorized;
+}
+
+fn shouldCollectManifestResilienceHeader(status: std.http.Status, header_name: []const u8) bool {
+    if (status == .too_many_requests or resilience.classifyHttpStatus(status) != .none) {
+        return resilience.isTrackedResilienceHeaderName(header_name);
+    }
+    if (status == .ok) {
+        return std.mem.startsWith(u8, header_name, "RateLimit-") or
+            std.ascii.startsWithIgnoreCase(header_name, "X-RateLimit-");
+    }
+    return false;
+}
+
 fn ownedManifestResponseMetadataFromHead(
     allocator: std.mem.Allocator,
     head: std.http.Client.Response.Head,
 ) ManifestExchangeError!OwnedManifestResponseMetadata {
+    const collect_auth_headers = shouldCollectManifestAuthHeaders(head.status);
+
     var www_authenticate_headers = std.ArrayList([]const u8).empty;
     errdefer {
         for (www_authenticate_headers.items) |header| allocator.free(header);
@@ -728,7 +761,7 @@ fn ownedManifestResponseMetadataFromHead(
         }
 
         if (std.ascii.eqlIgnoreCase(header.name, "www-authenticate")) {
-            if (www_authenticate_complete) continue;
+            if (!collect_auth_headers or www_authenticate_complete) continue;
             if (www_authenticate_headers.items.len >= max_www_authenticate_headers) {
                 return error.ResponseHeadersTooLarge;
             }
@@ -740,6 +773,7 @@ fn ownedManifestResponseMetadataFromHead(
         }
 
         if (resilience.isTrackedResilienceHeaderName(header.name)) {
+            if (!shouldCollectManifestResilienceHeader(head.status, header.name)) continue;
             if (resilienceHeaderAlreadyCollected(resilience_headers.items, header.name)) continue;
             if (resilience_headers.items.len >= max_resilience_headers) {
                 return error.ResponseHeadersTooLarge;
@@ -844,8 +878,7 @@ fn mapExhaustedManifestTransportError(
     const transport_retries_exhausted = budget.networkRetriesExhausted();
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.ResponseBodyTooLarge,
-        error.ResponseHeadersTooLarge => mappedFailureOutcome(Outcome, ctx, null, manifestParseError),
+        error.ResponseBodyTooLarge, error.ResponseHeadersTooLarge => mappedFailureOutcome(Outcome, ctx, null, manifestParseError),
         error.Timeout => mappedRetryFailureOutcome(Outcome, ctx, null, timeoutError, transport_retries_exhausted),
         else => mappedRetryFailureOutcome(Outcome, ctx, null, networkError, transport_retries_exhausted),
     };
@@ -1157,6 +1190,7 @@ fn classifyGetResponse(
 
     return switch (classification) {
         .ok => blk: {
+            owned_response.clearEphemeralMetadataHeaders(ctx.allocator);
             const stolen_body = owned_response.body;
             owned_response.body = null;
             break :blk classifyUsableGetResponse(ctx, request, metadata, stolen_body);
@@ -1317,17 +1351,6 @@ fn classifyUsableHeadMetadata(
     return .{ .success = try metadata.cloneAllocHeadSuccess(ctx.allocator) };
 }
 
-fn manifestGetResponseRetainsBody(operation: ResolverOperation, media_type: MediaType) bool {
-    if (operation == .get_manifest) return false;
-    if (operation == .resolve or operation == .resolve_child_manifest) {
-        return switch (media_type) {
-            .oci_manifest_v1, .docker_manifest_v2 => false,
-            else => true,
-        };
-    }
-    return true;
-}
-
 fn classifyUsableGetResponse(
     ctx: ResolverContext,
     request: ManifestRequest,
@@ -1349,7 +1372,15 @@ fn classifyUsableGetResponse(
     const response_body = owned_body orelse return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
     if (response_body.len == 0) return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
 
-    const resolved_digest = verifyManifestBodyIntegrityAlloc(ctx, metadata, response_body) catch |err| switch (err) {
+    var body_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    var body_arena_alive = true;
+    defer if (body_arena_alive) body_arena.deinit();
+
+    const transient_body = try body_arena.allocator().dupe(u8, response_body);
+    ctx.allocator.free(response_body);
+    owned_body = null;
+
+    const resolved_digest = verifyManifestBodyIntegrityAlloc(ctx, metadata, transient_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DigestMismatch => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), digestMismatchError),
         error.UnsupportedAlgorithm => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), unsupportedAlgorithmError),
@@ -1357,7 +1388,7 @@ fn classifyUsableGetResponse(
     var resolved_digest_raw: ?[]u8 = resolved_digest.raw;
     defer if (resolved_digest_raw) |raw| ctx.allocator.free(raw);
 
-    var document = parseManifestDocument(ctx.allocator, ctx.operation, media_type, response_body) catch |err| switch (err) {
+    var document = parseManifestDocument(ctx.allocator, ctx.operation, media_type, transient_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError),
     };
@@ -1368,13 +1399,8 @@ fn classifyUsableGetResponse(
         return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     }
 
-    var backing_body: ?[]u8 = null;
-    if (manifestGetResponseRetainsBody(ctx.operation, media_type)) {
-        backing_body = owned_body;
-    } else if (owned_body) |bytes_to_release| {
-        ctx.allocator.free(bytes_to_release);
-    }
-    owned_body = null;
+    body_arena.deinit();
+    body_arena_alive = false;
 
     keep_document = true;
     const owned_digest_raw = resolved_digest_raw.?;
@@ -1385,7 +1411,7 @@ fn classifyUsableGetResponse(
         .resolved_digest = resolved_digest.digest,
         .resolved_digest_raw = owned_digest_raw,
         .document = document,
-        .backing_body = backing_body,
+        .backing_body = null,
     } };
 }
 
@@ -1432,18 +1458,9 @@ fn parseManifestDocument(
         .oci_manifest_v1, .docker_manifest_v2 => if (shallow_single_manifest)
             .{ .manifest_media_type = try Manifest.parseMediaTypeShallow(allocator, body) }
         else
-            .{ .manifest = if (operation == .get_manifest)
-                try json.parse(Manifest, allocator, body)
-            else
-                try json.parseBorrowing(Manifest, allocator, body) },
-        .oci_index_v1 => .{ .oci_index = if (operation == .get_manifest)
-            try json.parse(OciImageIndex, allocator, body)
-        else
-            try json.parseBorrowing(OciImageIndex, allocator, body) },
-        .docker_manifest_list_v2 => .{ .docker_manifest_list = if (operation == .get_manifest)
-            try json.parse(DockerManifestList, allocator, body)
-        else
-            try json.parseBorrowing(DockerManifestList, allocator, body) },
+            .{ .manifest = try json.parse(Manifest, allocator, body) },
+        .oci_index_v1 => .{ .oci_index = try json.parse(OciImageIndex, allocator, body) },
+        .docker_manifest_list_v2 => .{ .docker_manifest_list = try json.parse(DockerManifestList, allocator, body) },
         else => error.UnexpectedToken,
     };
 }
@@ -1781,52 +1798,70 @@ test "ownedManifestResponseMetadataFromHead: stops copying www-authenticate afte
 }
 
 test "ownedManifestResponseMetadataFromHead: keeps unsupported schemes until bearer" {
-  const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
-    "WWW-Authenticate: Basic realm=\"example\"",
-    "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
-  });
-  defer std.testing.allocator.free(head.bytes);
+    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
+        "WWW-Authenticate: Basic realm=\"example\"",
+        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
+    });
+    defer std.testing.allocator.free(head.bytes);
 
-  var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-  defer owned.deinit(std.testing.allocator);
-  try std.testing.expectEqual(@as(usize, 2), owned.www_authenticate_headers.len);
+    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), owned.www_authenticate_headers.len);
 }
 
 test "ownedManifestResponseMetadataFromHead: rejects oversize header values" {
-  const oversized = try std.testing.allocator.alloc(u8, max_manifest_header_value_bytes + 1);
-  defer std.testing.allocator.free(oversized);
-  @memset(oversized, 'a');
+    const oversized = try std.testing.allocator.alloc(u8, max_manifest_header_value_bytes + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'a');
 
-  const header_line = try std.fmt.allocPrint(
-    std.testing.allocator,
-    "WWW-Authenticate: Bearer realm=\"{s}\",service=\"registry.example.test\"",
-    .{oversized},
-  );
-  defer std.testing.allocator.free(header_line);
+    const header_line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "WWW-Authenticate: Bearer realm=\"{s}\",service=\"registry.example.test\"",
+        .{oversized},
+    );
+    defer std.testing.allocator.free(header_line);
 
-  const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{header_line});
-  defer std.testing.allocator.free(head.bytes);
+    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{header_line});
+    defer std.testing.allocator.free(head.bytes);
 
-  try std.testing.expectError(
-    error.ResponseHeadersTooLarge,
-    ownedManifestResponseMetadataFromHead(std.testing.allocator, head),
-  );
+    try std.testing.expectError(
+        error.ResponseHeadersTooLarge,
+        ownedManifestResponseMetadataFromHead(std.testing.allocator, head),
+    );
 }
 
 test "ownedManifestResponseMetadataFromHead: deduplicates resilience headers" {
-  const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 429 Too Many Requests", &.{
-    "Retry-After: 30",
-    "Retry-After: 60",
-    "Date: Sun, 06 Nov 1994 08:49:37 GMT",
-  });
-  defer std.testing.allocator.free(head.bytes);
+    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 429 Too Many Requests", &.{
+        "Retry-After: 30",
+        "Retry-After: 60",
+        "Date: Sun, 06 Nov 1994 08:49:37 GMT",
+    });
+    defer std.testing.allocator.free(head.bytes);
 
-  var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-  defer owned.deinit(std.testing.allocator);
-  try std.testing.expectEqual(@as(usize, 2), owned.resilience_headers.len);
-  try std.testing.expectEqualStrings("Retry-After", owned.resilience_headers[0].name);
-  try std.testing.expectEqualStrings("30", owned.resilience_headers[0].value);
+    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), owned.resilience_headers.len);
+    try std.testing.expectEqualStrings("Retry-After", owned.resilience_headers[0].name);
+    try std.testing.expectEqualStrings("30", owned.resilience_headers[0].value);
     try std.testing.expectEqualStrings("Date", owned.resilience_headers[1].name);
+}
+
+test "ownedManifestResponseMetadataFromHead: ok responses keep rate-limit headers only" {
+    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
+        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
+        "Retry-After: 30",
+        "RateLimit-Limit: 100;w=21600",
+        "RateLimit-Remaining: 99;w=21600",
+        "RateLimit-Reset: 1746136938;w=21600",
+    });
+    defer std.testing.allocator.free(head.bytes);
+
+    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
+    try std.testing.expectEqual(@as(usize, 3), owned.resilience_headers.len);
+    try std.testing.expect(std.mem.startsWith(u8, owned.resilience_headers[0].name, "RateLimit-"));
 }
 
 test "ManifestResponseMetadata cloneAllocHeadSuccess omits auth and retry headers" {

@@ -32,6 +32,30 @@ pub fn parseBorrowing(comptime T: type, allocator: std.mem.Allocator, bytes: []c
     });
 }
 
+/// Deep-copy a `Parsed(T)` from a transient arena onto `caller_allocator`.
+///
+/// The input `parsed` is deinitialized; the returned value owns its own arena
+/// through `caller_allocator`.
+pub fn promoteParsed(
+    comptime T: type,
+    caller_allocator: std.mem.Allocator,
+    parsed: std.json.Parsed(T),
+) !std.json.Parsed(T) {
+    const scratch_allocator = parsed.arena.allocator();
+    var aw: std.Io.Writer.Allocating = .init(scratch_allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(parsed.value);
+
+    const bytes = try caller_allocator.dupe(u8, aw.written());
+    errdefer caller_allocator.free(bytes);
+    parsed.deinit();
+
+    const promoted = try parse(T, caller_allocator, bytes);
+    caller_allocator.free(bytes);
+    return promoted;
+}
+
 /// Test helper: stringify any json-serializable value into an owned buffer.
 /// The caller owns the returned Allocating writer and must call .deinit().
 pub fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
@@ -62,6 +86,32 @@ test "json: parseBorrowing requires input bytes to outlive parsed value" {
     const parsed = try parseBorrowing(Descriptor, std.testing.allocator, json_bytes);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u64, 256), parsed.value.size);
+}
+
+test "json: promoteParsed copies parsed value onto caller allocator" {
+    const json_bytes =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 1
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer transient_arena.deinit();
+    const transient = transient_arena.allocator();
+
+    const transient_parsed = try parse(Manifest, transient, json_bytes);
+    const promoted = try promoteParsed(Manifest, std.testing.allocator, transient_parsed);
+    defer promoted.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), promoted.value.schema_version);
+    try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", promoted.value.media_type.toString());
 }
 
 test "json: Parsed lifecycle with testing allocator" {
