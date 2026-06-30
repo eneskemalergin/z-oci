@@ -11,6 +11,7 @@ const std = @import("std");
 
 const Manifest = @import("Manifest.zig");
 const Descriptor = @import("Descriptor.zig");
+const Platform = @import("Platform.zig");
 
 /// Parse JSON bytes into T. Unknown fields are silently ignored so
 /// the caller handles spec extensions without error.
@@ -112,18 +113,17 @@ fn readBusyboxManifestFixtureAlloc(allocator: std.mem.Allocator) ![]u8 {
 // --- Tests ---
 
 test "json: parseBorrowing requires input bytes to outlive parsed value" {
-    const json_bytes = try std.testing.allocator.dupe(u8,
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        \\  "size": 256
-        \\}
-    );
-    defer std.testing.allocator.free(json_bytes);
+    var json_bytes: [64]u8 = undefined;
+    const content = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
+    @memcpy(json_bytes[0..content.len], content);
 
-    const parsed = try parseBorrowing(Descriptor, std.testing.allocator, json_bytes);
+    const parsed = try parseBorrowing(Platform, std.testing.allocator, json_bytes[0..content.len]);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u64, 256), parsed.value.size);
+    try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
+
+    @memset(json_bytes[0..content.len], 'X');
+    try std.testing.expect(!std.mem.eql(u8, "linux", parsed.value.os));
+    try std.testing.expectEqual(@as(u8, 'X'), parsed.value.os[0]);
 }
 
 test "json: promoteParsed copies parsed value onto caller allocator" {
@@ -199,26 +199,6 @@ test "json: promoteParsed allocation failures preserve input parsed value" {
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
-}
-
-test "json: Parsed lifecycle with testing allocator" {
-    // Arrange: use testing.allocator to detect leaks.
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        \\    "size": 1
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-    // Act + Assert: no leak detected by testing.allocator
-    const parsed = try parse(Manifest, std.testing.allocator, json_bytes);
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
 }
 
 // Unknown fields are ignored (spec extensions allowed by OCI)
@@ -347,29 +327,20 @@ test "json: repeated success and parse failures leave no residual allocations un
 
 // Error paths: missing required fields
 
-test "json: Descriptor missing required field returns error" {
-    // Missing "size" is a required field.
-    const json_bytes =
+test "json: missing required field returns error" {
+    try std.testing.expectError(error.MissingField, parse(Descriptor, std.testing.allocator,
         \\{
         \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
         \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         \\}
-    ;
-    const result = parse(Descriptor, std.testing.allocator, json_bytes);
-    try std.testing.expectError(error.MissingField, result);
-}
-
-test "json: Manifest missing required config field returns error" {
-    // Missing "config": layers alone is not enough.
-    const json_bytes =
+    ));
+    try std.testing.expectError(error.MissingField, parse(Manifest, std.testing.allocator,
         \\{
         \\  "schemaVersion": 2,
         \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
         \\  "layers": []
         \\}
-    ;
-    const result = parse(Manifest, std.testing.allocator, json_bytes);
-    try std.testing.expectError(error.MissingField, result);
+    ));
 }
 
 // Error paths: malformed values
@@ -400,8 +371,7 @@ test "json: unrecognized media type string returns error" {
     try std.testing.expectError(error.UnexpectedToken, result);
 }
 
-test "json: wrong JSON type for size returns error" {
-    // "size" is a string, not a number.
+test "json: wrong JSON type for size returns InvalidCharacter" {
     const json_bytes =
         \\{
         \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -409,11 +379,8 @@ test "json: wrong JSON type for size returns error" {
         \\  "size": "not-a-number"
         \\}
     ;
-    const result = parse(Descriptor, std.testing.allocator, json_bytes);
-    try std.testing.expect(if (result) |p| blk: {
-        p.deinit();
-        break :blk false;
-    } else |_| true);
+
+    try std.testing.expectError(error.InvalidCharacter, parse(Descriptor, std.testing.allocator, json_bytes));
 }
 
 // Platform round-trip with os.version and os.features

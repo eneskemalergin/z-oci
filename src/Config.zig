@@ -372,9 +372,47 @@ test "Config: bare Config{} compiles with all defaults" {
     try std.testing.expect(!c.rate_limit_enabled);
 }
 
-test "Config: rate_limit_enabled can be enabled for future pre-emptive throttling" {
-    const c = Config{ .rate_limit_enabled = true };
-    try std.testing.expect(c.rate_limit_enabled);
+test "Config: field defaults and overrides are stored correctly" {
+    const defaults = Config{};
+    try std.testing.expect(!defaults.rate_limit_enabled);
+    try std.testing.expectEqual(@as(u32, 0), defaults.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 30_000), defaults.read_timeout_ms);
+    try std.testing.expectEqual(DEFAULT_MAX_MANIFEST_BYTES, defaults.max_manifest_bytes);
+    try std.testing.expectEqual(DEFAULT_MAX_TOKEN_RESPONSE_BYTES, defaults.max_token_response_bytes);
+    try std.testing.expectEqual(DEFAULT_MAX_TOKEN_CACHE_ENTRIES, defaults.max_token_cache_entries);
+    try std.testing.expectEqual(std.Io.Timeout.none, defaults.connectIoTimeout());
+
+    const cases = [_]struct {
+        config: Config,
+        rate_limit_enabled: ?bool = null,
+        connect_timeout_ms: ?u32 = null,
+        read_timeout_ms: ?u32 = null,
+        max_network_retries: ?u8 = null,
+        max_rate_limit_retries: ?u8 = null,
+        max_retries: ?u8 = null,
+        ca_bundle_path: ?[]const u8 = null,
+    }{
+        .{ .config = .{ .rate_limit_enabled = true }, .rate_limit_enabled = true },
+        .{ .config = .{ .connect_timeout_ms = 5_000, .read_timeout_ms = 60_000 }, .connect_timeout_ms = 5_000, .read_timeout_ms = 60_000 },
+        .{ .config = .{ .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt" }, .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt" },
+        .{ .config = .{ .max_network_retries = 2, .max_rate_limit_retries = 4 }, .max_network_retries = 2, .max_rate_limit_retries = 4 },
+        .{ .config = .{ .connect_timeout_ms = 0 }, .connect_timeout_ms = 0 },
+        .{ .config = .{ .read_timeout_ms = 0 }, .read_timeout_ms = 0 },
+        .{ .config = .{ .max_retries = 255 }, .max_retries = 255 },
+    };
+
+    for (cases) |case| {
+        if (case.rate_limit_enabled) |value| try std.testing.expectEqual(value, case.config.rate_limit_enabled);
+        if (case.connect_timeout_ms) |value| try std.testing.expectEqual(value, case.config.connect_timeout_ms);
+        if (case.read_timeout_ms) |value| try std.testing.expectEqual(value, case.config.read_timeout_ms);
+        if (case.max_network_retries) |value| try std.testing.expectEqual(value, case.config.max_network_retries);
+        if (case.max_rate_limit_retries) |value| try std.testing.expectEqual(value, case.config.max_rate_limit_retries);
+        if (case.max_retries) |value| try std.testing.expectEqual(value, case.config.max_retries);
+        if (case.ca_bundle_path) |value| try std.testing.expectEqualSlices(u8, value, case.config.ca_bundle_path.?);
+    }
+
+    const connect_timeout = Config{ .connect_timeout_ms = 5_000 };
+    try std.testing.expect(connect_timeout.connectIoTimeout().duration.raw.toMilliseconds() == 5_000);
 }
 
 test "Config: credential_provider slot accepts a provider" {
@@ -439,51 +477,6 @@ test "Config: credential handle release hook can tear down secrets" {
     try std.testing.expect(State.released);
 }
 
-test "Config: timeout fields accept custom values" {
-    const c = Config{ .connect_timeout_ms = 5_000, .read_timeout_ms = 60_000 };
-    try std.testing.expectEqual(@as(u32, 5_000), c.connect_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 60_000), c.read_timeout_ms);
-}
-
-test "Config: ca_bundle_path stores and returns path" {
-    const c = Config{ .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt" };
-    try std.testing.expectEqualSlices(u8, "/etc/ssl/certs/ca-certificates.crt", c.ca_bundle_path.?);
-}
-
-test "Config: max_network_retries and max_rate_limit_retries accept custom values" {
-    const c = Config{
-        .max_network_retries = 2,
-        .max_rate_limit_retries = 4,
-    };
-    try std.testing.expectEqual(@as(u8, 2), c.max_network_retries);
-    try std.testing.expectEqual(@as(u8, 4), c.max_rate_limit_retries);
-}
-
-test "Config: max_manifest_bytes and max_token_response_bytes use safe defaults" {
-    const c = Config{};
-    try std.testing.expectEqual(DEFAULT_MAX_MANIFEST_BYTES, c.max_manifest_bytes);
-    try std.testing.expectEqual(DEFAULT_MAX_TOKEN_RESPONSE_BYTES, c.max_token_response_bytes);
-    try std.testing.expectEqual(DEFAULT_MAX_TOKEN_CACHE_ENTRIES, c.max_token_cache_entries);
-}
-
-test "Config: max_retries zero disables retries" {
-    // A caller that wants no retries must be able to set max_retries to 0.
-    const c = Config{ .max_retries = 0 };
-    try std.testing.expectEqual(@as(u8, 0), c.max_retries);
-}
-
-test "Config: connect_timeout_ms zero means unset connect Io timeout" {
-    const c = Config{ .connect_timeout_ms = 0 };
-    try std.testing.expectEqual(@as(u32, 0), c.connect_timeout_ms);
-    try std.testing.expectEqual(std.Io.Timeout.none, c.connectIoTimeout());
-}
-
-test "Config: connectIoTimeout maps milliseconds to real clock duration" {
-    const c = Config{ .connect_timeout_ms = 5_000 };
-    const timeout = c.connectIoTimeout();
-    try std.testing.expect(timeout.duration.raw.toMilliseconds() == 5_000);
-}
-
 test "Config: applyToClient is no-op when ca_bundle_path is null" {
     var client = std.http.Client{
         .allocator = std.testing.allocator,
@@ -517,6 +510,90 @@ test "Config: applyToClient skips reload when path and mtime are unchanged" {
     try client.ca_bundle_lock.lockShared(std.testing.io);
     defer client.ca_bundle_lock.unlockShared(std.testing.io);
     try std.testing.expectEqual(first_len, client.ca_bundle.bytes.items.len);
+}
+
+test "Config: applyToClient reloads bundle when file mtime changes" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = "mtime-ca.pem";
+    const enterprise = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/tls/enterprise-test-ca.pem",
+        std.testing.allocator,
+        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
+    );
+    defer std.testing.allocator.free(enterprise);
+    {
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, enterprise);
+    }
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
+    const abs_path = abs_buf[0..abs_len];
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try config.applyToClient(&client);
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    const first_len = client.ca_bundle.bytes.items.len;
+    const first_count = client.ca_bundle.map.count();
+    client.ca_bundle_lock.unlockShared(std.testing.io);
+
+    const test_ca = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/tls/test-ca.pem",
+        std.testing.allocator,
+        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
+    );
+    defer std.testing.allocator.free(test_ca);
+    try tmp.dir.deleteFile(std.testing.io, rel_path);
+    {
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, test_ca);
+    }
+
+    try config.applyToClient(&client);
+
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    defer client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expect(
+        first_len != client.ca_bundle.bytes.items.len or
+            first_count != client.ca_bundle.map.count(),
+    );
+}
+
+test "Config: applyToClient allocation failures do not leak" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    const abs_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
+    defer std.testing.allocator.free(abs_path);
+
+    const State = struct {
+        fn run(failing_allocator: std.mem.Allocator, path: [:0]const u8) !void {
+            var client = std.http.Client{
+                .allocator = failing_allocator,
+                .io = std.testing.io,
+            };
+            defer client.deinit();
+
+            const config = Config{ .ca_bundle_path = path };
+            try config.applyToClient(&client);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{abs_path});
 }
 
 test "Config: applyToClient repeated loads stay leak-free under DebugAllocator" {
@@ -599,6 +676,33 @@ test "Config: applyToClient rejects invalid PEM bundle" {
     const rel_path = "fixtures/tls/invalid-ca-bundle.pem";
     const abs_path = try fixtureAbsPath(std.testing.allocator, rel_path);
     defer std.testing.allocator.free(abs_path);
+
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const config = Config{ .ca_bundle_path = abs_path };
+    try std.testing.expectError(error.CaBundleInvalid, config.applyToClient(&client));
+}
+
+test "Config: applyToClient rejects ca bundle files larger than MAX_CA_BUNDLE_BYTES" {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = "oversized-ca.pem";
+    {
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, MAX_CA_BUNDLE_BYTES + 1);
+    }
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
+    const abs_path = abs_buf[0..abs_len];
 
     var client = std.http.Client{
         .allocator = std.testing.allocator,
@@ -723,10 +827,13 @@ test "Config: applyToClient rejects world-writable ca bundle file on POSIX" {
 test "Config: applyToClient rejects pem files containing private key blocks" {
     if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    const key_markers = [_][]const u8{
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    };
 
-    const rel_path = "ca-with-key.pem";
     const enterprise = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
         "fixtures/tls/enterprise-test-ca.pem",
@@ -734,25 +841,34 @@ test "Config: applyToClient rejects pem files containing private key blocks" {
         std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
     );
     defer std.testing.allocator.free(enterprise);
-    {
-        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, enterprise);
-        try file.writeStreamingAll(std.testing.io, "\n-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n");
+
+    for (key_markers) |marker| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const rel_path = "ca-with-key.pem";
+        {
+            var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, enterprise);
+            try file.writeStreamingAll(std.testing.io, "\n");
+            try file.writeStreamingAll(std.testing.io, marker);
+            try file.writeStreamingAll(std.testing.io, "\nZm9v\n-----END PRIVATE KEY-----\n");
+        }
+
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
+        const abs_path = abs_buf[0..abs_len];
+
+        var client = std.http.Client{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+        };
+        defer client.deinit();
+
+        const config = Config{ .ca_bundle_path = abs_path };
+        try std.testing.expectError(error.CaBundleContainsPrivateKey, config.applyToClient(&client));
     }
-
-    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
-    const abs_path = abs_buf[0..abs_len];
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = abs_path };
-    try std.testing.expectError(error.CaBundleContainsPrivateKey, config.applyToClient(&client));
 }
 
 test "Config: loaded ca bundle verifies fixture server certificate signed by that ca" {
@@ -782,21 +898,11 @@ test "Config: loaded ca bundle verifies fixture server certificate signed by tha
     try ca_bundle.verify(server_parsed, now.toSeconds());
 }
 
-test "Config: read_timeout_ms zero means no timeout" {
-    const c = Config{ .read_timeout_ms = 0 };
-    try std.testing.expectEqual(@as(u32, 0), c.read_timeout_ms);
-}
-
 test "Config: credential handle release with null release_fn is a no-op" {
     const handle = CredentialHandle{
         .credential = .{ .username = "u", .secret = "s" },
     };
     handle.release(); // must not crash or leak (covers default-null and explicit-null)
-}
-
-test "Config: max_retries at u8 maximum is valid" {
-    const c = Config{ .max_retries = 255 };
-    try std.testing.expectEqual(@as(u8, 255), c.max_retries);
 }
 
 test "Config: credential_provider null returns null for all registries" {

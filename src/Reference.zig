@@ -225,47 +225,36 @@ const ReferenceCorpusCase = struct {
 //
 // parse: Docker Hub bare names ------------------------------------------------
 
-test "parse: bare name expands to docker hub, library prefix, and latest tag" {
-    // Arrange
-    const alloc = std.testing.allocator;
-    // Act
-    var ref = try parse(alloc, "ubuntu");
-    defer ref.deinit(alloc);
-    // Assert: all three defaults are applied in one step.
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
-    try std.testing.expectEqualSlices(u8, "latest", ref.tag.?);
-    try std.testing.expect(ref.digest == null);
-}
-
-test "parse: bare name with explicit tag, library prefix still applied" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "ubuntu:22.04");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
-    try std.testing.expectEqualSlices(u8, "22.04", ref.tag.?);
-}
-
-test "parse: bare name with digest, no tag, no latest default" {
-    // When a digest is present and no tag, tag stays null (no latest default).
+test "parse: Docker Hub bare name defaults table" {
     const alloc = std.testing.allocator;
     const hex = "a" ** 64;
-    var ref = try parse(alloc, "ubuntu@sha256:" ++ hex);
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
-    try std.testing.expect(ref.tag == null);
-    try std.testing.expect(ref.digest != null);
-    try std.testing.expectEqualSlices(u8, hex, ref.digest.?.hex);
-}
+    const cases = [_]struct {
+        input: []const u8,
+        repository: []const u8,
+        tag: ?[]const u8,
+        has_digest: bool,
+    }{
+        .{ .input = "ubuntu", .repository = "library/ubuntu", .tag = "latest", .has_digest = false },
+        .{ .input = "ubuntu:22.04", .repository = "library/ubuntu", .tag = "22.04", .has_digest = false },
+        .{ .input = "ubuntu@sha256:" ++ hex, .repository = "library/ubuntu", .tag = null, .has_digest = true },
+        .{ .input = "ubuntu:20.04-slim", .repository = "library/ubuntu", .tag = "20.04-slim", .has_digest = false },
+    };
 
-test "parse: tag with hyphens and dots is preserved exactly" {
-    // Tags like "20.04-slim" must not be truncated or modified.
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "ubuntu:20.04-slim");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "20.04-slim", ref.tag.?);
+    for (cases) |case| {
+        var ref = try parse(alloc, case.input);
+        defer ref.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
+        try std.testing.expectEqualSlices(u8, case.repository, ref.repository);
+        if (case.tag) |tag| {
+            try std.testing.expectEqualSlices(u8, tag, ref.tag.?);
+        } else {
+            try std.testing.expect(ref.tag == null);
+        }
+        try std.testing.expect((ref.digest != null) == case.has_digest);
+        if (case.has_digest) {
+            try std.testing.expectEqualSlices(u8, hex, ref.digest.?.hex);
+        }
+    }
 }
 
 // parse: Docker Hub org paths -------------------------------------------------
@@ -336,36 +325,28 @@ test "parse: no tag and no digest defaults tag to latest" {
 
 // parse: Docker Hub alias normalization ---------------------------------------
 
-test "parse: docker.io alias is normalized to registry-1.docker.io" {
+test "parse: Docker Hub alias normalization table" {
     const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "docker.io/library/ubuntu:20.04");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
-    try std.testing.expectEqualSlices(u8, "20.04", ref.tag.?);
-}
+    const cases = [_]struct {
+        input: []const u8,
+        repository: []const u8,
+        tag: ?[]const u8,
+    }{
+        .{ .input = "docker.io/library/ubuntu:20.04", .repository = "library/ubuntu", .tag = "20.04" },
+        .{ .input = "index.docker.io/library/alpine:3.18", .repository = "library/alpine", .tag = "3.18" },
+        .{ .input = "DOCKER.IO/library/ubuntu:latest", .repository = "library/ubuntu", .tag = "latest" },
+        .{ .input = "REGISTRY-1.DOCKER.IO/ubuntu:latest", .repository = "library/ubuntu", .tag = "latest" },
+    };
 
-test "parse: index.docker.io alias is normalized to registry-1.docker.io" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "index.docker.io/library/alpine:3.18");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-}
-
-test "parse: docker.io alias normalization is case-insensitive" {
-    // "DOCKER.IO" must normalize the same as "docker.io".
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "DOCKER.IO/library/ubuntu:latest");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-}
-
-test "parse: canonical docker hub hostname is normalized case-insensitively" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "REGISTRY-1.DOCKER.IO/ubuntu:latest");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "library/ubuntu", ref.repository);
+    for (cases) |case| {
+        var ref = try parse(alloc, case.input);
+        defer ref.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
+        try std.testing.expectEqualSlices(u8, case.repository, ref.repository);
+        if (case.tag) |tag| {
+            try std.testing.expectEqualSlices(u8, tag, ref.tag.?);
+        }
+    }
 }
 
 // parse: digest and tag together ----------------------------------------------

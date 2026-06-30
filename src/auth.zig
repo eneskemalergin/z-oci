@@ -3443,39 +3443,65 @@ test "AuthEngine.authenticate: generic self-hosted bearer registry path uses doc
 
     try std.testing.expectEqualStrings("self-hosted-token", response.access_token.value);
 }
-test "buildTokenHttpRequest: get request includes query parameters" {
-    const request = try AuthenticateRequest.init(
-        "registry-1.docker.io",
+test "buildTokenHttpRequest: GET URL golden matrix" {
+    const cases = [_]struct {
+        registry: []const u8,
+        challenge: BearerChallenge,
+        expected_url: []const u8,
+    }{
         .{
-            .realm = "https://auth.example.test/token",
-            .service = "registry.example.test",
-            .scope = "repository:library/ubuntu:pull",
+            .registry = "registry-1.docker.io",
+            .challenge = .{
+                .realm = "https://auth.example.test/token",
+                .service = "registry.example.test",
+                .scope = "repository:library/ubuntu:pull",
+            },
+            .expected_url = "https://auth.example.test/token?service=registry.example.test&scope=repository%3Alibrary%2Fubuntu%3Apull",
         },
-    );
+        .{
+            .registry = "registry.example.test",
+            .challenge = .{ .realm = "https://auth.example.test/token" },
+            .expected_url = "https://auth.example.test/token",
+        },
+        .{
+            .registry = "registry-1.docker.io",
+            .challenge = .{
+                .realm = "https://auth.docker.io/token",
+                .service = "registry.docker.io",
+                .scope = "repository:samalba/my-app:pull repository:samalba/my-app:push",
+            },
+            .expected_url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository%3Asamalba%2Fmy-app%3Apull&scope=repository%3Asamalba%2Fmy-app%3Apush",
+        },
+        .{
+            .registry = "quay.io",
+            .challenge = .{
+                .realm = "https://quay.io/v2/auth",
+                .service = "quay.io",
+                .scope = "repository:quay/listocireferrs:pull,push",
+            },
+            .expected_url = "https://quay.io/v2/auth?service=quay.io&scope=repository%3Aquay%2Flistocireferrs%3Apull%2Cpush",
+        },
+        .{
+            .registry = "ghcr.io",
+            .challenge = .{
+                .realm = "https://ghcr.io/token",
+                .service = "ghcr.io",
+                .scope = "repository:owner/image:pull",
+            },
+            .expected_url = "https://ghcr.io/token?service=ghcr.io&scope=repository%3Aowner%2Fimage%3Apull",
+        },
+    };
 
-    var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
-    defer http_request.deinit(std.testing.allocator);
+    for (cases) |case| {
+        const request = try AuthenticateRequest.init(case.registry, case.challenge);
+        var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
+        defer http_request.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(TokenRequestMethod.get, http_request.method);
-    try std.testing.expectEqualStrings(
-        "https://auth.example.test/token?service=registry.example.test&scope=repository%3Alibrary%2Fubuntu%3Apull",
-        http_request.url,
-    );
-    try std.testing.expect(http_request.authorization == null);
-    try std.testing.expect(http_request.body == null);
-}
-test "buildTokenHttpRequest: get request omits empty query delimiter" {
-    const request = try AuthenticateRequest.init(
-        "registry.example.test",
-        .{ .realm = "https://auth.example.test/token" },
-    );
-
-    var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
-    defer http_request.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("https://auth.example.test/token", http_request.url);
-    try std.testing.expect(http_request.authorization == null);
-    try std.testing.expect(http_request.body == null);
+        try std.testing.expectEqual(TokenRequestMethod.get, http_request.method);
+        try std.testing.expectEqualStrings(case.expected_url, http_request.url);
+        try std.testing.expect(http_request.authorization == null);
+        try std.testing.expect(http_request.body == null);
+    }
 }
 test "buildTokenHttpRequest: post request includes body and optional basic auth" {
     const request = try AuthenticateRequest.init(
@@ -3542,60 +3568,6 @@ test "TokenHttpRequest.deinit: post teardown stays leak-free under allocation fa
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
-}
-test "buildTokenHttpRequest: docker token auth uses repeated scope query parameters" {
-    const request = try AuthenticateRequest.init(
-        "registry-1.docker.io",
-        .{
-            .realm = "https://auth.docker.io/token",
-            .service = "registry.docker.io",
-            .scope = "repository:samalba/my-app:pull repository:samalba/my-app:push",
-        },
-    );
-
-    var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
-    defer http_request.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings(
-        "https://auth.docker.io/token?service=registry.docker.io&scope=repository%3Asamalba%2Fmy-app%3Apull&scope=repository%3Asamalba%2Fmy-app%3Apush",
-        http_request.url,
-    );
-}
-test "buildTokenHttpRequest: quay realm and host service stay intact" {
-    const request = try AuthenticateRequest.init(
-        "quay.io",
-        .{
-            .realm = "https://quay.io/v2/auth",
-            .service = "quay.io",
-            .scope = "repository:quay/listocireferrs:pull,push",
-        },
-    );
-
-    var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
-    defer http_request.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings(
-        "https://quay.io/v2/auth?service=quay.io&scope=repository%3Aquay%2Flistocireferrs%3Apull%2Cpush",
-        http_request.url,
-    );
-}
-test "buildTokenHttpRequest: ghcr realm and service stay intact" {
-    const request = try AuthenticateRequest.init(
-        "ghcr.io",
-        .{
-            .realm = "https://ghcr.io/token",
-            .service = "ghcr.io",
-            .scope = "repository:owner/image:pull",
-        },
-    );
-
-    var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
-    defer http_request.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings(
-        "https://ghcr.io/token?service=ghcr.io&scope=repository%3Aowner%2Fimage%3Apull",
-        http_request.url,
-    );
 }
 test "parseTokenResponse: accepts matching duplicate token fields and preserves refresh token" {
     var response = try parseTokenResponse(std.testing.allocator,
@@ -3824,6 +3796,243 @@ test "AuthEngine.authenticate: retries connection reset on token exchange then s
 
     try std.testing.expectEqual(@as(usize, 2), State.calls);
     try std.testing.expectEqualStrings("reset-token", response.access_token.value);
+}
+test "AuthEngine.authenticate: maps token transport Timeout ConnectionRefused and UnknownHostName" {
+    const cases = [_]struct {
+        transport_err: AuthError,
+    }{
+        .{ .transport_err = error.Timeout },
+        .{ .transport_err = error.ConnectionRefused },
+        .{ .transport_err = error.UnknownHostName },
+    };
+
+    for (cases) |case| {
+        const State = struct {
+            var transport_err: AuthError = undefined;
+
+            fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+                defer request.deinit(std.testing.allocator);
+                return transport_err;
+            }
+        };
+
+        State.transport_err = case.transport_err;
+        var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.exchange);
+        defer engine.deinit();
+        var client: std.http.Client = undefined;
+        const request = try AuthenticateRequest.init(
+            "registry.example.test",
+            .{
+                .realm = "https://auth.example.test/token",
+                .service = "registry.example.test",
+                .scope = "repository:owner/image:pull",
+            },
+        );
+
+        try std.testing.expectError(case.transport_err, engine.authenticate(&client, request));
+    }
+}
+test "AuthEngine.authenticate: remembers POST-first realm preference after successful POST" {
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+
+            if (calls == 1) {
+                if (request.method != .get) return error.TokenExchangeFailed;
+                return .{ .status = .unauthorized, .body = "" };
+            }
+            if (calls == 2) {
+                if (request.method != .post) return error.TokenExchangeFailed;
+                return .{ .status = .ok, .body =
+                \\{"access_token": "post-first-token", "expires_in": 120}
+                };
+            }
+            if (calls == 3) {
+                if (request.method != .post) return error.TokenExchangeFailed;
+                return .{ .status = .ok, .body =
+                \\{"access_token": "post-first-token-2", "expires_in": 120}
+                };
+            }
+            return error.TokenExchangeFailed;
+        }
+    };
+
+    State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+    const request_a = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:scope=a:pull",
+        },
+    );
+    const request_b = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:scope=b:pull",
+        },
+    );
+
+    var first = (try engine.authenticate(&client, request_a)).?;
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("post-first-token", first.access_token.value);
+    try std.testing.expectEqual(@as(usize, 2), State.calls);
+
+    var second = (try engine.authenticate(&client, request_b)).?;
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("post-first-token-2", second.access_token.value);
+    try std.testing.expectEqual(@as(usize, 3), State.calls);
+}
+test "liveTokenHttpExchanger: invalid URL maps to TokenExchangeFailed" {
+    const request = TokenHttpRequest{
+        .method = .get,
+        .url = try std.testing.allocator.dupe(u8, "not-a-valid-uri"),
+    };
+    var client: std.http.Client = undefined;
+    try std.testing.expectError(error.TokenExchangeFailed, liveTokenHttpExchanger(std.testing.allocator, &client, request));
+}
+
+test "mapLiveTokenTransportError: maps transport and oversize errors without erasure" {
+    const cases = [_]struct { err: anyerror, expected: AuthError }{
+        .{ .err = error.OutOfMemory, .expected = error.OutOfMemory },
+        .{ .err = error.BodyTooLarge, .expected = error.TokenResponseTooLarge },
+        .{ .err = error.ConnectionResetByPeer, .expected = error.ConnectionResetByPeer },
+        .{ .err = error.Timeout, .expected = error.Timeout },
+        .{ .err = error.NetworkUnreachable, .expected = error.NetworkUnreachable },
+        .{ .err = error.ConnectionRefused, .expected = error.ConnectionRefused },
+        .{ .err = error.UnknownHostName, .expected = error.UnknownHostName },
+        .{ .err = error.UnexpectedToken, .expected = error.TokenExchangeFailed },
+    };
+    for (cases) |tc| {
+        try std.testing.expectEqual(tc.expected, mapLiveTokenTransportError(tc.err));
+    }
+}
+test "AuthEngine.loadDockerConfigFromEnvironment: USERPROFILE fallback when HOME is unset" {
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var docker_dir = try tmp_dir.dir.createDirPathOpen(io, ".docker", .{});
+    defer docker_dir.close(io);
+
+    const file = try docker_dir.createFile(io, "config.json", .{ .read = true });
+    defer file.close(io);
+
+    var file_buffer: [256]u8 = undefined;
+    var file_writer = file.writer(io, &file_buffer);
+    try file_writer.interface.writeAll(
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  }
+        \\}
+    );
+    try file_writer.interface.flush();
+
+    const userprofile_dir = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp_dir.sub_path[0..] });
+    defer std.testing.allocator.free(userprofile_dir);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(USERPROFILE_DIR_VAR, userprofile_dir);
+
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    defer engine.deinit();
+
+    try std.testing.expect(try engine.loadDockerConfigFromEnvironment(io));
+
+    const handle = (try engine.credentialForRegistry("ghcr.io")).?;
+    try std.testing.expectEqualStrings("octocat", handle.credential.username);
+    try std.testing.expectEqualStrings("ghp_example", handle.credential.secret);
+}
+test "AuthEngine.loadDockerConfigFromEnvironment: oversize config file is a clean miss" {
+    const io = std.testing.io;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var docker_dir = try tmp_dir.dir.createDirPathOpen(io, ".docker", .{});
+    defer docker_dir.close(io);
+
+    const file = try docker_dir.createFile(io, "config.json", .{ .read = true });
+    defer file.close(io);
+
+    var file_buffer: [256]u8 = undefined;
+    var file_writer = file.writer(io, &file_buffer);
+    try file_writer.interface.writeAll("{");
+    const oversize_fill = " ";
+    var remaining: usize = DOCKER_CONFIG_FILE_SIZE_LIMIT;
+    while (remaining > 0) {
+        const chunk = @min(remaining, oversize_fill.len);
+        try file_writer.interface.writeAll(oversize_fill[0..chunk]);
+        remaining -= chunk;
+    }
+    try file_writer.interface.writeAll("}");
+    try file_writer.interface.flush();
+
+    const home_dir = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp_dir.sub_path[0..] });
+    defer std.testing.allocator.free(home_dir);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(HOME_DIR_VAR, home_dir);
+
+    var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, Config{}, &environ_map);
+    defer engine.deinit();
+
+    try std.testing.expect(!(try engine.loadDockerConfigFromEnvironment(io)));
+    try std.testing.expect((try engine.credentialForRegistry("ghcr.io")) == null);
+}
+test "AuthEngine.authenticate: max_token_cache_entries zero disables LRU eviction" {
+    // limit == 0 skips evictLruTokenCacheEntriesUntilWithinLimit; cache may grow without bound.
+    const State = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+            const body = switch (calls) {
+                1 => "{\"access_token\": \"token-1\", \"expires_in\": 3600}",
+                2 => "{\"access_token\": \"token-2\", \"expires_in\": 3600}",
+                3 => "{\"access_token\": \"token-3\", \"expires_in\": 3600}",
+                else => return error.TokenExchangeFailed,
+            };
+            return .{ .status = .ok, .body = body };
+        }
+    };
+
+    State.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_token_cache_entries = 0,
+    }, State.exchange);
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+
+    inline for (0..3) |index| {
+        const request = try AuthenticateRequest.init(
+            "registry.example.test",
+            .{
+                .realm = "https://auth.example.test/token",
+                .service = "registry.example.test",
+                .scope = std.fmt.comptimePrint("repository:owner/image:scope={d}:pull", .{index}),
+            },
+        );
+        var response = (try engine.authenticate(&client, request)).?;
+        defer response.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), engine.token_cache.count());
 }
 test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
     const State = struct {
@@ -4588,104 +4797,157 @@ test "AuthEngine.authenticate: allocation failures do not leak during cache inse
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
 }
-test "AuthEngine.authenticate: uses credential handle for optional basic auth" {
-    const ProviderState = struct {
-        var released = false;
-
-        fn release(_: std.mem.Allocator, _: ConfigModule.Credential) void {
-            released = true;
-        }
-
-        fn get(_: []const u8) ?CredentialHandle {
-            return .{
-                .credential = .{ .username = "user", .secret = "token" },
-                .release_fn = release,
-                .release_allocator = std.testing.allocator,
-            };
-        }
-    };
-
-    const ExchangeState = struct {
-        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            if (request.authorization == null or !std.mem.eql(u8, request.authorization.?, "Basic dXNlcjp0b2tlbg==")) {
-                return error.TokenExchangeFailed;
-            }
-            return .{ .status = .ok, .body =
-            \\{
-            \\  "access_token": "credential-token"
-            \\}
-            };
-        }
-    };
-
-    ProviderState.released = false;
-    const provider = CredentialProvider{ .getCredentialFn = ProviderState.get };
-    var engine = AuthEngine.initWithTokenHttpExchanger(
-        std.testing.allocator,
-        .{ .credential_provider = &provider },
-        ExchangeState.exchange,
-    );
-    defer engine.deinit();
-    var client: std.http.Client = undefined;
-    const request = try AuthenticateRequest.init(
-        "ghcr.io",
-        .{ .realm = "https://auth.example.test/token" },
-    );
-
-    var response = (try engine.authenticate(&client, request)).?;
-    defer response.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("credential-token", response.access_token.value);
-    try std.testing.expect(ProviderState.released);
-}
-test "AuthEngine.authenticate: Docker Hub normalized reference uses env credentials for optional basic auth" {
-    const ExchangeState = struct {
-        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            if (request.method != .get) return error.TokenExchangeFailed;
-            if (request.authorization == null or !std.mem.eql(u8, request.authorization.?, "Basic ZG9ja2VyLXVzZXI6ZG9ja2VyLXRva2Vu")) {
-                return error.TokenExchangeFailed;
-            }
-            if (!std.mem.eql(u8, request.url, "https://auth.docker.io/token?service=registry.docker.io&scope=repository%3Alibrary%2Fubuntu%3Apull")) {
-                return error.TokenExchangeFailed;
-            }
-            return .{ .status = .ok, .body =
-            \\{
-            \\  "access_token": "docker-hub-auth-token"
-            \\}
-            };
-        }
-    };
-
-    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
-    defer environ_map.deinit();
-    try environ_map.put(ENV_REGISTRY_HOST, "docker.io");
-    try environ_map.put(ENV_REGISTRY_USER, "docker-user");
-    try environ_map.put(ENV_REGISTRY_TOKEN, "docker-token");
-
-    var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:latest");
-    defer ref.deinit(std.testing.allocator);
-    const view = referenceView(ref);
-
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, ExchangeState.exchange);
-    defer engine.deinit();
-    engine.environ_map = &environ_map;
-
-    var client: std.http.Client = undefined;
-    const request = try AuthenticateRequest.init(
-        view.registry,
+test "AuthEngine.authenticate: optional basic auth credential matrix" {
+    const cases = [_]struct {
+        name: []const u8,
+        use_provider: bool,
+        use_environ: bool,
+        registry: []const u8,
+        challenge: BearerChallenge,
+        expected_auth: ?[]const u8,
+        expected_url: ?[]const u8,
+        expected_token: []const u8,
+    }{
         .{
-            .realm = "https://auth.docker.io/token",
-            .service = "registry.docker.io",
-            .scope = "repository:library/ubuntu:pull",
+            .name = "config provider",
+            .use_provider = true,
+            .use_environ = false,
+            .registry = "ghcr.io",
+            .challenge = .{ .realm = "https://auth.example.test/token" },
+            .expected_auth = "Basic dXNlcjp0b2tlbg==",
+            .expected_url = null,
+            .expected_token = "credential-token",
         },
-    );
+        .{
+            .name = "docker hub env",
+            .use_provider = false,
+            .use_environ = true,
+            .registry = "registry-1.docker.io",
+            .challenge = .{
+                .realm = "https://auth.docker.io/token",
+                .service = "registry.docker.io",
+                .scope = "repository:library/ubuntu:pull",
+            },
+            .expected_auth = "Basic ZG9ja2VyLXVzZXI6ZG9ja2VyLXRva2Vu",
+            .expected_url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository%3Alibrary%2Fubuntu%3Apull",
+            .expected_token = "docker-hub-auth-token",
+        },
+        .{
+            .name = "docker hub anonymous",
+            .use_provider = false,
+            .use_environ = false,
+            .registry = "registry-1.docker.io",
+            .challenge = .{
+                .realm = "https://auth.docker.io/token",
+                .service = "registry.docker.io",
+                .scope = "repository:library/ubuntu:pull",
+            },
+            .expected_auth = null,
+            .expected_url = "https://auth.docker.io/token?service=registry.docker.io&scope=repository%3Alibrary%2Fubuntu%3Apull",
+            .expected_token = "docker-hub-anon-token",
+        },
+        .{
+            .name = "ghcr env mixed-case registry",
+            .use_provider = false,
+            .use_environ = true,
+            .registry = "GHCR.IO",
+            .challenge = .{
+                .realm = "https://ghcr.io/token",
+                .service = "ghcr.io",
+                .scope = "repository:stefanprodan/podinfo:pull",
+            },
+            .expected_auth = "Basic Z2hjci11c2VyOmdocnMtdG9rZW4=",
+            .expected_url = "https://ghcr.io/token?service=ghcr.io&scope=repository%3Astefanprodan%2Fpodinfo%3Apull",
+            .expected_token = "ghcr-token",
+        },
+    };
 
-    var response = (try engine.authenticate(&client, request)).?;
-    defer response.deinit(std.testing.allocator);
+    for (cases) |case| {
+        const ProviderState = struct {
+            var released = false;
 
-    try std.testing.expectEqualStrings("docker-hub-auth-token", response.access_token.value);
+            fn release(_: std.mem.Allocator, _: ConfigModule.Credential) void {
+                released = true;
+            }
+
+            fn get(_: []const u8) ?CredentialHandle {
+                return .{
+                    .credential = .{ .username = "user", .secret = "token" },
+                    .release_fn = release,
+                    .release_allocator = std.testing.allocator,
+                };
+            }
+        };
+
+        const ExchangeState = struct {
+            var expected_auth: ?[]const u8 = null;
+            var expected_url: ?[]const u8 = null;
+            var expected_token: []const u8 = undefined;
+
+            fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+                defer request.deinit(std.testing.allocator);
+                if (request.method != .get) return error.TokenExchangeFailed;
+                if (expected_auth) |auth_header| {
+                    if (request.authorization == null or !std.mem.eql(u8, request.authorization.?, auth_header)) {
+                        return error.TokenExchangeFailed;
+                    }
+                } else if (request.authorization != null) {
+                    return error.TokenExchangeFailed;
+                }
+                if (expected_url) |url| {
+                    if (!std.mem.eql(u8, request.url, url)) return error.TokenExchangeFailed;
+                }
+                const body: []const u8 = if (std.mem.eql(u8, expected_token, "credential-token"))
+                    \\{"access_token": "credential-token"}
+                else if (std.mem.eql(u8, expected_token, "docker-hub-auth-token"))
+                    \\{"access_token": "docker-hub-auth-token"}
+                else if (std.mem.eql(u8, expected_token, "docker-hub-anon-token"))
+                    \\{"access_token": "docker-hub-anon-token"}
+                else if (std.mem.eql(u8, expected_token, "ghcr-token"))
+                    \\{"access_token": "ghcr-token"}
+                else
+                    return error.TokenExchangeFailed;
+                return .{ .status = .ok, .body = body };
+            }
+        };
+
+        ProviderState.released = false;
+        ExchangeState.expected_auth = case.expected_auth;
+        ExchangeState.expected_url = case.expected_url;
+        ExchangeState.expected_token = case.expected_token;
+
+        var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+        defer environ_map.deinit();
+        if (case.use_environ) {
+            if (std.ascii.eqlIgnoreCase(case.registry, "ghcr.io")) {
+                try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
+                try environ_map.put(ENV_REGISTRY_USER, "ghcr-user");
+                try environ_map.put(ENV_REGISTRY_TOKEN, "ghrs-token");
+            } else {
+                try environ_map.put(ENV_REGISTRY_HOST, "docker.io");
+                try environ_map.put(ENV_REGISTRY_USER, "docker-user");
+                try environ_map.put(ENV_REGISTRY_TOKEN, "docker-token");
+            }
+        }
+
+        const provider = CredentialProvider{ .getCredentialFn = ProviderState.get };
+        var engine = AuthEngine.initWithTokenHttpExchanger(
+            std.testing.allocator,
+            if (case.use_provider) .{ .credential_provider = &provider } else .{},
+            ExchangeState.exchange,
+        );
+        defer engine.deinit();
+        if (case.use_environ) engine.environ_map = &environ_map;
+
+        var client: std.http.Client = undefined;
+        const request = try AuthenticateRequest.init(case.registry, case.challenge);
+
+        var response = (try engine.authenticate(&client, request)).?;
+        defer response.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualStrings(case.expected_token, response.access_token.value);
+        if (case.use_provider) try std.testing.expect(ProviderState.released);
+    }
 }
 test "AuthEngine.authenticate: env-owned credentials stay leak-free under DebugAllocator" {
     const ExchangeState = struct {
@@ -4731,89 +4993,6 @@ test "AuthEngine.authenticate: env-owned credentials stay leak-free under DebugA
         defer response.deinit(allocator);
         try std.testing.expectEqualStrings("env-debug-token", response.access_token.value);
     }
-}
-test "AuthEngine.authenticate: Docker Hub anonymous flow omits optional basic auth" {
-    const ExchangeState = struct {
-        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            if (request.method != .get) return error.TokenExchangeFailed;
-            if (request.authorization != null) return error.TokenExchangeFailed;
-            if (!std.mem.eql(u8, request.url, "https://auth.docker.io/token?service=registry.docker.io&scope=repository%3Alibrary%2Fubuntu%3Apull")) {
-                return error.TokenExchangeFailed;
-            }
-            return .{ .status = .ok, .body =
-            \\{
-            \\  "access_token": "docker-hub-anon-token"
-            \\}
-            };
-        }
-    };
-
-    var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:latest");
-    defer ref.deinit(std.testing.allocator);
-    const view = referenceView(ref);
-
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, ExchangeState.exchange);
-    defer engine.deinit();
-
-    var client: std.http.Client = undefined;
-    const request = try AuthenticateRequest.init(
-        view.registry,
-        .{
-            .realm = "https://auth.docker.io/token",
-            .service = "registry.docker.io",
-            .scope = "repository:library/ubuntu:pull",
-        },
-    );
-
-    var response = (try engine.authenticate(&client, request)).?;
-    defer response.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("docker-hub-anon-token", response.access_token.value);
-}
-test "AuthEngine.authenticate: GHCR mixed-case registry still uses env credentials for optional basic auth" {
-    const ExchangeState = struct {
-        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            if (request.method != .get) return error.TokenExchangeFailed;
-            if (request.authorization == null or !std.mem.eql(u8, request.authorization.?, "Basic Z2hjci11c2VyOmdocnMtdG9rZW4=")) {
-                return error.TokenExchangeFailed;
-            }
-            if (!std.mem.eql(u8, request.url, "https://ghcr.io/token?service=ghcr.io&scope=repository%3Astefanprodan%2Fpodinfo%3Apull")) {
-                return error.TokenExchangeFailed;
-            }
-            return .{ .status = .ok, .body =
-            \\{
-            \\  "access_token": "ghcr-token"
-            \\}
-            };
-        }
-    };
-
-    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
-    defer environ_map.deinit();
-    try environ_map.put(ENV_REGISTRY_HOST, "ghcr.io");
-    try environ_map.put(ENV_REGISTRY_USER, "ghcr-user");
-    try environ_map.put(ENV_REGISTRY_TOKEN, "ghrs-token");
-
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, ExchangeState.exchange);
-    defer engine.deinit();
-    engine.environ_map = &environ_map;
-
-    var client: std.http.Client = undefined;
-    const request = try AuthenticateRequest.init(
-        "GHCR.IO",
-        .{
-            .realm = "https://ghcr.io/token",
-            .service = "ghcr.io",
-            .scope = "repository:stefanprodan/podinfo:pull",
-        },
-    );
-
-    var response = (try engine.authenticate(&client, request)).?;
-    defer response.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("ghcr-token", response.access_token.value);
 }
 test "AuthEngine.authenticate: repeated success and failure runs stay leak-free" {
     const State = struct {
@@ -5265,20 +5444,32 @@ test "probe/authenticate: repeated success and failure runs leave no residual al
         try std.testing.expectEqualStrings("debug-check-token", response.access_token.value);
     }
 }
-test "tokenCacheKeysEqual: nil service vs non-nil service returns false" {
-    const a = TokenCacheKey{ .realm = "https://example.test/token" };
-    const b = TokenCacheKey{ .realm = "https://example.test/token", .service = "svc" };
-    try std.testing.expect(!tokenCacheKeysEqual(a, b));
-}
-test "tokenCacheKeysEqual: nil scope vs non-nil scope returns false" {
-    const a = TokenCacheKey{ .realm = "https://example.test/token" };
-    const b = TokenCacheKey{ .realm = "https://example.test/token", .scope = "repository:image:pull" };
-    try std.testing.expect(!tokenCacheKeysEqual(a, b));
-}
-test "tokenCacheKeysEqual: both nil service and scope returns true" {
-    const a = TokenCacheKey{ .realm = "https://example.test/token" };
-    const b = TokenCacheKey{ .realm = "https://example.test/token" };
-    try std.testing.expect(tokenCacheKeysEqual(a, b));
+test "tokenCacheKeysEqual: service and scope nil/non-nil matrix" {
+    const cases = [_]struct {
+        a: TokenCacheKey,
+        b: TokenCacheKey,
+        expected: bool,
+    }{
+        .{
+            .a = .{ .realm = "https://example.test/token" },
+            .b = .{ .realm = "https://example.test/token", .service = "svc" },
+            .expected = false,
+        },
+        .{
+            .a = .{ .realm = "https://example.test/token" },
+            .b = .{ .realm = "https://example.test/token", .scope = "repository:image:pull" },
+            .expected = false,
+        },
+        .{
+            .a = .{ .realm = "https://example.test/token" },
+            .b = .{ .realm = "https://example.test/token" },
+            .expected = true,
+        },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, tokenCacheKeysEqual(case.a, case.b));
+    }
 }
 test "parseAuthenticateHeader: bare challenge without scheme is UnsupportedAuthenticateScheme" {
     try std.testing.expectError(
@@ -5292,18 +5483,6 @@ test "parseAuthenticateHeader: multiple Bearer challenges selects first valid on
     );
     try std.testing.expect(challenge == .bearer);
     try std.testing.expectEqualStrings("https://first.test/token", challenge.bearer.realm);
-}
-test "buildTokenHttpRequest: empty scope request builds url without query when no service or scope" {
-    const request = try AuthenticateRequest.init(
-        "registry.example.test",
-        .{ .realm = "https://auth.example.test/token" },
-    );
-
-    var http_request = try buildTokenHttpRequest(std.testing.allocator, request, .get, null);
-    defer http_request.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("https://auth.example.test/token", http_request.url);
-    try std.testing.expect(http_request.body == null);
 }
 test "classifyProbeResponse: unsupported status code returns error" {
     try std.testing.expectError(

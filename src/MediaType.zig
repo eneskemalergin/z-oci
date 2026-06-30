@@ -122,16 +122,15 @@ test "fromString: all known types parse from their canonical MIME string" {
     }
 }
 
-test "fromString: empty string returns null" {
-    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(""));
-}
-
-test "fromString: completely unknown MIME type returns null" {
-    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString("application/json"));
-}
-
-test "fromString: plain text returns null" {
-    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString("text/plain"));
+test "fromString: unrecognized inputs return null" {
+    const cases = [_][]const u8{
+        "",
+        "application/json",
+        "text/plain",
+    };
+    for (cases) |input| {
+        try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(input));
+    }
 }
 
 test "fromString: prefix of a known type does not match" {
@@ -156,50 +155,30 @@ test "fromString: matching is case-insensitive for all casing variants" {
     try std.testing.expectEqual(MediaType.oci_manifest_v1, MediaType.fromString(mixed).?);
 }
 
-// isMultiArch -----------------------------------------------------------------
-
-test "isMultiArch: oci_index_v1 returns true" {
-    try std.testing.expect(MediaType.oci_index_v1.isMultiArch());
+test "isMultiArch: classifies index and manifest-list types" {
+    const cases = [_]struct { mt: MediaType, expected: bool }{
+        .{ .mt = .oci_index_v1, .expected = true },
+        .{ .mt = .docker_manifest_list_v2, .expected = true },
+        .{ .mt = .oci_manifest_v1, .expected = false },
+        .{ .mt = .docker_manifest_v2, .expected = false },
+        .{ .mt = .docker_manifest_v1_signed, .expected = false },
+    };
+    for (cases) |tc| {
+        try std.testing.expectEqual(tc.expected, tc.mt.isMultiArch());
+    }
 }
 
-test "isMultiArch: docker_manifest_list_v2 returns true" {
-    try std.testing.expect(MediaType.docker_manifest_list_v2.isMultiArch());
-}
-
-test "isMultiArch: oci_manifest_v1 returns false" {
-    // Guards against isMultiArch returning true for single-arch types.
-    try std.testing.expect(!MediaType.oci_manifest_v1.isMultiArch());
-}
-
-test "isMultiArch: docker_manifest_v2 returns false" {
-    try std.testing.expect(!MediaType.docker_manifest_v2.isMultiArch());
-}
-
-test "isMultiArch: docker_manifest_v1_signed returns false" {
-    try std.testing.expect(!MediaType.docker_manifest_v1_signed.isMultiArch());
-}
-
-// isLegacy --------------------------------------------------------------------
-
-test "isLegacy: docker_manifest_v1_signed returns true" {
-    try std.testing.expect(MediaType.docker_manifest_v1_signed.isLegacy());
-}
-
-test "isLegacy: oci_manifest_v1 returns false" {
-    // Guards against isLegacy returning true for current types.
-    try std.testing.expect(!MediaType.oci_manifest_v1.isLegacy());
-}
-
-test "isLegacy: oci_index_v1 returns false" {
-    try std.testing.expect(!MediaType.oci_index_v1.isLegacy());
-}
-
-test "isLegacy: docker_manifest_v2 returns false" {
-    try std.testing.expect(!MediaType.docker_manifest_v2.isLegacy());
-}
-
-test "isLegacy: docker_manifest_list_v2 returns false" {
-    try std.testing.expect(!MediaType.docker_manifest_list_v2.isLegacy());
+test "isLegacy: classifies legacy v1 signed manifest" {
+    const cases = [_]struct { mt: MediaType, expected: bool }{
+        .{ .mt = .docker_manifest_v1_signed, .expected = true },
+        .{ .mt = .oci_manifest_v1, .expected = false },
+        .{ .mt = .oci_index_v1, .expected = false },
+        .{ .mt = .docker_manifest_v2, .expected = false },
+        .{ .mt = .docker_manifest_list_v2, .expected = false },
+    };
+    for (cases) |tc| {
+        try std.testing.expectEqual(tc.expected, tc.mt.isLegacy());
+    }
 }
 
 // jsonParse / jsonStringify ---------------------------------------------------
@@ -235,7 +214,7 @@ test "MediaType jsonStringify: produces canonical MIME string" {
     defer aw.deinit();
     var ws: std.json.Stringify = .{ .writer = &aw.writer };
     try ws.write(MediaType.oci_manifest_v1);
-    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "application/vnd.oci.image.manifest.v1+json") != null);
+    try std.testing.expectEqualSlices(u8, "\"application/vnd.oci.image.manifest.v1+json\"", aw.written());
 }
 
 test "MediaType jsonStringify: round-trip preserves all types" {

@@ -271,62 +271,70 @@ pub const ResolveError = union(enum) {
 
 // Tests
 
-test "ResolveError.format: AuthFailed with HTTP status" {
-    // Arrange
-    const err = ResolveError{ .auth_failed = .{
-        .registry = "ghcr.io",
-        .reference = "ghcr.io/owner/repo:v1",
-        .http_status = 401,
-    } };
-    // Act
-    var buf: [256]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try err.format(&w);
-    const out = w.buffered();
-    // Assert
-    try std.testing.expect(std.mem.indexOf(u8, out, "authentication failed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "ghcr.io") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "401") != null);
-}
-
-test "ResolveError.format: NotFound without HTTP status" {
-    // Arrange
-    const err = ResolveError{ .not_found = .{
-        .registry = "registry-1.docker.io",
-        .reference = "library/ubuntu:latest",
-    } };
-    // Act
-    var buf: [256]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try err.format(&w);
-    const out = w.buffered();
-    // Assert: status is absent when not set
-    try std.testing.expect(std.mem.indexOf(u8, out, "manifest not found") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "ubuntu") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "HTTP") == null);
-}
-
-test "ResolveError.format: all variants produce non-empty output" {
-    // Arrange: spot-check a handful of variants.
-    const cases = [_]ResolveError{
-        .{ .rate_limited = .{ .registry = "r", .reference = "ref", .http_status = 429 } },
-        .{ .digest_mismatch = .{ .registry = "r", .reference = "ref" } },
-        .{ .platform_not_found = .{ .registry = "r", .reference = "ref" } },
-        .{ .platform_required = .{ .registry = "r", .reference = "ref" } },
-        .{ .manifest_parse_error = .{ .registry = "r", .reference = "ref" } },
-        .{ .network_error = .{ .registry = "r", .reference = "ref" } },
-        .{ .unsupported_algorithm = .{ .registry = "r", .reference = "ref" } },
-        .{ .content_type_mismatch = .{ .registry = "r", .reference = "ref", .http_status = 200 } },
-        .{ .timeout = .{ .registry = "r", .reference = "ref" } },
-        .{ .depth_limit_exceeded = .{ .registry = "r", .reference = "ref" } },
-        .{ .response_too_large = .{ .registry = "r", .reference = "ref" } },
+test "ResolveError.format: spot-checks summary, context, and HTTP status" {
+    const cases = [_]struct {
+        err: ResolveError,
+        summary: []const u8,
+        expect_http: bool,
+        expect_registry: []const u8,
+        expect_ref_fragment: []const u8,
+    }{
+        .{
+            .err = .{ .auth_failed = .{
+                .registry = "ghcr.io",
+                .reference = "ghcr.io/owner/repo:v1",
+                .http_status = 401,
+            } },
+            .summary = "authentication failed",
+            .expect_http = true,
+            .expect_registry = "ghcr.io",
+            .expect_ref_fragment = "owner/repo",
+        },
+        .{
+            .err = .{ .not_found = .{
+                .registry = "registry-1.docker.io",
+                .reference = "library/ubuntu:latest",
+            } },
+            .summary = "manifest not found",
+            .expect_http = false,
+            .expect_registry = "registry-1.docker.io",
+            .expect_ref_fragment = "ubuntu",
+        },
+        .{
+            .err = .{ .auth_failed = .{
+                .registry = "r",
+                .reference = "ref",
+            } },
+            .summary = "authentication failed",
+            .expect_http = false,
+            .expect_registry = "r",
+            .expect_ref_fragment = "ref",
+        },
+        .{
+            .err = .{ .auth_failed = .{
+                .registry = "r",
+                .reference = "ref",
+                .http_status = 401,
+            } },
+            .summary = "authentication failed",
+            .expect_http = true,
+            .expect_registry = "r",
+            .expect_ref_fragment = "ref",
+        },
     };
-    for (cases) |err| {
+    for (cases) |tc| {
         var buf: [256]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try err.format(&w);
-        // Each variant must produce at least the summary text and registry.
-        try std.testing.expect(w.buffered().len > 0);
+        try tc.err.format(&w);
+        const out = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, out, tc.summary));
+        try std.testing.expect(std.mem.indexOf(u8, out, tc.expect_registry) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, tc.expect_ref_fragment) != null);
+        if (tc.expect_http) {
+            try std.testing.expect(std.mem.indexOf(u8, out, "HTTP") != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, out, "HTTP") == null);
+        }
     }
 }
 
@@ -376,7 +384,6 @@ test "ResolveError.format: all variants include a plain summary" {
 }
 
 test "ResolveError.format: HTTP status appears only when set" {
-    // A variant without http_status must not emit any "HTTP" substring.
     const without = ResolveError{ .auth_failed = .{
         .registry = "r",
         .reference = "ref",
@@ -386,7 +393,6 @@ test "ResolveError.format: HTTP status appears only when set" {
     try without.format(&w);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "HTTP") == null);
 
-    // A variant with http_status must include the status code.
     const with_status = ResolveError{ .auth_failed = .{
         .registry = "r",
         .reference = "ref",
@@ -398,47 +404,52 @@ test "ResolveError.format: HTTP status appears only when set" {
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "401") != null);
 }
 
-test "ResolveError.format: registry and reference appear in output" {
-    // Both context strings must be present so logs are actionable.
-    const err = ResolveError{ .not_found = .{
-        .registry = "gcr.io",
-        .reference = "gcr.io/project/image:v2",
-    } };
-    var buf: [256]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try err.format(&w);
-    const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "gcr.io") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "project/image") != null);
+test "ResolveError.withOwnedReference: preserves registry, status, and transport flags" {
+    const owned = "library/busybox:latest";
+    const cases = [_]struct { input: ResolveError, tag: std.meta.Tag(ResolveError) }{
+        .{ .input = .{ .auth_failed = .{ .registry = "ghcr.io", .reference = "old", .http_status = 401 } }, .tag = .auth_failed },
+        .{ .input = .{ .rate_limited = .{ .registry = "r", .reference = "old", .http_status = 429, .transport_retries_exhausted = true } }, .tag = .rate_limited },
+        .{ .input = .{ .network_error = .{ .registry = "r", .reference = "old", .transport_retries_exhausted = true } }, .tag = .network_error },
+        .{ .input = .{ .timeout = .{ .registry = "r", .reference = "old", .http_status = 504, .transport_retries_exhausted = false } }, .tag = .timeout },
+    };
+    for (cases) |tc| {
+        const rebuilt = tc.input.withOwnedReference(owned);
+        try std.testing.expectEqual(tc.tag, std.meta.activeTag(rebuilt));
+        const ctx = rebuilt.context();
+        try std.testing.expectEqualSlices(u8, tc.input.context().registry, ctx.registry);
+        try std.testing.expectEqualSlices(u8, owned, ctx.reference);
+        try std.testing.expectEqual(tc.input.context().http_status, ctx.http_status);
+        switch (rebuilt) {
+            .rate_limited => |v| try std.testing.expectEqual(tc.input.rate_limited.transport_retries_exhausted, v.transport_retries_exhausted),
+            .network_error => |v| try std.testing.expectEqual(tc.input.network_error.transport_retries_exhausted, v.transport_retries_exhausted),
+            .timeout => |v| try std.testing.expectEqual(tc.input.timeout.transport_retries_exhausted, v.transport_retries_exhausted),
+            else => {},
+        }
+    }
 }
 
-test "ResolveError.deinitOwned: frees owned public-style reference context" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const alloc = gpa.allocator();
+test "ResolveError lifecycle: deinitOwned and releaseOwnedReference on transport variants" {
+    const variants = [_]ResolveError{
+        .{ .rate_limited = .{ .registry = "registry-1.docker.io", .reference = "" } },
+        .{ .network_error = .{ .registry = "registry-1.docker.io", .reference = "" } },
+        .{ .timeout = .{ .registry = "registry-1.docker.io", .reference = "" } },
+        .{ .platform_required = .{ .registry = "registry-1.docker.io", .reference = "" } },
+    };
+    for (variants) |template| {
+        var gpa = std.heap.DebugAllocator(.{}){};
+        defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+        const alloc = gpa.allocator();
 
-    const owned_reference = try alloc.dupe(u8, "library/busybox:latest");
-    const err = ResolveError{ .platform_required = .{
-        .registry = "registry-1.docker.io",
-        .reference = owned_reference,
-    } };
+        const owned_reference = try alloc.dupe(u8, "library/busybox:latest");
+        var err = template.withOwnedReference(owned_reference);
+        err.deinitOwned(alloc);
 
-    err.deinitOwned(alloc);
-}
-
-test "ResolveError.releaseOwnedReference: clears reference after free" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const alloc = gpa.allocator();
-
-    const owned_reference = try alloc.dupe(u8, "library/busybox:latest");
-    var err = ResolveError{ .platform_required = .{
-        .registry = "registry-1.docker.io",
-        .reference = owned_reference,
-    } };
-
-    err.releaseOwnedReference(alloc);
-    try std.testing.expect(err.platform_required.reference.len == 0);
+        const owned_reference2 = try alloc.dupe(u8, "library/alpine:latest");
+        var err2 = template.withOwnedReference(owned_reference2);
+        err2.releaseOwnedReference(alloc);
+        const ctx = err2.context();
+        try std.testing.expect(ctx.reference.len == 0);
+    }
 }
 
 test "ResolveError.format: very long registry and reference are not truncated" {
@@ -458,18 +469,43 @@ test "ResolveError.format: very long registry and reference are not truncated" {
     try std.testing.expect(std.mem.indexOf(u8, out, "429") != null);
 }
 
-test "ResolveError.format: transport retry exhaustion appears in retry-related failures" {
-    const err = ResolveError{ .rate_limited = .{
-        .registry = "registry-1.docker.io",
-        .reference = "library/busybox:latest",
-        .http_status = 429,
-        .transport_retries_exhausted = true,
-    } };
-    var buf: [256]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try err.format(&w);
-    const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "after transport retries exhausted") != null);
+test "ResolveError.format: transport retry exhaustion suffix on retry-related failures" {
+    const cases = [_]struct { err: ResolveError, expect_suffix: bool }{
+        .{ .err = .{ .rate_limited = .{
+            .registry = "registry-1.docker.io",
+            .reference = "library/busybox:latest",
+            .http_status = 429,
+            .transport_retries_exhausted = true,
+        } }, .expect_suffix = true },
+        .{ .err = .{ .network_error = .{
+            .registry = "registry-1.docker.io",
+            .reference = "library/busybox:latest",
+            .transport_retries_exhausted = true,
+        } }, .expect_suffix = true },
+        .{ .err = .{ .timeout = .{
+            .registry = "registry-1.docker.io",
+            .reference = "library/busybox:latest",
+            .transport_retries_exhausted = true,
+        } }, .expect_suffix = true },
+        .{ .err = .{ .network_error = .{
+            .registry = "registry-1.docker.io",
+            .reference = "library/busybox:latest",
+            .transport_retries_exhausted = false,
+        } }, .expect_suffix = false },
+        .{ .err = .{ .timeout = .{
+            .registry = "registry-1.docker.io",
+            .reference = "library/busybox:latest",
+            .transport_retries_exhausted = false,
+        } }, .expect_suffix = false },
+    };
+    for (cases) |tc| {
+        var buf: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try tc.err.format(&w);
+        const out = w.buffered();
+        const has_suffix = std.mem.indexOf(u8, out, "after transport retries exhausted") != null;
+        try std.testing.expectEqual(tc.expect_suffix, has_suffix);
+    }
 }
 
 test "ResolveError.format: typical error output length is bounded" {

@@ -174,17 +174,13 @@ test "match: architecture mismatch returns false" {
     try std.testing.expect(!match(candidate, filter));
 }
 
-test "match: filter omits variant, candidate with variant still matches" {
-    // Verifies the partial match rule: omitting variant accepts any.
-    const candidate = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
+test "match: filter omits variant, candidate with or without variant matches" {
     const filter = Platform{ .os = "linux", .architecture = "arm64" };
-    try std.testing.expect(match(candidate, filter));
-}
+    const with_variant = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
+    const without_variant = Platform{ .os = "linux", .architecture = "arm64" };
 
-test "match: filter omits variant, candidate without variant also matches" {
-    const candidate = Platform{ .os = "linux", .architecture = "arm64" };
-    const filter = Platform{ .os = "linux", .architecture = "arm64" };
-    try std.testing.expect(match(candidate, filter));
+    try std.testing.expect(match(with_variant, filter));
+    try std.testing.expect(match(without_variant, filter));
 }
 
 test "match: filter specifies variant, candidate variant must match" {
@@ -401,14 +397,35 @@ test "Platform jsonParse: parses all optional fields" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.os_features.?.len);
 }
 
-test "Platform jsonParse: missing os field returns MissingField" {
-    const json_bytes = "{\"architecture\": \"amd64\"}";
-    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true }));
+test "Platform jsonParse: missing required field returns MissingField" {
+    const cases = [_][]const u8{
+        "{\"architecture\": \"amd64\"}",
+        "{\"os\": \"linux\"}",
+    };
+    for (cases) |json_bytes| {
+        try std.testing.expectError(
+            error.MissingField,
+            std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true }),
+        );
+    }
 }
 
-test "Platform jsonParse: missing architecture field returns MissingField" {
-    const json_bytes = "{\"os\": \"linux\"}";
-    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true }));
+test "Platform jsonParse: non-object root returns UnexpectedToken" {
+    const cases = [_][]const u8{ "null", "[]" };
+    for (cases) |json_bytes| {
+        try std.testing.expectError(
+            error.UnexpectedToken,
+            std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true }),
+        );
+    }
+}
+
+test "Platform jsonParse: ignore_unknown_fields=true skips extension fields" {
+    const json_bytes = "{\"os\": \"linux\", \"architecture\": \"amd64\", \"customField\": \"value\"}";
+    const parsed = try std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
+    try std.testing.expectEqualSlices(u8, "amd64", parsed.value.architecture);
 }
 
 test "Platform jsonParse: unknown fields cause error when ignore_unknown_fields=false" {

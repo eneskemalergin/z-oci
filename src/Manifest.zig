@@ -142,8 +142,7 @@ pub fn jsonStringify(self: Manifest, jw: anytype) !void {
 
 // --- Tests ---
 
-test "Manifest: OCI image manifest stores all required fields" {
-    // Arrange
+test "Manifest: struct literal stores required fields and defaults" {
     const config = Descriptor{
         .media_type = .oci_manifest_v1,
         .digest = try Digest.parse("sha256:" ++ "a" ** 64),
@@ -155,49 +154,61 @@ test "Manifest: OCI image manifest stores all required fields" {
         .size = 4096,
     };
     const layers = [_]Descriptor{layer};
-    // Act
     const m = Manifest{
         .schema_version = 2,
         .media_type = .oci_manifest_v1,
         .config = config,
         .layers = &layers,
     };
-    // Assert
+
     try std.testing.expectEqual(@as(u8, 2), m.schema_version);
     try std.testing.expectEqual(MediaType.oci_manifest_v1, m.media_type);
     try std.testing.expectEqual(@as(u64, 256), m.config.size);
     try std.testing.expectEqualSlices(u8, "a" ** 64, m.config.digest.hex);
-}
-
-test "Manifest: annotations defaults to null" {
-    const stub = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "a" ** 64),
-        .size = 0,
-    };
-    const m = Manifest{
-        .schema_version = 2,
-        .media_type = .oci_manifest_v1,
-        .config = stub,
-        .layers = &.{},
-    };
     try std.testing.expect(m.annotations == null);
-}
 
-test "Manifest: empty layers slice is valid" {
-    // A manifest with no layers is legal (e.g. scratch-based images).
-    const config = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "c" ** 64),
-        .size = 128,
-    };
-    const m = Manifest{
+    const empty_layers = Manifest{
         .schema_version = 2,
         .media_type = .oci_manifest_v1,
         .config = config,
         .layers = &.{},
     };
-    try std.testing.expectEqual(@as(usize, 0), m.layers.len);
+    try std.testing.expectEqual(@as(usize, 0), empty_layers.layers.len);
+}
+
+test "Manifest parseMediaTypeShallow: extracts mediaType from manifest JSON" {
+    const oci_manifest =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 1
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    const mt = try Manifest.parseMediaTypeShallow(std.testing.allocator, oci_manifest);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, mt);
+}
+
+test "Manifest parseMediaTypeShallow: minimal JSON with only mediaType" {
+    const minimal = "{\"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\"}";
+    const mt = try Manifest.parseMediaTypeShallow(std.testing.allocator, minimal);
+    try std.testing.expectEqual(MediaType.docker_manifest_v2, mt);
+}
+
+test "Manifest parseMediaTypeShallow: missing mediaType returns MissingField" {
+    const json_bytes = "{\"schemaVersion\": 2}";
+    try std.testing.expectError(error.MissingField, Manifest.parseMediaTypeShallow(std.testing.allocator, json_bytes));
+}
+
+test "Manifest parseMediaTypeShallow: index mediaType is parsed without manifest validation" {
+    const index_json = "{\"mediaType\": \"application/vnd.oci.image.index.v1+json\"}";
+    const mt = try Manifest.parseMediaTypeShallow(std.testing.allocator, index_json);
+    try std.testing.expectEqual(MediaType.oci_index_v1, mt);
 }
 
 test "Manifest: layers are stored in declaration order" {
@@ -469,9 +480,12 @@ test "Manifest JSON: repeated parse rounds leave no residual allocations under D
         \\  "layers": []
         \\}
     ;
-    for (0..16) |_| {
-        const parsed = try json.parse(Manifest, allocator, json_bytes);
-        parsed.deinit();
+    const iterations = [_]usize{ 16, 1000 };
+    for (iterations) |n| {
+        for (0..n) |_| {
+            const parsed = try json.parse(Manifest, allocator, json_bytes);
+            parsed.deinit();
+        }
     }
 }
 
@@ -488,27 +502,4 @@ test "Manifest JSON: missing layers returns MissingField" {
         \\}
     ;
     try std.testing.expectError(error.MissingField, json.parse(Manifest, std.testing.allocator, json_bytes));
-}
-
-test "Manifest JSON: 1000x repeated parse/deinit under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        \\    "size": 1
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-    for (0..1000) |_| {
-        const parsed = try json.parse(Manifest, allocator, json_bytes);
-        parsed.deinit();
-    }
 }

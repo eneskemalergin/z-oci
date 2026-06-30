@@ -52,6 +52,13 @@ test "test_support: parseFixture result survives helper buffer teardown" {
     try std.testing.expect(parsed.value.artifact_type != null);
 }
 
+test "test_support: parseFixture returns error for nonexistent path" {
+    try std.testing.expectError(
+        error.FileNotFound,
+        parseFixture(Descriptor, "fixtures/does-not-exist.json", 16 * 1024),
+    );
+}
+
 test "test_support: parseFixture enforces the max-bytes limit" {
     try std.testing.expectError(
         error.StreamTooLong,
