@@ -466,6 +466,7 @@ fn benchAuthenticateRateLimit(io: Io, iterations: usize, counting: bool) !void {
         }
     };
 
+    ExchangeState.calls = 0;
     var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{
         .max_rate_limit_retries = 1,
     }, ExchangeState.exchange);

@@ -77,12 +77,12 @@ Representative Debug `--counting` snapshot for v0.4.0 (see `benchmarks/baselines
 
 | Operation             | Mean per iteration | Allocs per call |
 | --------------------- | ------------------ | --------------- |
-| `resolve-single`      | 89 μs              | 12              |
-| `resolve-multi`       | 304 μs             | 27              |
-| `validate-single`     | 43 μs              | 5               |
-| `get-manifest`        | 76 μs              | 10              |
-| `authenticate` (miss) | 108 μs             | 11              |
-| `authenticate` (hit)  | 8 μs               | 1               |
+| `resolve-single`      | 78 μs              | 6               |
+| `resolve-multi`       | 664 μs             | 10              |
+| `validate-single`     | 28 μs              | 3               |
+| `get-manifest`        | 125 μs             | 6               |
+| `authenticate` (miss) | 109 μs             | 10              |
+| `authenticate` (hit)  | 3 μs               | 0               |
 
 Full zebrac baselines, parser microbenchmarks, and wall-time summaries live in `benchmarks/baselines/`. Release notes live in [CHANGELOG.md](CHANGELOG.md).
 

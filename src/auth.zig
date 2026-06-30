@@ -748,6 +748,14 @@ pub const AuthEngine = struct {
         request: AuthenticateRequest,
         token_response: *TokenResponse,
     ) AuthError!void {
+        const limit = self.config.max_token_cache_entries;
+        const is_new_entry = self.token_cache.getAdapted(request, TokenCacheRequestContext{}) == null;
+        if (limit > 0 and is_new_entry) {
+            while (self.token_cache.count() >= limit) {
+                self.evictLruTokenCacheEntry();
+            }
+        }
+
         var key = try TokenCacheKey.initOwnedFromRequest(self.allocator, request);
         errdefer key.deinit(self.allocator);
 
@@ -760,32 +768,26 @@ pub const AuthEngine = struct {
 
         const now = self.now_unix_seconds_fn(client);
         gop.value_ptr.* = cachedTokenFromResponse(token_response, now, DEFAULT_TOKEN_CACHE_TTL_SECONDS);
-        self.evictLruTokenCacheEntriesUntilWithinLimit();
     }
 
-    fn evictLruTokenCacheEntriesUntilWithinLimit(self: *AuthEngine) void {
-        const limit = self.config.max_token_cache_entries;
-        if (limit == 0) return;
+    fn evictLruTokenCacheEntry(self: *AuthEngine) void {
+        var victim_key: ?TokenCacheKey = null;
+        var victim_last_used: u64 = std.math.maxInt(u64);
 
-        while (self.token_cache.count() > limit) {
-            var victim_key: ?TokenCacheKey = null;
-            var victim_last_used: u64 = std.math.maxInt(u64);
-
-            var it = self.token_cache.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.last_used_unix_seconds <= victim_last_used) {
-                    victim_last_used = entry.value_ptr.last_used_unix_seconds;
-                    victim_key = entry.key_ptr.*;
-                }
+        var it = self.token_cache.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.last_used_unix_seconds < victim_last_used) {
+                victim_last_used = entry.value_ptr.last_used_unix_seconds;
+                victim_key = entry.key_ptr.*;
             }
-
-            const key = victim_key orelse break;
-            const removed = self.token_cache.fetchRemove(key) orelse break;
-            var removed_key = removed.key;
-            removed_key.deinit(self.allocator);
-            var removed_token = removed.value;
-            removed_token.deinit(self.allocator);
         }
+
+        const key = victim_key orelse return;
+        const removed = self.token_cache.fetchRemove(key) orelse return;
+        var removed_key = removed.key;
+        removed_key.deinit(self.allocator);
+        var removed_token = removed.value;
+        removed_token.deinit(self.allocator);
     }
 
     fn invalidateCachedTokenForRequest(self: *AuthEngine, request: AuthenticateRequest) AuthError!bool {
@@ -3649,7 +3651,7 @@ test "mapLiveTokenTransportError: maps transport and oversize errors without era
     }
 }
 test "AuthEngine.authenticate: max_token_cache_entries zero disables LRU eviction" {
-    // limit == 0 skips evictLruTokenCacheEntriesUntilWithinLimit; cache may grow without bound.
+    // limit == 0 skips pre-insert LRU eviction; cache may grow without bound.
     const MockHarness = struct {
         var calls: usize = 0;
 
@@ -3978,6 +3980,47 @@ test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
     defer hit_b.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), MockHarness.calls);
     try std.testing.expectEqualStrings("token-b", hit_b.access_token.value);
+}
+test "AuthEngine.authenticate: LRU eviction keeps freshly stored entry when timestamps tie" {
+    const MockHarness = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+            return .{ .status = .ok, .body = "{\"access_token\": \"token\", \"expires_in\": 3600}" };
+        }
+
+        fn now(_: *std.http.Client) u64 {
+            return 1_000;
+        }
+    };
+
+    MockHarness.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
+        .max_token_cache_entries = 2,
+    }, MockHarness.exchange);
+    defer engine.deinit();
+    engine.now_unix_seconds_fn = MockHarness.now;
+
+    var client: std.http.Client = undefined;
+    for (0..3) |i| {
+        var scope_buf: [64]u8 = undefined;
+        const scope = try std.fmt.bufPrint(&scope_buf, "repository:owner/image:scope={d}:pull", .{i});
+        const request = try AuthenticateRequest.init(
+            "registry.example.test",
+            .{
+                .realm = "https://auth.example.test/token",
+                .service = "registry.example.test",
+                .scope = scope,
+            },
+        );
+        var response = (try engine.authenticate(&client, request)).?;
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("token", response.access_token.value);
+    }
+    try std.testing.expectEqual(@as(usize, 3), MockHarness.calls);
+    try std.testing.expectEqual(@as(usize, 2), engine.token_cache.count());
 }
 test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
     const MockHarness = struct {

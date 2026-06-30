@@ -9,7 +9,7 @@
 //! - `example-normalize-reference`, `example-inspect-manifest`, `example-select-platform`,
 //!   and `example-resolve-reference`: run one example with forwarded CLI args.
 //! - `examples-smoke`: run offline examples with fixed fixture inputs.
-//! - `bench`: build the benchmark CLI.
+//! - `bench`: build and install the benchmark CLI to `zig-out/bin/z-oci-bench`.
 //! - `security-check`: reject private-key PEM blocks in tracked repo material.
 
 const std = @import("std");
@@ -185,10 +185,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(bench);
+    const bench_install = b.addInstallArtifact(bench, .{});
+    b.getInstallStep().dependOn(&bench_install.step);
 
-    const bench_step = b.step("bench", "Build the benchmark CLI");
-    bench_step.dependOn(&bench.step);
+    const bench_step = b.step("bench", "Build and install the benchmark CLI");
+    bench_step.dependOn(&bench_install.step);
 
     const smoke_examples_step = b.step("examples-smoke", "Run a minimal smoke pass over the offline examples");
     // resolve-reference hits live registries, so it stays out of the offline smoke gate.

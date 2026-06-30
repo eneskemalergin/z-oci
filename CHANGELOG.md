@@ -49,7 +49,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
     - Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
     - Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
 - **Testing**
-    - Duplicate resolver, auth, and workflow tests now run through scenario loops in `test_matrix.zig`, shared by `root.zig` and `workflow_smoke.zig`. The release gate reports 203/203 tests (down from 535); the same `ResolveError` arms, validate/get-manifest failure paths, and C4 public API entries are still covered.
+    - Duplicate resolver, auth, and workflow tests now run through scenario loops in `test_matrix.zig`, shared by `root.zig` and `workflow_smoke.zig`. The release gate reports 204/204 tests (down from 535); the same `ResolveError` arms, validate/get-manifest failure paths, and C4 public API entries are still covered.
 
 ### Fixed
 
@@ -65,13 +65,15 @@ Production resilience for live registry traffic: reactive retries and rate-limit
     - Redirect-without-`Location` and exhausted reactive failures preserve HTTP status and retry-budget context on the public resolver error path.
 - **Multi-arch**
     - `recurseIntoMultiArchDocument` tears down the parent index document correctly on `platform_required` and `platform_not_found` early returns.
+- **Token cache**
+    - LRU eviction now runs before inserting a new cache entry, so a freshly stored token is never selected as the eviction victim when many entries share the same `last_used` timestamp (fixes `authenticate-miss` and `authenticate-rate-limit` benches at high iteration counts).
 
 ### Verified
 
-- `zig build test --summary all` passes (203/203 tests, examples-smoke, workflow-smoke, security-check).
+- `zig build test --summary all` passes (204/204 tests, examples-smoke, workflow-smoke, security-check).
 - `zig build -Doptimize=ReleaseFast` and `-Doptimize=ReleaseSmall` pass.
 - `zig fmt --check src/ examples/ benchmarks/ build.zig tools/` passes.
-- `benchmarks/baselines/v0.4.0.json` records the post-optimization bench snapshot.
+- `benchmarks/baselines/v0.4.0.json` records the post-optimization bench snapshot (zebrac 0.6.0, `./tools/zebrac`).
 
 ## [0.3.0] - 2026-05-24 - [Tagged]
 
