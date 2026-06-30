@@ -7,6 +7,8 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-30 - [Tagged]
+
 Production resilience for live registry traffic: reactive retries and rate-limit handling, custom CA trust bundles, tighter HTTP and cache limits, resolver performance improvements, and memory-ownership hardening across `resolve`, `validate`, and `getManifest`.
 
 ### Added
@@ -46,6 +48,8 @@ Production resilience for live registry traffic: reactive retries and rate-limit
     - Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; uses stack SHA-256 hex before digest string allocation; drops wasted GET metadata clones.
     - Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
     - Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
+- **Testing**
+    - Duplicate resolver, auth, and workflow tests now run through scenario loops in `test_matrix.zig`, shared by `root.zig` and `workflow_smoke.zig`. The release gate reports 203/203 tests (down from 535); the same `ResolveError` arms, validate/get-manifest failure paths, and C4 public API entries are still covered.
 
 ### Fixed
 
@@ -61,6 +65,13 @@ Production resilience for live registry traffic: reactive retries and rate-limit
     - Redirect-without-`Location` and exhausted reactive failures preserve HTTP status and retry-budget context on the public resolver error path.
 - **Multi-arch**
     - `recurseIntoMultiArchDocument` tears down the parent index document correctly on `platform_required` and `platform_not_found` early returns.
+
+### Verified
+
+- `zig build test --summary all` passes (203/203 tests, examples-smoke, workflow-smoke, security-check).
+- `zig build -Doptimize=ReleaseFast` and `-Doptimize=ReleaseSmall` pass.
+- `zig fmt --check src/ examples/ benchmarks/ build.zig tools/` passes.
+- `benchmarks/baselines/v0.4.0.json` records the post-optimization bench snapshot.
 
 ## [0.3.0] - 2026-05-24 - [Tagged]
 
@@ -485,3 +496,4 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 [0.1.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.1.0
 [0.2.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.2.0
 [0.3.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.3.0
+[0.4.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.4.0

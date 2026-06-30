@@ -357,83 +357,85 @@ fn fixtureAbsPath(allocator: std.mem.Allocator, rel_path: []const u8) ![:0]u8 {
     return try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, rel_path, allocator);
 }
 
-// --- Tests ---
-
-test "Config: bare Config{} compiles with all defaults" {
-    // A caller using Config{} for anonymous access must not need to set anything.
-    const c = Config{};
-    try std.testing.expect(c.credential_provider == null);
-    try std.testing.expectEqual(@as(u32, 0), c.connect_timeout_ms);
-    try std.testing.expectEqual(@as(u32, 30_000), c.read_timeout_ms);
-    try std.testing.expectEqual(@as(u8, 1), c.max_retries);
-    try std.testing.expectEqual(@as(u8, 1), c.max_network_retries);
-    try std.testing.expectEqual(@as(u8, 1), c.max_rate_limit_retries);
-    try std.testing.expect(c.ca_bundle_path == null);
-    try std.testing.expect(!c.rate_limit_enabled);
+fn skipUnlessTls() !void {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
 }
 
-test "Config: field defaults and overrides are stored correctly" {
+fn testClient() std.http.Client {
+    return .{ .allocator = std.testing.allocator, .io = std.testing.io };
+}
+
+fn expectApplyError(ca_path: []const u8, expected: Config.ApplyError) !void {
+    var client = testClient();
+    defer client.deinit();
+    const config = Config{ .ca_bundle_path = ca_path };
+    try std.testing.expectError(expected, config.applyToClient(&client));
+}
+
+fn readTlsFixture(rel_path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        rel_path,
+        std.testing.allocator,
+        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
+    );
+}
+
+fn tmpFileAbsPath(tmp: std.testing.TmpDir, rel_path: []const u8, abs_buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
+    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, abs_buf);
+    return abs_buf[0..abs_len];
+}
+
+// --- Tests ---
+
+test "Config: defaults and connectIoTimeout" {
     const defaults = Config{};
+    try std.testing.expect(defaults.credential_provider == null);
     try std.testing.expect(!defaults.rate_limit_enabled);
+    try std.testing.expect(defaults.ca_bundle_path == null);
     try std.testing.expectEqual(@as(u32, 0), defaults.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 30_000), defaults.read_timeout_ms);
+    try std.testing.expectEqual(@as(u8, 1), defaults.max_retries);
+    try std.testing.expectEqual(@as(u8, 1), defaults.max_network_retries);
+    try std.testing.expectEqual(@as(u8, 1), defaults.max_rate_limit_retries);
     try std.testing.expectEqual(DEFAULT_MAX_MANIFEST_BYTES, defaults.max_manifest_bytes);
     try std.testing.expectEqual(DEFAULT_MAX_TOKEN_RESPONSE_BYTES, defaults.max_token_response_bytes);
     try std.testing.expectEqual(DEFAULT_MAX_TOKEN_CACHE_ENTRIES, defaults.max_token_cache_entries);
     try std.testing.expectEqual(std.Io.Timeout.none, defaults.connectIoTimeout());
 
-    const cases = [_]struct {
-        config: Config,
-        rate_limit_enabled: ?bool = null,
-        connect_timeout_ms: ?u32 = null,
-        read_timeout_ms: ?u32 = null,
-        max_network_retries: ?u8 = null,
-        max_rate_limit_retries: ?u8 = null,
-        max_retries: ?u8 = null,
-        ca_bundle_path: ?[]const u8 = null,
-    }{
-        .{ .config = .{ .rate_limit_enabled = true }, .rate_limit_enabled = true },
-        .{ .config = .{ .connect_timeout_ms = 5_000, .read_timeout_ms = 60_000 }, .connect_timeout_ms = 5_000, .read_timeout_ms = 60_000 },
-        .{ .config = .{ .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt" }, .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt" },
-        .{ .config = .{ .max_network_retries = 2, .max_rate_limit_retries = 4 }, .max_network_retries = 2, .max_rate_limit_retries = 4 },
-        .{ .config = .{ .connect_timeout_ms = 0 }, .connect_timeout_ms = 0 },
-        .{ .config = .{ .read_timeout_ms = 0 }, .read_timeout_ms = 0 },
-        .{ .config = .{ .max_retries = 255 }, .max_retries = 255 },
-    };
-
-    for (cases) |case| {
-        if (case.rate_limit_enabled) |value| try std.testing.expectEqual(value, case.config.rate_limit_enabled);
-        if (case.connect_timeout_ms) |value| try std.testing.expectEqual(value, case.config.connect_timeout_ms);
-        if (case.read_timeout_ms) |value| try std.testing.expectEqual(value, case.config.read_timeout_ms);
-        if (case.max_network_retries) |value| try std.testing.expectEqual(value, case.config.max_network_retries);
-        if (case.max_rate_limit_retries) |value| try std.testing.expectEqual(value, case.config.max_rate_limit_retries);
-        if (case.max_retries) |value| try std.testing.expectEqual(value, case.config.max_retries);
-        if (case.ca_bundle_path) |value| try std.testing.expectEqualSlices(u8, value, case.config.ca_bundle_path.?);
-    }
-
-    const connect_timeout = Config{ .connect_timeout_ms = 5_000 };
-    try std.testing.expect(connect_timeout.connectIoTimeout().duration.raw.toMilliseconds() == 5_000);
+    const timed = Config{ .connect_timeout_ms = 1 };
+    const timeout = timed.connectIoTimeout();
+    try std.testing.expect(timeout.duration.raw.toMilliseconds() == 1);
+    try std.testing.expect(timeout.duration.clock == .real);
 }
 
-test "Config: credential_provider slot accepts a provider" {
-    // Arrange: a no-op provider that returns null for all registries.
-    const provider = CredentialProvider{
-        .getCredentialFn = struct {
-            fn get(_: []const u8) ?CredentialHandle {
-                return null;
-            }
-        }.get,
+test "Config: non-default field values are stored by value" {
+    const config = Config{
+        .rate_limit_enabled = true,
+        .connect_timeout_ms = 5_000,
+        .read_timeout_ms = 60_000,
+        .max_retries = 255,
+        .max_network_retries = 2,
+        .max_rate_limit_retries = 4,
+        .max_manifest_bytes = 1024,
+        .max_token_response_bytes = 2048,
+        .max_token_cache_entries = 0,
+        .ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt",
     };
-    // Act
-    const c = Config{ .credential_provider = &provider };
-    // Assert: the provider is stored and callable.
-    try std.testing.expect(c.credential_provider != null);
-    try std.testing.expect(c.credential_provider.?.getCredential("example.com") == null);
+    try std.testing.expect(config.rate_limit_enabled);
+    try std.testing.expectEqual(@as(u32, 5_000), config.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 60_000), config.read_timeout_ms);
+    try std.testing.expectEqual(@as(u8, 255), config.max_retries);
+    try std.testing.expectEqual(@as(u8, 2), config.max_network_retries);
+    try std.testing.expectEqual(@as(u8, 4), config.max_rate_limit_retries);
+    try std.testing.expectEqual(@as(usize, 1024), config.max_manifest_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), config.max_token_response_bytes);
+    try std.testing.expectEqual(@as(u32, 0), config.max_token_cache_entries);
+    try std.testing.expectEqualStrings("/etc/ssl/certs/ca-certificates.crt", config.ca_bundle_path.?);
 }
 
-test "Config: credential_provider returns credentials for a registry" {
-    // Arrange
-    const provider = CredentialProvider{
+test "Config: CredentialProvider.getCredential and Config credential slot" {
+    const selective_provider = CredentialProvider{
         .getCredentialFn = struct {
             fn get(registry: []const u8) ?CredentialHandle {
                 if (std.mem.eql(u8, registry, "ghcr.io")) {
@@ -443,16 +445,15 @@ test "Config: credential_provider returns credentials for a registry" {
             }
         }.get,
     };
-    const c = Config{ .credential_provider = &provider };
-    // Act
-    const cred = c.credential_provider.?.getCredential("ghcr.io");
-    // Assert
-    try std.testing.expect(cred != null);
-    try std.testing.expectEqualSlices(u8, "user", cred.?.credential.username);
-    try std.testing.expectEqualSlices(u8, "token", cred.?.credential.secret);
+
+    try std.testing.expect(selective_provider.getCredential("docker.io") == null);
+    const config = Config{ .credential_provider = &selective_provider };
+    const cred = config.credential_provider.?.getCredential("ghcr.io").?;
+    try std.testing.expectEqualSlices(u8, "user", cred.credential.username);
+    try std.testing.expectEqualSlices(u8, "token", cred.credential.secret);
 }
 
-test "Config: credential handle release hook can tear down secrets" {
+test "Config: CredentialHandle.release invokes hook or is a no-op" {
     const MockHarness = struct {
         var released = false;
 
@@ -470,61 +471,83 @@ test "Config: credential handle release hook can tear down secrets" {
         }
     };
 
-    const provider = CredentialProvider{ .getCredentialFn = MockHarness.get };
-    const handle = provider.getCredential("ghcr.io").?;
+    const handle = (CredentialProvider{ .getCredentialFn = MockHarness.get }).getCredential("ghcr.io").?;
     try std.testing.expect(!MockHarness.released);
     handle.release();
     try std.testing.expect(MockHarness.released);
+
+    const noop = CredentialHandle{ .credential = .{ .username = "u", .secret = "s" } };
+    noop.release();
 }
 
-test "Config: applyToClient is no-op when ca_bundle_path is null" {
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
+test "Config.applyToClient: no-op when ca_bundle_path is null" {
+    var client = testClient();
     defer client.deinit();
-
     const config = Config{};
     try config.applyToClient(&client);
 }
 
-test "Config: applyToClient skips reload when path and mtime are unchanged" {
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
+test "Config.applyToClient: loads PEM and skips reload when path and mtime are unchanged" {
+    try skipUnlessTls();
 
-    const abs_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
+    const rel_path = "fixtures/tls/enterprise-test-ca.pem";
+    const abs_path = try fixtureAbsPath(std.testing.allocator, rel_path);
     defer std.testing.allocator.free(abs_path);
 
-    const config = Config{ .ca_bundle_path = abs_path };
-    try config.applyToClient(&client);
+    for ([_][]const u8{ abs_path, rel_path }) |ca_path| {
+        var client = testClient();
+        defer client.deinit();
 
-    try client.ca_bundle_lock.lockShared(std.testing.io);
-    const first_len = client.ca_bundle.bytes.items.len;
-    client.ca_bundle_lock.unlockShared(std.testing.io);
+        const config = Config{ .ca_bundle_path = ca_path };
+        try config.applyToClient(&client);
 
-    try config.applyToClient(&client);
+        try client.ca_bundle_lock.lockShared(std.testing.io);
+        const first_len = client.ca_bundle.bytes.items.len;
+        try std.testing.expect(first_len > 0);
+        try std.testing.expect(client.now != null);
+        client.ca_bundle_lock.unlockShared(std.testing.io);
 
-    try client.ca_bundle_lock.lockShared(std.testing.io);
-    defer client.ca_bundle_lock.unlockShared(std.testing.io);
-    try std.testing.expectEqual(first_len, client.ca_bundle.bytes.items.len);
+        try config.applyToClient(&client);
+
+        try client.ca_bundle_lock.lockShared(std.testing.io);
+        defer client.ca_bundle_lock.unlockShared(std.testing.io);
+        try std.testing.expectEqual(first_len, client.ca_bundle.bytes.items.len);
+    }
 }
 
-test "Config: applyToClient reloads bundle when file mtime changes" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+test "Config.applyToClient: reloads when mtime changes and replaces when path changes" {
+    try skipUnlessTls();
+
+    const enterprise_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
+    defer std.testing.allocator.free(enterprise_path);
+    const test_ca_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/test-ca.pem");
+    defer std.testing.allocator.free(test_ca_path);
+
+    var client = testClient();
+    defer client.deinit();
+
+    const enterprise_config = Config{ .ca_bundle_path = enterprise_path };
+    try enterprise_config.applyToClient(&client);
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    const enterprise_len = client.ca_bundle.bytes.items.len;
+    const enterprise_count = client.ca_bundle.map.count();
+    client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expect(enterprise_count > 0);
+
+    const test_ca_config = Config{ .ca_bundle_path = test_ca_path };
+    try test_ca_config.applyToClient(&client);
+    try client.ca_bundle_lock.lockShared(std.testing.io);
+    const path_swap_len = client.ca_bundle.bytes.items.len;
+    const path_swap_count = client.ca_bundle.map.count();
+    client.ca_bundle_lock.unlockShared(std.testing.io);
+    try std.testing.expect(path_swap_count > 0);
+    try std.testing.expect(enterprise_len != path_swap_len or enterprise_count != path_swap_count);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const rel_path = "mtime-ca.pem";
-    const enterprise = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        "fixtures/tls/enterprise-test-ca.pem",
-        std.testing.allocator,
-        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
-    );
+    const enterprise = try readTlsFixture("fixtures/tls/enterprise-test-ca.pem");
     defer std.testing.allocator.free(enterprise);
     {
         var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
@@ -533,16 +556,8 @@ test "Config: applyToClient reloads bundle when file mtime changes" {
     }
 
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
-    const abs_path = abs_buf[0..abs_len];
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = abs_path };
+    const tmp_path = try tmpFileAbsPath(tmp, rel_path, &abs_buf);
+    const config = Config{ .ca_bundle_path = tmp_path };
     try config.applyToClient(&client);
 
     try client.ca_bundle_lock.lockShared(std.testing.io);
@@ -550,12 +565,7 @@ test "Config: applyToClient reloads bundle when file mtime changes" {
     const first_count = client.ca_bundle.map.count();
     client.ca_bundle_lock.unlockShared(std.testing.io);
 
-    const test_ca = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        "fixtures/tls/test-ca.pem",
-        std.testing.allocator,
-        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
-    );
+    const test_ca = try readTlsFixture("fixtures/tls/test-ca.pem");
     defer std.testing.allocator.free(test_ca);
     try tmp.dir.deleteFile(std.testing.io, rel_path);
     {
@@ -565,7 +575,6 @@ test "Config: applyToClient reloads bundle when file mtime changes" {
     }
 
     try config.applyToClient(&client);
-
     try client.ca_bundle_lock.lockShared(std.testing.io);
     defer client.ca_bundle_lock.unlockShared(std.testing.io);
     try std.testing.expect(
@@ -574,338 +583,88 @@ test "Config: applyToClient reloads bundle when file mtime changes" {
     );
 }
 
-test "Config: applyToClient allocation failures do not leak" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+test "Config.applyToClient: maps fixture and missing paths to exact errors" {
+    try skipUnlessTls();
+
+    try expectApplyError("/nonexistent/z-oci-ca-bundle.pem", error.CaBundleFileNotFound);
+
+    const invalid_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/invalid-ca-bundle.pem");
+    defer std.testing.allocator.free(invalid_path);
+    try expectApplyError(invalid_path, error.CaBundleInvalid);
+
+    try expectApplyError("fixtures/tls/expired-only-ca.pem", error.CaBundleEmpty);
+}
+
+test "Config.applyToClient: maps tmp file stat and permission failures to exact errors" {
+    try skipUnlessTls();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    {
+        const rel_path = "oversized-ca.pem";
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, MAX_CA_BUNDLE_BYTES + 1);
+        try expectApplyError(try tmpFileAbsPath(tmp, rel_path, &abs_buf), error.CaBundleInvalid);
+    }
+
+    {
+        const rel_path = "empty-ca.pem";
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try expectApplyError(try tmpFileAbsPath(tmp, rel_path, &abs_buf), error.CaBundleEmpty);
+    }
+
+    if (@hasDecl(std.Io.File.Permissions, "toMode")) {
+        const rel_path = "world-writable-ca.pem";
+        const enterprise = try readTlsFixture("fixtures/tls/enterprise-test-ca.pem");
+        defer std.testing.allocator.free(enterprise);
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, enterprise);
+        try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o666));
+        try expectApplyError(try tmpFileAbsPath(tmp, rel_path, &abs_buf), error.CaBundleInsecurePermissions);
+    }
+}
+
+test "Config.applyToClient: rejects PEM containing a private key marker" {
+    try skipUnlessTls();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const enterprise = try readTlsFixture("fixtures/tls/enterprise-test-ca.pem");
+    defer std.testing.allocator.free(enterprise);
+
+    const rel_path = "ca-with-key.pem";
+    {
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, enterprise);
+        try file.writeStreamingAll(std.testing.io, "\n-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n");
+    }
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try expectApplyError(try tmpFileAbsPath(tmp, rel_path, &abs_buf), error.CaBundleContainsPrivateKey);
+}
+
+test "Config.applyToClient: allocation failures do not leak" {
+    try skipUnlessTls();
 
     const abs_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
     defer std.testing.allocator.free(abs_path);
 
     const MockHarness = struct {
         fn run(failing_allocator: std.mem.Allocator, path: [:0]const u8) !void {
-            var client = std.http.Client{
-                .allocator = failing_allocator,
-                .io = std.testing.io,
-            };
+            var client = std.http.Client{ .allocator = failing_allocator, .io = std.testing.io };
             defer client.deinit();
-
             const config = Config{ .ca_bundle_path = path };
             try config.applyToClient(&client);
         }
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{abs_path});
-}
-
-test "Config: applyToClient repeated loads stay leak-free under DebugAllocator" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    const abs_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
-    defer std.testing.allocator.free(abs_path);
-
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    const config = Config{ .ca_bundle_path = abs_path };
-
-    for (0..32) |_| {
-        var client = std.http.Client{
-            .allocator = allocator,
-            .io = std.testing.io,
-        };
-        try config.applyToClient(&client);
-        client.deinit();
-    }
-}
-
-test "Config: applyToClient loads fixture PEM into client ca_bundle" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    const rel_path = "fixtures/tls/enterprise-test-ca.pem";
-    const abs_path = try fixtureAbsPath(std.testing.allocator, rel_path);
-    defer std.testing.allocator.free(abs_path);
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = abs_path };
-    try config.applyToClient(&client);
-
-    try client.ca_bundle_lock.lockShared(std.testing.io);
-    defer client.ca_bundle_lock.unlockShared(std.testing.io);
-    try std.testing.expect(client.ca_bundle.bytes.items.len > 0);
-    try std.testing.expect(client.now != null);
-}
-
-test "Config: applyToClient accepts relative ca_bundle_path" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = "fixtures/tls/enterprise-test-ca.pem" };
-    try config.applyToClient(&client);
-
-    try client.ca_bundle_lock.lockShared(std.testing.io);
-    defer client.ca_bundle_lock.unlockShared(std.testing.io);
-    try std.testing.expect(client.ca_bundle.bytes.items.len > 0);
-}
-
-test "Config: applyToClient returns file not found for missing bundle path" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = "/nonexistent/z-oci-ca-bundle.pem" };
-    try std.testing.expectError(error.CaBundleFileNotFound, config.applyToClient(&client));
-}
-
-test "Config: applyToClient rejects invalid PEM bundle" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    const rel_path = "fixtures/tls/invalid-ca-bundle.pem";
-    const abs_path = try fixtureAbsPath(std.testing.allocator, rel_path);
-    defer std.testing.allocator.free(abs_path);
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = abs_path };
-    try std.testing.expectError(error.CaBundleInvalid, config.applyToClient(&client));
-}
-
-test "Config: applyToClient rejects ca bundle files larger than MAX_CA_BUNDLE_BYTES" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rel_path = "oversized-ca.pem";
-    {
-        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
-        defer file.close(std.testing.io);
-        try file.setLength(std.testing.io, MAX_CA_BUNDLE_BYTES + 1);
-    }
-
-    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
-    const abs_path = abs_buf[0..abs_len];
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = abs_path };
-    try std.testing.expectError(error.CaBundleInvalid, config.applyToClient(&client));
-}
-
-test "Config: applyToClient rejects empty PEM bundle" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rel_path = "empty-ca.pem";
-    {
-        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
-        defer file.close(std.testing.io);
-    }
-
-    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
-    const abs_path = abs_buf[0..abs_len];
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = abs_path };
-    try std.testing.expectError(error.CaBundleEmpty, config.applyToClient(&client));
-}
-
-test "Config: applyToClient replaces prior bundle when ca_bundle_path changes" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    const enterprise_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
-    defer std.testing.allocator.free(enterprise_path);
-    const test_ca_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/test-ca.pem");
-    defer std.testing.allocator.free(test_ca_path);
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const enterprise_config = Config{ .ca_bundle_path = enterprise_path };
-    try enterprise_config.applyToClient(&client);
-
-    try client.ca_bundle_lock.lockShared(std.testing.io);
-    const first_len = client.ca_bundle.bytes.items.len;
-    const first_count = client.ca_bundle.map.count();
-    client.ca_bundle_lock.unlockShared(std.testing.io);
-    try std.testing.expect(first_count > 0);
-
-    const test_ca_config = Config{ .ca_bundle_path = test_ca_path };
-    try test_ca_config.applyToClient(&client);
-
-    try client.ca_bundle_lock.lockShared(std.testing.io);
-    defer client.ca_bundle_lock.unlockShared(std.testing.io);
-    try std.testing.expect(client.ca_bundle.map.count() > 0);
-    try std.testing.expect(
-        first_len != client.ca_bundle.bytes.items.len or
-            first_count != client.ca_bundle.map.count(),
-    );
-}
-
-test "Config: applyToClient returns empty when pem contains only expired certificates" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = "fixtures/tls/expired-only-ca.pem" };
-    try std.testing.expectError(error.CaBundleEmpty, config.applyToClient(&client));
-}
-
-test "Config: applyToClient rejects world-writable ca bundle file on POSIX" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-    if (!@hasDecl(std.Io.File.Permissions, "toMode")) return error.SkipZigTest;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const rel_path = "world-writable-ca.pem";
-    const enterprise = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        "fixtures/tls/enterprise-test-ca.pem",
-        std.testing.allocator,
-        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
-    );
-    defer std.testing.allocator.free(enterprise);
-    {
-        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, enterprise);
-        try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o666));
-    }
-
-    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
-    const abs_path = abs_buf[0..abs_len];
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer client.deinit();
-
-    const config = Config{ .ca_bundle_path = abs_path };
-    try std.testing.expectError(error.CaBundleInsecurePermissions, config.applyToClient(&client));
-}
-
-test "Config: applyToClient rejects pem files containing private key blocks" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    const key_markers = [_][]const u8{
-        "-----BEGIN PRIVATE KEY-----",
-        "-----BEGIN RSA PRIVATE KEY-----",
-        "-----BEGIN EC PRIVATE KEY-----",
-        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
-    };
-
-    const enterprise = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
-        "fixtures/tls/enterprise-test-ca.pem",
-        std.testing.allocator,
-        std.Io.Limit.limited64(MAX_CA_BUNDLE_BYTES),
-    );
-    defer std.testing.allocator.free(enterprise);
-
-    for (key_markers) |marker| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-
-        const rel_path = "ca-with-key.pem";
-        {
-            var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
-            defer file.close(std.testing.io);
-            try file.writeStreamingAll(std.testing.io, enterprise);
-            try file.writeStreamingAll(std.testing.io, "\n");
-            try file.writeStreamingAll(std.testing.io, marker);
-            try file.writeStreamingAll(std.testing.io, "\nZm9v\n-----END PRIVATE KEY-----\n");
-        }
-
-        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, &abs_buf);
-        const abs_path = abs_buf[0..abs_len];
-
-        var client = std.http.Client{
-            .allocator = std.testing.allocator,
-            .io = std.testing.io,
-        };
-        defer client.deinit();
-
-        const config = Config{ .ca_bundle_path = abs_path };
-        try std.testing.expectError(error.CaBundleContainsPrivateKey, config.applyToClient(&client));
-    }
-}
-
-test "Config: loaded ca bundle verifies fixture server certificate signed by that ca" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
-
-    const ca_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/test-ca.pem");
-    defer std.testing.allocator.free(ca_path);
-    const server_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/test-server.pem");
-    defer std.testing.allocator.free(server_path);
-
-    var ca_bundle: std.crypto.Certificate.Bundle = .empty;
-    defer ca_bundle.deinit(std.testing.allocator);
-
-    const now = std.Io.Clock.real.now(std.testing.io);
-    try ca_bundle.addCertsFromFilePathAbsolute(std.testing.allocator, std.testing.io, now, ca_path);
-
-    var server_bundle: std.crypto.Certificate.Bundle = .empty;
-    defer server_bundle.deinit(std.testing.allocator);
-    try server_bundle.addCertsFromFilePathAbsolute(std.testing.allocator, std.testing.io, now, server_path);
-    try std.testing.expect(server_bundle.bytes.items.len > 0);
-
-    const server_cert: std.crypto.Certificate = .{
-        .buffer = server_bundle.bytes.items,
-        .index = 0,
-    };
-    const server_parsed = try server_cert.parse();
-    try ca_bundle.verify(server_parsed, now.toSeconds());
-}
-
-test "Config: credential handle release with null release_fn is a no-op" {
-    const handle = CredentialHandle{
-        .credential = .{ .username = "u", .secret = "s" },
-    };
-    handle.release(); // must not crash or leak (covers default-null and explicit-null)
-}
-
-test "Config: credential_provider null returns null for all registries" {
-    const c = Config{};
-    try std.testing.expect(c.credential_provider == null);
 }

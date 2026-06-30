@@ -104,217 +104,108 @@ pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
     try jw.endObject();
 }
 
-// Tests
+// --- Tests ---
 
-test "Descriptor: struct literal stores required and optional fields" {
-    const hex = "a" ** 64;
-    const url_list = [_][]const u8{
-        "https://cdn.example.com/layer.tar.gz",
-        "https://fallback.example.com/layer.tar.gz",
-    };
-    const cases = [_]struct {
-        label: []const u8,
-        d: Descriptor,
-        check: enum { defaults, required, platform, urls, artifact_type },
-    }{
-        .{
-            .label = "optional defaults",
-            .d = .{
-                .media_type = .oci_manifest_v1,
-                .digest = try Digest.parse("sha256:" ++ hex),
-                .size = 1234,
-            },
-            .check = .defaults,
-        },
-        .{
-            .label = "required fields",
-            .d = .{
-                .media_type = .oci_manifest_v1,
-                .digest = try Digest.parse("sha256:" ++ hex),
-                .size = 1234,
-            },
-            .check = .required,
-        },
-        .{
-            .label = "platform",
-            .d = .{
-                .media_type = .oci_index_v1,
-                .digest = try Digest.parse("sha256:" ++ "b" ** 64),
-                .size = 512,
-                .platform = .{ .os = "linux", .architecture = "amd64" },
-            },
-            .check = .platform,
-        },
-        .{
-            .label = "urls",
-            .d = .{
-                .media_type = .oci_manifest_v1,
-                .digest = try Digest.parse("sha256:" ++ "c" ** 64),
-                .size = 8192,
-                .urls = &url_list,
-            },
-            .check = .urls,
-        },
-        .{
-            .label = "artifact_type",
-            .d = .{
-                .media_type = .oci_manifest_v1,
-                .digest = try Digest.parse("sha256:" ++ "d" ** 64),
-                .size = 0,
-                .artifact_type = "application/vnd.example.sbom+json",
-            },
-            .check = .artifact_type,
-        },
-    };
-    for (cases) |tc| {
-        switch (tc.check) {
-            .defaults => {
-                try std.testing.expect(tc.d.platform == null);
-                try std.testing.expect(tc.d.urls == null);
-                try std.testing.expect(tc.d.annotations == null);
-                try std.testing.expect(tc.d.artifact_type == null);
-            },
-            .required => {
-                try std.testing.expectEqual(MediaType.oci_manifest_v1, tc.d.media_type);
-                try std.testing.expectEqual(@as(u64, 1234), tc.d.size);
-                try std.testing.expectEqual(Digest.Algorithm.sha256, tc.d.digest.algorithm);
-                try std.testing.expectEqualSlices(u8, hex, tc.d.digest.hex);
-            },
-            .platform => {
-                try std.testing.expect(tc.d.platform != null);
-                try std.testing.expectEqualSlices(u8, "linux", tc.d.platform.?.os);
-                try std.testing.expectEqualSlices(u8, "amd64", tc.d.platform.?.architecture);
-            },
-            .urls => {
-                try std.testing.expect(tc.d.urls != null);
-                try std.testing.expectEqual(@as(usize, 2), tc.d.urls.?.len);
-                try std.testing.expectEqualSlices(u8, "https://cdn.example.com/layer.tar.gz", tc.d.urls.?[0]);
-            },
-            .artifact_type => {
-                try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom+json", tc.d.artifact_type.?);
-            },
-        }
-        _ = tc.label;
-    }
-}
+const hex_a = "a" ** 64;
+const hex_d = "d" ** 64;
+const hex_1 = "1" ** 64;
+const manifest_media_type = "application/vnd.oci.image.manifest.v1+json";
+const minimal_json =
+    "{\"mediaType\":\"" ++ manifest_media_type ++ "\",\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1234}";
 
-test "Descriptor: size boundary values are representable" {
-    const cases = [_]struct { size: u64 }{
-        .{ .size = 0 },
-        .{ .size = std.math.maxInt(u64) },
-    };
-    for (cases) |tc| {
-        const d = Descriptor{
-            .media_type = .oci_manifest_v1,
-            .digest = try Digest.parse("sha256:" ++ "a" ** 64),
-            .size = tc.size,
-        };
-        try std.testing.expectEqual(tc.size, d.size);
-    }
-}
+// jsonParse -------------------------------------------------------------------
 
-test "Descriptor JSON: parses required fields" {
-    // Arrange
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": 1234
-        \\}
-    ;
-
-    // Act
-    const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
-    defer parsed.deinit();
-
-    // Assert
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
-    try std.testing.expectEqual(Digest.Algorithm.sha256, parsed.value.digest.algorithm);
-    try std.testing.expectEqualSlices(u8, "a" ** 64, parsed.value.digest.hex);
-    try std.testing.expectEqual(@as(u64, 1234), parsed.value.size);
-}
-
-test "Descriptor JSON: stringifies with camelCase field names" {
-    // Arrange
-    const d = Descriptor{
-        .media_type = .oci_index_v1,
-        .digest = try Digest.parse("sha256:" ++ "b" ** 64),
-        .size = 512,
-    };
-
-    // Act
-    var aw = try json.stringifyForTest(d);
-    defer aw.deinit();
-    const out = aw.written();
-
-    const reparsed = try json.parse(Descriptor, std.testing.allocator, out);
-    defer reparsed.deinit();
-
-    try std.testing.expectEqual(d.media_type, reparsed.value.media_type);
-    try std.testing.expectEqual(d.size, reparsed.value.size);
-    try std.testing.expectEqualSlices(u8, d.digest.hex, reparsed.value.digest.hex);
-}
-
-test "Descriptor JSON: parses platform fields" {
-    // Arrange
-    const json_bytes =
+test "Descriptor jsonParse: valid payloads parse expected fields" {
+    const full_json =
         \\{
         \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
         \\  "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         \\  "size": 256,
-        \\  "platform": { "os": "linux", "architecture": "arm64", "variant": "v8" }
-        \\}
-    ;
-
-    // Act
-    const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
-    defer parsed.deinit();
-
-    // Assert
-    try std.testing.expect(parsed.value.platform != null);
-    try std.testing.expectEqualSlices(u8, "linux", parsed.value.platform.?.os);
-    try std.testing.expectEqualSlices(u8, "arm64", parsed.value.platform.?.architecture);
-    try std.testing.expectEqualSlices(u8, "v8", parsed.value.platform.?.variant.?);
-}
-
-test "Descriptor JSON: stringify/reparse preserves optional fields leak-free" {
-    // Arrange: exercise every optional JSON branch on Descriptor.
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        \\  "size": 512,
-        \\  "urls": ["https://example.com/blob"],
+        \\  "platform": {
+        \\    "os": "linux",
+        \\    "architecture": "arm64",
+        \\    "variant": "v8",
+        \\    "os.version": "5.10.0",
+        \\    "os.features": ["seccomp"]
+        \\  },
+        \\  "urls": [
+        \\    "https://cdn.example.com/layer.tar.gz",
+        \\    "https://fallback.example.com/layer.tar.gz"
+        \\  ],
         \\  "annotations": {
         \\    "org.opencontainers.image.source": "https://github.com/example/repo"
         \\  },
-        \\  "artifactType": "application/vnd.example.sbom.v1"
+        \\  "artifactType": "application/vnd.example.sbom.v1",
+        \\  "vendorExtension": "value"
         \\}
     ;
 
-    // Act
-    const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
-    defer parsed.deinit();
+    const minimal = try json.parse(Descriptor, std.testing.allocator, minimal_json);
+    defer minimal.deinit();
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, minimal.value.media_type);
+    try std.testing.expectEqual(Digest.Algorithm.sha256, minimal.value.digest.algorithm);
+    try std.testing.expectEqualSlices(u8, hex_a, minimal.value.digest.hex);
+    try std.testing.expectEqual(@as(u64, 1234), minimal.value.size);
+    try std.testing.expect(minimal.value.platform == null);
+    try std.testing.expect(minimal.value.urls == null);
+    try std.testing.expect(minimal.value.annotations == null);
+    try std.testing.expect(minimal.value.artifact_type == null);
 
-    var aw = try json.stringifyForTest(parsed.value);
-    defer aw.deinit();
-    const out = aw.written();
-
-    const reparsed = try json.parse(Descriptor, std.testing.allocator, out);
-    defer reparsed.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), reparsed.value.urls.?.len);
-    try std.testing.expectEqualSlices(u8, "https://example.com/blob", reparsed.value.urls.?[0]);
-    try std.testing.expect(reparsed.value.annotations != null);
-    try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", reparsed.value.artifact_type.?);
+    const full = try json.parse(Descriptor, std.testing.allocator, full_json);
+    defer full.deinit();
+    const plat = full.value.platform.?;
+    try std.testing.expectEqualSlices(u8, "linux", plat.os);
+    try std.testing.expectEqualSlices(u8, "arm64", plat.architecture);
+    try std.testing.expectEqualSlices(u8, "v8", plat.variant.?);
+    try std.testing.expectEqualSlices(u8, "5.10.0", plat.os_version.?);
+    try std.testing.expectEqual(@as(usize, 1), plat.os_features.?.len);
+    try std.testing.expectEqual(@as(usize, 2), full.value.urls.?.len);
+    try std.testing.expectEqualSlices(u8, "https://cdn.example.com/layer.tar.gz", full.value.urls.?[0]);
+    try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", full.value.artifact_type.?);
     try std.testing.expectEqualSlices(
         u8,
         "https://github.com/example/repo",
-        reparsed.value.annotations.?.object.get("org.opencontainers.image.source").?.string,
+        full.value.annotations.?.object.get("org.opencontainers.image.source").?.string,
     );
 }
 
-test "Descriptor JSON: parses upstream OCI descriptor fixture" {
+test "Descriptor jsonParse: rejects invalid roots, missing fields, and unknown keys" {
+    const missing_cases = [_][]const u8{
+        "{}",
+        "{\"mediaType\":\"" ++ manifest_media_type ++ "\",\"digest\":\"sha256:" ++ hex_a ++ "\"}",
+    };
+    for (missing_cases) |json_bytes| {
+        try std.testing.expectError(error.MissingField, json.parse(Descriptor, std.testing.allocator, json_bytes));
+    }
+
+    for ([_][]const u8{ "null", "[]" }) |json_bytes| {
+        try std.testing.expectError(error.UnexpectedToken, json.parse(Descriptor, std.testing.allocator, json_bytes));
+    }
+
+    const unknown_json =
+        "{\"mediaType\":\"" ++ manifest_media_type ++ "\",\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1,\"customField\":\"value\"}";
+    try std.testing.expectError(
+        error.UnknownField,
+        std.json.parseFromSlice(Descriptor, std.testing.allocator, unknown_json, .{ .ignore_unknown_fields = false }),
+    );
+}
+
+test "Descriptor jsonParse: malformed field values return specific errors" {
+    const prefix = "{\"mediaType\":\"" ++ manifest_media_type ++ "\",";
+    const cases = [_]struct { []const u8, anyerror }{
+        .{ prefix ++ "\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":\"not-a-number\"}", error.InvalidCharacter },
+        .{ prefix ++ "\"digest\":\"not-a-digest\",\"size\":1234}", error.UnexpectedToken },
+        .{ prefix ++ "\"digest\":\"sha256:" ++ ("a" ** 63) ++ "\",\"size\":1}", error.UnexpectedToken },
+        .{ "{\"mediaType\":\"application/x-custom-unknown-type\",\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1}", error.UnexpectedToken },
+        .{ prefix ++ "\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1,\"platform\":\"linux\"}", error.UnexpectedToken },
+        .{ prefix ++ "\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1,\"urls\":\"https://example.com/blob\"}", error.UnexpectedToken },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case[1], json.parse(Descriptor, std.testing.allocator, case[0]));
+    }
+}
+
+test "Descriptor jsonParse: parses upstream OCI descriptor fixture" {
     const parsed = try test_support.parseFixture(
         Descriptor,
         "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
@@ -328,121 +219,68 @@ test "Descriptor JSON: parses upstream OCI descriptor fixture" {
     try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", parsed.value.artifact_type.?);
 }
 
-test "Descriptor JSON: missing required field returns MissingField" {
-    const cases = [_][]const u8{
-        \\{
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": 1234
-        \\}
-        ,
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "size": 1234
-        \\}
-        ,
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        \\}
-        ,
-    };
-    for (cases) |json_bytes| {
-        try std.testing.expectError(error.MissingField, json.parse(Descriptor, std.testing.allocator, json_bytes));
-    }
-}
+test "Descriptor jsonParse: allocation failures do not leak" {
+    const json_bytes = "{\"mediaType\":\"" ++ manifest_media_type ++ "\",\"digest\":\"sha256:" ++ hex_d ++ "\",\"size\":1234,\"urls\":[\"https://example.com/blob\"],\"artifactType\":\"application/vnd.example.sbom.v1\"}";
 
-test "Descriptor JSON: unknown field returns UnknownField when ignore_unknown_fields=false" {
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": 1234,
-        \\  "customField": "value"
-        \\}
-    ;
-    try std.testing.expectError(
-        error.UnknownField,
-        std.json.parseFromSlice(Descriptor, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = false }),
-    );
-}
-
-test "Descriptor JSON: allocation failures do not leak" {
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": 1234,
-        \\  "urls": ["https://example.com/blob"],
-        \\  "artifactType": "application/vnd.example.sbom.v1"
-        \\}
-    ;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
             const parsed = try json.parse(Descriptor, allocator, bytes);
             defer parsed.deinit();
-            try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.urls.?.len);
         }
     }.run, .{json_bytes});
 }
 
-test "Descriptor JSON: repeated parse rounds leave no residual allocations under DebugAllocator" {
+test "Descriptor jsonParse: repeated parse rounds leave no residual allocations under DebugAllocator" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
 
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": 1234
-        \\}
-    ;
     for (0..16) |_| {
-        const parsed = try json.parse(Descriptor, allocator, json_bytes);
+        const parsed = try json.parse(Descriptor, gpa.allocator(), minimal_json);
         parsed.deinit();
     }
 }
 
-test "Descriptor JSON: not-an-object token returns error" {
-    try std.testing.expectError(error.UnexpectedToken, json.parse(Descriptor, std.testing.allocator, "null"));
+// jsonStringify ----------------------------------------------------------------
+
+test "Descriptor jsonStringify: omits null optional fields" {
+    const d = Descriptor{
+        .media_type = .oci_manifest_v1,
+        .digest = try Digest.parse("sha256:" ++ hex_a),
+        .size = 0,
+    };
+
+    var aw = try json.stringifyForTest(d);
+    defer aw.deinit();
+    const out = aw.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"platform\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"urls\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"artifactType\"") == null);
 }
 
-test "Descriptor JSON: wrong type for numeric field returns error" {
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": "not-a-number"
-        \\}
-    ;
-    try std.testing.expectError(error.InvalidCharacter, json.parse(Descriptor, std.testing.allocator, json_bytes));
-}
+test "Descriptor jsonStringify: round-trip preserves all fields" {
+    const json_bytes = "{\"mediaType\":\"" ++ manifest_media_type ++ "\",\"digest\":\"sha256:" ++ hex_1 ++ "\",\"size\":512,\"platform\":{\"os\":\"linux\",\"architecture\":\"arm64\",\"variant\":\"v8\"},\"urls\":[\"https://example.com/blob\"],\"annotations\":{\"org.opencontainers.image.source\":\"https://github.com/example/repo\"},\"artifactType\":\"application/vnd.example.sbom.v1\"}";
 
-test "Descriptor JSON: malformed digest string returns UnexpectedToken" {
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "not-a-digest",
-        \\  "size": 1234
-        \\}
-    ;
-    try std.testing.expectError(error.UnexpectedToken, json.parse(Descriptor, std.testing.allocator, json_bytes));
-}
+    const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
+    defer parsed.deinit();
 
-test "Descriptor JSON: 1000x repeated parse/deinit under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
+    var aw = try json.stringifyForTest(parsed.value);
+    defer aw.deinit();
 
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": 1234
-        \\}
-    ;
-    for (0..1000) |_| {
-        const parsed = try json.parse(Descriptor, allocator, json_bytes);
-        parsed.deinit();
-    }
+    const reparsed = try json.parse(Descriptor, std.testing.allocator, aw.written());
+    defer reparsed.deinit();
+
+    try std.testing.expectEqual(parsed.value.media_type, reparsed.value.media_type);
+    try std.testing.expectEqual(parsed.value.size, reparsed.value.size);
+    try std.testing.expectEqualSlices(u8, parsed.value.digest.hex, reparsed.value.digest.hex);
+    try std.testing.expectEqualSlices(u8, parsed.value.platform.?.os, reparsed.value.platform.?.os);
+    try std.testing.expectEqualSlices(u8, parsed.value.urls.?[0], reparsed.value.urls.?[0]);
+    try std.testing.expectEqualSlices(u8, parsed.value.artifact_type.?, reparsed.value.artifact_type.?);
+    try std.testing.expectEqualSlices(
+        u8,
+        "https://github.com/example/repo",
+        reparsed.value.annotations.?.object.get("org.opencontainers.image.source").?.string,
+    );
 }

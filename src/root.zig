@@ -1154,6 +1154,61 @@ const readFixtureAlloc = test_matrix.readFixtureAlloc;
 const sha256DigestStringAlloc = test_matrix.sha256DigestStringAlloc;
 const buildIndexBodyAlloc = test_matrix.buildIndexBodyAlloc;
 
+const busybox_fixture = "fixtures/manifests/busybox-amd64-live-oci-manifest.json";
+const busybox_literal_ref = Reference{
+    .registry = "registry-1.docker.io",
+    .repository = "library/busybox",
+    .tag = "latest",
+    .digest = null,
+    .digest_raw = null,
+};
+
+fn skipUnlessTls() !void {
+    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+}
+
+fn refuseToken(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    request: auth.TokenHttpRequest,
+) auth.AuthError!auth.TokenExchangeResponse {
+    return test_matrix.refuseTokenExchange(allocator, client, request);
+}
+
+fn busyboxManifestExchange(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    request: resolver.ManifestHttpRequest,
+) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+    defer request.deinit(allocator);
+
+    const body = readFixtureAlloc(allocator, busybox_fixture, 16 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TransportFailed,
+    };
+    defer allocator.free(body);
+
+    const digest = try sha256DigestStringAlloc(allocator, body);
+    defer allocator.free(digest);
+
+    return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+        .status = .ok,
+        .content_type = MediaType.oci_manifest_v1.toString(),
+        .docker_content_digest = digest,
+    }, body);
+}
+
+fn expectPlatformRequiredFailure(failure: ResolveError) !void {
+    try expectResolveFailure(
+        failure,
+        "platform_required",
+        "registry-1.docker.io",
+        "registry-1.docker.io/library/busybox:latest",
+        null,
+        null,
+    );
+}
+
 // Pulling every sub-module into the test build.
 // zig test only includes tests from the root file unless sub-modules are
 // referenced here. Each @import forces the compiler to compile that file in
@@ -1179,1010 +1234,58 @@ test {
     _ = @import("test_support.zig");
     _ = @import("test_matrix.zig");
 }
-test "resolveWithExchangers returns pinned single-arch result for tag reference" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
+test "resolveWithExchangers: single-arch success pins digest and preserves parsed reference pointers" {
+    const Case = enum { literal_ref, parsed_ref_moves };
+    const cases = [_]Case{ .literal_ref, .parsed_ref_moves };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = if (case == .literal_ref) arena.allocator() else std.testing.allocator;
+
+        var ref: Reference = undefined;
+        var registry_ptr: ?[*]const u8 = null;
+        var repository_ptr: ?[*]const u8 = null;
+        var tag_ptr: ?[*]const u8 = null;
+
+        switch (case) {
+            .literal_ref => ref = busybox_literal_ref,
+            .parsed_ref_moves => {
+                ref = try Reference.parse(alloc, "registry-1.docker.io/library/busybox:latest");
+                registry_ptr = ref.registry.ptr;
+                repository_ptr = ref.repository.ptr;
+                tag_ptr = ref.tag.?.ptr;
+            },
         }
 
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
-
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const arena_allocator = arena.allocator();
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try resolveWithExchangers(
-        arena_allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-
-    switch (outcome) {
-        .success => |result| {
-            try std.testing.expectEqual(MediaType.oci_manifest_v1, result.media_type);
-            try std.testing.expect(result.platform == null);
-            try std.testing.expectEqualSlices(u8, "registry-1.docker.io", result.reference.registry);
-            try std.testing.expectEqualSlices(u8, "library/busybox", result.reference.repository);
-            try std.testing.expectEqualSlices(u8, "latest", result.reference.tag.?);
-            try std.testing.expect(result.reference.digest != null);
-            try std.testing.expect(result.reference.digest_raw != null);
-            try std.testing.expectEqualSlices(u8, result.digest.hex, result.reference.digest.?.hex);
-            try std.testing.expectEqualSlices(u8, result.reference.digest_raw.?[("sha256:").len..], result.digest.hex);
-        },
-        .failure => return error.TestUnexpectedResult,
-    }
-}
-test "resolveWithExchangers moves input reference strings into result without re-duping" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
-
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_manifest_v1.toString(),
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    const allocator = std.testing.allocator;
-    const ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
-    const registry_ptr = ref.registry.ptr;
-    const repository_ptr = ref.repository.ptr;
-    const tag_ptr = ref.tag.?.ptr;
-
-    var client: std.http.Client = undefined;
-    const outcome = try resolveWithExchangers(
-        allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-
-    switch (outcome) {
-        .success => |result| {
-            try std.testing.expect(result.reference.registry.ptr == registry_ptr);
-            try std.testing.expect(result.reference.repository.ptr == repository_ptr);
-            try std.testing.expect(result.reference.tag.?.ptr == tag_ptr);
-            try std.testing.expect(result.reference.digest != null);
-            try std.testing.expect(result.reference.digest_raw != null);
-            try std.testing.expectEqualSlices(u8, result.digest.hex, result.reference.digest.?.hex);
-
-            var owned = result;
-            owned.deinit(allocator);
-        },
-        .failure => return error.TestUnexpectedResult,
-    }
-}
-test "resolveWithExchangers repeated single-arch runs leave no residual allocations under DebugAllocator" {
-    const MockHarness = struct {
-        var body: []u8 = undefined;
-        var digest: []u8 = undefined;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_manifest_v1.toString(),
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    MockHarness.body = try readFixtureAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
-    defer std.testing.allocator.free(MockHarness.body);
-
-    MockHarness.digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.body);
-    defer std.testing.allocator.free(MockHarness.digest);
-
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = undefined;
-
-    for (0..32) |_| {
-        const ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
-        const outcome = try resolveWithExchangers(
-            allocator,
-            &client,
-            Config{},
-            ref,
-            null,
-            MockHarness.tokenExchange,
-            MockHarness.manifestExchange,
-            .{},
-        );
+        var client: std.http.Client = undefined;
+        const outcome = try resolveWithExchangers(alloc, &client, Config{}, ref, null, refuseToken, busyboxManifestExchange, .{});
 
         switch (outcome) {
             .success => |result| {
-                var owned = result;
-                owned.deinit(allocator);
+                try std.testing.expectEqual(MediaType.oci_manifest_v1, result.media_type);
+                try std.testing.expect(result.platform == null);
+                try std.testing.expectEqualSlices(u8, "registry-1.docker.io", result.reference.registry);
+                try std.testing.expectEqualSlices(u8, "library/busybox", result.reference.repository);
+                try std.testing.expectEqualSlices(u8, "latest", result.reference.tag.?);
+                try std.testing.expect(result.reference.digest != null);
+                try std.testing.expect(result.reference.digest_raw != null);
+                try std.testing.expectEqualSlices(u8, result.digest.hex, result.reference.digest.?.hex);
+                try std.testing.expectEqualSlices(u8, result.reference.digest_raw.?[("sha256:").len..], result.digest.hex);
+                if (case == .parsed_ref_moves) {
+                    try std.testing.expect(result.reference.registry.ptr == registry_ptr.?);
+                    try std.testing.expect(result.reference.repository.ptr == repository_ptr.?);
+                    try std.testing.expect(result.reference.tag.?.ptr == tag_ptr.?);
+                    var owned = result;
+                    owned.deinit(alloc);
+                }
             },
             .failure => return error.TestUnexpectedResult,
         }
     }
 }
-test "getManifestWithExchangers returns parsed single-arch manifest" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
 
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
-
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try getManifestWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-
-    switch (outcome) {
-        .success => |parsed| {
-            defer parsed.deinit();
-            try std.testing.expectEqual(@as(u32, 2), parsed.value.schema_version);
-            try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
-            try std.testing.expect(parsed.value.config.digest.hex.len == 64);
-            try std.testing.expect(parsed.value.layers.len > 0);
-            try std.testing.expectEqualSlices(u8, "925ff61909aebae4bcc9bc04bb96a8bd15cd2271f13159fe95ce4338824531dd", parsed.value.config.digest.hex);
-        },
-        .failure => return error.TestUnexpectedResult,
-    }
-}
-test "getManifestWithExchangers per-resolve arena promotes manifest without leaking" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
-
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    for (0..32) |_| {
-        const outcome = try getManifestWithExchangers(
-            allocator,
-            &client,
-            Config{},
-            ref,
-            null,
-            MockHarness.tokenExchange,
-            MockHarness.manifestExchange,
-            .{},
-        );
-
-        switch (outcome) {
-            .success => |parsed| parsed.deinit(),
-            .failure => return error.TestUnexpectedResult,
-        }
-    }
-}
-test "ResolvedManifestSuccess: detachForResolvePromotion clears digest alias before deinit" {
-    const hex = "a" ** 64;
-    const raw = try std.fmt.allocPrint(std.testing.allocator, "sha256:{s}", .{hex});
-
-    var success = ResolvedManifestSuccess{
-        .resolved_digest = try Digest.parse(raw),
-        .resolved_digest_raw = raw,
-        .document = .{ .manifest_media_type = .docker_manifest_v2 },
-        .platform = null,
-    };
-
-    const detached = success.detachForResolvePromotion();
-    defer std.testing.allocator.free(detached.resolved_digest_raw);
-
-    try std.testing.expect(success.resolved_digest_raw.len == 0);
-    try std.testing.expect(success.resolved_digest.hex.len == 0);
-    success.deinit(std.testing.allocator);
-}
-test "validateOutcomeFromResolvedManifestOutcome: failure release clears stored reference" {
-    const owned_reference = try std.testing.allocator.dupe(u8, "registry.example.test/library/busybox:latest");
-    var outcome = ResolvedManifestOutcome{ .failure = .{ .platform_required = .{
-        .registry = "registry.example.test",
-        .reference = owned_reference,
-        .http_status = null,
-    } } };
-
-    const result = try validateOutcomeFromResolvedManifestOutcome(
-        std.testing.allocator,
-        std.testing.allocator,
-        &outcome,
-    );
-    switch (result) {
-        .failure => |failure| {
-            defer failure.deinitOwned(std.testing.allocator);
-            try std.testing.expectEqualStrings("platform_required", @tagName(std.meta.activeTag(failure)));
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    try std.testing.expect(outcome.failure.platform_required.reference.len == 0);
-}
-test "ResolvedManifestSuccess: deinit clears every owned field" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "size": 1,
-        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-
-    const parsed = try std.json.parseFromSlice(
-        Manifest,
-        std.testing.allocator,
-        json_bytes,
-        .{},
-    );
-    const hex = "b" ** 64;
-    const raw = try std.fmt.allocPrint(std.testing.allocator, "sha256:{s}", .{hex});
-    const platform = Platform{
-        .os = try std.testing.allocator.dupe(u8, "linux"),
-        .architecture = try std.testing.allocator.dupe(u8, "amd64"),
-    };
-
-    var success = ResolvedManifestSuccess{
-        .resolved_digest = try Digest.parse(raw),
-        .resolved_digest_raw = raw,
-        .document = .{ .manifest = parsed },
-        .platform = platform,
-        .backing_body = try std.testing.allocator.dupe(u8, json_bytes),
-    };
-
-    success.deinit(std.testing.allocator);
-
-    try std.testing.expect(success.resolved_digest_raw.len == 0);
-    try std.testing.expect(success.resolved_digest.hex.len == 0);
-    try std.testing.expect(success.backing_body == null);
-    try std.testing.expect(success.platform == null);
-    switch (success.document) {
-        .manifest_media_type => |media_type| try std.testing.expectEqual(MediaType.oci_manifest_v1, media_type),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "ResolvedManifestSuccess: detachManifestForPromotion OOM leaves shell deinit-safe" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        \\    "size": 1
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-
-    const MockHarness = struct {
-        fn run(caller_allocator: std.mem.Allocator, bytes: []const u8) !void {
-            var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-            defer transient_arena.deinit();
-            const transient = transient_arena.allocator();
-
-            const parsed_local = try json.parse(Manifest, transient, bytes);
-            var success_local = ResolvedManifestSuccess{
-                .resolved_digest = try Digest.parse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
-                .resolved_digest_raw = try transient.dupe(u8, "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
-                .document = .{ .manifest = parsed_local },
-                .platform = null,
-            };
-            errdefer success_local.deinit(transient);
-
-            const promoted = try success_local.detachManifestForPromotion(caller_allocator);
-            promoted.deinit();
-            success_local.deinit(transient);
-        }
-    };
-
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{json_bytes});
-}
-test "ResolvedManifestSuccess: detachManifestForPromotion clears digest fields on success" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        \\    "size": 1
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-
-    var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer transient_arena.deinit();
-    const transient = transient_arena.allocator();
-
-    const parsed_local = try json.parse(Manifest, transient, json_bytes);
-    var success_local = ResolvedManifestSuccess{
-        .resolved_digest = try Digest.parse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
-        .resolved_digest_raw = try transient.dupe(u8, "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
-        .document = .{ .manifest = parsed_local },
-        .platform = null,
-    };
-    defer success_local.deinit(transient);
-
-    const promoted = try success_local.detachManifestForPromotion(std.testing.allocator);
-    defer promoted.deinit();
-
-    try std.testing.expect(success_local.resolved_digest_raw.len == 0);
-    try std.testing.expect(success_local.resolved_digest.hex.len == 0);
-    try std.testing.expectEqual(.manifest_media_type, std.meta.activeTag(success_local.document));
-}
-test "getManifestWithExchangers matches direct parse of live busybox fixture" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
-
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    const fixture_bytes = try readFixtureAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
-    defer std.testing.allocator.free(fixture_bytes);
-
-    const direct = try json.parse(Manifest, std.testing.allocator, fixture_bytes);
-    defer direct.deinit();
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try getManifestWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-
-    switch (outcome) {
-        .success => |parsed| {
-            defer parsed.deinit();
-            try std.testing.expectEqual(direct.value.schema_version, parsed.value.schema_version);
-            try std.testing.expectEqual(direct.value.media_type, parsed.value.media_type);
-            try std.testing.expectEqual(direct.value.config.size, parsed.value.config.size);
-            try std.testing.expectEqualSlices(u8, direct.value.config.digest.hex, parsed.value.config.digest.hex);
-            try std.testing.expectEqual(direct.value.layers.len, parsed.value.layers.len);
-            try std.testing.expectEqual(direct.value.layers[0].size, parsed.value.layers[0].size);
-            try std.testing.expectEqualSlices(u8, direct.value.layers[0].digest.hex, parsed.value.layers[0].digest.hex);
-            try std.testing.expect(direct.value.annotations != null);
-            try std.testing.expect(parsed.value.annotations != null);
-            try std.testing.expectEqualStrings(
-                direct.value.annotations.?.object.get("org.opencontainers.image.version").?.string,
-                parsed.value.annotations.?.object.get("org.opencontainers.image.version").?.string,
-            );
-        },
-        .failure => return error.TestUnexpectedResult,
-    }
-}
-test "getManifestWithExchangers failure promotes caller-owned reference" {
-    const MockHarness = struct {
-        var index_body: []u8 = undefined;
-        var index_digest: []u8 = undefined;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-            if (!std.mem.endsWith(u8, request.url, "/manifests/latest")) return error.TransportFailed;
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_index_v1.toString(),
-                .docker_content_digest = index_digest,
-            }, index_body);
-        }
-    };
-
-    const child_digest = "sha256:9999999999999999999999999999999999999999999999999999999999999999";
-    MockHarness.index_body = try buildIndexBodyAlloc(
-        std.testing.allocator,
-        MediaType.oci_index_v1.toString(),
-        MediaType.oci_manifest_v1.toString(),
-        child_digest,
-        "linux",
-        "arm64",
-    );
-    defer std.testing.allocator.free(MockHarness.index_body);
-
-    MockHarness.index_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.index_body);
-    defer std.testing.allocator.free(MockHarness.index_digest);
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try getManifestWithExchangers(std.testing.allocator, &client, Config{}, ref, null, MockHarness.tokenExchange, MockHarness.manifestExchange, .{});
-    defer switch (outcome) {
-        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-        else => {},
-    };
-
-    switch (outcome) {
-        .success => return error.TestUnexpectedResult,
-        .failure => |failure| try expectResolveFailure(
-            failure,
-            "platform_required",
-            "registry-1.docker.io",
-            "registry-1.docker.io/library/busybox:latest",
-            null,
-            null,
-        ),
-    }
-}
-test "validateWithExchangers returns not_found for missing manifest" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .not_found,
-            }, null);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/alpine",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try validateWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-
-    try std.testing.expectEqual(ValidateOutcome.not_found, outcome);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "library/alpine", ref.repository);
-    try std.testing.expectEqualSlices(u8, "latest", ref.tag.?);
-}
-test "validateWithExchangers returns valid from HEAD for single-arch manifest" {
-    const MockHarness = struct {
-        var saw_head = false;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            if (request.method != .head) return error.TransportFailed;
-            saw_head = true;
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_manifest_v1.toString(),
-                .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            }, null);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/alpine",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try validateWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-
-    try std.testing.expect(MockHarness.saw_head);
-    try std.testing.expectEqual(ValidateOutcome.valid, outcome);
-}
-test "validateWithExchangers single-arch HEAD avoids metadata clone allocations" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-            if (request.method != .head) return error.TransportFailed;
-            return .{ .metadata = .{
-                .status = .ok,
-                .content_type = MediaType.oci_manifest_v1.toString(),
-                .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            } };
-        }
-    };
-
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/alpine",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    for (0..32) |_| {
-        const outcome = try validateWithExchangers(
-            allocator,
-            &client,
-            Config{},
-            ref,
-            null,
-            MockHarness.tokenExchange,
-            MockHarness.manifestExchange,
-            .{},
-        );
-        try std.testing.expectEqual(ValidateOutcome.valid, outcome);
-    }
-}
-test "validateWithExchangers HEAD to GET fallback stays leak-free under DebugAllocator" {
-    const MockHarness = struct {
-        var saw_get = false;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            if (request.method == .head) {
-                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .ok,
-                }, null);
-            }
-
-            saw_get = true;
-            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
-
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_manifest_v1.toString(),
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    for (0..16) |_| {
-        MockHarness.saw_get = false;
-        const outcome = try validateWithExchangers(
-            allocator,
-            &client,
-            Config{},
-            ref,
-            .{ .os = "linux", .architecture = "amd64" },
-            MockHarness.tokenExchange,
-            MockHarness.manifestExchange,
-            .{},
-        );
-        try std.testing.expect(MockHarness.saw_get);
-        try std.testing.expectEqual(ValidateOutcome.valid, outcome);
-    }
-}
-test "validateWithExchangers returns platform_required from HEAD for multi-arch request without platform" {
-    const MockHarness = struct {
-        var calls: usize = 0;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-            calls += 1;
-            if (request.method != .head) return error.TransportFailed;
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_index_v1.toString(),
-                .docker_content_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            }, null);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try validateWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-    defer switch (outcome) {
-        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-        else => {},
-    };
-
-    try std.testing.expectEqual(@as(usize, 1), MockHarness.calls);
-    switch (outcome) {
-        .failure => |failure| try expectResolveFailure(
-            failure,
-            "platform_required",
-            "registry-1.docker.io",
-            "registry-1.docker.io/library/busybox:latest",
-            null,
-            null,
-        ),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "resolveWithExchangers propagates resolver failure matrix with full context" {
-    const MockHarness = struct {
-        var scenario: test_matrix.Scenario = .network_error;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            return test_matrix.manifestExchange(scenario, allocator, request);
-        }
-    };
-
-    defer test_matrix.Fixtures.reset(std.testing.allocator);
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    for (test_matrix.resolve_failure_scenarios) |scenario| {
-        MockHarness.scenario = scenario;
-        try test_matrix.prepareScenario(scenario, std.testing.allocator);
-
-        const outcome = try resolveWithExchangers(
-            std.testing.allocator,
-            &client,
-            test_matrix.scenarioConfig(scenario),
-            ref,
-            test_matrix.scenarioPlatform(scenario),
-            MockHarness.tokenExchange,
-            MockHarness.manifestExchange,
-            .{},
-        );
-        defer switch (outcome) {
-            .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-            else => {},
-        };
-
-        switch (outcome) {
-            .success => return error.TestUnexpectedResult,
-            .failure => |failure| try expectResolveFailure(
-                failure,
-                @tagName(scenario),
-                "registry-1.docker.io",
-                test_matrix.expectedReference(scenario),
-                test_matrix.expectedHttpStatus(scenario),
-                if (scenario == .rate_limited) false else null,
-            ),
-        }
-    }
-}
-test "validateWithExchangers propagates representative failure matrix with full context" {
-    const MockHarness = struct {
-        var scenario: test_matrix.Scenario = .not_found;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            return test_matrix.manifestExchange(scenario, allocator, request);
-        }
-    };
-
-    defer test_matrix.Fixtures.reset(std.testing.allocator);
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    for (test_matrix.validate_failure_scenarios) |scenario| {
-        MockHarness.scenario = scenario;
-        try test_matrix.prepareScenario(scenario, std.testing.allocator);
-
-        const outcome = try validateWithExchangers(
-            std.testing.allocator,
-            &client,
-            test_matrix.scenarioConfig(scenario),
-            ref,
-            test_matrix.scenarioPlatform(scenario),
-            MockHarness.tokenExchange,
-            MockHarness.manifestExchange,
-            .{},
-        );
-        defer switch (outcome) {
-            .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-            else => {},
-        };
-
-        switch (scenario) {
-            .not_found => try std.testing.expectEqual(ValidateOutcome.not_found, outcome),
-            else => switch (outcome) {
-                .valid, .not_found => return error.TestUnexpectedResult,
-                .failure => |failure| try expectResolveFailure(
-                    failure,
-                    @tagName(scenario),
-                    "registry-1.docker.io",
-                    test_matrix.expectedReference(scenario),
-                    test_matrix.expectedHttpStatus(scenario),
-                    null,
-                ),
-            },
-        }
-    }
-}
-test "getManifestWithExchangers propagates representative failure matrix with full context" {
-    const MockHarness = struct {
-        var scenario: test_matrix.Scenario = .not_found;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            return test_matrix.manifestExchange(scenario, allocator, request);
-        }
-    };
-
-    defer test_matrix.Fixtures.reset(std.testing.allocator);
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    for (test_matrix.get_manifest_failure_scenarios) |scenario| {
-        MockHarness.scenario = scenario;
-        try test_matrix.prepareScenario(scenario, std.testing.allocator);
-
-        const outcome = try getManifestWithExchangers(
-            std.testing.allocator,
-            &client,
-            test_matrix.scenarioConfig(scenario),
-            ref,
-            test_matrix.scenarioPlatform(scenario),
-            MockHarness.tokenExchange,
-            MockHarness.manifestExchange,
-            .{},
-        );
-        defer switch (outcome) {
-            .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-            .success => |parsed| parsed.deinit(),
-        };
-
-        switch (outcome) {
-            .success => return error.TestUnexpectedResult,
-            .failure => |failure| try expectResolveFailure(
-                failure,
-                @tagName(scenario),
-                "registry-1.docker.io",
-                test_matrix.expectedReference(scenario),
-                test_matrix.expectedHttpStatus(scenario),
-                null,
-            ),
-        }
-    }
-}
-test "resolveWithExchangers authenticates on challenge and resolves manifest" {
+test "resolveWithExchangers: authenticates on challenge then resolves manifest" {
     const MockHarness = struct {
         var manifest_calls: usize = 0;
         const token_body = "{\"access_token\":\"resolve-token\",\"expires_in\":3600}";
@@ -2206,10 +1309,11 @@ test "resolveWithExchangers authenticates on challenge and resolves manifest" {
                 }, null);
             }
 
-            if (request.authorization == null) return error.TransportFailed;
-            if (!std.mem.eql(u8, request.authorization.?, "Bearer resolve-token")) return error.TransportFailed;
+            if (request.authorization == null or !std.mem.eql(u8, request.authorization.?, "Bearer resolve-token")) {
+                return error.TransportFailed;
+            }
 
-            const body = readFixtureAlloc(allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024) catch |err| switch (err) {
+            const body = readFixtureAlloc(allocator, busybox_fixture, 16 * 1024) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.TransportFailed,
             };
@@ -2232,19 +1336,11 @@ test "resolveWithExchangers authenticates on challenge and resolves manifest" {
     defer arena.deinit();
 
     var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
     const outcome = try resolveWithExchangers(
         arena.allocator(),
         &client,
         Config{},
-        ref,
+        busybox_literal_ref,
         null,
         MockHarness.tokenExchange,
         MockHarness.manifestExchange,
@@ -2255,8 +1351,6 @@ test "resolveWithExchangers authenticates on challenge and resolves manifest" {
         .success => |result| {
             try std.testing.expectEqual(MediaType.oci_manifest_v1, result.media_type);
             try std.testing.expect(result.platform == null);
-            try std.testing.expectEqualSlices(u8, "registry-1.docker.io", result.reference.registry);
-            try std.testing.expectEqualSlices(u8, "library/busybox", result.reference.repository);
             try std.testing.expectEqualSlices(u8, "latest", result.reference.tag.?);
             try std.testing.expect(result.reference.digest != null);
             try std.testing.expectEqualSlices(u8, result.digest.hex, result.reference.digest.?.hex);
@@ -2265,10 +1359,10 @@ test "resolveWithExchangers authenticates on challenge and resolves manifest" {
         .failure => return error.TestUnexpectedResult,
     }
 }
-test "resolveWithExchangers maps exhausted token transport timeout to timeout" {
+
+test "resolveWithExchangers: maps exhausted token transport timeout to timeout" {
     const MockHarness = struct {
         var token_attempts: usize = 0;
-        var manifest_calls: usize = 0;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
             defer request.deinit(std.testing.allocator);
@@ -2276,13 +1370,8 @@ test "resolveWithExchangers maps exhausted token transport timeout to timeout" {
             return error.Timeout;
         }
 
-        fn manifestExchange(
-            allocator: std.mem.Allocator,
-            _: *std.http.Client,
-            request: resolver.ManifestHttpRequest,
-        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
-            manifest_calls += 1;
             return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
                 .status = .unauthorized,
                 .www_authenticate_headers = &.{
@@ -2292,25 +1381,14 @@ test "resolveWithExchangers maps exhausted token transport timeout to timeout" {
         }
     };
 
-    defer {
-        MockHarness.token_attempts = 0;
-        MockHarness.manifest_calls = 0;
-    }
+    defer MockHarness.token_attempts = 0;
 
     var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
     const outcome = try resolveWithExchangers(
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 1 },
-        ref,
+        busybox_literal_ref,
         null,
         MockHarness.tokenExchange,
         MockHarness.manifestExchange,
@@ -2336,54 +1414,26 @@ test "resolveWithExchangers maps exhausted token transport timeout to timeout" {
         else => return error.TestUnexpectedResult,
     }
 }
-test "resolveWithExchangers applies fixture ca_bundle_path without breaking mock resolve" {
-    if (comptime std.http.Client.disable_tls) return error.SkipZigTest;
+
+test "resolveWithExchangers: applies fixture ca_bundle_path without breaking mock resolve" {
+    try skipUnlessTls();
 
     const rel_path = "fixtures/tls/enterprise-test-ca.pem";
     const abs_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, rel_path, std.testing.allocator);
     defer std.testing.allocator.free(abs_path);
 
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            const body = readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
-
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    var client = std.http.Client{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
+    var client = std.http.Client{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     const ref = try Reference.parse(std.testing.allocator, "registry-1.docker.io/library/busybox:latest");
-
     const outcome = try resolveWithExchangers(
         std.testing.allocator,
         &client,
         .{ .ca_bundle_path = abs_path },
         ref,
         null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
+        refuseToken,
+        busyboxManifestExchange,
         .{},
     );
     defer switch (outcome) {
@@ -2403,205 +1453,273 @@ test "resolveWithExchangers applies fixture ca_bundle_path without breaking mock
     defer client.ca_bundle_lock.unlockShared(std.testing.io);
     try std.testing.expect(client.ca_bundle.bytes.items.len > 0);
 }
-test "resolveWithEngine per-resolve arena promotes failures without leaking" {
+
+test "resolveWithExchangers: multi-arch success selects child platform and digest" {
     const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+        var index_body: []u8 = undefined;
+        var index_digest: []u8 = undefined;
+        var child_body: []u8 = undefined;
+        var child_digest: []u8 = undefined;
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
 
-            const body = readFixtureAlloc(allocator, "fixtures/indexes/busybox-latest-live-oci-index.json", 32 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = index_digest,
+                }, index_body);
+            }
 
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
+            if (std.mem.endsWith(u8, request.url, child_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_manifest_v1.toString(),
+                    .docker_content_digest = child_digest,
+                }, child_body);
+            }
 
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.index.v1+json",
-                .docker_content_digest = digest,
-            }, body);
+            return error.TransportFailed;
         }
     };
 
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
+    MockHarness.child_body = try std.testing.allocator.dupe(
+        u8,
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 123
+        \\  },
+        \\  "layers": []
+        \\}
+        ,
+    );
+    defer std.testing.allocator.free(MockHarness.child_body);
+
+    MockHarness.child_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.child_body);
+    defer std.testing.allocator.free(MockHarness.child_digest);
+
+    MockHarness.index_body = try buildIndexBodyAlloc(
+        std.testing.allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        MockHarness.child_digest,
+        "linux",
+        "arm64",
+    );
+    defer std.testing.allocator.free(MockHarness.index_body);
+
+    MockHarness.index_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.index_body);
+    defer std.testing.allocator.free(MockHarness.index_digest);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
+    const outcome = try resolveWithExchangers(
+        arena.allocator(),
+        &client,
+        Config{},
+        busybox_literal_ref,
+        .{ .os = "linux", .architecture = "arm64" },
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
 
-    for (0..32) |_| {
-        var ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
-        defer ref.deinit(allocator);
+    switch (outcome) {
+        .success => |result| {
+            try std.testing.expectEqual(MediaType.oci_manifest_v1, result.media_type);
+            try std.testing.expect(result.platform != null);
+            try std.testing.expectEqualSlices(u8, "linux", result.platform.?.os);
+            try std.testing.expectEqualSlices(u8, "arm64", result.platform.?.architecture);
+            try std.testing.expectEqualSlices(u8, MockHarness.child_digest[("sha256:").len..], result.digest.hex);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
 
-        const outcome = try resolveWithEngine(
-            allocator,
+test "resolveWithExchangers propagates resolver failure matrix with full context" {
+    const MockHarness = struct {
+        var scenario: test_matrix.Scenario = .network_error;
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            return test_matrix.manifestExchange(scenario, allocator, request);
+        }
+    };
+
+    defer test_matrix.Fixtures.reset(std.testing.allocator);
+
+    var client: std.http.Client = undefined;
+
+    for (test_matrix.resolve_failure_scenarios) |scenario| {
+        MockHarness.scenario = scenario;
+        try test_matrix.prepareScenario(scenario, std.testing.allocator);
+
+        const outcome = try resolveWithExchangers(
+            std.testing.allocator,
             &client,
-            Config{},
-            &engine,
-            ref,
-            null,
-            MockHarness.tokenExchange,
+            test_matrix.scenarioConfig(scenario),
+            busybox_literal_ref,
+            test_matrix.scenarioPlatform(scenario),
+            refuseToken,
             MockHarness.manifestExchange,
             .{},
         );
+        defer switch (outcome) {
+            .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+            else => {},
+        };
 
         switch (outcome) {
             .success => return error.TestUnexpectedResult,
-            .failure => |failure| {
-                defer deinitOwnedResolveError(failure, allocator);
-                try expectResolveFailure(
-                    failure,
-                    "platform_required",
-                    "registry-1.docker.io",
-                    "registry-1.docker.io/library/busybox:latest",
-                    null,
-                    null,
-                );
-            },
+            .failure => |failure| try expectResolveFailure(
+                failure,
+                @tagName(scenario),
+                "registry-1.docker.io",
+                test_matrix.expectedReference(scenario),
+                test_matrix.expectedHttpStatus(scenario),
+                if (scenario == .rate_limited) false else null,
+            ),
         }
     }
 }
-test "validateWithEngine per-resolve arena promotes failures without leaking" {
+
+test "resolveWithExchangers: depth_limit_exceeded for nested indexes beyond limit" {
+    const depth = MAX_CHILD_MANIFEST_DEPTH + 1;
     const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+        var bodies: [depth][]u8 = undefined;
+        var digests: [depth][]u8 = undefined;
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
 
-            const body = readFixtureAlloc(allocator, "fixtures/indexes/busybox-latest-live-oci-index.json", 32 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = digests[0],
+                }, bodies[0]);
+            }
 
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
+            for (1..depth) |index| {
+                if (std.mem.endsWith(u8, request.url, digests[index])) {
+                    return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = .ok,
+                        .content_type = MediaType.oci_index_v1.toString(),
+                        .docker_content_digest = digests[index],
+                    }, bodies[index]);
+                }
+            }
 
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_index_v1.toString(),
-                .docker_content_digest = digest,
-            }, body);
+            return error.TransportFailed;
         }
     };
 
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
+    var next_digest: []const u8 = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    var reverse_index: usize = depth;
+    while (reverse_index > 0) {
+        reverse_index -= 1;
+        MockHarness.bodies[reverse_index] = try buildIndexBodyAlloc(
+            std.testing.allocator,
+            MediaType.oci_index_v1.toString(),
+            MediaType.oci_index_v1.toString(),
+            next_digest,
+            "linux",
+            "arm64",
+        );
+        MockHarness.digests[reverse_index] = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.bodies[reverse_index]);
+        next_digest = MockHarness.digests[reverse_index];
+    }
+    defer for (MockHarness.bodies) |body| std.testing.allocator.free(body);
+    defer for (MockHarness.digests) |digest| std.testing.allocator.free(digest);
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
+    const outcome = try resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        busybox_literal_ref,
+        .{ .os = "linux", .architecture = "arm64" },
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
 
-    for (0..32) |_| {
-        var ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
-        defer ref.deinit(allocator);
-
-        const outcome = try validateWithEngine(
-            allocator,
-            &client,
-            Config{},
-            &engine,
-            ref,
-            null,
-            MockHarness.tokenExchange,
-            MockHarness.manifestExchange,
-            .{},
-        );
-
-        switch (outcome) {
-            .valid, .not_found => return error.TestUnexpectedResult,
-            .failure => |failure| {
-                defer deinitOwnedResolveError(failure, allocator);
-                try expectResolveFailure(
-                    failure,
-                    "platform_required",
-                    "registry-1.docker.io",
-                    "registry-1.docker.io/library/busybox:latest",
-                    null,
-                    null,
-                );
-            },
-        }
+    switch (outcome) {
+        .success => return error.TestUnexpectedResult,
+        .failure => |failure| try std.testing.expectEqual(@as(std.meta.Tag(ResolveError), .depth_limit_exceeded), std.meta.activeTag(failure)),
     }
 }
-test "getManifestWithEngine per-resolve arena promotes failures without leaking" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
 
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+test "validateWithExchangers: single-arch HEAD validation and HEAD-to-GET fallback" {
+    const Scenario = enum { head_ok, head_fallback_get };
+    const cases = [_]Scenario{ .head_ok, .head_fallback_get };
+
+    const MockHarness = struct {
+        var active: Scenario = .head_ok;
+        var saw_get = false;
+
+        fn manifestExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
 
-            const body = readFixtureAlloc(allocator, "fixtures/indexes/busybox-latest-live-oci-index.json", 32 * 1024) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.TransportFailed,
-            };
-            defer allocator.free(body);
+            if (request.method == .head) {
+                return switch (active) {
+                    .head_ok => resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = .ok,
+                        .content_type = MediaType.oci_manifest_v1.toString(),
+                        .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    }, null),
+                    .head_fallback_get => resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{ .status = .ok }, null),
+                };
+            }
 
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_index_v1.toString(),
-                .docker_content_digest = digest,
-            }, body);
+            saw_get = true;
+            return busyboxManifestExchange(allocator, client, request);
         }
     };
 
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
+    for (cases) |scenario| {
+        MockHarness.active = scenario;
+        MockHarness.saw_get = false;
 
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
+        var client: std.http.Client = undefined;
+        const platform: ?Platform = if (scenario == .head_fallback_get)
+            .{ .os = "linux", .architecture = "amd64" }
+        else
+            null;
 
-    for (0..32) |_| {
-        var ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
-        defer ref.deinit(allocator);
-
-        const outcome = try getManifestWithEngine(
-            allocator,
+        const outcome = try validateWithExchangers(
+            std.testing.allocator,
             &client,
             Config{},
-            &engine,
-            ref,
-            null,
-            MockHarness.tokenExchange,
+            busybox_literal_ref,
+            platform,
+            refuseToken,
             MockHarness.manifestExchange,
             .{},
         );
 
-        switch (outcome) {
-            .success => |parsed| parsed.deinit(),
-            .failure => |failure| {
-                defer deinitOwnedResolveError(failure, allocator);
-                try expectResolveFailure(
-                    failure,
-                    "platform_required",
-                    "registry-1.docker.io",
-                    "registry-1.docker.io/library/busybox:latest",
-                    null,
-                    null,
-                );
+        switch (scenario) {
+            .head_ok => try std.testing.expectEqual(ValidateOutcome.valid, outcome),
+            .head_fallback_get => {
+                try std.testing.expect(MockHarness.saw_get);
+                try std.testing.expectEqual(ValidateOutcome.valid, outcome);
             },
         }
     }
 }
-test "validateWithExchangers returns valid for selected multi-arch child manifest" {
+
+test "validateWithExchangers: multi-arch child HEAD returns valid without GET" {
     const MockHarness = struct {
         var index_body: []u8 = undefined;
         var index_digest: []u8 = undefined;
@@ -2609,17 +1727,11 @@ test "validateWithExchangers returns valid for selected multi-arch child manifes
         var child_digest: []u8 = undefined;
         var child_head_calls: usize = 0;
         var child_get_calls: usize = 0;
-        var index_calls: usize = 0;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
 
             if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
-                index_calls += 1;
                 return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
                     .status = .ok,
                     .content_type = MediaType.oci_index_v1.toString(),
@@ -2677,440 +1789,254 @@ test "validateWithExchangers returns valid for selected multi-arch child manifes
 
     MockHarness.child_head_calls = 0;
     MockHarness.child_get_calls = 0;
-    MockHarness.index_calls = 0;
 
     var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
     const outcome = try validateWithExchangers(
         std.testing.allocator,
         &client,
         Config{},
-        ref,
+        busybox_literal_ref,
         .{ .os = "linux", .architecture = "arm64" },
-        MockHarness.tokenExchange,
+        refuseToken,
         MockHarness.manifestExchange,
         .{},
     );
 
     try std.testing.expectEqual(ValidateOutcome.valid, outcome);
-    try std.testing.expect(MockHarness.index_calls >= 1);
     try std.testing.expectEqual(@as(usize, 1), MockHarness.child_head_calls);
     try std.testing.expectEqual(@as(usize, 0), MockHarness.child_get_calls);
 }
-test "validateWithExchangers returns platform_required when multi-arch request omits platform" {
-    const MockHarness = struct {
-        var index_body: []u8 = undefined;
-        var index_digest: []u8 = undefined;
 
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+test "validateWithExchangers propagates representative failure matrix with full context" {
+    const MockHarness = struct {
+        var scenario: test_matrix.Scenario = .not_found;
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-            if (!std.mem.endsWith(u8, request.url, "/manifests/latest")) return error.TransportFailed;
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_index_v1.toString(),
-                .docker_content_digest = index_digest,
-            }, index_body);
+            return test_matrix.manifestExchange(scenario, allocator, request);
         }
     };
+
+    defer test_matrix.Fixtures.reset(std.testing.allocator);
+
+    var client: std.http.Client = undefined;
+
+    for (test_matrix.validate_failure_scenarios) |scenario| {
+        MockHarness.scenario = scenario;
+        try test_matrix.prepareScenario(scenario, std.testing.allocator);
+
+        const outcome = try validateWithExchangers(
+            std.testing.allocator,
+            &client,
+            test_matrix.scenarioConfig(scenario),
+            busybox_literal_ref,
+            test_matrix.scenarioPlatform(scenario),
+            refuseToken,
+            MockHarness.manifestExchange,
+            .{},
+        );
+        defer switch (outcome) {
+            .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+            else => {},
+        };
+
+        switch (scenario) {
+            .not_found => try std.testing.expectEqual(ValidateOutcome.not_found, outcome),
+            else => switch (outcome) {
+                .valid, .not_found => return error.TestUnexpectedResult,
+                .failure => |failure| try expectResolveFailure(
+                    failure,
+                    @tagName(scenario),
+                    "registry-1.docker.io",
+                    test_matrix.expectedReference(scenario),
+                    test_matrix.expectedHttpStatus(scenario),
+                    null,
+                ),
+            },
+        }
+    }
+}
+
+test "public exchangers: platform_required when multi-arch omits platform" {
+    const Api = enum { validate_head_only, validate_index, get_manifest };
+    const cases = [_]Api{ .validate_head_only, .validate_index, .get_manifest };
 
     const child_digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    MockHarness.index_body = try buildIndexBodyAlloc(
-        std.testing.allocator,
-        MediaType.oci_index_v1.toString(),
-        MediaType.oci_manifest_v1.toString(),
-        child_digest,
-        "linux",
-        "arm64",
-    );
-    defer std.testing.allocator.free(MockHarness.index_body);
 
-    MockHarness.index_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.index_body);
-    defer std.testing.allocator.free(MockHarness.index_digest);
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try validateWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-    defer switch (outcome) {
-        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-        else => {},
-    };
-
-    switch (outcome) {
-        .valid, .not_found => return error.TestUnexpectedResult,
-        .failure => |failure| try expectResolveFailure(
-            failure,
-            "platform_required",
-            "registry-1.docker.io",
-            "registry-1.docker.io/library/busybox:latest",
-            null,
-            null,
-        ),
-    }
-}
-test "getManifestWithExchangers returns platform_required when multi-arch request omits platform" {
     const MockHarness = struct {
+        var active: Api = .validate_head_only;
         var index_body: []u8 = undefined;
         var index_digest: []u8 = undefined;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+        var head_calls: usize = 0;
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
+
+            if (active == .validate_head_only and request.method != .head) return error.TransportFailed;
             if (!std.mem.endsWith(u8, request.url, "/manifests/latest")) return error.TransportFailed;
+
+            head_calls += 1;
             return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
                 .status = .ok,
                 .content_type = MediaType.oci_index_v1.toString(),
                 .docker_content_digest = index_digest,
-            }, index_body);
+            }, if (active == .validate_head_only) null else index_body);
         }
     };
 
-    const child_digest = "sha256:9999999999999999999999999999999999999999999999999999999999999999";
-    MockHarness.index_body = try buildIndexBodyAlloc(
-        std.testing.allocator,
-        MediaType.oci_index_v1.toString(),
-        MediaType.oci_manifest_v1.toString(),
-        child_digest,
-        "linux",
-        "arm64",
-    );
-    defer std.testing.allocator.free(MockHarness.index_body);
+    for (cases) |api| {
+        MockHarness.active = api;
+        MockHarness.index_body = try buildIndexBodyAlloc(
+            std.testing.allocator,
+            MediaType.oci_index_v1.toString(),
+            MediaType.oci_manifest_v1.toString(),
+            child_digest,
+            "linux",
+            "arm64",
+        );
+        defer std.testing.allocator.free(MockHarness.index_body);
 
-    MockHarness.index_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.index_body);
-    defer std.testing.allocator.free(MockHarness.index_digest);
+        MockHarness.index_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.index_body);
+        defer std.testing.allocator.free(MockHarness.index_digest);
 
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
+        MockHarness.head_calls = 0;
 
-    const outcome = try getManifestWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        null,
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-    defer switch (outcome) {
-        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-        else => {},
-    };
+        var client: std.http.Client = undefined;
 
-    switch (outcome) {
-        .success => |parsed| {
-            parsed.deinit();
-            return error.TestUnexpectedResult;
-        },
-        .failure => |failure| try expectResolveFailure(
-            failure,
-            "platform_required",
-            "registry-1.docker.io",
-            "registry-1.docker.io/library/busybox:latest",
-            null,
-            null,
-        ),
+        switch (api) {
+            .validate_head_only, .validate_index => {
+                const outcome = try validateWithExchangers(
+                    std.testing.allocator,
+                    &client,
+                    Config{},
+                    busybox_literal_ref,
+                    null,
+                    refuseToken,
+                    MockHarness.manifestExchange,
+                    .{},
+                );
+                defer switch (outcome) {
+                    .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+                    else => {},
+                };
+
+                if (api == .validate_head_only) try std.testing.expectEqual(@as(usize, 1), MockHarness.head_calls);
+                switch (outcome) {
+                    .valid, .not_found => return error.TestUnexpectedResult,
+                    .failure => |failure| try expectPlatformRequiredFailure(failure),
+                }
+            },
+            .get_manifest => {
+                const outcome = try getManifestWithExchangers(
+                    std.testing.allocator,
+                    &client,
+                    Config{},
+                    busybox_literal_ref,
+                    null,
+                    refuseToken,
+                    MockHarness.manifestExchange,
+                    .{},
+                );
+                defer switch (outcome) {
+                    .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+                    .success => |parsed| parsed.deinit(),
+                };
+
+                switch (outcome) {
+                    .success => return error.TestUnexpectedResult,
+                    .failure => |failure| try expectPlatformRequiredFailure(failure),
+                }
+            },
+        }
     }
 }
-test "resolveWithExchangers resolves multi-arch index to selected child manifest" {
-    const MockHarness = struct {
-        var index_body: []u8 = undefined;
-        var index_digest: []u8 = undefined;
-        var child_body: []u8 = undefined;
-        var child_digest: []u8 = undefined;
 
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+test "getManifestWithExchangers: single-arch matches direct fixture parse and promotes without leaking" {
+    const fixture_bytes = try readFixtureAlloc(std.testing.allocator, busybox_fixture, 16 * 1024);
+    defer std.testing.allocator.free(fixture_bytes);
 
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
-                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .ok,
-                    .content_type = MediaType.oci_index_v1.toString(),
-                    .docker_content_digest = index_digest,
-                }, index_body);
-            }
-
-            if (std.mem.endsWith(u8, request.url, child_digest)) {
-                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .ok,
-                    .content_type = MediaType.oci_manifest_v1.toString(),
-                    .docker_content_digest = child_digest,
-                }, child_body);
-            }
-
-            return error.TransportFailed;
-        }
-    };
-
-    MockHarness.child_body = try std.testing.allocator.dupe(
-        u8,
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\    "size": 123
-        \\  },
-        \\  "layers": []
-        \\}
-        ,
-    );
-    defer std.testing.allocator.free(MockHarness.child_body);
-
-    MockHarness.child_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.child_body);
-    defer std.testing.allocator.free(MockHarness.child_digest);
-
-    MockHarness.index_body = try buildIndexBodyAlloc(
-        std.testing.allocator,
-        MediaType.oci_index_v1.toString(),
-        MediaType.oci_manifest_v1.toString(),
-        MockHarness.child_digest,
-        "linux",
-        "arm64",
-    );
-    defer std.testing.allocator.free(MockHarness.index_body);
-
-    MockHarness.index_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.index_body);
-    defer std.testing.allocator.free(MockHarness.index_digest);
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try resolveWithExchangers(
-        arena.allocator(),
-        &client,
-        Config{},
-        ref,
-        .{ .os = "linux", .architecture = "arm64" },
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-
-    switch (outcome) {
-        .success => |result| {
-            try std.testing.expectEqual(MediaType.oci_manifest_v1, result.media_type);
-            try std.testing.expect(result.platform != null);
-            try std.testing.expectEqualSlices(u8, "linux", result.platform.?.os);
-            try std.testing.expectEqualSlices(u8, "arm64", result.platform.?.architecture);
-            try std.testing.expectEqualSlices(u8, MockHarness.child_digest[("sha256:").len..], result.digest.hex);
-        },
-        .failure => return error.TestUnexpectedResult,
-    }
-}
-test "resolveWithExchangers repeated multi-arch runs leave no residual allocations under DebugAllocator" {
-    const MockHarness = struct {
-        var index_body: []u8 = undefined;
-        var index_digest: []u8 = undefined;
-        var child_body: []u8 = undefined;
-        var child_digest: []u8 = undefined;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-
-            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
-                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .ok,
-                    .content_type = MediaType.oci_index_v1.toString(),
-                    .docker_content_digest = index_digest,
-                }, index_body);
-            }
-
-            if (std.mem.endsWith(u8, request.url, child_digest)) {
-                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .ok,
-                    .content_type = MediaType.oci_manifest_v1.toString(),
-                    .docker_content_digest = child_digest,
-                }, child_body);
-            }
-
-            return error.TransportFailed;
-        }
-    };
-
-    MockHarness.child_body = try std.testing.allocator.dupe(
-        u8,
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\    "size": 123
-        \\  },
-        \\  "layers": []
-        \\}
-        ,
-    );
-    defer std.testing.allocator.free(MockHarness.child_body);
-
-    MockHarness.child_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.child_body);
-    defer std.testing.allocator.free(MockHarness.child_digest);
-
-    MockHarness.index_body = try buildIndexBodyAlloc(
-        std.testing.allocator,
-        MediaType.oci_index_v1.toString(),
-        MediaType.oci_manifest_v1.toString(),
-        MockHarness.child_digest,
-        "linux",
-        "arm64",
-    );
-    defer std.testing.allocator.free(MockHarness.index_body);
-
-    MockHarness.index_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.index_body);
-    defer std.testing.allocator.free(MockHarness.index_digest);
+    const direct = try json.parse(Manifest, std.testing.allocator, fixture_bytes);
+    defer direct.deinit();
 
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
     const allocator = gpa.allocator();
 
     var client: std.http.Client = undefined;
+    const outcome = try getManifestWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        busybox_literal_ref,
+        null,
+        refuseToken,
+        busyboxManifestExchange,
+        .{},
+    );
 
-    for (0..32) |_| {
-        const ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
-        const outcome = try resolveWithExchangers(
-            allocator,
+    switch (outcome) {
+        .success => |parsed| {
+            defer parsed.deinit();
+            try std.testing.expectEqual(direct.value.schema_version, parsed.value.schema_version);
+            try std.testing.expectEqual(direct.value.media_type, parsed.value.media_type);
+            try std.testing.expectEqualSlices(u8, direct.value.config.digest.hex, parsed.value.config.digest.hex);
+            try std.testing.expectEqual(direct.value.layers.len, parsed.value.layers.len);
+            try std.testing.expectEqualSlices(u8, direct.value.layers[0].digest.hex, parsed.value.layers[0].digest.hex);
+            try std.testing.expect(parsed.value.annotations != null);
+            try std.testing.expectEqualStrings(
+                direct.value.annotations.?.object.get("org.opencontainers.image.version").?.string,
+                parsed.value.annotations.?.object.get("org.opencontainers.image.version").?.string,
+            );
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "getManifestWithExchangers propagates representative failure matrix with full context" {
+    const MockHarness = struct {
+        var scenario: test_matrix.Scenario = .not_found;
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            return test_matrix.manifestExchange(scenario, allocator, request);
+        }
+    };
+
+    defer test_matrix.Fixtures.reset(std.testing.allocator);
+
+    var client: std.http.Client = undefined;
+
+    for (test_matrix.get_manifest_failure_scenarios) |scenario| {
+        MockHarness.scenario = scenario;
+        try test_matrix.prepareScenario(scenario, std.testing.allocator);
+
+        const outcome = try getManifestWithExchangers(
+            std.testing.allocator,
             &client,
-            Config{},
-            ref,
-            .{ .os = "linux", .architecture = "arm64" },
-            MockHarness.tokenExchange,
+            test_matrix.scenarioConfig(scenario),
+            busybox_literal_ref,
+            test_matrix.scenarioPlatform(scenario),
+            refuseToken,
             MockHarness.manifestExchange,
             .{},
         );
+        defer switch (outcome) {
+            .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+            .success => |parsed| parsed.deinit(),
+        };
 
         switch (outcome) {
-            .success => |result| {
-                var owned = result;
-                owned.deinit(allocator);
-            },
-            .failure => return error.TestUnexpectedResult,
+            .success => return error.TestUnexpectedResult,
+            .failure => |failure| try expectResolveFailure(
+                failure,
+                @tagName(scenario),
+                "registry-1.docker.io",
+                test_matrix.expectedReference(scenario),
+                test_matrix.expectedHttpStatus(scenario),
+                null,
+            ),
         }
     }
 }
-test "resolveWithExchangers returns platform_not_found when multi-arch platform is missing" {
-    const MockHarness = struct {
-        var index_body: []u8 = undefined;
-        var index_digest: []u8 = undefined;
 
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
-            defer request.deinit(allocator);
-            if (!std.mem.endsWith(u8, request.url, "/manifests/latest")) return error.TransportFailed;
-            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_index_v1.toString(),
-                .docker_content_digest = index_digest,
-            }, index_body);
-        }
-    };
-
-    const child_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    MockHarness.index_body = try buildIndexBodyAlloc(
-        std.testing.allocator,
-        MediaType.oci_index_v1.toString(),
-        MediaType.oci_manifest_v1.toString(),
-        child_digest,
-        "linux",
-        "arm64",
-    );
-    defer std.testing.allocator.free(MockHarness.index_body);
-
-    MockHarness.index_digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.index_body);
-    defer std.testing.allocator.free(MockHarness.index_digest);
-
-    var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
-    const outcome = try resolveWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        .{ .os = "windows", .architecture = "amd64" },
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-    defer switch (outcome) {
-        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-        else => {},
-    };
-
-    switch (outcome) {
-        .success => return error.TestUnexpectedResult,
-        .failure => |failure| try expectResolveFailure(
-            failure,
-            "platform_not_found",
-            "registry-1.docker.io",
-            "registry-1.docker.io/library/busybox:latest",
-            null,
-            null,
-        ),
-    }
-}
 test "getManifestWithExchangers resolves nested index to leaf manifest" {
     const MockHarness = struct {
         var outer_body: []u8 = undefined;
@@ -3119,10 +2045,6 @@ test "getManifestWithExchangers resolves nested index to leaf manifest" {
         var inner_digest: []u8 = undefined;
         var leaf_body: []u8 = undefined;
         var leaf_digest: []u8 = undefined;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
@@ -3198,21 +2120,13 @@ test "getManifestWithExchangers resolves nested index to leaf manifest" {
     defer std.testing.allocator.free(MockHarness.outer_digest);
 
     var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
-
     const outcome = try getManifestWithExchangers(
         std.testing.allocator,
         &client,
         Config{},
-        ref,
+        busybox_literal_ref,
         .{ .os = "linux", .architecture = "arm64" },
-        MockHarness.tokenExchange,
+        refuseToken,
         MockHarness.manifestExchange,
         .{},
     );
@@ -3228,89 +2142,218 @@ test "getManifestWithExchangers resolves nested index to leaf manifest" {
         },
     }
 }
-test "resolveWithExchangers returns depth_limit_exceeded for nested indexes beyond limit" {
-    const depth = MAX_CHILD_MANIFEST_DEPTH + 1;
+
+test "WithEngine: per-resolve arena promotes platform_required failures without leaking" {
+    const Api = enum { resolve, validate, get_manifest };
+    const cases = [_]Api{ .resolve, .validate, .get_manifest };
+
     const MockHarness = struct {
-        var bodies: [depth][]u8 = undefined;
-        var digests: [depth][]u8 = undefined;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
             defer request.deinit(allocator);
 
-            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
-                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .ok,
-                    .content_type = MediaType.oci_index_v1.toString(),
-                    .docker_content_digest = digests[0],
-                }, bodies[0]);
-            }
+            const body = readFixtureAlloc(allocator, "fixtures/indexes/busybox-latest-live-oci-index.json", 32 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
 
-            for (1..depth) |index| {
-                if (std.mem.endsWith(u8, request.url, digests[index])) {
-                    return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                        .status = .ok,
-                        .content_type = MediaType.oci_index_v1.toString(),
-                        .docker_content_digest = digests[index],
-                    }, bodies[index]);
-                }
-            }
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
 
-            return error.TransportFailed;
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_index_v1.toString(),
+                .docker_content_digest = digest,
+            }, body);
         }
     };
 
-    var next_digest: []const u8 = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-
-    var reverse_index: usize = depth;
-    while (reverse_index > 0) {
-        reverse_index -= 1;
-        MockHarness.bodies[reverse_index] = try buildIndexBodyAlloc(
-            std.testing.allocator,
-            MediaType.oci_index_v1.toString(),
-            MediaType.oci_index_v1.toString(),
-            next_digest,
-            "linux",
-            "arm64",
-        );
-        MockHarness.digests[reverse_index] = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.bodies[reverse_index]);
-        next_digest = MockHarness.digests[reverse_index];
-    }
-    defer for (MockHarness.bodies) |body| std.testing.allocator.free(body);
-    defer for (MockHarness.digests) |digest| std.testing.allocator.free(digest);
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
 
     var client: std.http.Client = undefined;
-    const ref = Reference{
-        .registry = "registry-1.docker.io",
-        .repository = "library/busybox",
-        .tag = "latest",
-        .digest = null,
-        .digest_raw = null,
-    };
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{}, refuseToken);
+    defer engine.deinit();
 
-    const outcome = try resolveWithExchangers(
-        std.testing.allocator,
-        &client,
-        Config{},
-        ref,
-        .{ .os = "linux", .architecture = "arm64" },
-        MockHarness.tokenExchange,
-        MockHarness.manifestExchange,
-        .{},
-    );
-    defer switch (outcome) {
-        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
-        else => {},
-    };
+    for (cases) |api| {
+        var ref = try Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest");
+        defer ref.deinit(allocator);
 
-    switch (outcome) {
-        .success => return error.TestUnexpectedResult,
-        .failure => |failure| switch (failure) {
-            .depth_limit_exceeded => {},
-            else => return error.TestUnexpectedResult,
-        },
+        switch (api) {
+            .resolve => {
+                const outcome = try resolveWithEngine(allocator, &client, Config{}, &engine, ref, null, refuseToken, MockHarness.manifestExchange, .{});
+                switch (outcome) {
+                    .success => return error.TestUnexpectedResult,
+                    .failure => |failure| {
+                        defer deinitOwnedResolveError(failure, allocator);
+                        try expectPlatformRequiredFailure(failure);
+                    },
+                }
+            },
+            .validate => {
+                const outcome = try validateWithEngine(allocator, &client, Config{}, &engine, ref, null, refuseToken, MockHarness.manifestExchange, .{});
+                switch (outcome) {
+                    .valid, .not_found => return error.TestUnexpectedResult,
+                    .failure => |failure| {
+                        defer deinitOwnedResolveError(failure, allocator);
+                        try expectPlatformRequiredFailure(failure);
+                    },
+                }
+            },
+            .get_manifest => {
+                const outcome = try getManifestWithEngine(allocator, &client, Config{}, &engine, ref, null, refuseToken, MockHarness.manifestExchange, .{});
+                switch (outcome) {
+                    .success => |parsed| parsed.deinit(),
+                    .failure => |failure| {
+                        defer deinitOwnedResolveError(failure, allocator);
+                        try expectPlatformRequiredFailure(failure);
+                    },
+                }
+            },
+        }
     }
+}
+
+test "ResolvedManifestSuccess: promotion and teardown invariants" {
+    const minimal_manifest_json =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 1
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    const Scenario = enum {
+        detach_for_resolve,
+        deinit_clears_owned_fields,
+        detach_manifest_oom_safe,
+        detach_manifest_clears_digest,
+    };
+    const cases = [_]Scenario{
+        .detach_for_resolve,
+        .deinit_clears_owned_fields,
+        .detach_manifest_oom_safe,
+        .detach_manifest_clears_digest,
+    };
+
+    for (cases) |scenario| {
+        switch (scenario) {
+            .detach_for_resolve => {
+                const hex = "a" ** 64;
+                const raw = try std.fmt.allocPrint(std.testing.allocator, "sha256:{s}", .{hex});
+
+                var success = ResolvedManifestSuccess{
+                    .resolved_digest = try Digest.parse(raw),
+                    .resolved_digest_raw = raw,
+                    .document = .{ .manifest_media_type = .docker_manifest_v2 },
+                    .platform = null,
+                };
+
+                const detached = success.detachForResolvePromotion();
+                defer std.testing.allocator.free(detached.resolved_digest_raw);
+
+                try std.testing.expect(success.resolved_digest_raw.len == 0);
+                try std.testing.expect(success.resolved_digest.hex.len == 0);
+                success.deinit(std.testing.allocator);
+            },
+            .deinit_clears_owned_fields => {
+                const parsed = try std.json.parseFromSlice(Manifest, std.testing.allocator, minimal_manifest_json, .{});
+                const hex = "b" ** 64;
+                const raw = try std.fmt.allocPrint(std.testing.allocator, "sha256:{s}", .{hex});
+                const platform = Platform{
+                    .os = try std.testing.allocator.dupe(u8, "linux"),
+                    .architecture = try std.testing.allocator.dupe(u8, "amd64"),
+                };
+
+                var success = ResolvedManifestSuccess{
+                    .resolved_digest = try Digest.parse(raw),
+                    .resolved_digest_raw = raw,
+                    .document = .{ .manifest = parsed },
+                    .platform = platform,
+                    .backing_body = try std.testing.allocator.dupe(u8, minimal_manifest_json),
+                };
+
+                success.deinit(std.testing.allocator);
+
+                try std.testing.expect(success.resolved_digest_raw.len == 0);
+                try std.testing.expect(success.resolved_digest.hex.len == 0);
+                try std.testing.expect(success.backing_body == null);
+                try std.testing.expect(success.platform == null);
+                try std.testing.expectEqual(.manifest_media_type, std.meta.activeTag(success.document));
+            },
+            .detach_manifest_oom_safe => {
+                try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+                    fn run(caller_allocator: std.mem.Allocator, bytes: []const u8) !void {
+                        var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                        defer transient_arena.deinit();
+                        const transient = transient_arena.allocator();
+
+                        const parsed_local = try json.parse(Manifest, transient, bytes);
+                        var success_local = ResolvedManifestSuccess{
+                            .resolved_digest = try Digest.parse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+                            .resolved_digest_raw = try transient.dupe(u8, "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+                            .document = .{ .manifest = parsed_local },
+                            .platform = null,
+                        };
+                        errdefer success_local.deinit(transient);
+
+                        const promoted = try success_local.detachManifestForPromotion(caller_allocator);
+                        promoted.deinit();
+                        success_local.deinit(transient);
+                    }
+                }.run, .{minimal_manifest_json});
+            },
+            .detach_manifest_clears_digest => {
+                var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer transient_arena.deinit();
+                const transient = transient_arena.allocator();
+
+                const parsed_local = try json.parse(Manifest, transient, minimal_manifest_json);
+                var success_local = ResolvedManifestSuccess{
+                    .resolved_digest = try Digest.parse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+                    .resolved_digest_raw = try transient.dupe(u8, "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+                    .document = .{ .manifest = parsed_local },
+                    .platform = null,
+                };
+                defer success_local.deinit(transient);
+
+                const promoted = try success_local.detachManifestForPromotion(std.testing.allocator);
+                defer promoted.deinit();
+
+                try std.testing.expect(success_local.resolved_digest_raw.len == 0);
+                try std.testing.expect(success_local.resolved_digest.hex.len == 0);
+                try std.testing.expectEqual(.manifest_media_type, std.meta.activeTag(success_local.document));
+            },
+        }
+    }
+}
+
+test "validateOutcomeFromResolvedManifestOutcome: failure release clears stored reference" {
+    const owned_reference = try std.testing.allocator.dupe(u8, "registry.example.test/library/busybox:latest");
+    var outcome = ResolvedManifestOutcome{ .failure = .{ .platform_required = .{
+        .registry = "registry.example.test",
+        .reference = owned_reference,
+        .http_status = null,
+    } } };
+
+    const result = try validateOutcomeFromResolvedManifestOutcome(
+        std.testing.allocator,
+        std.testing.allocator,
+        &outcome,
+    );
+    switch (result) {
+        .failure => |failure| {
+            defer failure.deinitOwned(std.testing.allocator);
+            try std.testing.expectEqualStrings("platform_required", @tagName(std.meta.activeTag(failure)));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(outcome.failure.platform_required.reference.len == 0);
 }

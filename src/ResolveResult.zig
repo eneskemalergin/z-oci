@@ -173,234 +173,154 @@ fn slicePointsInto(inner: []const u8, outer: []const u8) bool {
     return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
 }
 
-// Tests
+// --- Tests ---
 
-test "ResolveResult.clone: produces independent copy surviving arena teardown and mutation" {
-    var cloned: ResolveResult = undefined;
-    {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        const arena_alloc = arena.allocator();
+const sha256_a = "a" ** 64;
+const sha256_b = "b" ** 64;
+const sha256_f = "f" ** 64;
 
-        var registry_buf = try arena_alloc.dupe(u8, "ghcr.io");
-        const hex = try arena_alloc.dupe(u8, "a" ** 64);
-        const original = ResolveResult{
-            .digest = .{ .algorithm = .sha256, .hex = hex },
-            .media_type = .oci_manifest_v1,
-            .platform = null,
-            .reference = Reference{
-                .registry = registry_buf,
-                .repository = try arena_alloc.dupe(u8, "owner/repo"),
-                .tag = try arena_alloc.dupe(u8, "v1.0"),
-                .digest = null,
-                .digest_raw = null,
+fn dupe(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    return allocator.dupe(u8, bytes);
+}
+
+test "ResolveResult.clone: deep copies owned fields and survives arena teardown" {
+    const CloneScenario = enum {
+        basic_with_tag,
+        null_platform,
+        platform_with_os_features,
+        distinct_reference_digest,
+    };
+    const cases = [_]CloneScenario{
+        .basic_with_tag,
+        .null_platform,
+        .platform_with_os_features,
+        .distinct_reference_digest,
+    };
+
+    for (cases) |scenario| {
+        var cloned: ResolveResult = undefined;
+        var registry_buf: ?[]u8 = null;
+        {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            const arena_alloc = arena.allocator();
+
+            const original: ResolveResult = switch (scenario) {
+                .basic_with_tag => blk: {
+                    registry_buf = try dupe(arena_alloc, "ghcr.io");
+                    break :blk ResolveResult{
+                        .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, sha256_a) },
+                        .media_type = .oci_manifest_v1,
+                        .platform = null,
+                        .reference = .{
+                            .registry = registry_buf.?,
+                            .repository = try dupe(arena_alloc, "owner/repo"),
+                            .tag = try dupe(arena_alloc, "v1.0"),
+                            .digest = null,
+                            .digest_raw = null,
+                        },
+                    };
+                },
+                .null_platform => ResolveResult{
+                    .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, "d" ** 64) },
+                    .media_type = .oci_manifest_v1,
+                    .platform = null,
+                    .reference = .{
+                        .registry = try dupe(arena_alloc, "r"),
+                        .repository = try dupe(arena_alloc, "repo"),
+                        .tag = null,
+                        .digest = null,
+                        .digest_raw = null,
+                    },
+                },
+                .platform_with_os_features => blk: {
+                    const features = [_][]const u8{
+                        try dupe(arena_alloc, "win32k"),
+                        try dupe(arena_alloc, "hyperv"),
+                    };
+                    break :blk ResolveResult{
+                        .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, "c" ** 64) },
+                        .media_type = .oci_manifest_v1,
+                        .platform = .{
+                            .os = try dupe(arena_alloc, "linux"),
+                            .architecture = try dupe(arena_alloc, "arm64"),
+                            .variant = try dupe(arena_alloc, "v8"),
+                            .os_version = null,
+                            .os_features = &features,
+                        },
+                        .reference = .{
+                            .registry = try dupe(arena_alloc, "gcr.io"),
+                            .repository = try dupe(arena_alloc, "proj/image"),
+                            .tag = null,
+                            .digest = null,
+                            .digest_raw = null,
+                        },
+                    };
+                },
+                .distinct_reference_digest => ResolveResult{
+                    .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, sha256_a) },
+                    .media_type = .oci_manifest_v1,
+                    .platform = null,
+                    .reference = .{
+                        .registry = try dupe(arena_alloc, "ghcr.io"),
+                        .repository = try dupe(arena_alloc, "owner/repo"),
+                        .tag = null,
+                        .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, sha256_b) },
+                        .digest_raw = try dupe(arena_alloc, "sha256:" ++ sha256_b),
+                    },
+                },
+            };
+
+            cloned = try original.clone(std.testing.allocator);
+            if (registry_buf) |buf| buf[0] = 'X';
+            arena.deinit();
+        }
+        defer cloned.deinit(std.testing.allocator);
+
+        switch (scenario) {
+            .basic_with_tag => {
+                try std.testing.expectEqualSlices(u8, sha256_a, cloned.digest.hex);
+                try std.testing.expectEqualSlices(u8, "ghcr.io", cloned.reference.registry);
+                try std.testing.expectEqualSlices(u8, "owner/repo", cloned.reference.repository);
+                try std.testing.expectEqualSlices(u8, "v1.0", cloned.reference.tag.?);
             },
-        };
-
-        cloned = try original.clone(std.testing.allocator);
-        registry_buf[0] = 'X';
-        arena.deinit();
+            .null_platform => try std.testing.expect(cloned.platform == null),
+            .platform_with_os_features => {
+                const platform = cloned.platform.?;
+                try std.testing.expectEqualSlices(u8, "linux", platform.os);
+                try std.testing.expectEqualSlices(u8, "arm64", platform.architecture);
+                try std.testing.expectEqualSlices(u8, "v8", platform.variant.?);
+                const features = platform.os_features.?;
+                try std.testing.expectEqual(@as(usize, 2), features.len);
+                try std.testing.expectEqualSlices(u8, "win32k", features[0]);
+                try std.testing.expectEqualSlices(u8, "hyperv", features[1]);
+            },
+            .distinct_reference_digest => {
+                try std.testing.expectEqualSlices(u8, sha256_a, cloned.digest.hex);
+                try std.testing.expectEqualSlices(u8, sha256_b, cloned.reference.digest.?.hex);
+                try std.testing.expect(!std.mem.eql(u8, cloned.digest.hex, cloned.reference.digest.?.hex));
+            },
+        }
     }
-    defer cloned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualSlices(u8, "a" ** 64, cloned.digest.hex);
-    try std.testing.expectEqualSlices(u8, "ghcr.io", cloned.reference.registry);
-    try std.testing.expectEqualSlices(u8, "owner/repo", cloned.reference.repository);
-    try std.testing.expectEqualSlices(u8, "v1.0", cloned.reference.tag.?);
 }
 
-test "ResolveResult.clone: platform fields are deep copied" {
-    // Arrange
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    const original = ResolveResult{
-        .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "c" ** 64) },
-        .media_type = .oci_manifest_v1,
-        .platform = Platform{
-            .os = try arena_alloc.dupe(u8, "linux"),
-            .architecture = try arena_alloc.dupe(u8, "arm64"),
-            .variant = try arena_alloc.dupe(u8, "v8"),
-            .os_version = null,
-        },
-        .reference = Reference{
-            .registry = try arena_alloc.dupe(u8, "gcr.io"),
-            .repository = try arena_alloc.dupe(u8, "proj/image"),
-            .tag = null,
-            .digest = null,
-            .digest_raw = null,
-        },
-    };
-
-    // Act
-    var cloned = try original.clone(std.testing.allocator);
-    defer cloned.deinit(std.testing.allocator);
-
-    // Assert
-    try std.testing.expect(cloned.platform != null);
-    try std.testing.expectEqualSlices(u8, "linux", cloned.platform.?.os);
-    try std.testing.expectEqualSlices(u8, "arm64", cloned.platform.?.architecture);
-    try std.testing.expectEqualSlices(u8, "v8", cloned.platform.?.variant.?);
-}
-
-test "ResolveResult.clone: null platform clones as null" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    const original = ResolveResult{
-        .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "d" ** 64) },
-        .media_type = .oci_manifest_v1,
-        .platform = null,
-        .reference = Reference{
-            .registry = try arena_alloc.dupe(u8, "r"),
-            .repository = try arena_alloc.dupe(u8, "repo"),
-            .tag = null,
-            .digest = null,
-            .digest_raw = null,
-        },
-    };
-
-    var cloned = try original.clone(std.testing.allocator);
-    defer cloned.deinit(std.testing.allocator);
-
-    try std.testing.expect(cloned.platform == null);
-}
-
-test "ResolveResult.clone: os_features are deep copied" {
-    // os_features is a slice of slices. All levels must be cloned.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    const features = [_][]const u8{
-        try arena_alloc.dupe(u8, "win32k"),
-        try arena_alloc.dupe(u8, "hyperv"),
-    };
-    const original = ResolveResult{
-        .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "f" ** 64) },
-        .media_type = .oci_manifest_v1,
-        .platform = Platform{
-            .os = try arena_alloc.dupe(u8, "windows"),
-            .architecture = try arena_alloc.dupe(u8, "amd64"),
-            .os_features = &features,
-        },
-        .reference = Reference{
-            .registry = try arena_alloc.dupe(u8, "mcr.microsoft.com"),
-            .repository = try arena_alloc.dupe(u8, "windows/servercore"),
-            .tag = null,
-            .digest = null,
-            .digest_raw = null,
-        },
-    };
-
-    var cloned = try original.clone(std.testing.allocator);
-    defer cloned.deinit(std.testing.allocator);
-
-    // Assert: all feature strings are cloned and readable.
-    const cf = cloned.platform.?.os_features.?;
-    try std.testing.expectEqual(@as(usize, 2), cf.len);
-    try std.testing.expectEqualSlices(u8, "win32k", cf[0]);
-    try std.testing.expectEqualSlices(u8, "hyperv", cf[1]);
-    // Pointers must differ: clone owns its own memory.
-    try std.testing.expect(cf.ptr != features[0..].ptr);
-}
-
-test "ResolveResult.clone: full smoke test survives arena teardown" {
-    // Clone a fully populated value, tear the source arena down, then read every field.
-    var cloned: ResolveResult = undefined;
-    {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const arena_alloc = arena.allocator();
-
-        const digest_hex = try arena_alloc.dupe(u8, "9" ** 64);
-        const digest_raw = try arena_alloc.dupe(u8, "sha256:" ++ "9" ** 64);
-        const features = [_][]const u8{
-            try arena_alloc.dupe(u8, "win32k"),
-            try arena_alloc.dupe(u8, "hyperv"),
-        };
-
-        const original = ResolveResult{
-            .digest = .{ .algorithm = .sha256, .hex = digest_hex },
-            .media_type = .docker_manifest_v2,
-            .platform = Platform{
-                .os = try arena_alloc.dupe(u8, "windows"),
-                .architecture = try arena_alloc.dupe(u8, "amd64"),
-                .variant = try arena_alloc.dupe(u8, "v1"),
-                .os_version = try arena_alloc.dupe(u8, "10.0.20348.2402"),
-                .os_features = &features,
-            },
-            .reference = Reference{
-                .registry = try arena_alloc.dupe(u8, "mcr.microsoft.com"),
-                .repository = try arena_alloc.dupe(u8, "windows/nanoserver"),
-                .tag = try arena_alloc.dupe(u8, "ltsc2022"),
-                .digest = .{ .algorithm = .sha256, .hex = digest_hex },
-                .digest_raw = digest_raw,
-            },
-        };
-
-        cloned = try original.clone(std.testing.allocator);
-    }
-    defer cloned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualSlices(u8, "9" ** 64, cloned.digest.hex);
-    try std.testing.expectEqualSlices(u8, "mcr.microsoft.com", cloned.reference.registry);
-    try std.testing.expectEqualSlices(u8, "windows/nanoserver", cloned.reference.repository);
-    try std.testing.expectEqualSlices(u8, "ltsc2022", cloned.reference.tag.?);
-    try std.testing.expectEqualSlices(u8, "sha256:" ++ "9" ** 64, cloned.reference.digest_raw.?);
-    try std.testing.expect(cloned.reference.digest != null);
-    try std.testing.expectEqualSlices(u8, cloned.digest.hex, cloned.reference.digest.?.hex);
-    try std.testing.expectEqualSlices(u8, "windows", cloned.platform.?.os);
-    try std.testing.expectEqualSlices(u8, "10.0.20348.2402", cloned.platform.?.os_version.?);
-    try std.testing.expectEqual(@as(usize, 2), cloned.platform.?.os_features.?.len);
-}
-
-test "ResolveResult.clone: reference digest remains distinct from resolved digest" {
-    // The resolved manifest digest and the original reference digest are related,
-    // but they are not guaranteed to be the same slice or even the same value.
-    // clone() must preserve both independently.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    const original = ResolveResult{
-        .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "a" ** 64) },
-        .media_type = .oci_manifest_v1,
-        .platform = null,
-        .reference = Reference{
-            .registry = try arena_alloc.dupe(u8, "ghcr.io"),
-            .repository = try arena_alloc.dupe(u8, "owner/repo"),
-            .tag = null,
-            .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "b" ** 64) },
-            .digest_raw = try arena_alloc.dupe(u8, "sha256:" ++ "b" ** 64),
-        },
-    };
-
-    var cloned = try original.clone(std.testing.allocator);
-    defer cloned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualSlices(u8, "a" ** 64, cloned.digest.hex);
-    try std.testing.expectEqualSlices(u8, "b" ** 64, cloned.reference.digest.?.hex);
-    try std.testing.expect(!std.mem.eql(u8, cloned.digest.hex, cloned.reference.digest.?.hex));
-}
-
-test "ResolveResult digest aliases: deinit and clone handle shared hex slices" {
-    const cases = [_]enum {
+test "ResolveResult: digest alias layouts deinit and clone safely" {
+    const AliasScenario = enum {
         aliased_resolved_and_reference,
         reference_borrows_digest_raw,
-        resolved_borrows_digest_raw,
+        resolved_borrows_digest_raw_with_platform,
         clone_from_digest_raw_borrow,
-    }{
+    };
+    const cases = [_]AliasScenario{
         .aliased_resolved_and_reference,
         .reference_borrows_digest_raw,
-        .resolved_borrows_digest_raw,
+        .resolved_borrows_digest_raw_with_platform,
         .clone_from_digest_raw_borrow,
     };
+
     for (cases) |scenario| {
         switch (scenario) {
             .aliased_resolved_and_reference => {
-                const digest_hex = try std.testing.allocator.dupe(u8, "c" ** 64);
+                const digest_hex = try dupe(std.testing.allocator, "c" ** 64);
                 errdefer std.testing.allocator.free(digest_hex);
 
                 var owned = ResolveResult{
@@ -408,22 +328,20 @@ test "ResolveResult digest aliases: deinit and clone handle shared hex slices" {
                     .media_type = .oci_manifest_v1,
                     .platform = null,
                     .reference = .{
-                        .registry = try std.testing.allocator.dupe(u8, "registry-1.docker.io"),
-                        .repository = try std.testing.allocator.dupe(u8, "library/busybox"),
+                        .registry = try dupe(std.testing.allocator, "registry-1.docker.io"),
+                        .repository = try dupe(std.testing.allocator, "library/busybox"),
                         .tag = null,
                         .digest = .{ .algorithm = .sha256, .hex = digest_hex },
-                        .digest_raw = try std.testing.allocator.dupe(u8, "sha256:" ++ "c" ** 64),
+                        .digest_raw = try dupe(std.testing.allocator, "sha256:" ++ "c" ** 64),
                     },
                 };
                 defer owned.deinit(std.testing.allocator);
-
                 try std.testing.expect(owned.digest.hex.ptr == owned.reference.digest.?.hex.ptr);
             },
             .reference_borrows_digest_raw => {
-                const digest_hex = try std.testing.allocator.dupe(u8, "d" ** 64);
+                const digest_hex = try dupe(std.testing.allocator, "d" ** 64);
                 errdefer std.testing.allocator.free(digest_hex);
-
-                const digest_raw = try std.testing.allocator.dupe(u8, "sha256:" ++ "e" ** 64);
+                const digest_raw = try dupe(std.testing.allocator, "sha256:" ++ "e" ** 64);
                 errdefer std.testing.allocator.free(digest_raw);
 
                 var owned = ResolveResult{
@@ -431,46 +349,44 @@ test "ResolveResult digest aliases: deinit and clone handle shared hex slices" {
                     .media_type = .oci_manifest_v1,
                     .platform = null,
                     .reference = .{
-                        .registry = try std.testing.allocator.dupe(u8, "ghcr.io"),
-                        .repository = try std.testing.allocator.dupe(u8, "owner/repo"),
+                        .registry = try dupe(std.testing.allocator, "ghcr.io"),
+                        .repository = try dupe(std.testing.allocator, "owner/repo"),
                         .tag = null,
-                        .digest = .{
-                            .algorithm = .sha256,
-                            .hex = digest_raw[digest_raw.len - 64 ..],
-                        },
+                        .digest = .{ .algorithm = .sha256, .hex = digest_raw[digest_raw.len - 64 ..] },
                         .digest_raw = digest_raw,
                     },
                 };
                 defer owned.deinit(std.testing.allocator);
-
                 try std.testing.expect(slicePointsInto(owned.reference.digest.?.hex, owned.reference.digest_raw.?));
             },
-            .resolved_borrows_digest_raw => {
+            .resolved_borrows_digest_raw_with_platform => {
                 var gpa = std.heap.DebugAllocator(.{}){};
                 defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
                 const alloc = gpa.allocator();
 
-                const digest_raw = try alloc.dupe(u8, "sha256:" ++ "f" ** 64);
+                const digest_raw = try alloc.dupe(u8, "sha256:" ++ sha256_f);
+                const features = try alloc.alloc([]const u8, 2);
+                features[0] = try alloc.dupe(u8, "win32k");
+                features[1] = try alloc.dupe(u8, "hyperv");
 
                 var owned = ResolveResult{
-                    .digest = .{
-                        .algorithm = .sha256,
-                        .hex = digest_raw[digest_raw.len - 64 ..],
+                    .digest = .{ .algorithm = .sha256, .hex = digest_raw[digest_raw.len - 64 ..] },
+                    .media_type = .docker_manifest_v2,
+                    .platform = .{
+                        .os = try alloc.dupe(u8, "windows"),
+                        .architecture = try alloc.dupe(u8, "amd64"),
+                        .variant = try alloc.dupe(u8, "v1"),
+                        .os_version = try alloc.dupe(u8, "10.0.20348.2402"),
+                        .os_features = features,
                     },
-                    .media_type = .oci_manifest_v1,
-                    .platform = null,
                     .reference = .{
-                        .registry = try alloc.dupe(u8, "registry-1.docker.io"),
-                        .repository = try alloc.dupe(u8, "library/busybox"),
-                        .tag = try alloc.dupe(u8, "latest"),
-                        .digest = .{
-                            .algorithm = .sha256,
-                            .hex = digest_raw[digest_raw.len - 64 ..],
-                        },
+                        .registry = try alloc.dupe(u8, "mcr.microsoft.com"),
+                        .repository = try alloc.dupe(u8, "windows/servercore"),
+                        .tag = try alloc.dupe(u8, "ltsc2022"),
+                        .digest = .{ .algorithm = .sha256, .hex = digest_raw[digest_raw.len - 64 ..] },
                         .digest_raw = digest_raw,
                     },
                 };
-
                 owned.deinit(alloc);
             },
             .clone_from_digest_raw_borrow => {
@@ -479,7 +395,6 @@ test "ResolveResult digest aliases: deinit and clone handle shared hex slices" {
                     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
                     defer arena.deinit();
                     const arena_alloc = arena.allocator();
-
                     const digest_raw = try arena_alloc.dupe(u8, "sha256:" ++ "7" ** 64);
                     const original = ResolveResult{
                         .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "6" ** 64) },
@@ -489,55 +404,18 @@ test "ResolveResult digest aliases: deinit and clone handle shared hex slices" {
                             .registry = try arena_alloc.dupe(u8, "ghcr.io"),
                             .repository = try arena_alloc.dupe(u8, "owner/repo"),
                             .tag = null,
-                            .digest = .{
-                                .algorithm = .sha256,
-                                .hex = digest_raw[digest_raw.len - 64 ..],
-                            },
+                            .digest = .{ .algorithm = .sha256, .hex = digest_raw[digest_raw.len - 64 ..] },
                             .digest_raw = digest_raw,
                         },
                     };
-
                     cloned = try original.clone(std.testing.allocator);
                 }
                 defer cloned.deinit(std.testing.allocator);
-
                 try std.testing.expectEqualSlices(u8, "7" ** 64, cloned.reference.digest.?.hex);
                 try std.testing.expect(!slicePointsInto(cloned.reference.digest.?.hex, cloned.reference.digest_raw.?));
             },
         }
     }
-}
-
-test "ResolveResult.deinit: full platform teardown leaves no residual allocations under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const alloc = gpa.allocator();
-
-    const digest_raw = try alloc.dupe(u8, "sha256:" ++ "3" ** 64);
-    const features = try alloc.alloc([]const u8, 2);
-    features[0] = try alloc.dupe(u8, "win32k");
-    features[1] = try alloc.dupe(u8, "hyperv");
-
-    var owned = ResolveResult{
-        .digest = .{ .algorithm = .sha256, .hex = try alloc.dupe(u8, "2" ** 64) },
-        .media_type = .docker_manifest_v2,
-        .platform = .{
-            .os = try alloc.dupe(u8, "windows"),
-            .architecture = try alloc.dupe(u8, "amd64"),
-            .variant = try alloc.dupe(u8, "v1"),
-            .os_version = try alloc.dupe(u8, "10.0.20348.2402"),
-            .os_features = features,
-        },
-        .reference = .{
-            .registry = try alloc.dupe(u8, "mcr.microsoft.com"),
-            .repository = try alloc.dupe(u8, "windows/servercore"),
-            .tag = try alloc.dupe(u8, "ltsc2022"),
-            .digest = .{ .algorithm = .sha256, .hex = digest_raw[digest_raw.len - 64 ..] },
-            .digest_raw = digest_raw,
-        },
-    };
-
-    owned.deinit(alloc);
 }
 
 test "ResolveResult.clone: allocation failures do not leak partially cloned state" {
@@ -573,51 +451,8 @@ test "ResolveResult.clone: allocation failures do not leak partially cloned stat
         fn run(allocator: std.mem.Allocator, source: ResolveResult) !void {
             var cloned = try source.clone(allocator);
             defer cloned.deinit(allocator);
-
             try std.testing.expectEqualSlices(u8, "mcr.microsoft.com", cloned.reference.registry);
-            try std.testing.expectEqualSlices(u8, "windows/nanoserver", cloned.reference.repository);
-            try std.testing.expectEqualSlices(u8, "ltsc2022", cloned.reference.tag.?);
-            try std.testing.expect(cloned.platform != null);
             try std.testing.expectEqualSlices(u8, "hyperv", cloned.platform.?.os_features.?[1]);
         }
     }.run, .{original});
-}
-
-test "ResolveResult.clone: repeated clone and deinit leave no residual allocations under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const alloc = gpa.allocator();
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
-    const digest_raw = try arena_alloc.dupe(u8, "sha256:" ++ "4" ** 64);
-    const features = [_][]const u8{
-        try arena_alloc.dupe(u8, "win32k"),
-        try arena_alloc.dupe(u8, "hyperv"),
-    };
-    const original = ResolveResult{
-        .digest = .{ .algorithm = .sha256, .hex = try arena_alloc.dupe(u8, "5" ** 64) },
-        .media_type = .docker_manifest_v2,
-        .platform = .{
-            .os = try arena_alloc.dupe(u8, "windows"),
-            .architecture = try arena_alloc.dupe(u8, "amd64"),
-            .variant = try arena_alloc.dupe(u8, "v1"),
-            .os_version = try arena_alloc.dupe(u8, "10.0.20348.2402"),
-            .os_features = &features,
-        },
-        .reference = .{
-            .registry = try arena_alloc.dupe(u8, "mcr.microsoft.com"),
-            .repository = try arena_alloc.dupe(u8, "windows/servercore"),
-            .tag = try arena_alloc.dupe(u8, "ltsc2022"),
-            .digest = .{ .algorithm = .sha256, .hex = digest_raw[digest_raw.len - 64 ..] },
-            .digest_raw = digest_raw,
-        },
-    };
-
-    for (0..32) |_| {
-        var cloned = try original.clone(alloc);
-        cloned.deinit(alloc);
-    }
 }

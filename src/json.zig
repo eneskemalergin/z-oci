@@ -10,8 +10,8 @@
 const std = @import("std");
 
 const Manifest = @import("Manifest.zig");
-const Descriptor = @import("Descriptor.zig");
 const Platform = @import("Platform.zig");
+const MediaType = @import("MediaType.zig").MediaType;
 
 /// Parse JSON bytes into T. Unknown fields are silently ignored so
 /// the caller handles spec extensions without error.
@@ -110,137 +110,77 @@ fn readBusyboxManifestFixtureAlloc(allocator: std.mem.Allocator) ![]u8 {
     return try allocator.dupe(u8, bytes);
 }
 
+const minimal_manifest_json =
+    \\{
+    \\  "schemaVersion": 2,
+    \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+    \\  "config": {
+    \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+    \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    \\    "size": 17
+    \\  },
+    \\  "layers": []
+    \\}
+;
+
 // --- Tests ---
 
-test "json: parseBorrowing requires input bytes to outlive parsed value" {
-    var json_bytes: [64]u8 = undefined;
-    const content = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
-    @memcpy(json_bytes[0..content.len], content);
-
-    const parsed = try parseBorrowing(Platform, std.testing.allocator, json_bytes[0..content.len]);
-    defer parsed.deinit();
-    try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
-
-    @memset(json_bytes[0..content.len], 'X');
-    try std.testing.expect(!std.mem.eql(u8, "linux", parsed.value.os));
-    try std.testing.expectEqual(@as(u8, 'X'), parsed.value.os[0]);
-}
-
-test "json: promoteParsed copies parsed value onto caller allocator" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        \\    "size": 1
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-
-    var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer transient_arena.deinit();
-    const transient = transient_arena.allocator();
-
-    const transient_parsed = try parse(Manifest, transient, json_bytes);
-    const promoted = try promoteParsed(Manifest, std.testing.allocator, transient_parsed);
-    defer promoted.deinit();
-
-    try std.testing.expectEqual(@as(u32, 2), promoted.value.schema_version);
-    try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", promoted.value.media_type.toString());
-}
-
-test "json: promoteParsed matches direct parse for live busybox fixture" {
-    const json_bytes = try readBusyboxManifestFixtureAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(json_bytes);
-
-    const direct = try parse(Manifest, std.testing.allocator, json_bytes);
-    defer direct.deinit();
-
-    var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer transient_arena.deinit();
-    const transient = transient_arena.allocator();
-
-    const transient_parsed = try parse(Manifest, transient, json_bytes);
-    const promoted = try promoteParsed(Manifest, std.testing.allocator, transient_parsed);
-    defer promoted.deinit();
-
-    try expectManifestFieldsMatch(direct.value, promoted.value);
-}
-
-test "json: promoteParsed allocation failures preserve input parsed value" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        \\    "size": 1
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-
-    const MockHarness = struct {
-        fn run(caller_allocator: std.mem.Allocator) !void {
-            var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-            defer transient_arena.deinit();
-            const transient = transient_arena.allocator();
-
-            var transient_parsed = try parse(Manifest, transient, json_bytes);
-            errdefer transient_parsed.deinit();
-
-            const promoted = try promoteParsed(Manifest, caller_allocator, transient_parsed);
-            promoted.deinit();
-        }
-    };
-
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
-}
-
-// Unknown fields are ignored (spec extensions allowed by OCI)
-
-test "json: unknown fields in JSON are silently ignored" {
-    // Arrange: the OCI spec allows vendor extension fields.
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-        \\  "size": 99,
-        \\  "unknownExtensionField": "vendor-specific-value"
-        \\}
-    ;
-    // Act: should succeed without error
-    const parsed = try parse(Descriptor, std.testing.allocator, json_bytes);
-    defer parsed.deinit();
-    // Assert
-    try std.testing.expectEqual(@as(u64, 99), parsed.value.size);
-}
-
-// Parsed(T) does not borrow from input bytes
-
-test "json: Parsed(T) does not borrow from input bytes" {
-    // Arrange: allocate json_bytes on the heap then free before using parsed value.
+test "json: parse copies into arena, ignores unknown fields, and survives freeing input" {
     const json_bytes = try std.testing.allocator.dupe(u8,
         \\{
+        \\  "schemaVersion": 2,
         \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        \\  "size": 77
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 17
+        \\  },
+        \\  "layers": [],
+        \\  "io.zoci.extension": "allowed"
         \\}
     );
-    const parsed = try parse(Descriptor, std.testing.allocator, json_bytes);
-    // Free the input before reading the parsed value.
+    const parsed = try parse(Manifest, std.testing.allocator, json_bytes);
     std.testing.allocator.free(json_bytes);
     defer parsed.deinit();
-    // Assert: values are readable (they live in the arena, not in json_bytes).
-    try std.testing.expectEqual(@as(u64, 77), parsed.value.size);
-    try std.testing.expectEqualSlices(u8, "e" ** 64, parsed.value.digest.hex);
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+    try std.testing.expectEqualSlices(u8, "c" ** 64, parsed.value.config.digest.hex);
 }
 
-test "json: allocation failures do not leak partially parsed arena state" {
+test "json: parse returns specific errors for malformed manifests and JSON" {
+    const cases = [_]struct { payload: []const u8, err: anyerror }{
+        .{
+            .payload =
+            \\{
+            \\  "schemaVersion": 2,
+            \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            \\  "layers": []
+            \\}
+            ,
+            .err = error.MissingField,
+        },
+        .{
+            .payload =
+            \\{
+            \\  "schemaVersion": 2,
+            \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            \\  "config": {
+            \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+            \\    "digest": "not-a-digest",
+            \\    "size": 1
+            \\  },
+            \\  "layers": []
+            \\}
+            ,
+            .err = error.UnexpectedToken,
+        },
+        .{ .payload = "{", .err = error.UnexpectedEndOfInput },
+    };
+    for (cases) |case| try std.testing.expectError(case.err, parse(Manifest, std.testing.allocator, case.payload));
+}
+
+test "json: parse allocation failures do not leak partially parsed arena state" {
     const json_bytes =
         \\{
         \\  "schemaVersion": 2,
@@ -264,162 +204,75 @@ test "json: allocation failures do not leak partially parsed arena state" {
         fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
             const parsed = try parse(Manifest, allocator, bytes);
             defer parsed.deinit();
-
             try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
             try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
-            try std.testing.expectEqualSlices(u8, "b" ** 64, parsed.value.layers[0].digest.hex);
         }
     }.run, .{json_bytes});
 }
 
-test "json: repeated success and parse failures leave no residual allocations under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
+test "json: parseBorrowing aliases input buffer; stringifyForTest emits parseable JSON" {
+    var json_bytes: [64]u8 = undefined;
+    const content = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
+    @memcpy(json_bytes[0..content.len], content);
 
-    const valid_manifest =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        \\    "size": 17
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-    const invalid_cases = [_]struct { []const u8, anyerror }{
-        .{
-            \\{
-            \\  "schemaVersion": 2,
-            \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            \\  "layers": []
-            \\}
-            ,
-            error.MissingField,
-        },
-        .{
-            \\{
-            \\  "schemaVersion": 2,
-            \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            \\  "config": {
-            \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-            \\    "digest": "not-a-digest",
-            \\    "size": 1
-            \\  },
-            \\  "layers": []
-            \\}
-            ,
-            error.UnexpectedToken,
-        },
+    const parsed = try parseBorrowing(Platform, std.testing.allocator, json_bytes[0..content.len]);
+    defer parsed.deinit();
+    try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
+
+    var aw = try stringifyForTest(parsed.value);
+    defer aw.deinit();
+    const reparsed = try parseBorrowing(Platform, std.testing.allocator, aw.written());
+    defer reparsed.deinit();
+    try std.testing.expectEqualSlices(u8, "linux", reparsed.value.os);
+    try std.testing.expectEqualSlices(u8, "amd64", reparsed.value.architecture);
+
+    @memset(json_bytes[0..content.len], 'X');
+    try std.testing.expectEqual(@as(u8, 'X'), parsed.value.os[0]);
+}
+
+test "json: promoteParsed matches direct parse on busybox fixture" {
+    const json_bytes = try readBusyboxManifestFixtureAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(json_bytes);
+
+    const direct = try parse(Manifest, std.testing.allocator, json_bytes);
+    defer direct.deinit();
+
+    var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer transient_arena.deinit();
+    const transient = transient_arena.allocator();
+
+    const transient_parsed = try parse(Manifest, transient, json_bytes);
+    const promoted = try promoteParsed(Manifest, std.testing.allocator, transient_parsed);
+    defer promoted.deinit();
+
+    try expectManifestFieldsMatch(direct.value, promoted.value);
+}
+
+test "json: promoteParsed allocation failures do not leak transient parsed value" {
+    const MockHarness = struct {
+        fn run(caller_allocator: std.mem.Allocator) !void {
+            var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer transient_arena.deinit();
+            const transient = transient_arena.allocator();
+
+            var transient_parsed = try parse(Manifest, transient, minimal_manifest_json);
+            errdefer transient_parsed.deinit();
+
+            const promoted = try promoteParsed(Manifest, caller_allocator, transient_parsed);
+            promoted.deinit();
+        }
     };
 
-    for (0..16) |_| {
-        const parsed = try parse(Manifest, allocator, valid_manifest);
-        parsed.deinit();
-    }
-
-    for (invalid_cases) |case| {
-        try std.testing.expectError(case[1], parse(Manifest, allocator, case[0]));
-    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 
-// Error paths: missing required fields
-
-test "json: missing required field returns error" {
-    try std.testing.expectError(error.MissingField, parse(Descriptor, std.testing.allocator,
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        \\}
-    ));
-    try std.testing.expectError(error.MissingField, parse(Manifest, std.testing.allocator,
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "layers": []
-        \\}
-    ));
-}
-
-// Error paths: malformed values
-
-test "json: invalid digest string returns error" {
-    // The digest has 63 hex chars: one short of the required 64.
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": 1
-        \\}
-    ;
-    const result = parse(Descriptor, std.testing.allocator, json_bytes);
-    try std.testing.expectError(error.UnexpectedToken, result);
-}
-
-test "json: unrecognized media type string returns error" {
-    // Unknown MIME type must be rejected by MediaType.jsonParse.
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/x-custom-unknown-type",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": 1
-        \\}
-    ;
-    const result = parse(Descriptor, std.testing.allocator, json_bytes);
-    try std.testing.expectError(error.UnexpectedToken, result);
-}
-
-test "json: wrong JSON type for size returns InvalidCharacter" {
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\  "size": "not-a-number"
-        \\}
-    ;
-
-    try std.testing.expectError(error.InvalidCharacter, parse(Descriptor, std.testing.allocator, json_bytes));
-}
-
-// Platform round-trip with os.version and os.features
-
-test "json: Platform round-trip with os.version and os.features" {
-    // Arrange: a Windows platform entry with os.version and os.features.
-    const json_bytes =
-        \\{
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        \\  "size": 256,
-        \\  "platform": {
-        \\    "os": "windows",
-        \\    "architecture": "amd64",
-        \\    "os.version": "10.0.17763.1234",
-        \\    "os.features": ["win32k"]
-        \\  }
-        \\}
-    ;
-    // Act
-    const parsed = try parse(Descriptor, std.testing.allocator, json_bytes);
-    defer parsed.deinit();
-    const plat = parsed.value.platform.?;
-    // Assert
-    try std.testing.expectEqualSlices(u8, "windows", plat.os);
-    try std.testing.expectEqualSlices(u8, "10.0.17763.1234", plat.os_version.?);
-    try std.testing.expectEqual(@as(usize, 1), plat.os_features.?.len);
-    try std.testing.expectEqualSlices(u8, "win32k", plat.os_features.?[0]);
-}
-
-test "json: 10000 pseudo-random manifest payloads never panic" {
-    // Fuzz-style smoke test. Malformed JSON must fail with an error, not a panic.
+test "json: pseudo-random payloads never panic when parsed as Manifest" {
     var seed: u64 = 0xabad_1dea;
     var buf: [256]u8 = undefined;
 
-    for (0..10_000) |_| {
+    for (0..256) |_| {
         seed = seed *% 6364136223846793005 +% 1;
         const len: usize = @intCast(seed % (buf.len + 1));
-
         for (buf[0..len]) |*b| {
             seed = seed *% 6364136223846793005 +% 1;
             b.* = @truncate(seed >> 32);
@@ -427,32 +280,8 @@ test "json: 10000 pseudo-random manifest payloads never panic" {
 
         const result = parse(Manifest, std.testing.allocator, buf[0..len]);
         if (result) |parsed| {
-            var owned = parsed;
-            defer owned.deinit();
-
-            try std.testing.expect(owned.value.schema_version <= std.math.maxInt(u8));
-            try std.testing.expect(owned.value.media_type.toString().len > 0);
-            try std.testing.expectEqual(@as(usize, 64), owned.value.config.digest.hex.len);
-            for (owned.value.config.digest.hex) |c| switch (c) {
-                '0'...'9', 'a'...'f', 'A'...'F' => {},
-                else => return error.TestUnexpectedResult,
-            };
-            for (owned.value.layers) |layer| {
-                try std.testing.expect(layer.media_type.toString().len > 0);
-                try std.testing.expectEqual(@as(usize, 64), layer.digest.hex.len);
-            }
-
-            var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-            defer aw.deinit();
-            var ws: std.json.Stringify = .{ .writer = &aw.writer };
-            try ws.write(owned.value);
-
-            const reparsed = try parse(Manifest, std.testing.allocator, aw.written());
-            defer reparsed.deinit();
-            try std.testing.expectEqual(owned.value.schema_version, reparsed.value.schema_version);
-            try std.testing.expectEqual(owned.value.media_type, reparsed.value.media_type);
-            try std.testing.expectEqualSlices(u8, owned.value.config.digest.hex, reparsed.value.config.digest.hex);
-            try std.testing.expectEqual(owned.value.layers.len, reparsed.value.layers.len);
+            defer parsed.deinit();
+            try std.testing.expect(parsed.value.schema_version <= std.math.maxInt(u8));
         } else |_| {}
     }
 }

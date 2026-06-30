@@ -94,27 +94,29 @@ pub fn jsonStringify(self: Digest, jw: anytype) !void {
 }
 
 // Tests
+//
+// parse
 
-test "parse: hex slice borrows from input without copying" {
-    // Guards the zero-allocation contract: d.hex must point inside input,
-    // not into a separately allocated buffer.
-    const input = "sha256:" ++ "b" ** 64;
-    const d = try parse(input);
-    // "sha256:" is 7 bytes; hex starts at offset 7.
-    try std.testing.expectEqual(input.ptr + 7, d.hex.ptr);
-    try std.testing.expectEqual(@as(usize, 64), d.hex.len);
-}
-
-test "parse: mixed case hex is accepted" {
-    // All of 0-9, a-f, A-F must be valid hex digits.
-    const d = try parse("sha256:aAbBcCdDeEfF" ++ "0" ** 52);
-    try std.testing.expectEqual(Algorithm.sha256, d.algorithm);
-}
-
-test "parse: algorithm matching is case-sensitive, SHA256 uppercase is rejected" {
-    // Guards against accidentally using eqlIgnoreCase for the algorithm string.
-    // OCI spec uses lowercase algorithm names.
-    try std.testing.expectError(error.UnsupportedAlgorithm, parse("SHA256:" ++ "a" ** 64));
+test "parse: valid inputs borrow hex slice and return expected fields" {
+    const hex_lower = "abcdef0123456789" ** 4;
+    const cases = [_]struct {
+        input: []const u8,
+        expect_hex: []const u8,
+    }{
+        .{ .input = "sha256:" ++ hex_lower, .expect_hex = hex_lower },
+        .{ .input = "sha256:aAbBcCdDeEfF" ++ "0" ** 52, .expect_hex = "aAbBcCdDeEfF" ++ "0" ** 52 },
+        .{ .input = "sha256:" ++ "00" ++ "ff" ++ "aa" ++ "a" ** 58, .expect_hex = "00ffaa" ++ "a" ** 58 },
+    };
+    for (cases) |tc| {
+        const d = try parse(tc.input);
+        try std.testing.expectEqual(Algorithm.sha256, d.algorithm);
+        try std.testing.expectEqualSlices(u8, tc.expect_hex, d.hex);
+    }
+    // First case also guards the zero-allocation borrow contract.
+    const borrow_input = cases[0].input;
+    const borrowed = try parse(borrow_input);
+    try std.testing.expectEqual(borrow_input.ptr + 7, borrowed.hex.ptr);
+    try std.testing.expectEqual(@as(usize, 64), borrowed.hex.len);
 }
 
 test "parse: malformed inputs return specific errors" {
@@ -123,32 +125,54 @@ test "parse: malformed inputs return specific errors" {
         .{ .input = ":" ++ "a" ** 64, .err = error.UnsupportedAlgorithm },
         .{ .input = "sha256" ++ "a" ** 64, .err = error.MissingColon },
         .{ .input = "md5:" ++ "a" ** 32, .err = error.UnsupportedAlgorithm },
+        .{ .input = "sha384:" ++ "a" ** 64, .err = error.UnsupportedAlgorithm },
+        .{ .input = "SHA256:" ++ "a" ** 64, .err = error.UnsupportedAlgorithm },
         .{ .input = "sha256:", .err = error.InvalidHexLength },
         .{ .input = "sha256:" ++ "a" ** 63, .err = error.InvalidHexLength },
         .{ .input = "sha256:" ++ "a" ** 65, .err = error.InvalidHexLength },
         .{ .input = "sha256:" ++ "a" ** 63 ++ "z", .err = error.InvalidHexChar },
         .{ .input = "sha256:z" ++ "a" ** 63, .err = error.InvalidHexChar },
+        .{ .input = "sha256:" ++ "a" ** 63 ++ ":", .err = error.InvalidHexChar },
     };
-    for (cases) |tc| {
-        try std.testing.expectError(tc.err, parse(tc.input));
+    for (cases) |tc| try std.testing.expectError(tc.err, parse(tc.input));
+}
+
+test "parse: pseudo-random inputs never panic and only return declared errors" {
+    var seed: u64 = 0x5eed_d1ce_57;
+    var buf: [96]u8 = undefined;
+    for (0..256) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+        const result = parse(buf[0..len]);
+        if (result) |digest| {
+            try std.testing.expectEqual(Algorithm.sha256, digest.algorithm);
+            try std.testing.expectEqual(@as(usize, 64), digest.hex.len);
+        } else |err| switch (err) {
+            error.MissingColon, error.UnsupportedAlgorithm, error.InvalidHexLength, error.InvalidHexChar => {},
+        }
     }
 }
 
-// eql -------------------------------------------------------------------------
+// eql
 
-test "eql: identical digests return true" {
-    const hex = "abcdef0123456789" ** 4;
-    const a = try parse("sha256:" ++ hex);
-    const b = try parse("sha256:" ++ hex);
-    try std.testing.expect(eql(a, b));
-}
-
-test "eql: differing hex strings return false" {
+test "eql: compares algorithm and hex case-sensitively" {
+    const hex = "d" ** 64;
+    var other_buf: [7 + 64]u8 = undefined;
+    @memcpy(other_buf[0..7], "sha256:");
+    @memcpy(other_buf[7..], hex);
+    const same_a = try parse("sha256:" ++ hex);
+    const same_b = try parse(other_buf[0..]);
     const cases = [_]struct { a: []const u8, b: []const u8 }{
         .{ .a = "sha256:" ++ "a" ** 64, .b = "sha256:" ++ "b" ** 64 },
         .{ .a = "sha256:" ++ "a" ** 63 ++ "b", .b = "sha256:" ++ "a" ** 63 ++ "c" },
         .{ .a = "sha256:a" ++ "b" ** 63, .b = "sha256:c" ++ "b" ** 63 },
+        .{ .a = "sha256:" ++ "a" ** 64, .b = "sha256:" ++ "A" ** 64 },
     };
+    try std.testing.expect(eql(same_a, same_b));
     for (cases) |tc| {
         const a = try parse(tc.a);
         const b = try parse(tc.b);
@@ -156,71 +180,48 @@ test "eql: differing hex strings return false" {
     }
 }
 
-test "parse: 10000 pseudo-random inputs either parse correctly or return a known error" {
-    // Fuzz-style smoke test. The parser must never panic on arbitrary bytes.
-    var seed: u64 = 0x5eed_d1ce_57;
-    var buf: [96]u8 = undefined;
+// format / jsonStringify
 
-    for (0..10_000) |_| {
-        seed = seed *% 6364136223846793005 +% 1;
-        const len: usize = @intCast(seed % (buf.len + 1));
-
-        for (buf[0..len]) |*b| {
-            seed = seed *% 6364136223846793005 +% 1;
-            b.* = @truncate(seed >> 32);
-        }
-
-        const result = parse(buf[0..len]);
-        if (result) |digest| {
-            try std.testing.expectEqual(Algorithm.sha256, digest.algorithm);
-            try std.testing.expectEqual(@as(usize, 64), digest.hex.len);
-            for (digest.hex) |c| switch (c) {
-                '0'...'9', 'a'...'f', 'A'...'F' => {},
-                else => return error.TestUnexpectedResult,
-            };
-        } else |err| switch (err) {
-            error.MissingColon,
-            error.UnsupportedAlgorithm,
-            error.InvalidHexLength,
-            error.InvalidHexChar,
-            => {},
-        }
-    }
-}
-
-// jsonParse / jsonStringify ---------------------------------------------------
-
-test "Digest jsonParse: valid sha256 hex string" {
-    const json_bytes = "\"sha256:" ++ "a" ** 64 ++ "\"";
-    const parsed = try std.json.parseFromSlice(Digest, std.testing.allocator, json_bytes, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(Algorithm.sha256, parsed.value.algorithm);
-    try std.testing.expectEqualSlices(u8, "a" ** 64, parsed.value.hex);
-}
-
-test "Digest jsonParse: non-string token returns UnexpectedToken" {
-    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Digest, std.testing.allocator, "123", .{}));
-}
-
-test "Digest jsonParse: invalid digest string returns UnexpectedToken" {
-    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Digest, std.testing.allocator, "\"not-a-digest\"", .{}));
-}
-
-test "Digest format: produces canonical algorithm:hex string" {
+test "Digest format and jsonStringify emit canonical algorithm:hex" {
     const d = try parse("sha256:" ++ "b" ** 64);
     var buf: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try d.format(&w);
     try std.testing.expectEqualSlices(u8, "sha256:" ++ "b" ** 64, w.buffered());
-}
 
-test "Digest jsonStringify: produces canonical algorithm:hex JSON string" {
-    const d = try parse("sha256:" ++ "b" ** 64);
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     var ws: std.json.Stringify = .{ .writer = &aw.writer };
     try ws.write(d);
     try std.testing.expectEqualSlices(u8, "\"sha256:" ++ "b" ** 64 ++ "\"", aw.written());
+}
+
+test "Digest json round-trip preserves digest and arena-owns parsed hex" {
+    const hex = "d" ** 64;
+    const d = try parse("sha256:" ++ hex);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(d);
+    const out = aw.written();
+    try std.testing.expectEqualSlices(u8, "\"sha256:" ++ hex ++ "\"", out);
+
+    const reparsed = try std.json.parseFromSlice(Digest, std.testing.allocator, out, .{});
+    defer reparsed.deinit();
+    try std.testing.expect(eql(d, reparsed.value));
+    const json_start: usize = @intFromPtr(out.ptr);
+    const json_end = json_start + out.len;
+    const hex_ptr: usize = @intFromPtr(reparsed.value.hex.ptr);
+    try std.testing.expect(!(hex_ptr >= json_start and hex_ptr < json_end));
+}
+
+// jsonParse
+
+test "Digest jsonParse: bad tokens return UnexpectedToken" {
+    const bad_tokens = [_][]const u8{ "123", "true", "null", "{}", "\"not-a-digest\"", "\"\"" };
+    for (bad_tokens) |json| {
+        try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(Digest, std.testing.allocator, json, .{}));
+    }
 }
 
 test "Digest jsonParse: allocation failures do not leak" {
@@ -234,21 +235,12 @@ test "Digest jsonParse: allocation failures do not leak" {
     }.run, .{});
 }
 
-test "parse: 00, ff, and boundary hex values are accepted" {
-    const d = try parse("sha256:" ++ "00" ++ "ff" ++ "aa" ++ "a" ** 58);
-    try std.testing.expectEqualSlices(u8, "00ffaa" ++ "a" ** 58, d.hex);
-}
-
-test "Digest jsonStringify: round-trip preserves digest" {
-    const hex = "d" ** 64;
-    const d = try parse("sha256:" ++ hex);
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(d);
-    const out = aw.written();
-    const reparsed = try std.json.parseFromSlice(Digest, std.testing.allocator, out, .{});
-    defer reparsed.deinit();
-    try std.testing.expectEqual(Algorithm.sha256, reparsed.value.algorithm);
-    try std.testing.expectEqualSlices(u8, hex, reparsed.value.hex);
+test "Digest jsonParse: repeated rounds leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const allocator = gpa.allocator();
+    for (0..4) |_| {
+        const parsed = try std.json.parseFromSlice(Digest, allocator, "\"sha256:" ++ "f" ** 64 ++ "\"", .{});
+        parsed.deinit();
+    }
 }

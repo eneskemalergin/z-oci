@@ -471,31 +471,220 @@ pub fn expectResolveFailure(
     }
 }
 
-test "C4 keep-list: resolve validate getManifest tables cover all ResolveError arms" {
-    const resolve_error_count = resolve_failure_scenarios.len;
-    try std.testing.expectEqual(@as(usize, 13), resolve_error_count);
-    try std.testing.expectEqual(@as(usize, @typeInfo(ResolveError).@"union".fields.len), resolve_error_count);
+// --- Test helpers ---
 
-    try std.testing.expectEqual(@as(usize, 4), validate_failure_scenarios.len);
-    try std.testing.expectEqual(@as(usize, 3), get_manifest_failure_scenarios.len);
+fn allocManifestGet(allocator: std.mem.Allocator, url: []const u8) !resolver.ManifestHttpRequest {
+    return .{
+        .method = .get,
+        .url = try allocator.dupe(u8, url),
+    };
+}
 
-    var resolve_errors: [resolve_error_count]C4Entry = undefined;
-    _ = c4ResolveErrorEntries(&resolve_errors);
+fn scenarioInList(scenario: Scenario, list: []const Scenario) bool {
+    for (list) |entry| {
+        if (entry == scenario) return true;
+    }
+    return false;
+}
+
+fn expectScenarioTagMatchesResolveError(scenario: Scenario) !void {
+    const name = @tagName(scenario);
+    inline for (std.meta.fields(ResolveError)) |field| {
+        if (std.mem.eql(u8, name, field.name)) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+// --- Tests ---
+
+test "test_matrix: failure scenarios align with ResolveError tags and C4 entry builders" {
+    try std.testing.expectEqual(@typeInfo(ResolveError).@"union".fields.len, resolve_failure_scenarios.len);
+
+    var resolve_errors: [resolve_failure_scenarios.len]C4Entry = undefined;
+    try std.testing.expectEqual(resolve_failure_scenarios.len, c4ResolveErrorEntries(&resolve_errors));
 
     var validate_errors: [validate_failure_scenarios.len]C4Entry = undefined;
-    _ = c4ValidateFailureEntries(&validate_errors, 0);
+    try std.testing.expectEqual(validate_failure_scenarios.len, c4ValidateFailureEntries(&validate_errors, 0));
 
     var get_manifest_errors: [get_manifest_failure_scenarios.len]C4Entry = undefined;
-    _ = c4GetManifestFailureEntries(&get_manifest_errors, 0);
+    try std.testing.expectEqual(get_manifest_failure_scenarios.len, c4GetManifestFailureEntries(&get_manifest_errors, 0));
 
-    inline for (resolve_failure_scenarios) |expected| {
-        var found = false;
+    for (resolve_failure_scenarios) |scenario| {
+        try expectScenarioTagMatchesResolveError(scenario);
+
+        var listed = false;
         for (resolve_errors) |entry| {
-            if (entry.scenario == expected) found = true;
+            if (entry.scenario == scenario) listed = true;
         }
-        try std.testing.expect(found);
+        try std.testing.expect(listed);
+        try std.testing.expectEqual(PublicApi.resolve, resolve_errors[0].api);
     }
 
-    try std.testing.expect(c4_success_entries.len >= 4);
-    try std.testing.expect(c4_public_api_error_entries.len >= 2);
+    for (validate_failure_scenarios) |scenario| {
+        try std.testing.expect(scenarioInList(scenario, &resolve_failure_scenarios));
+        const expected_surface: C4Surface = if (scenario == .not_found) .validate_not_found else .resolve_error;
+        var listed = false;
+        for (validate_errors) |entry| {
+            if (entry.scenario == scenario) {
+                listed = true;
+                try std.testing.expectEqual(PublicApi.validate, entry.api);
+                try std.testing.expectEqual(expected_surface, entry.surface);
+            }
+        }
+        try std.testing.expect(listed);
+    }
+
+    for (get_manifest_failure_scenarios) |scenario| {
+        try std.testing.expect(scenarioInList(scenario, &resolve_failure_scenarios));
+        var listed = false;
+        for (get_manifest_errors) |entry| {
+            if (entry.scenario == scenario) {
+                listed = true;
+                try std.testing.expectEqual(PublicApi.get_manifest, entry.api);
+                try std.testing.expectEqual(C4Surface.resolve_error, entry.surface);
+            }
+        }
+        try std.testing.expect(listed);
+    }
+}
+
+test "test_matrix: scenario metadata, digest helper, index builder, and expectResolveFailure" {
+    const metadata_cases = [_]struct {
+        scenario: Scenario,
+        http_status: ?u16,
+        reference: []const u8,
+        platform: ?Platform,
+        rate_limit_retries: u8,
+    }{
+        .{
+            .scenario = .not_found,
+            .http_status = null,
+            .reference = "registry-1.docker.io/library/busybox:latest",
+            .platform = null,
+            .rate_limit_retries = 1,
+        },
+        .{
+            .scenario = .rate_limited,
+            .http_status = 429,
+            .reference = "registry-1.docker.io/library/busybox:latest",
+            .platform = null,
+            .rate_limit_retries = 0,
+        },
+        .{
+            .scenario = .depth_limit_exceeded,
+            .http_status = null,
+            .reference = "registry-1.docker.io/library/busybox@" ++ index_child_digest,
+            .platform = .{ .os = "linux", .architecture = "arm64" },
+            .rate_limit_retries = 1,
+        },
+        .{
+            .scenario = .platform_not_found,
+            .http_status = null,
+            .reference = "registry-1.docker.io/library/busybox:latest",
+            .platform = .{ .os = "linux", .architecture = "ppc64" },
+            .rate_limit_retries = 1,
+        },
+    };
+    for (metadata_cases) |tc| {
+        try std.testing.expectEqual(tc.http_status, expectedHttpStatus(tc.scenario));
+        try std.testing.expectEqualStrings(tc.reference, expectedReference(tc.scenario));
+        try std.testing.expectEqual(tc.rate_limit_retries, scenarioConfig(tc.scenario).max_rate_limit_retries);
+        const platform = scenarioPlatform(tc.scenario);
+        if (tc.platform) |expected| {
+            try std.testing.expect(platform != null);
+            try std.testing.expect(expected.match(platform.?));
+        } else {
+            try std.testing.expect(platform == null);
+        }
+    }
+
+    const body = "fixture-bytes";
+    const digest = try sha256DigestStringAlloc(std.testing.allocator, body);
+    defer std.testing.allocator.free(digest);
+    try std.testing.expect(std.mem.startsWith(u8, digest, "sha256:"));
+    try std.testing.expectEqual(@as(usize, 71), digest.len);
+
+    const index_body = try buildIndexBodyAlloc(
+        std.testing.allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        index_child_digest,
+        "linux",
+        "arm64",
+    );
+    defer std.testing.allocator.free(index_body);
+    try std.testing.expect(std.mem.indexOf(u8, index_body, index_child_digest) != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_body, "\"architecture\": \"arm64\"") != null);
+
+    const failure = ResolveError{ .not_found = .{
+        .registry = "registry-1.docker.io",
+        .reference = "registry-1.docker.io/library/busybox:latest",
+        .http_status = 404,
+    } };
+    try expectResolveFailure(
+        failure,
+        "not_found",
+        "registry-1.docker.io",
+        "registry-1.docker.io/library/busybox:latest",
+        404,
+        null,
+    );
+}
+
+test "test_matrix: manifestExchange and refuseTokenExchange implement scenario plans" {
+    defer Fixtures.reset(std.testing.allocator);
+    const alloc = std.testing.allocator;
+
+    var client: std.http.Client = undefined;
+    const token_request = auth.TokenHttpRequest{
+        .method = .get,
+        .url = try alloc.dupe(u8, "https://auth.example.test/token"),
+    };
+    try std.testing.expectError(error.TokenExchangeFailed, refuseTokenExchange(alloc, &client, token_request));
+
+    const manifest_url = "https://registry-1.docker.io/v2/library/busybox/manifests/latest";
+    const exchange_cases = [_]struct {
+        scenario: Scenario,
+        status: ?std.http.Status,
+        err: ?resolver.ManifestExchangeError,
+    }{
+        .{ .scenario = .network_error, .status = .temporary_redirect, .err = null },
+        .{ .scenario = .auth_failed, .status = .unauthorized, .err = null },
+        .{ .scenario = .not_found, .status = .not_found, .err = null },
+        .{ .scenario = .rate_limited, .status = .too_many_requests, .err = null },
+        .{ .scenario = .timeout, .status = null, .err = error.Timeout },
+        .{ .scenario = .response_too_large, .status = null, .err = error.ResponseBodyTooLarge },
+        .{ .scenario = .content_type_mismatch, .status = .ok, .err = null },
+        .{ .scenario = .digest_mismatch, .status = .ok, .err = null },
+        .{ .scenario = .unsupported_algorithm, .status = .ok, .err = null },
+        .{ .scenario = .manifest_parse_error, .status = .ok, .err = null },
+        .{ .scenario = .platform_required, .status = .ok, .err = null },
+        .{ .scenario = .platform_not_found, .status = .ok, .err = null },
+        .{ .scenario = .depth_limit_exceeded, .status = .ok, .err = null },
+    };
+
+    for (exchange_cases) |tc| {
+        try prepareScenario(tc.scenario, alloc);
+        const request = try allocManifestGet(alloc, manifest_url);
+        const result = manifestExchange(tc.scenario, alloc, request);
+        if (tc.err) |expected_err| {
+            try std.testing.expectError(expected_err, result);
+        } else {
+            const response = try result;
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(tc.status.?, response.metadata.status);
+            if (tc.scenario == .auth_failed) {
+                try std.testing.expectEqual(@as(usize, 1), response.metadata.www_authenticate_headers.len);
+            }
+            if (tc.scenario == .digest_mismatch) {
+                try std.testing.expectEqualStrings(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    response.metadata.docker_content_digest.?,
+                );
+            }
+            if (tc.scenario == .unsupported_algorithm) {
+                try std.testing.expect(std.mem.startsWith(u8, response.metadata.docker_content_digest.?, "sha512:"));
+            }
+        }
+    }
 }

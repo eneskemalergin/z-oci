@@ -1733,6 +1733,22 @@ fn testHttpHeadFromLines(allocator: std.mem.Allocator, status_line: []const u8, 
 const test_matrix = @import("test_matrix.zig");
 const sha256DigestStringAlloc = test_matrix.sha256DigestStringAlloc;
 
+const ResolverTestHarness = struct {
+    const busybox_ref = auth.AuthReferenceView{
+        .registry = "registry-1.docker.io",
+        .repository_path = "library/busybox",
+        .ref_string = "latest",
+    };
+
+    fn refuseTokenExchange(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        request: auth.TokenHttpRequest,
+    ) auth.AuthError!auth.TokenExchangeResponse {
+        return test_matrix.refuseTokenExchange(allocator, client, request);
+    }
+};
+
 test "resolveRedirectUrlAlloc resolves relative redirect against manifest URL" {
     const base_url = "https://registry.example.test/v2/library/ubuntu/manifests/latest";
     const base_uri = try std.Uri.parse(base_url);
@@ -1750,41 +1766,26 @@ test "resolveRedirectUrlAlloc resolves relative redirect against manifest URL" {
         resolved,
     );
 }
-test "shouldKeepAuthorizationOnRedirect only keeps same-origin authorization" {
-    const base_uri = try std.Uri.parse("https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04");
+test "shouldKeepAuthorizationOnRedirect: same-origin and rejection matrix" {
+    const docker_base = try std.Uri.parse("https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04");
+    const example_base = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
 
-    try std.testing.expect(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04",
-    ));
-    try std.testing.expect(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://registry-1.docker.io:443/v2/library/ubuntu/manifests/22.04",
-    ));
-    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/abc/data",
-    )));
-    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "http://registry-1.docker.io/v2/library/ubuntu/manifests/22.04",
-    )));
-}
-test "shouldKeepAuthorizationOnRedirect rejects subdomain redirects" {
-    const base_uri = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
+    const cases = [_]struct {
+        base: std.Uri,
+        redirect: []const u8,
+        keep: bool,
+    }{
+        .{ .base = docker_base, .redirect = "https://registry-1.docker.io/v2/library/ubuntu/manifests/22.04", .keep = true },
+        .{ .base = docker_base, .redirect = "https://registry-1.docker.io:443/v2/library/ubuntu/manifests/22.04", .keep = true },
+        .{ .base = docker_base, .redirect = "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/abc/data", .keep = false },
+        .{ .base = docker_base, .redirect = "http://registry-1.docker.io/v2/library/ubuntu/manifests/22.04", .keep = false },
+        .{ .base = example_base, .redirect = "https://cdn.registry.example.test/v2/owner/repo/manifests/latest", .keep = false },
+        .{ .base = example_base, .redirect = "https://registry.example.test:8443/v2/owner/repo/manifests/latest", .keep = false },
+    };
 
-    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://cdn.registry.example.test/v2/owner/repo/manifests/latest",
-    )));
-}
-test "shouldKeepAuthorizationOnRedirect rejects port changes" {
-    const base_uri = try std.Uri.parse("https://registry.example.test/v2/owner/repo/manifests/latest");
-
-    try std.testing.expect(!(try shouldKeepAuthorizationOnRedirect(
-        base_uri,
-        "https://registry.example.test:8443/v2/owner/repo/manifests/latest",
-    )));
+    for (cases) |case| {
+        try std.testing.expectEqual(case.keep, try shouldKeepAuthorizationOnRedirect(case.base, case.redirect));
+    }
 }
 test "ResolverParams init preserves normalized reference and operation" {
     var client: std.http.Client = undefined;
@@ -1809,8 +1810,8 @@ test "ResolverParams init preserves normalized reference and operation" {
     try std.testing.expectEqual(ResolverOperation.resolve, ctx.operation);
     try std.testing.expect(ctx.platform != null);
 }
-test "ManifestRequest uriAlloc uses normalized repository path and ref" {
-    const request = ManifestRequest{
+test "manifest request shaping: URI and HTTP request fields" {
+    const head_request = ManifestRequest{
         .method = .head,
         .operation = .resolve,
         .reference = .{
@@ -1819,265 +1820,208 @@ test "ManifestRequest uriAlloc uses normalized repository path and ref" {
             .ref_string = "v1.2.3",
         },
     };
+    const head_uri = try head_request.uriAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(head_uri);
+    try std.testing.expectEqualStrings("https://ghcr.io/v2/owner/repo/manifests/v1.2.3", head_uri);
 
-    const uri = try request.uriAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(uri);
-
-    try std.testing.expectEqualStrings("https://ghcr.io/v2/owner/repo/manifests/v1.2.3", uri);
-}
-test "canonicalReferenceAlloc uses digest separator for pinned references" {
-    const reference = auth.AuthReferenceView{
+    const digest_ref = auth.AuthReferenceView{
         .registry = "registry-1.docker.io",
         .repository_path = "library/busybox",
         .ref_string = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
     };
-
-    const text = try canonicalReferenceAlloc(std.testing.allocator, reference);
-    defer std.testing.allocator.free(text);
-
+    const digest_text = try canonicalReferenceAlloc(std.testing.allocator, digest_ref);
+    defer std.testing.allocator.free(digest_text);
     try std.testing.expectEqualStrings(
         "registry-1.docker.io/library/busybox@sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-        text,
+        digest_text,
     );
-}
-test "canonicalReferenceAlloc uses tag separator for tag references" {
-    const reference = auth.AuthReferenceView{
+
+    const tag_ref = auth.AuthReferenceView{
         .registry = "registry-1.docker.io",
         .repository_path = "library/ubuntu",
         .ref_string = "22.04",
     };
+    const tag_text = try canonicalReferenceAlloc(std.testing.allocator, tag_ref);
+    defer std.testing.allocator.free(tag_text);
+    try std.testing.expectEqualStrings("registry-1.docker.io/library/ubuntu:22.04", tag_text);
 
-    const text = try canonicalReferenceAlloc(std.testing.allocator, reference);
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expectEqualStrings("registry-1.docker.io/library/ubuntu:22.04", text);
+    const http_request = try buildManifestHttpRequestAlloc(
+        std.testing.allocator,
+        .{
+            .method = .head,
+            .operation = .resolve,
+            .reference = head_request.reference,
+            .accept = &.{"application/vnd.oci.image.manifest.v1+json"},
+        },
+        "token-123",
+    );
+    defer http_request.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ManifestRequestMethod.head, http_request.method);
+    try std.testing.expectEqualStrings("https://ghcr.io/v2/owner/repo/manifests/v1.2.3", http_request.url);
+    try std.testing.expectEqualStrings("Bearer token-123", http_request.authorization.?);
+    try std.testing.expectEqual(@as(usize, 1), http_request.accept.len);
 }
-test "ManifestResponseMetadata probeClassification reuses auth probe rules" {
-    const metadata = ManifestResponseMetadata{
-        .status = .unauthorized,
-        .www_authenticate_headers = &.{"Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\""},
+test "ManifestResponseMetadata.probeClassification: bearer challenge matrix" {
+    const cases = [_]ManifestResponseMetadata{
+        .{
+            .status = .unauthorized,
+            .www_authenticate_headers = &.{"Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\""},
+        },
+        .{
+            .status = .unauthorized,
+            .www_authenticate_headers = &.{
+                "Basic realm=\"example\"",
+                "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
+            },
+        },
     };
 
-    const result = try metadata.probeClassification();
-    switch (result) {
-        .auth_required => |challenge| switch (challenge) {
-            .bearer => |bearer| {
-                try std.testing.expectEqualStrings("https://auth.example.test/token", bearer.realm);
-                try std.testing.expectEqualStrings("registry.example.test", bearer.service.?);
+    for (cases) |metadata| {
+        const result = try metadata.probeClassification();
+        switch (result) {
+            .auth_required => |challenge| switch (challenge) {
+                .bearer => |bearer| {
+                    try std.testing.expectEqualStrings("https://auth.example.test/token", bearer.realm);
+                    try std.testing.expectEqualStrings("registry.example.test", bearer.service.?);
+                },
+                else => return error.TestUnexpectedResult,
             },
             else => return error.TestUnexpectedResult,
-        },
-        else => return error.TestUnexpectedResult,
+        }
     }
 }
-test "ManifestResponseMetadata probeClassification selects bearer from repeated headers" {
-    const metadata = ManifestResponseMetadata{
-        .status = .unauthorized,
-        .www_authenticate_headers = &.{
-            "Basic realm=\"example\"",
-            "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
-        },
-    };
-
-    const result = try metadata.probeClassification();
-    switch (result) {
-        .auth_required => |challenge| switch (challenge) {
-            .bearer => |bearer| {
-                try std.testing.expectEqualStrings("https://auth.example.test/token", bearer.realm);
-                try std.testing.expectEqualStrings("registry.example.test", bearer.service.?);
-            },
-            else => return error.TestUnexpectedResult,
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "ownedManifestResponseMetadataFromHead: www-authenticate flood is bounded" {
-    var header_lines: [100][]const u8 = undefined;
-    for (&header_lines, 0..) |*line, index| {
+test "ownedManifestResponseMetadataFromHead: header collection matrix" {
+    // Exceeds MAX_WWW_AUTHENTICATE_HEADERS (8).
+    var flood_lines: [9][]const u8 = undefined;
+    for (&flood_lines, 0..) |*line, index| {
         line.* = try std.fmt.allocPrint(
             std.testing.allocator,
             "WWW-Authenticate: Basic realm=\"bogus-{d}\"",
             .{index},
         );
     }
-    defer for (header_lines) |line| std.testing.allocator.free(line);
-
-    const head = try testHttpHeadFromLines(
+    defer for (flood_lines) |line| std.testing.allocator.free(line);
+    const flood_head = try testHttpHeadFromLines(
         std.testing.allocator,
         "HTTP/1.1 401 Unauthorized",
-        &header_lines,
+        &flood_lines,
     );
-    defer std.testing.allocator.free(head.bytes);
-
+    defer std.testing.allocator.free(flood_head.bytes);
     try std.testing.expectError(
         error.ResponseHeadersTooLarge,
-        ownedManifestResponseMetadataFromHead(std.testing.allocator, head),
+        ownedManifestResponseMetadataFromHead(std.testing.allocator, flood_head),
     );
-}
-test "ownedManifestResponseMetadataFromHead: stops copying www-authenticate after bearer" {
+
     const bearer = "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\",scope=\"repository:owner/repo:pull\"";
-    var trailing: [20][]const u8 = undefined;
-    for (&trailing, 0..) |*line, index| {
-        line.* = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "WWW-Authenticate: Bearer realm=\"trailing-{d}\",service=\"registry.example.test\"",
-            .{index},
-        );
-    }
-    defer for (trailing) |line| std.testing.allocator.free(line);
-
-    var header_lines = std.ArrayList([]const u8).empty;
-    defer header_lines.deinit(std.testing.allocator);
-    try header_lines.append(std.testing.allocator, bearer);
-    try header_lines.appendSlice(std.testing.allocator, &trailing);
-
-    const head = try testHttpHeadFromLines(
+    const stop_after_bearer_head = try testHttpHeadFromLines(
         std.testing.allocator,
         "HTTP/1.1 401 Unauthorized",
-        header_lines.items,
+        &.{ bearer, "WWW-Authenticate: Bearer realm=\"trailing\",service=\"registry.example.test\"" },
     );
-    defer std.testing.allocator.free(head.bytes);
+    defer std.testing.allocator.free(stop_after_bearer_head.bytes);
+    var stop_after_bearer = try ownedManifestResponseMetadataFromHead(std.testing.allocator, stop_after_bearer_head);
+    defer stop_after_bearer.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), stop_after_bearer.www_authenticate_headers.len);
 
-    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), owned.www_authenticate_headers.len);
-}
-test "ownedManifestResponseMetadataFromHead: keeps unsupported schemes until bearer" {
-    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
+    const mixed_auth_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
         "WWW-Authenticate: Basic realm=\"example\"",
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
     });
-    defer std.testing.allocator.free(head.bytes);
+    defer std.testing.allocator.free(mixed_auth_head.bytes);
+    var mixed_auth = try ownedManifestResponseMetadataFromHead(std.testing.allocator, mixed_auth_head);
+    defer mixed_auth.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), mixed_auth.www_authenticate_headers.len);
 
-    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), owned.www_authenticate_headers.len);
-}
-test "ownedManifestResponseMetadataFromHead: rejects oversize header values" {
     const oversized = try std.testing.allocator.alloc(u8, MAX_MANIFEST_HEADER_VALUE_BYTES + 1);
     defer std.testing.allocator.free(oversized);
     @memset(oversized, 'a');
-
-    const header_line = try std.fmt.allocPrint(
+    const oversized_line = try std.fmt.allocPrint(
         std.testing.allocator,
         "WWW-Authenticate: Bearer realm=\"{s}\",service=\"registry.example.test\"",
         .{oversized},
     );
-    defer std.testing.allocator.free(header_line);
-
-    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{header_line});
-    defer std.testing.allocator.free(head.bytes);
-
+    defer std.testing.allocator.free(oversized_line);
+    const oversized_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{oversized_line});
+    defer std.testing.allocator.free(oversized_head.bytes);
     try std.testing.expectError(
         error.ResponseHeadersTooLarge,
-        ownedManifestResponseMetadataFromHead(std.testing.allocator, head),
+        ownedManifestResponseMetadataFromHead(std.testing.allocator, oversized_head),
     );
-}
-test "ownedManifestResponseMetadataFromHead: deduplicates resilience headers" {
-    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 429 Too Many Requests", &.{
+
+    const rate_limit_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 429 Too Many Requests", &.{
         "Retry-After: 30",
         "Retry-After: 60",
         "Date: Sun, 06 Nov 1994 08:49:37 GMT",
     });
-    defer std.testing.allocator.free(head.bytes);
+    defer std.testing.allocator.free(rate_limit_head.bytes);
+    var rate_limit_owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, rate_limit_head);
+    defer rate_limit_owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), rate_limit_owned.resilience_headers.len);
+    try std.testing.expectEqualStrings("Retry-After", rate_limit_owned.resilience_headers[0].name);
+    try std.testing.expectEqualStrings("30", rate_limit_owned.resilience_headers[0].value);
 
-    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-    defer owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), owned.resilience_headers.len);
-    try std.testing.expectEqualStrings("Retry-After", owned.resilience_headers[0].name);
-    try std.testing.expectEqualStrings("30", owned.resilience_headers[0].value);
-    try std.testing.expectEqualStrings("Date", owned.resilience_headers[1].name);
-}
-test "ownedManifestResponseMetadataFromHead: ok responses keep rate-limit headers only" {
-    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
+    const ok_rate_limit_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
         "Retry-After: 30",
         "RateLimit-Limit: 100;w=21600",
         "RateLimit-Remaining: 99;w=21600",
         "RateLimit-Reset: 1746136938;w=21600",
     });
-    defer std.testing.allocator.free(head.bytes);
+    defer std.testing.allocator.free(ok_rate_limit_head.bytes);
+    var ok_rate_limit = try ownedManifestResponseMetadataFromHead(std.testing.allocator, ok_rate_limit_head);
+    defer ok_rate_limit.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ok_rate_limit.www_authenticate_headers.len);
+    try std.testing.expectEqual(@as(usize, 3), ok_rate_limit.resilience_headers.len);
 
-    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
-    try std.testing.expectEqual(@as(usize, 3), owned.resilience_headers.len);
-    try std.testing.expect(std.mem.startsWith(u8, owned.resilience_headers[0].name, "RateLimit-"));
-}
-test "ownedManifestResponseMetadataFromHead: ok responses omit Retry-After and Date" {
-    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
+    const ok_no_resilience_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
         "Retry-After: 30",
         "Date: Sun, 06 Nov 1994 08:49:37 GMT",
     });
-    defer std.testing.allocator.free(head.bytes);
+    defer std.testing.allocator.free(ok_no_resilience_head.bytes);
+    var ok_no_resilience = try ownedManifestResponseMetadataFromHead(std.testing.allocator, ok_no_resilience_head);
+    defer ok_no_resilience.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ok_no_resilience.resilience_headers.len);
 
-    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
-    try std.testing.expectEqual(@as(usize, 0), owned.resilience_headers.len);
-}
-test "ownedManifestResponseMetadataFromHead: forbidden and not_found omit auth headers" {
-    const forbidden = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 403 Forbidden", &.{
+    const forbidden_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 403 Forbidden", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
     });
-    defer std.testing.allocator.free(forbidden.bytes);
-
-    var forbidden_owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, forbidden);
+    defer std.testing.allocator.free(forbidden_head.bytes);
+    var forbidden_owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, forbidden_head);
     defer forbidden_owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), forbidden_owned.www_authenticate_headers.len);
+    try std.testing.expectError(error.UnsupportedProbeStatus, forbidden_owned.view(.forbidden).probeClassification());
 
-    const not_found = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 404 Not Found", &.{
-        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
+    const unauthorized_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
+        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
     });
-    defer std.testing.allocator.free(not_found.bytes);
+    defer std.testing.allocator.free(unauthorized_head.bytes);
+    var unauthorized_owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, unauthorized_head);
+    defer unauthorized_owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), unauthorized_owned.www_authenticate_headers.len);
+    try std.testing.expect((try unauthorized_owned.view(.unauthorized).probeClassification()) == .auth_required);
 
-    var not_found_owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, not_found);
-    defer not_found_owned.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), not_found_owned.www_authenticate_headers.len);
-}
-test "ownedManifestResponseMetadataFromHead: retryable 502 keeps resilience not auth" {
-    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 502 Bad Gateway", &.{
+    const retryable_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 502 Bad Gateway", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
         "Retry-After: 15",
         "Date: Sun, 06 Nov 1994 08:49:37 GMT",
     });
-    defer std.testing.allocator.free(head.bytes);
-
-    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
-    try std.testing.expectEqual(@as(usize, 2), owned.resilience_headers.len);
+    defer std.testing.allocator.free(retryable_head.bytes);
+    var retryable_owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, retryable_head);
+    defer retryable_owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), retryable_owned.www_authenticate_headers.len);
+    try std.testing.expectEqual(@as(usize, 2), retryable_owned.resilience_headers.len);
 }
-test "ownedManifestResponseMetadataFromHead: unauthorized still collects auth headers" {
-    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 401 Unauthorized", &.{
-        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
-    });
-    defer std.testing.allocator.free(head.bytes);
-
-    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), owned.www_authenticate_headers.len);
-    try std.testing.expectEqual(@as(usize, 0), owned.resilience_headers.len);
-
-    const metadata = owned.view(.unauthorized);
-    const probe = try metadata.probeClassification();
-    try std.testing.expect(probe == .auth_required);
-}
-test "ownedManifestResponseMetadataFromHead: forbidden probe classification unchanged without stored auth headers" {
-    const head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 403 Forbidden", &.{
-        "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
-    });
-    defer std.testing.allocator.free(head.bytes);
-
-    var owned = try ownedManifestResponseMetadataFromHead(std.testing.allocator, head);
-    defer owned.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 0), owned.www_authenticate_headers.len);
-    try std.testing.expectError(error.UnsupportedProbeStatus, owned.view(.forbidden).probeClassification());
+test "ownedManifestResponseMetadataFromHead: allocation failure paths" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const head = try testHttpHeadFromLines(allocator, "HTTP/1.1 401 Unauthorized", &.{
+                "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\"",
+            });
+            defer allocator.free(head.bytes);
+            var owned = try ownedManifestResponseMetadataFromHead(allocator, head);
+            owned.deinit(allocator);
+        }
+    }.run, .{});
 }
 test "ManifestResponseMetadata cloneAllocHeadSuccess omits auth and retry headers" {
     const metadata = ManifestResponseMetadata{
@@ -2325,59 +2269,6 @@ test "resolver error helpers keep registry, reference, and status" {
     try std.testing.expectEqualStrings("digest_mismatch", @tagName(digest_mismatch_err));
     try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(unsupported_algorithm_err));
 }
-test "performManifestHead retries transient 502 then succeeds" {
-    const MockHarness = struct {
-        var attempts: usize = 0;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            attempts += 1;
-            if (attempts == 1) {
-                return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .bad_gateway,
-                }, null);
-            }
-
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-            }, null);
-        }
-    };
-
-    defer MockHarness.attempts = 0;
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
-        .max_network_retries = 1,
-    }, MockHarness.tokenExchange);
-    defer engine.deinit();
-
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        .{ .max_network_retries = 1 },
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
-    switch (outcome) {
-        .success => |metadata| {
-            try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", metadata.content_type.?);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
 test "performManifestGet maps exhausted 504 to network_error" {
     const MockHarness = struct {
         var attempts: usize = 0;
@@ -2442,172 +2333,6 @@ test "ManifestResponseMetadata.releaseOwned: clears owned slices in place" {
     try std.testing.expect(metadata.location == null);
     try std.testing.expect(metadata.www_authenticate_headers.len == 0);
     try std.testing.expect(metadata.resilience_headers.len == 0);
-}
-test "performManifestGet repeated GET runs leave no residual allocations under DebugAllocator" {
-    const MockHarness = struct {
-        var body: []u8 = undefined;
-        var digest: []u8 = undefined;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_manifest_v1.toString(),
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    MockHarness.body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
-    defer std.testing.allocator.free(MockHarness.body);
-    MockHarness.digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.body);
-    defer std.testing.allocator.free(MockHarness.digest);
-
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-
-    const ctx = ResolverParams.init(
-        allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    for (0..32) |_| {
-        var outcome = try performManifestGet(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-        defer outcome.deinit(allocator);
-        switch (outcome) {
-            .success => |success| try std.testing.expect(success.backing_body == null),
-            else => return error.TestUnexpectedResult,
-        }
-    }
-}
-test "performManifestGet retry path leaves no residual allocations under DebugAllocator" {
-    const MockHarness = struct {
-        var attempts: usize = 0;
-        var body: []u8 = undefined;
-        var digest: []u8 = undefined;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            attempts += 1;
-            if (@rem(attempts, 2) == 1) {
-                return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .service_unavailable,
-                }, null);
-            }
-
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = MediaType.oci_manifest_v1.toString(),
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    MockHarness.body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
-    defer std.testing.allocator.free(MockHarness.body);
-    MockHarness.digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.body);
-    defer std.testing.allocator.free(MockHarness.digest);
-
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{
-        .max_network_retries = 1,
-    }, MockHarness.tokenExchange);
-    defer engine.deinit();
-
-    const ctx = ResolverParams.init(
-        allocator,
-        &client,
-        .{ .max_network_retries = 1 },
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    for (0..16) |_| {
-        MockHarness.attempts = 0;
-        var outcome = try performManifestGet(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-        defer outcome.deinit(allocator);
-        switch (outcome) {
-            .success => |success| try std.testing.expect(success.backing_body == null),
-            else => return error.TestUnexpectedResult,
-        }
-        try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
-    }
-}
-test "performManifestHead retry path leaves no residual allocations under DebugAllocator" {
-    const MockHarness = struct {
-        var attempts: usize = 0;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            attempts += 1;
-            if (@rem(attempts, 2) == 1) {
-                return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                    .status = .service_unavailable,
-                }, null);
-            }
-
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-            }, null);
-        }
-    };
-
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{
-        .max_network_retries = 1,
-    }, MockHarness.tokenExchange);
-    defer engine.deinit();
-
-    const ctx = ResolverParams.init(
-        allocator,
-        &client,
-        .{ .max_network_retries = 1 },
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    for (0..32) |_| {
-        var outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-        defer outcome.deinit(allocator);
-
-        switch (outcome) {
-            .success => {},
-            else => return error.TestUnexpectedResult,
-        }
-    }
 }
 test "performManifestHead marks transport_retries_exhausted after rate-limit retries" {
     const MockHarness = struct {
@@ -2734,999 +2459,475 @@ test "performManifestGet preemptive sleep before request when engine carries exh
         else => return error.TestUnexpectedResult,
     }
 }
-test "performManifestHead does not retry not found" {
-    const MockHarness = struct {
-        var attempts: usize = 0;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            attempts += 1;
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .not_found,
-            }, null);
-        }
-    };
-
-    defer MockHarness.attempts = 0;
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
-        .max_network_retries = 2,
-    }, MockHarness.tokenExchange);
-    defer engine.deinit();
-
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        .{ .max_network_retries = 2 },
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    const outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    switch (outcome) {
-        .not_found => {
-            try std.testing.expectEqual(@as(usize, 1), MockHarness.attempts);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestHead exhausts repeated 429 on rate limit budget" {
-    const MockHarness = struct {
-        var attempts: usize = 0;
-
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            attempts += 1;
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .too_many_requests,
-                .resilience_headers = &.{
-                    .{ .name = "Retry-After", .value = "1" },
-                },
-            }, null);
-        }
-    };
-
-    defer MockHarness.attempts = 0;
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
-        .max_rate_limit_retries = 1,
-    }, MockHarness.tokenExchange);
-    defer engine.deinit();
-
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        .{ .max_rate_limit_retries = 1 },
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    const outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    switch (outcome) {
-        .failure => |failure| {
-            try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
-            try std.testing.expectEqualStrings("rate_limited", @tagName(failure));
-            failure.deinitOwned(std.testing.allocator);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "buildManifestHttpRequestAlloc shapes HEAD request and optional bearer header" {
-    const request = ManifestRequest{
-        .method = .head,
-        .operation = .resolve,
-        .reference = .{
-            .registry = "ghcr.io",
-            .repository_path = "owner/repo",
-            .ref_string = "latest",
-        },
-        .accept = &.{"application/vnd.oci.image.manifest.v1+json"},
-    };
-
-    const http_request = try buildManifestHttpRequestAlloc(std.testing.allocator, request, "token-123");
-    defer http_request.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(ManifestRequestMethod.head, http_request.method);
-    try std.testing.expectEqualStrings("https://ghcr.io/v2/owner/repo/manifests/latest", http_request.url);
-    try std.testing.expectEqualStrings("Bearer token-123", http_request.authorization.?);
-    try std.testing.expectEqual(@as(usize, 1), http_request.accept.len);
-}
-test "manifestDocumentMediaType normalizes parameters and rejects non-manifest types" {
+test "manifest media type classifiers: normalize, accept, and reject" {
     try std.testing.expectEqual(MediaType.oci_manifest_v1, manifestDocumentMediaType(" application/vnd.oci.image.manifest.v1+json; charset=utf-8 ").?);
     try std.testing.expectEqual(@as(?MediaType, null), manifestDocumentMediaType("application/vnd.oci.image.config.v1+json"));
     try std.testing.expectEqual(@as(?MediaType, null), manifestDocumentMediaType("application/vnd.docker.distribution.manifest.v1+prettyjws"));
-}
-test "acceptsManifestMediaType matches normalized exact entries and wildcard" {
+
     try std.testing.expect(acceptsManifestMediaType(&.{" application/vnd.oci.image.manifest.v1+json; q=1.0 "}, .oci_manifest_v1));
     try std.testing.expect(acceptsManifestMediaType(&.{"*/*"}, .docker_manifest_list_v2));
     try std.testing.expect(!acceptsManifestMediaType(&.{"application/vnd.oci.image.index.v1+json"}, .docker_manifest_v2));
 }
-test "performManifestHead returns validate_single_arch_ok for validate operation" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{ .metadata = .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-            } };
-        }
+test "performManifestHead: outcome and validation matrix" {
+    const Case = enum {
+        validate_manifest_ok,
+        validate_digest_mismatch,
+        anonymous_success,
+        incomplete_metadata_fallback,
+        not_found_no_retry,
+        transport_failure,
+        content_type_unknown,
+        content_type_non_manifest,
     };
 
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .validate,
-    );
-
-    const outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    try std.testing.expectEqual(
-        HeadRequestOutcome{ .validate_manifest_ok = MediaType.oci_manifest_v1 },
-        outcome,
-    );
-}
-test "performManifestHead rejects mismatched pinned digest on validate" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{ .metadata = .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            } };
-        }
-    };
-
+    const digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65";
     const pinned_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = pinned_digest },
-        null,
-        .validate,
-    );
-
-    const outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    switch (outcome) {
-        .failure => |failure| {
-            switch (failure) {
-                .digest_mismatch => {},
-                else => return error.TestUnexpectedResult,
-            }
-            failure.deinitOwned(std.testing.allocator);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestHead returns success for anonymous usable HEAD metadata" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+    const HeadState = struct {
+        var case: Case = undefined;
+        var attempts: usize = 0;
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
             defer request.deinit(allocator);
-            if (request.authorization != null) return error.TransportFailed;
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-            }, null);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(std.testing.allocator);
-    switch (outcome) {
-        .success => |metadata| {
-            try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", metadata.content_type.?);
-            try std.testing.expectEqualStrings(
-                "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-                metadata.docker_content_digest.?,
-            );
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestHead falls back to GET when usable HEAD metadata is incomplete" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{ .metadata = .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-            } };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(std.testing.allocator);
-    switch (outcome) {
-        .use_get_fallback => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestHead returns not_found for missing manifest" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{ .metadata = .{ .status = .not_found } };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "missing" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{});
-    defer outcome.deinit(std.testing.allocator);
-    switch (outcome) {
-        .not_found => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestHead maps transport failures into resolver failures" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return error.TransportFailed;
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{});
-    defer outcome.deinit(arena.allocator());
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("network_error", @tagName(err)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestHead rejects unsupported content type on HEAD success" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{ .metadata = .{
-                .status = .ok,
-                .content_type = "application/json",
-                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-            } };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{});
-    defer outcome.deinit(arena.allocator());
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestHead rejects known non-manifest content type on HEAD success" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{ .metadata = .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.config.v1+json",
-                .docker_content_digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
-            } };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{});
-    defer outcome.deinit(arena.allocator());
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet parses OCI manifest fixture with normalized content type" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            if (request.method != .get) return error.TransportFailed;
-            if (request.accept.len != 2) return error.TransportFailed;
-            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
-            defer allocator.free(body);
-            const digest = try sha256DigestStringAlloc(allocator, body);
-            defer allocator.free(digest);
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = " application/vnd.oci.image.manifest.v1+json; charset=utf-8 ",
-                .docker_content_digest = digest,
-            }, body);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .get_manifest,
-    );
-
-    var outcome = try performManifestGet(
-        ctx,
-        &engine,
-        MockHarness.exchange,
-        &.{
-            "application/vnd.oci.image.manifest.v1+json",
-            "application/vnd.docker.distribution.manifest.v2+json",
-        },
-    );
-    defer outcome.deinit(std.testing.allocator);
-
-    switch (outcome) {
-        .success => |success| {
-            try std.testing.expectEqual(ManifestRequestMethod.get, success.request.method);
-            try std.testing.expect(success.backing_body == null);
-            try std.testing.expectEqual(MediaType.oci_manifest_v1, success.document.mediaType());
-            switch (success.document) {
-                .manifest => |parsed| {
-                    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
-                    try std.testing.expectEqual(@as(usize, 3), parsed.value.layers.len);
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet parses Docker manifest fixture" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{
-                .metadata = .{
-                    .status = .ok,
-                    .content_type = "application/vnd.docker.distribution.manifest.v2+json",
-                },
-                .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json", 32 * 1024),
-            };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "quay.io", .repository_path = "prometheus/busybox", .ref_string = "latest" },
-        null,
-        .get_manifest,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.docker.distribution.manifest.v2+json"});
-    defer outcome.deinit(std.testing.allocator);
-
-    switch (outcome) {
-        .success => |success| switch (success.document) {
-            .manifest => |parsed| {
-                try std.testing.expectEqual(MediaType.docker_manifest_v2, parsed.value.media_type);
-                try std.testing.expect(parsed.value.layers.len > 0);
-            },
-            else => return error.TestUnexpectedResult,
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet parses OCI index fixture" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{
-                .metadata = .{
-                    .status = .ok,
-                    .content_type = "application/vnd.oci.image.index.v1+json",
-                },
-                .body = try fixtureBodyAlloc(allocator, "fixtures/indexes/oci-image-index-spec-example.json", 16 * 1024),
-            };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "example.com", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.index.v1+json"});
-    defer outcome.deinit(std.testing.allocator);
-
-    switch (outcome) {
-        .success => |success| switch (success.document) {
-            .oci_index => |parsed| {
-                try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value.media_type);
-                try std.testing.expect(parsed.value.manifests.len > 0);
-            },
-            else => return error.TestUnexpectedResult,
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet parses Docker manifest list fixture" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{
-                .metadata = .{
-                    .status = .ok,
-                    .content_type = "application/vnd.docker.distribution.manifest.list.v2+json",
-                },
-                .body = try fixtureBodyAlloc(allocator, "fixtures/indexes/docker-manifest-list-spec-example.json", 16 * 1024),
-            };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "example.com", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.docker.distribution.manifest.list.v2+json"});
-    defer outcome.deinit(std.testing.allocator);
-
-    switch (outcome) {
-        .success => |success| switch (success.document) {
-            .docker_manifest_list => |parsed| {
-                try std.testing.expectEqual(MediaType.docker_manifest_list_v2, parsed.value.media_type);
-                try std.testing.expect(parsed.value.manifests.len > 0);
-            },
-            else => return error.TestUnexpectedResult,
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet maps missing body into manifest parse error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{ .metadata = .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-            } };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
-
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("manifest_parse_error", @tagName(err)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet maps empty body into manifest parse error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/invalid-empty-manifest.json", 1024);
-            defer allocator.free(body);
-            return try ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-            }, body);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
-
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("manifest_parse_error", @tagName(err)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet maps unsupported content type into resolver failure" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{
-                .metadata = .{
-                    .status = .ok,
-                    .content_type = "application/vnd.oci.image.config.v1+json",
-                },
-                .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024),
-            };
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
-
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet rejects body whose declared mediaType disagrees with Content-Type" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            return .{
-                .metadata = .{
+            attempts += 1;
+            return switch (case) {
+                .validate_manifest_ok, .validate_digest_mismatch => .{ .metadata = .{
                     .status = .ok,
                     .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    .docker_content_digest = if (case == .validate_digest_mismatch)
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    else
+                        digest,
+                } },
+                .anonymous_success => blk: {
+                    if (request.authorization != null) return error.TransportFailed;
+                    break :blk try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = .ok,
+                        .content_type = "application/vnd.oci.image.manifest.v1+json",
+                        .docker_content_digest = digest,
+                    }, null);
                 },
-                .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json", 32 * 1024),
+                .incomplete_metadata_fallback => .{ .metadata = .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                } },
+                .not_found_no_retry => .{ .metadata = .{ .status = .not_found } },
+                .transport_failure => error.TransportFailed,
+                .content_type_unknown => .{ .metadata = .{
+                    .status = .ok,
+                    .content_type = "application/json",
+                    .docker_content_digest = digest,
+                } },
+                .content_type_non_manifest => .{ .metadata = .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.config.v1+json",
+                    .docker_content_digest = digest,
+                } },
             };
         }
     };
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+    const cases = [_]struct {
+        case: Case,
+        ref_string: []const u8,
+        operation: ResolverOperation,
+        config: Config,
+        expected_tag: []const u8,
+        check_attempts: ?usize,
+    }{
+        .{ .case = .validate_manifest_ok, .ref_string = "latest", .operation = .validate, .config = .{}, .expected_tag = "validate_manifest_ok", .check_attempts = null },
+        .{ .case = .validate_digest_mismatch, .ref_string = pinned_digest, .operation = .validate, .config = .{}, .expected_tag = "digest_mismatch", .check_attempts = null },
+        .{ .case = .anonymous_success, .ref_string = "latest", .operation = .resolve, .config = .{}, .expected_tag = "success", .check_attempts = null },
+        .{ .case = .incomplete_metadata_fallback, .ref_string = "latest", .operation = .resolve, .config = .{}, .expected_tag = "use_get_fallback", .check_attempts = null },
+        .{ .case = .not_found_no_retry, .ref_string = "latest", .operation = .resolve, .config = .{ .max_network_retries = 2 }, .expected_tag = "not_found", .check_attempts = 1 },
+        .{ .case = .transport_failure, .ref_string = "latest", .operation = .resolve, .config = .{}, .expected_tag = "network_error", .check_attempts = null },
+        .{ .case = .content_type_unknown, .ref_string = "latest", .operation = .resolve, .config = .{}, .expected_tag = "content_type_mismatch", .check_attempts = null },
+        .{ .case = .content_type_non_manifest, .ref_string = "latest", .operation = .resolve, .config = .{}, .expected_tag = "content_type_mismatch", .check_attempts = null },
+    };
 
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
+    for (cases) |c| {
+        HeadState.case = c.case;
+        HeadState.attempts = 0;
 
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
+        var client: std.http.Client = undefined;
+        var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, c.config, ResolverTestHarness.refuseTokenExchange);
+        defer engine.deinit();
 
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
-        else => return error.TestUnexpectedResult,
+        const ctx = ResolverParams.init(
+            std.testing.allocator,
+            &client,
+            c.config,
+            .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = c.ref_string },
+            null,
+            c.operation,
+        );
+
+        var outcome = try performManifestHead(ctx, &engine, HeadState.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        defer outcome.deinit(std.testing.allocator);
+
+        if (std.mem.eql(u8, c.expected_tag, "validate_manifest_ok")) {
+            try std.testing.expectEqual(HeadRequestOutcome{ .validate_manifest_ok = MediaType.oci_manifest_v1 }, outcome);
+        } else if (std.mem.eql(u8, c.expected_tag, "success")) {
+            switch (outcome) {
+                .success => |metadata| {
+                    try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", metadata.content_type.?);
+                    try std.testing.expectEqualStrings(digest, metadata.docker_content_digest.?);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else if (std.mem.eql(u8, c.expected_tag, "use_get_fallback")) {
+            try std.testing.expect(outcome == .use_get_fallback);
+        } else if (std.mem.eql(u8, c.expected_tag, "not_found")) {
+            try std.testing.expect(outcome == .not_found);
+        } else {
+            switch (outcome) {
+                .failure => |failure| try std.testing.expectEqualStrings(c.expected_tag, @tagName(failure)),
+                else => return error.TestUnexpectedResult,
+            }
+        }
+
+        if (c.check_attempts) |expected| {
+            try std.testing.expectEqual(expected, HeadState.attempts);
+        }
     }
 }
-test "performManifestGet verifies matching pinned digest reference" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+test "performManifestGet: fixture document parsing matrix" {
+    const DocumentKind = enum { oci_manifest, docker_manifest, oci_index, docker_list };
+
+    const FixtureState = struct {
+        var fixture_path: []const u8 = undefined;
+        var content_type: []const u8 = undefined;
+        var normalize_whitespace: bool = false;
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
             defer request.deinit(allocator);
-            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
-            defer allocator.free(body);
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-            }, body);
+            const body = try fixtureBodyAlloc(allocator, fixture_path, 32 * 1024);
+            if (normalize_whitespace) {
+                errdefer allocator.free(body);
+                const digest = try sha256DigestStringAlloc(allocator, body);
+                defer allocator.free(digest);
+                const response = try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = content_type,
+                    .docker_content_digest = digest,
+                }, body);
+                allocator.free(body);
+                return response;
+            }
+            return .{
+                .metadata = .{ .status = .ok, .content_type = content_type },
+                .body = body,
+            };
         }
     };
+
+    const cases = [_]struct {
+        fixture_path: []const u8,
+        content_type: []const u8,
+        normalize_whitespace: bool,
+        accept: []const []const u8,
+        operation: ResolverOperation,
+        kind: DocumentKind,
+        expected_media_type: MediaType,
+    }{
+        .{
+            .fixture_path = "fixtures/manifests/oci-image-manifest-spec-example.json",
+            .content_type = " application/vnd.oci.image.manifest.v1+json; charset=utf-8 ",
+            .normalize_whitespace = true,
+            .accept = &.{
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            },
+            .operation = .get_manifest,
+            .kind = .oci_manifest,
+            .expected_media_type = .oci_manifest_v1,
+        },
+        .{
+            .fixture_path = "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json",
+            .content_type = "application/vnd.docker.distribution.manifest.v2+json",
+            .normalize_whitespace = false,
+            .accept = &.{"application/vnd.docker.distribution.manifest.v2+json"},
+            .operation = .get_manifest,
+            .kind = .docker_manifest,
+            .expected_media_type = .docker_manifest_v2,
+        },
+        .{
+            .fixture_path = "fixtures/indexes/oci-image-index-spec-example.json",
+            .content_type = "application/vnd.oci.image.index.v1+json",
+            .normalize_whitespace = false,
+            .accept = &.{"application/vnd.oci.image.index.v1+json"},
+            .operation = .resolve,
+            .kind = .oci_index,
+            .expected_media_type = .oci_index_v1,
+        },
+        .{
+            .fixture_path = "fixtures/indexes/docker-manifest-list-spec-example.json",
+            .content_type = "application/vnd.docker.distribution.manifest.list.v2+json",
+            .normalize_whitespace = false,
+            .accept = &.{"application/vnd.docker.distribution.manifest.list.v2+json"},
+            .operation = .resolve,
+            .kind = .docker_list,
+            .expected_media_type = .docker_manifest_list_v2,
+        },
+    };
+
+    for (cases) |c| {
+        FixtureState.fixture_path = c.fixture_path;
+        FixtureState.content_type = c.content_type;
+        FixtureState.normalize_whitespace = c.normalize_whitespace;
+
+        var client: std.http.Client = undefined;
+        var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, ResolverTestHarness.refuseTokenExchange);
+        defer engine.deinit();
+        const ctx = ResolverParams.init(
+            std.testing.allocator,
+            &client,
+            Config{},
+            ResolverTestHarness.busybox_ref,
+            null,
+            c.operation,
+        );
+
+        var outcome = try performManifestGet(ctx, &engine, FixtureState.exchange, c.accept);
+        defer outcome.deinit(std.testing.allocator);
+
+        switch (outcome) {
+            .success => |success| {
+                try std.testing.expect(success.backing_body == null);
+                try std.testing.expectEqual(c.expected_media_type, success.document.mediaType());
+                switch (c.kind) {
+                    .oci_manifest => switch (success.document) {
+                        .manifest => |parsed| {
+                            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+                            try std.testing.expect(parsed.value.layers.len > 0);
+                        },
+                        else => return error.TestUnexpectedResult,
+                    },
+                    .docker_manifest => switch (success.document) {
+                        .manifest => |parsed| try std.testing.expect(parsed.value.layers.len > 0),
+                        else => return error.TestUnexpectedResult,
+                    },
+                    .oci_index => switch (success.document) {
+                        .oci_index => |parsed| try std.testing.expect(parsed.value.manifests.len > 0),
+                        else => return error.TestUnexpectedResult,
+                    },
+                    .docker_list => switch (success.document) {
+                        .docker_manifest_list => |parsed| try std.testing.expect(parsed.value.manifests.len > 0),
+                        else => return error.TestUnexpectedResult,
+                    },
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+test "performManifestGet: body and content-type failure matrix" {
+    const FailureCase = enum {
+        missing_body,
+        empty_body,
+        invalid_json,
+        unsupported_content_type,
+        body_media_type_disagrees,
+    };
+
+    const FailureState = struct {
+        var case: FailureCase = undefined;
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return switch (case) {
+                .missing_body => .{ .metadata = .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                } },
+                .empty_body => blk: {
+                    const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/invalid-empty-manifest.json", 1024);
+                    errdefer allocator.free(body);
+                    const response = try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                        .status = .ok,
+                        .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    }, body);
+                    allocator.free(body);
+                    break :blk response;
+                },
+                .invalid_json => try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                }, "{not-json"),
+                .unsupported_content_type => .{
+                    .metadata = .{
+                        .status = .ok,
+                        .content_type = "application/vnd.oci.image.config.v1+json",
+                    },
+                    .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024),
+                },
+                .body_media_type_disagrees => .{
+                    .metadata = .{
+                        .status = .ok,
+                        .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    },
+                    .body = try fixtureBodyAlloc(allocator, "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json", 32 * 1024),
+                },
+            };
+        }
+    };
+
+    const cases = [_]struct { failure: FailureCase, expected_tag: []const u8 }{
+        .{ .failure = .missing_body, .expected_tag = "manifest_parse_error" },
+        .{ .failure = .empty_body, .expected_tag = "manifest_parse_error" },
+        .{ .failure = .invalid_json, .expected_tag = "manifest_parse_error" },
+        .{ .failure = .unsupported_content_type, .expected_tag = "content_type_mismatch" },
+        .{ .failure = .body_media_type_disagrees, .expected_tag = "content_type_mismatch" },
+    };
+
+    for (cases) |c| {
+        FailureState.case = c.failure;
+
+        var client: std.http.Client = undefined;
+        var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, ResolverTestHarness.refuseTokenExchange);
+        defer engine.deinit();
+        const ctx = ResolverParams.init(
+            std.testing.allocator,
+            &client,
+            Config{},
+            ResolverTestHarness.busybox_ref,
+            null,
+            .resolve,
+        );
+
+        var outcome = try performManifestGet(ctx, &engine, FailureState.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        defer outcome.deinit(std.testing.allocator);
+
+        switch (outcome) {
+            .failure => |failure| try std.testing.expectEqualStrings(c.expected_tag, @tagName(failure)),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+test "performManifestGet: digest verification matrix" {
+    const DigestCase = enum {
+        matching_pinned,
+        header_mismatch,
+        pinned_mismatch,
+        unsupported_algorithm,
+    };
+
+    const wrong_sha256 = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const wrong_sha512 = "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     const fixture_body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer std.testing.allocator.free(fixture_body);
-    const pinned_digest = try sha256DigestStringAlloc(std.testing.allocator, fixture_body);
-    defer std.testing.allocator.free(pinned_digest);
+    const matching_digest = try sha256DigestStringAlloc(std.testing.allocator, fixture_body);
+    defer std.testing.allocator.free(matching_digest);
 
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = pinned_digest },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(std.testing.allocator);
-
-    switch (outcome) {
-        .success => |success| try std.testing.expectEqual(MediaType.oci_manifest_v1, success.document.mediaType()),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet rejects mismatched response digest header" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+    const DigestState = struct {
+        var case: DigestCase = undefined;
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
             defer request.deinit(allocator);
             const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
-            defer allocator.free(body);
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            }, body);
+            errdefer allocator.free(body);
+            const response = switch (case) {
+                .matching_pinned, .pinned_mismatch => try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                }, body),
+                .header_mismatch => try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    .docker_content_digest = wrong_sha256,
+                }, body),
+                .unsupported_algorithm => try ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = "application/vnd.oci.image.manifest.v1+json",
+                    .docker_content_digest = wrong_sha512,
+                }, body),
+            };
+            allocator.free(body);
+            return response;
         }
     };
 
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
-
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("digest_mismatch", @tagName(err)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet rejects mismatched pinned digest reference" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
-            defer allocator.free(body);
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-            }, body);
-        }
+    const cases = [_]struct {
+        case: DigestCase,
+        ref_string: []const u8,
+        expected_tag: []const u8,
+    }{
+        .{ .case = .matching_pinned, .ref_string = matching_digest, .expected_tag = "success" },
+        .{ .case = .header_mismatch, .ref_string = "latest", .expected_tag = "digest_mismatch" },
+        .{ .case = .pinned_mismatch, .ref_string = wrong_sha256, .expected_tag = "digest_mismatch" },
+        .{ .case = .unsupported_algorithm, .ref_string = "latest", .expected_tag = "unsupported_algorithm" },
     };
 
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-        null,
-        .resolve,
-    );
+    for (cases) |c| {
+        DigestState.case = c.case;
 
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
+        var client: std.http.Client = undefined;
+        var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, ResolverTestHarness.refuseTokenExchange);
+        defer engine.deinit();
+        const ctx = ResolverParams.init(
+            std.testing.allocator,
+            &client,
+            Config{},
+            .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = c.ref_string },
+            null,
+            .resolve,
+        );
 
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("digest_mismatch", @tagName(err)),
-        else => return error.TestUnexpectedResult,
+        var outcome = try performManifestGet(ctx, &engine, DigestState.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        defer outcome.deinit(std.testing.allocator);
+
+        if (std.mem.eql(u8, c.expected_tag, "success")) {
+            switch (outcome) {
+                .success => |success| try std.testing.expectEqual(MediaType.oci_manifest_v1, success.document.mediaType()),
+                else => return error.TestUnexpectedResult,
+            }
+        } else {
+            switch (outcome) {
+                .failure => |failure| try std.testing.expectEqualStrings(c.expected_tag, @tagName(failure)),
+                else => return error.TestUnexpectedResult,
+            }
+        }
     }
 }
-test "performManifestGet rejects unsupported digest algorithm in response header" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
+test "performManifestGet: oversize transport maps to response_too_large" {
+    const OversizeCase = enum { body, headers };
 
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
-            defer allocator.free(body);
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = "sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            }, body);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "ghcr.io", .repository_path = "owner/repo", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
-
-    switch (outcome) {
-        .failure => |err| try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(err)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet maps oversize transport body to response_too_large" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
+    const OversizeState = struct {
+        var case: OversizeCase = undefined;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
             defer request.deinit(std.testing.allocator);
-            return error.ResponseBodyTooLarge;
+            return switch (case) {
+                .body => error.ResponseBodyTooLarge,
+                .headers => error.ResponseHeadersTooLarge,
+            };
         }
     };
 
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
+    for ([_]OversizeCase{ .body, .headers }) |c| {
+        OversizeState.case = c;
 
-    const outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    switch (outcome) {
-        .failure => |failure| {
-            defer failure.deinitOwned(std.testing.allocator);
-            try std.testing.expectEqualStrings("response_too_large", @tagName(failure));
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "performManifestGet maps oversize response headers to response_too_large" {
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
+        var client: std.http.Client = undefined;
+        var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, ResolverTestHarness.refuseTokenExchange);
+        defer engine.deinit();
+        const ctx = ResolverParams.init(
+            std.testing.allocator,
+            &client,
+            Config{},
+            ResolverTestHarness.busybox_ref,
+            null,
+            .resolve,
+        );
+
+        const outcome = try performManifestGet(ctx, &engine, OversizeState.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        switch (outcome) {
+            .failure => |failure| {
+                defer failure.deinitOwned(std.testing.allocator);
+                try std.testing.expectEqualStrings("response_too_large", @tagName(failure));
+            },
+            else => return error.TestUnexpectedResult,
         }
-
-        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.ResponseHeadersTooLarge;
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        std.testing.allocator,
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    const outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    switch (outcome) {
-        .failure => |failure| {
-            defer failure.deinitOwned(std.testing.allocator);
-            try std.testing.expectEqualStrings("response_too_large", @tagName(failure));
-        },
-        else => return error.TestUnexpectedResult,
     }
 }
 test "performManifestGet maps oversize token response to auth_failed" {
@@ -3773,85 +2974,6 @@ test "performManifestGet maps oversize token response to auth_failed" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectEqual(custom_cap, MockHarness.seen_cap.?);
-}
-test "classifyGetManifestBody maps invalid JSON syntax to manifest_parse_error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            const body = try allocator.dupe(u8, "{not-json");
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-            }, body);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
-
-    switch (outcome) {
-        .failure => |failure| try std.testing.expectEqualStrings("manifest_parse_error", @tagName(failure)),
-        else => return error.TestUnexpectedResult,
-    }
-}
-test "classifyGetManifestBody maps header digest mismatch to digest_mismatch" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const MockHarness = struct {
-        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            return test_matrix.refuseTokenExchange(allocator, client, request);
-        }
-
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
-            defer request.deinit(allocator);
-            const body = try fixtureBodyAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
-            return ManifestHttpResponse.initOwnedAlloc(allocator, .{
-                .status = .ok,
-                .content_type = "application/vnd.oci.image.manifest.v1+json",
-                .docker_content_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            }, body);
-        }
-    };
-
-    var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
-    defer engine.deinit();
-    const ctx = ResolverParams.init(
-        arena.allocator(),
-        &client,
-        Config{},
-        .{ .registry = "registry-1.docker.io", .repository_path = "library/busybox", .ref_string = "latest" },
-        null,
-        .resolve,
-    );
-
-    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
-    defer outcome.deinit(arena.allocator());
-
-    switch (outcome) {
-        .failure => |failure| try std.testing.expectEqualStrings("digest_mismatch", @tagName(failure)),
-        else => return error.TestUnexpectedResult,
-    }
 }
 test "performManifestHead: validate with platform falls back to GET" {
     const MockHarness = struct {

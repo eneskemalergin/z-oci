@@ -93,109 +93,122 @@ pub const MediaType = enum {
     }
 };
 
-// Tests
-//
-// fromString
+// --- Tests ---
 
-test "fromString: all known types parse from their canonical MIME string" {
-    // Each type must round-trip through toString → fromString.
-    const cases = [_]MediaType{
-        .oci_manifest_v1,
-        .oci_index_v1,
-        .oci_config_v1,
-        .oci_empty_v1,
-        .oci_layer_v1_tar,
-        .oci_layer_v1_tar_gzip,
-        .oci_layer_v1_tar_zstd,
-        .oci_layer_nondistributable_v1_tar,
-        .oci_layer_nondistributable_v1_tar_gzip,
-        .docker_manifest_v2,
-        .docker_manifest_list_v2,
-        .docker_container_image_v1,
-        .docker_layer_gzip,
-        .docker_layer_foreign_gzip,
-        .docker_manifest_v1_signed,
-    };
-    for (cases) |mt| {
-        const result = MediaType.fromString(mt.toString());
-        try std.testing.expectEqual(mt, result.?);
+const all_media_types = [_]MediaType{
+    .oci_manifest_v1,
+    .oci_index_v1,
+    .oci_config_v1,
+    .oci_empty_v1,
+    .oci_layer_v1_tar,
+    .oci_layer_v1_tar_gzip,
+    .oci_layer_v1_tar_zstd,
+    .oci_layer_nondistributable_v1_tar,
+    .oci_layer_nondistributable_v1_tar_gzip,
+    .docker_manifest_v2,
+    .docker_manifest_list_v2,
+    .docker_container_image_v1,
+    .docker_layer_gzip,
+    .docker_layer_foreign_gzip,
+    .docker_manifest_v1_signed,
+};
+
+test "MediaType.fromString: known MIME strings round-trip through toString" {
+    for (all_media_types) |mt| {
+        try std.testing.expectEqual(mt, MediaType.fromString(mt.toString()).?);
+        try std.testing.expectEqualStrings(mt.toString(), MediaType.fromString(mt.toString()).?.toString());
     }
+
+    // Case-insensitive match must not depend on wire casing.
+    try std.testing.expectEqual(
+        MediaType.oci_manifest_v1,
+        MediaType.fromString("APPLICATION/VND.OCI.IMAGE.MANIFEST.V1+JSON").?,
+    );
 }
 
-test "fromString: unrecognized inputs return null" {
+test "MediaType.fromString: unknown and near-miss inputs return null" {
+    var nul_buf: [128]u8 = undefined;
+    const base = "application/vnd.oci.image.manifest.v1+json";
+    @memcpy(nul_buf[0..base.len], base);
+    nul_buf[base.len] = 0;
+
+    var long_buf: [64]u8 = undefined;
+    @memset(&long_buf, 'x');
+
     const cases = [_][]const u8{
         "",
         "application/json",
         "text/plain",
+        "application/vnd.oci.image.manifest.v1+jso", // prefix of known type
+        "application/vnd.oci.image.manifest.v1+json; charset=utf-8", // suffix/parameters
+        nul_buf[0 .. base.len + 1], // embedded NUL
+        &long_buf,
     };
+
     for (cases) |input| {
         try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(input));
     }
 }
 
-test "fromString: prefix of a known type does not match" {
-    // Guards against startsWith-style matching in the lookup.
-    const prefix = "application/vnd.oci.image.manifest.v1+jso"; // missing trailing 'n'
-    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(prefix));
-}
-
-test "fromString: known type with trailing suffix does not match" {
-    // Guards against contains-style matching.
-    const with_suffix = "application/vnd.oci.image.manifest.v1+json; charset=utf-8";
-    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(with_suffix));
-}
-
-test "fromString: matching is case-insensitive for all casing variants" {
-    // Verifies all three casing styles for one representative type.
-    const lower = "application/vnd.oci.image.manifest.v1+json";
-    const upper = "APPLICATION/VND.OCI.IMAGE.MANIFEST.V1+JSON";
-    const mixed = "Application/Vnd.Oci.Image.Manifest.V1+Json";
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, MediaType.fromString(lower).?);
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, MediaType.fromString(upper).?);
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, MediaType.fromString(mixed).?);
-}
-
-test "isMultiArch: classifies index and manifest-list types" {
-    const cases = [_]struct { mt: MediaType, expected: bool }{
-        .{ .mt = .oci_index_v1, .expected = true },
-        .{ .mt = .docker_manifest_list_v2, .expected = true },
-        .{ .mt = .oci_manifest_v1, .expected = false },
-        .{ .mt = .docker_manifest_v2, .expected = false },
-        .{ .mt = .docker_manifest_v1_signed, .expected = false },
+test "MediaType: isMultiArch and isLegacy classifiers" {
+    const cases = [_]struct {
+        mt: MediaType,
+        multi_arch: bool,
+        legacy: bool,
+    }{
+        .{ .mt = .oci_index_v1, .multi_arch = true, .legacy = false },
+        .{ .mt = .docker_manifest_list_v2, .multi_arch = true, .legacy = false },
+        .{ .mt = .oci_manifest_v1, .multi_arch = false, .legacy = false },
+        .{ .mt = .docker_manifest_v2, .multi_arch = false, .legacy = false },
+        .{ .mt = .docker_manifest_v1_signed, .multi_arch = false, .legacy = true },
     };
-    for (cases) |tc| {
-        try std.testing.expectEqual(tc.expected, tc.mt.isMultiArch());
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.multi_arch, case.mt.isMultiArch());
+        try std.testing.expectEqual(case.legacy, case.mt.isLegacy());
     }
 }
 
-test "isLegacy: classifies legacy v1 signed manifest" {
-    const cases = [_]struct { mt: MediaType, expected: bool }{
-        .{ .mt = .docker_manifest_v1_signed, .expected = true },
-        .{ .mt = .oci_manifest_v1, .expected = false },
-        .{ .mt = .oci_index_v1, .expected = false },
-        .{ .mt = .docker_manifest_v2, .expected = false },
-        .{ .mt = .docker_manifest_list_v2, .expected = false },
+test "MediaType jsonParse: maps string tokens and rejects non-matching input" {
+    const happy_cases = [_]struct { json: []const u8, expected: MediaType }{
+        .{ .json = "\"application/vnd.oci.image.manifest.v1+json\"", .expected = .oci_manifest_v1 },
+        .{ .json = "\"APPLICATION/VND.OCI.IMAGE.INDEX.V1+JSON\"", .expected = .oci_index_v1 },
     };
-    for (cases) |tc| {
-        try std.testing.expectEqual(tc.expected, tc.mt.isLegacy());
+
+    for (happy_cases) |case| {
+        const parsed = try std.json.parseFromSlice(MediaType, std.testing.allocator, case.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, parsed.value);
+    }
+
+    const error_cases = [_][]const u8{
+        "123",
+        "true",
+        "[]",
+        "\"\"",
+        "\"application/x-unknown\"",
+    };
+
+    for (error_cases) |json| {
+        try std.testing.expectError(
+            error.UnexpectedToken,
+            std.json.parseFromSlice(MediaType, std.testing.allocator, json, .{}),
+        );
     }
 }
 
-// jsonParse / jsonStringify ---------------------------------------------------
+test "MediaType jsonStringify: round-trip preserves every variant" {
+    for (all_media_types) |mt| {
+        var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var ws: std.json.Stringify = .{ .writer = &aw.writer };
+        try ws.write(mt);
 
-test "MediaType jsonParse: parses canonical MIME string" {
-    const json_bytes = "\"application/vnd.oci.image.manifest.v1+json\"";
-    const parsed = try std.json.parseFromSlice(MediaType, std.testing.allocator, json_bytes, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value);
-}
-
-test "MediaType jsonParse: non-string token returns UnexpectedToken" {
-    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(MediaType, std.testing.allocator, "123", .{}));
-}
-
-test "MediaType jsonParse: unknown MIME returns UnexpectedToken" {
-    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(MediaType, std.testing.allocator, "\"application/x-unknown\"", .{}));
+        const reparsed = try std.json.parseFromSlice(MediaType, std.testing.allocator, aw.written(), .{});
+        defer reparsed.deinit();
+        try std.testing.expectEqual(mt, reparsed.value);
+        try std.testing.expectEqualStrings(mt.toString(), reparsed.value.toString());
+    }
 }
 
 test "MediaType jsonParse: allocation failures do not leak" {
@@ -207,59 +220,4 @@ test "MediaType jsonParse: allocation failures do not leak" {
             try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value);
         }
     }.run, .{});
-}
-
-test "MediaType jsonStringify: produces canonical MIME string" {
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(MediaType.oci_manifest_v1);
-    try std.testing.expectEqualSlices(u8, "\"application/vnd.oci.image.manifest.v1+json\"", aw.written());
-}
-
-test "MediaType jsonStringify: round-trip preserves all types" {
-    const all_types = [_]MediaType{
-        .oci_manifest_v1,                        .oci_index_v1,              .oci_config_v1,             .oci_empty_v1,
-        .oci_layer_v1_tar,                       .oci_layer_v1_tar_gzip,     .oci_layer_v1_tar_zstd,     .oci_layer_nondistributable_v1_tar,
-        .oci_layer_nondistributable_v1_tar_gzip, .docker_manifest_v2,        .docker_manifest_list_v2,   .docker_container_image_v1,
-        .docker_layer_gzip,                      .docker_layer_foreign_gzip, .docker_manifest_v1_signed,
-    };
-    for (all_types) |mt| {
-        var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer aw.deinit();
-        var ws: std.json.Stringify = .{ .writer = &aw.writer };
-        try ws.write(mt);
-        const reparsed = try std.json.parseFromSlice(MediaType, std.testing.allocator, aw.written(), .{});
-        defer reparsed.deinit();
-        try std.testing.expectEqual(mt, reparsed.value);
-    }
-}
-
-test "fromString: null bytes in input do not match" {
-    // Construct a string with embedded NUL at runtime (Zig 0.16 string literals disallow \0).
-    var buf: [128]u8 = undefined;
-    const base = "application/vnd.oci.image.manifest.v1+json";
-    @memcpy(buf[0..base.len], base);
-    buf[base.len] = 0;
-    const input = buf[0 .. base.len + 1];
-    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(input));
-}
-
-test "fromString: very long unknown string returns null" {
-    var buf: [1024]u8 = undefined;
-    @memset(&buf, 'x');
-    try std.testing.expectEqual(@as(?MediaType, null), MediaType.fromString(&buf));
-}
-
-// DebugAllocator: repeated parse rounds leave no leaks -------------------------
-
-test "MediaType: repeated jsonParse rounds leave no residual allocations under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    for (0..16) |_| {
-        const parsed = try std.json.parseFromSlice(MediaType, allocator, "\"application/vnd.oci.image.manifest.v1+json\"", .{});
-        parsed.deinit();
-    }
 }

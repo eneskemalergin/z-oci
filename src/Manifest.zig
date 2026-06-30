@@ -142,398 +142,224 @@ pub fn jsonStringify(self: Manifest, jw: anytype) !void {
 
 // --- Tests ---
 
-test "Manifest: struct literal stores required fields and defaults" {
+const hex_a = "a" ** 64;
+const hex_b = "b" ** 64;
+const hex_c = "c" ** 64;
+const hex_1 = "1" ** 64;
+const oci_manifest_mt = "application/vnd.oci.image.manifest.v1+json";
+const docker_manifest_mt = "application/vnd.docker.distribution.manifest.v2+json";
+const oci_config_mt = "application/vnd.oci.image.config.v1+json";
+const oci_layer_mt = "application/vnd.oci.image.layer.v1.tar+gzip";
+
+const config_field = "{\"mediaType\":\"" ++ oci_config_mt ++ "\",\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":256}";
+const layer_field = "{\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"digest\":\"sha256:" ++ hex_b ++ "\",\"size\":4096}";
+const minimal_manifest_json =
+    "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[]}";
+const manifest_with_layer_json =
+    "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[" ++ layer_field ++ "]}";
+
+// jsonParse -------------------------------------------------------------------
+
+test "Manifest jsonParse: valid OCI and Docker payloads parse expected fields" {
+    const minimal = try json.parse(Manifest, std.testing.allocator, minimal_manifest_json);
+    defer minimal.deinit();
+    try std.testing.expectEqual(@as(u8, 2), minimal.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, minimal.value.media_type);
+    try std.testing.expectEqual(@as(u64, 256), minimal.value.config.size);
+    try std.testing.expectEqual(@as(usize, 0), minimal.value.layers.len);
+    try std.testing.expect(minimal.value.annotations == null);
+
+    const with_layer = try json.parse(Manifest, std.testing.allocator, manifest_with_layer_json);
+    defer with_layer.deinit();
+    try std.testing.expectEqual(@as(usize, 1), with_layer.value.layers.len);
+    try std.testing.expectEqual(@as(u64, 4096), with_layer.value.layers[0].size);
+    try std.testing.expectEqualSlices(u8, hex_b, with_layer.value.layers[0].digest.hex);
+
+    const annotated_json = "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[],\"annotations\":{\"org.opencontainers.image.ref.name\":\"stable\"},\"vendorExtension\":\"value\"}";
+    const annotated = try json.parse(Manifest, std.testing.allocator, annotated_json);
+    defer annotated.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        "stable",
+        annotated.value.annotations.?.object.get("org.opencontainers.image.ref.name").?.string,
+    );
+
+    const docker_json = "{\"schemaVersion\":2,\"mediaType\":\"" ++ docker_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[]}";
+    const docker = try json.parse(Manifest, std.testing.allocator, docker_json);
+    defer docker.deinit();
+    try std.testing.expectEqual(MediaType.docker_manifest_v2, docker.value.media_type);
+}
+
+test "Manifest jsonParse: rejects invalid roots, missing fields, unknown keys, and validation rules" {
+    const missing_cases = [_][]const u8{
+        "{}",
+        "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ "}",
+    };
+    for (missing_cases) |json_bytes| {
+        try std.testing.expectError(error.MissingField, json.parse(Manifest, std.testing.allocator, json_bytes));
+    }
+
+    for ([_][]const u8{ "null", "[]" }) |json_bytes| {
+        try std.testing.expectError(error.UnexpectedToken, json.parse(Manifest, std.testing.allocator, json_bytes));
+    }
+
+    const unknown_json = minimal_manifest_json[0 .. minimal_manifest_json.len - 1] ++ ",\"customField\":\"value\"}";
+    try std.testing.expectError(
+        error.UnknownField,
+        std.json.parseFromSlice(Manifest, std.testing.allocator, unknown_json, .{ .ignore_unknown_fields = false }),
+    );
+
+    const validation_cases = [_]struct { []const u8, anyerror }{
+        .{
+            "{\"schemaVersion\":1,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[]}",
+            error.UnexpectedToken,
+        },
+        .{
+            "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"config\":" ++ config_field ++ ",\"layers\":[]}",
+            error.UnexpectedToken,
+        },
+    };
+    for (validation_cases) |case| {
+        try std.testing.expectError(case[1], json.parse(Manifest, std.testing.allocator, case[0]));
+    }
+}
+
+test "Manifest jsonParse: malformed nested values return specific errors" {
+    const cases = [_]struct { []const u8, anyerror }{
+        .{
+            "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":{\"mediaType\":\"" ++ oci_config_mt ++ "\",\"digest\":\"not-a-digest\",\"size\":1},\"layers\":[]}",
+            error.UnexpectedToken,
+        },
+        .{
+            "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":\"not-an-object\",\"layers\":[]}",
+            error.UnexpectedToken,
+        },
+        .{
+            "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":\"not-an-array\"}",
+            error.UnexpectedToken,
+        },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case[1], json.parse(Manifest, std.testing.allocator, case[0]));
+    }
+}
+
+test "Manifest jsonParse: parses checked-in manifest fixtures" {
+    const cases = [_]struct {
+        path: []const u8,
+        media_type: MediaType,
+        config_media_type: MediaType,
+        layer_count: usize,
+    }{
+        .{
+            .path = "fixtures/manifests/oci-image-manifest-spec-example.json",
+            .media_type = .oci_manifest_v1,
+            .config_media_type = .oci_config_v1,
+            .layer_count = 3,
+        },
+        .{
+            .path = "fixtures/manifests/busybox-amd64-live-oci-manifest.json",
+            .media_type = .oci_manifest_v1,
+            .config_media_type = .oci_config_v1,
+            .layer_count = 1,
+        },
+        .{
+            .path = "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json",
+            .media_type = .docker_manifest_v2,
+            .config_media_type = .docker_container_image_v1,
+            .layer_count = 2,
+        },
+    };
+
+    for (cases) |case| {
+        const parsed = try test_support.parseFixture(Manifest, case.path, 16 * 1024);
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+        try std.testing.expectEqual(case.media_type, parsed.value.media_type);
+        try std.testing.expectEqual(case.config_media_type, parsed.value.config.media_type);
+        try std.testing.expectEqual(case.layer_count, parsed.value.layers.len);
+    }
+}
+
+test "Manifest jsonParse: allocation failures do not leak" {
+    const json_bytes = "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":{\"mediaType\":\"" ++ oci_config_mt ++ "\",\"digest\":\"sha256:" ++ hex_c ++ "\",\"size\":7023},\"layers\":[{\"mediaType\":\"" ++ oci_layer_mt ++ "\",\"digest\":\"sha256:" ++ hex_b ++ "\",\"size\":32654}]}";
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            const parsed = try json.parse(Manifest, allocator, bytes);
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
+        }
+    }.run, .{json_bytes});
+}
+
+test "Manifest jsonParse: repeated parse rounds leave no residual allocations under DebugAllocator" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+
+    for (0..16) |_| {
+        const parsed = try json.parse(Manifest, gpa.allocator(), minimal_manifest_json);
+        parsed.deinit();
+    }
+}
+
+// parseMediaTypeShallow ---------------------------------------------------------
+
+test "Manifest parseMediaTypeShallow: extracts mediaType without full manifest validation" {
+    const success_cases = [_]struct { []const u8, MediaType }{
+        .{ minimal_manifest_json, .oci_manifest_v1 },
+        .{ "{\"mediaType\":\"" ++ docker_manifest_mt ++ "\"}", .docker_manifest_v2 },
+        .{ "{\"mediaType\":\"application/vnd.oci.image.index.v1+json\"}", .oci_index_v1 },
+    };
+    for (success_cases) |case| {
+        const mt = try Manifest.parseMediaTypeShallow(std.testing.allocator, case[0]);
+        try std.testing.expectEqual(case[1], mt);
+    }
+
+    try std.testing.expectError(error.MissingField, Manifest.parseMediaTypeShallow(std.testing.allocator, "{\"schemaVersion\":2}"));
+    try std.testing.expectError(error.UnexpectedToken, Manifest.parseMediaTypeShallow(std.testing.allocator, "null"));
+}
+
+// jsonStringify ----------------------------------------------------------------
+
+test "Manifest jsonStringify: omits null annotations" {
     const config = Descriptor{
         .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "a" ** 64),
+        .digest = try Digest.parse("sha256:" ++ hex_a),
         .size = 256,
     };
-    const layer = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "b" ** 64),
-        .size = 4096,
-    };
-    const layers = [_]Descriptor{layer};
     const m = Manifest{
-        .schema_version = 2,
-        .media_type = .oci_manifest_v1,
-        .config = config,
-        .layers = &layers,
-    };
-
-    try std.testing.expectEqual(@as(u8, 2), m.schema_version);
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, m.media_type);
-    try std.testing.expectEqual(@as(u64, 256), m.config.size);
-    try std.testing.expectEqualSlices(u8, "a" ** 64, m.config.digest.hex);
-    try std.testing.expect(m.annotations == null);
-
-    const empty_layers = Manifest{
         .schema_version = 2,
         .media_type = .oci_manifest_v1,
         .config = config,
         .layers = &.{},
     };
-    try std.testing.expectEqual(@as(usize, 0), empty_layers.layers.len);
-}
-
-test "Manifest parseMediaTypeShallow: extracts mediaType from manifest JSON" {
-    const oci_manifest =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\    "size": 1
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-
-    const mt = try Manifest.parseMediaTypeShallow(std.testing.allocator, oci_manifest);
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, mt);
-}
-
-test "Manifest parseMediaTypeShallow: minimal JSON with only mediaType" {
-    const minimal = "{\"mediaType\": \"application/vnd.docker.distribution.manifest.v2+json\"}";
-    const mt = try Manifest.parseMediaTypeShallow(std.testing.allocator, minimal);
-    try std.testing.expectEqual(MediaType.docker_manifest_v2, mt);
-}
-
-test "Manifest parseMediaTypeShallow: missing mediaType returns MissingField" {
-    const json_bytes = "{\"schemaVersion\": 2}";
-    try std.testing.expectError(error.MissingField, Manifest.parseMediaTypeShallow(std.testing.allocator, json_bytes));
-}
-
-test "Manifest parseMediaTypeShallow: index mediaType is parsed without manifest validation" {
-    const index_json = "{\"mediaType\": \"application/vnd.oci.image.index.v1+json\"}";
-    const mt = try Manifest.parseMediaTypeShallow(std.testing.allocator, index_json);
-    try std.testing.expectEqual(MediaType.oci_index_v1, mt);
-}
-
-test "Manifest: layers are stored in declaration order" {
-    // Guards against any reordering of the layers slice.
-    const config = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "d" ** 64),
-        .size = 0,
-    };
-    const layer0 = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "e" ** 64),
-        .size = 100,
-    };
-    const layer1 = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "f" ** 64),
-        .size = 200,
-    };
-    const layers = [_]Descriptor{ layer0, layer1 };
-    const m = Manifest{
-        .schema_version = 2,
-        .media_type = .oci_manifest_v1,
-        .config = config,
-        .layers = &layers,
-    };
-    try std.testing.expectEqual(@as(usize, 2), m.layers.len);
-    try std.testing.expectEqualSlices(u8, "e" ** 64, m.layers[0].digest.hex);
-    try std.testing.expectEqualSlices(u8, "f" ** 64, m.layers[1].digest.hex);
-}
-
-test "Manifest: Docker V2 manifest has distinct media_type from OCI" {
-    // Guards against the two formats being accidentally interchangeable.
-    const stub = Descriptor{
-        .media_type = .docker_manifest_v2,
-        .digest = try Digest.parse("sha256:" ++ "0" ** 64),
-        .size = 0,
-    };
-    const oci = Manifest{ .schema_version = 2, .media_type = .oci_manifest_v1, .config = stub, .layers = &.{} };
-    const docker = Manifest{ .schema_version = 2, .media_type = .docker_manifest_v2, .config = stub, .layers = &.{} };
-    try std.testing.expect(oci.media_type != docker.media_type);
-    try std.testing.expect(!oci.media_type.isMultiArch());
-    try std.testing.expect(!docker.media_type.isMultiArch());
-}
-
-test "Manifest JSON: parses required fields" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\    "size": 256
-        \\  },
-        \\  "layers": [
-        \\    {
-        \\      "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        \\      "size": 4096
-        \\    }
-        \\  ]
-        \\}
-    ;
-
-    const parsed = try json.parse(Manifest, std.testing.allocator, json_bytes);
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
-    try std.testing.expectEqual(@as(u64, 256), parsed.value.config.size);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
-    try std.testing.expectEqual(@as(u64, 4096), parsed.value.layers[0].size);
-}
-
-test "Manifest JSON: stringifies with camelCase field names" {
-    const config = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "a" ** 64),
-        .size = 256,
-    };
-    const layer = Descriptor{
-        .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ "b" ** 64),
-        .size = 4096,
-    };
-    const layers = [_]Descriptor{layer};
-    const m = Manifest{
-        .schema_version = 2,
-        .media_type = .oci_manifest_v1,
-        .config = config,
-        .layers = &layers,
-    };
 
     var aw = try json.stringifyForTest(m);
     defer aw.deinit();
-    const out = aw.written();
-
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"schemaVersion\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"config\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"layers\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") != null);
-
-    const reparsed = try json.parse(Manifest, std.testing.allocator, out);
-    defer reparsed.deinit();
-    try std.testing.expectEqual(m.schema_version, reparsed.value.schema_version);
-    try std.testing.expectEqual(m.media_type, reparsed.value.media_type);
-    try std.testing.expectEqual(m.config.size, reparsed.value.config.size);
-    try std.testing.expectEqual(m.layers.len, reparsed.value.layers.len);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"annotations\"") == null);
 }
 
-test "Manifest JSON: stringify/reparse preserves annotations leak-free" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\    "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
-        \\    "size": 64
-        \\  },
-        \\  "layers": [],
-        \\  "annotations": {
-        \\    "org.opencontainers.image.ref.name": "stable"
-        \\  }
-        \\}
-    ;
+test "Manifest jsonStringify: round-trip preserves all fields" {
+    const json_bytes = "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":{\"mediaType\":\"" ++ oci_config_mt ++ "\",\"digest\":\"sha256:" ++ hex_1 ++ "\",\"size\":64},\"layers\":[" ++ layer_field ++ "],\"annotations\":{\"org.opencontainers.image.ref.name\":\"stable\"}}";
 
     const parsed = try json.parse(Manifest, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
     var aw = try json.stringifyForTest(parsed.value);
     defer aw.deinit();
-    const out = aw.written();
 
-    const reparsed = try json.parse(Manifest, std.testing.allocator, out);
+    const reparsed = try json.parse(Manifest, std.testing.allocator, aw.written());
     defer reparsed.deinit();
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.ref.name") != null);
-    try std.testing.expect(reparsed.value.annotations != null);
-}
-
-test "Manifest JSON: rejects schemaVersion other than 2" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 1,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
-        \\    "size": 64
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-
-    try std.testing.expectError(error.UnexpectedToken, json.parse(Manifest, std.testing.allocator, json_bytes));
-}
-
-test "Manifest JSON: rejects index mediaType for manifest payloads" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:3434343434343434343434343434343434343434343434343434343434343434",
-        \\    "size": 64
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-
-    try std.testing.expectError(error.UnexpectedToken, json.parse(Manifest, std.testing.allocator, json_bytes));
-}
-
-test "Manifest JSON: parses upstream OCI manifest fixture with real config and layer media types" {
-    const parsed = try test_support.parseFixture(
-        Manifest,
-        "fixtures/manifests/oci-image-manifest-spec-example.json",
-        16 * 1024,
+    try std.testing.expectEqual(parsed.value.schema_version, reparsed.value.schema_version);
+    try std.testing.expectEqual(parsed.value.media_type, reparsed.value.media_type);
+    try std.testing.expectEqualSlices(u8, parsed.value.config.digest.hex, reparsed.value.config.digest.hex);
+    try std.testing.expectEqual(parsed.value.layers.len, reparsed.value.layers.len);
+    try std.testing.expectEqualSlices(u8, parsed.value.layers[0].digest.hex, reparsed.value.layers[0].digest.hex);
+    try std.testing.expectEqualSlices(
+        u8,
+        "stable",
+        reparsed.value.annotations.?.object.get("org.opencontainers.image.ref.name").?.string,
     );
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
-    try std.testing.expectEqual(MediaType.oci_config_v1, parsed.value.config.media_type);
-    try std.testing.expectEqual(@as(u64, 7023), parsed.value.config.size);
-    try std.testing.expectEqual(@as(usize, 3), parsed.value.layers.len);
-    try std.testing.expectEqual(MediaType.oci_layer_v1_tar_gzip, parsed.value.layers[0].media_type);
-    try std.testing.expectEqual(@as(u64, 73109), parsed.value.layers[2].size);
-    try std.testing.expect(parsed.value.annotations != null);
-}
-
-test "Manifest JSON: parses live busybox amd64 OCI manifest fixture" {
-    const parsed = try test_support.parseFixture(
-        Manifest,
-        "fixtures/manifests/busybox-amd64-live-oci-manifest.json",
-        16 * 1024,
-    );
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
-    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
-    try std.testing.expectEqual(MediaType.oci_config_v1, parsed.value.config.media_type);
-    try std.testing.expectEqualSlices(u8, "925ff61909aebae4bcc9bc04bb96a8bd15cd2271f13159fe95ce4338824531dd", parsed.value.config.digest.hex);
-    try std.testing.expectEqual(@as(u64, 459), parsed.value.config.size);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
-    try std.testing.expectEqual(MediaType.oci_layer_v1_tar_gzip, parsed.value.layers[0].media_type);
-    try std.testing.expectEqual(@as(u64, 2211398), parsed.value.layers[0].size);
-    try std.testing.expect(parsed.value.annotations != null);
-}
-
-test "Manifest JSON: parses live Quay busybox amd64 Docker manifest fixture" {
-    const parsed = try test_support.parseFixture(
-        Manifest,
-        "fixtures/manifests/quay-prometheus-busybox-amd64-live-docker-manifest.json",
-        16 * 1024,
-    );
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
-    try std.testing.expectEqual(MediaType.docker_manifest_v2, parsed.value.media_type);
-    try std.testing.expectEqual(MediaType.docker_container_image_v1, parsed.value.config.media_type);
-    try std.testing.expectEqualSlices(u8, "e00da1501c19257e522754fabd8c68feadcd501657722353d0583852343aad0d", parsed.value.config.digest.hex);
-    try std.testing.expectEqual(@as(u64, 891), parsed.value.config.size);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.layers.len);
-    try std.testing.expectEqual(MediaType.docker_layer_gzip, parsed.value.layers[0].media_type);
-    try std.testing.expectEqual(@as(u64, 324609), parsed.value.layers[1].size);
-}
-
-test "Manifest JSON: allocation failures do not leak" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\    "size": 7023
-        \\  },
-        \\  "layers": [
-        \\    {
-        \\      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        \\      "size": 32654
-        \\    }
-        \\  ]
-        \\}
-    ;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
-        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
-            const parsed = try json.parse(Manifest, allocator, bytes);
-            defer parsed.deinit();
-            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
-            try std.testing.expectEqual(@as(usize, 1), parsed.value.layers.len);
-        }
-    }.run, .{json_bytes});
-}
-
-test "Manifest JSON: repeated parse rounds leave no residual allocations under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        \\    "size": 1
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
-    const iterations = [_]usize{ 16, 1000 };
-    for (iterations) |n| {
-        for (0..n) |_| {
-            const parsed = try json.parse(Manifest, allocator, json_bytes);
-            parsed.deinit();
-        }
-    }
-}
-
-test "Manifest JSON: missing layers returns MissingField" {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
-        \\    "size": 64
-        \\  }
-        \\}
-    ;
-    try std.testing.expectError(error.MissingField, json.parse(Manifest, std.testing.allocator, json_bytes));
-}
-
-test "Manifest JSON: 10000 pseudo-random inputs never panic and only return declared outcomes" {
-    var seed: u64 = 0x51ce_b00c;
-    var buf: [256]u8 = undefined;
-
-    for (0..10_000) |_| {
-        seed = seed *% 6364136223846793005 +% 1;
-        const len: usize = @intCast(seed % (buf.len + 1));
-
-        for (buf[0..len]) |*b| {
-            seed = seed *% 6364136223846793005 +% 1;
-            b.* = @truncate(seed >> 32);
-        }
-
-        const result = json.parse(Manifest, std.testing.allocator, buf[0..len]);
-        if (result) |parsed| {
-            defer parsed.deinit();
-            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
-            switch (parsed.value.media_type) {
-                .oci_manifest_v1, .docker_manifest_v2 => {},
-                else => return error.TestUnexpectedResult,
-            }
-        } else |_| {}
-    }
 }

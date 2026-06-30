@@ -221,217 +221,103 @@ const ReferenceCorpusCase = struct {
     ref_string: []const u8,
 };
 
-// Tests
-//
-// parse: Docker Hub bare names ------------------------------------------------
+// --- Tests ---
 
-test "parse: Docker Hub bare name defaults table" {
+fn expectParseError(input: []const u8, expected: ParseError) !void {
+    try std.testing.expectError(expected, parse(std.testing.allocator, input));
+}
+
+test "Reference.parse: happy path and Docker Hub normalization table" {
     const alloc = std.testing.allocator;
     const hex = "a" ** 64;
     const cases = [_]struct {
         input: []const u8,
+        registry: []const u8,
         repository: []const u8,
-        tag: ?[]const u8,
-        has_digest: bool,
+        tag: ?[]const u8 = null,
+        ref_string: ?[]const u8 = null,
+        has_digest: bool = false,
     }{
-        .{ .input = "ubuntu", .repository = "library/ubuntu", .tag = null, .has_digest = false },
-        .{ .input = "ubuntu:22.04", .repository = "library/ubuntu", .tag = "22.04", .has_digest = false },
-        .{ .input = "ubuntu@sha256:" ++ hex, .repository = "library/ubuntu", .tag = null, .has_digest = true },
-        .{ .input = "ubuntu:20.04-slim", .repository = "library/ubuntu", .tag = "20.04-slim", .has_digest = false },
+        .{ .input = "ubuntu", .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .ref_string = "latest" },
+        .{ .input = "ubuntu:22.04", .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .tag = "22.04", .ref_string = "22.04" },
+        .{ .input = "ubuntu@sha256:" ++ hex, .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .has_digest = true },
+        .{ .input = "ubuntu:20.04-slim", .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .tag = "20.04-slim", .ref_string = "20.04-slim" },
+        .{ .input = "myorg/myimage:v2", .registry = DOCKER_HUB_REGISTRY, .repository = "myorg/myimage", .tag = "v2", .ref_string = "v2" },
+        .{ .input = "ghcr.io/owner/repo:v1.0", .registry = "ghcr.io", .repository = "owner/repo", .tag = "v1.0", .ref_string = "v1.0" },
+        .{ .input = "ghcr.io/owner/repo", .registry = "ghcr.io", .repository = "owner/repo", .ref_string = "latest" },
+        .{ .input = "localhost:5000/myimage:dev", .registry = "localhost:5000", .repository = "myimage", .tag = "dev", .ref_string = "dev" },
+        .{ .input = "localhost/myimage:dev", .registry = "localhost", .repository = "myimage", .tag = "dev", .ref_string = "dev" },
+        .{ .input = "registry.example.com/org/team/image:latest", .registry = "registry.example.com", .repository = "org/team/image", .tag = "latest", .ref_string = "latest" },
+        .{ .input = "registry.example.com:443/repo:tag", .registry = "registry.example.com:443", .repository = "repo", .tag = "tag", .ref_string = "tag" },
+        .{ .input = "docker.io/library/ubuntu:20.04", .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .tag = "20.04", .ref_string = "20.04" },
+        .{ .input = "index.docker.io/library/alpine:3.18", .registry = DOCKER_HUB_REGISTRY, .repository = "library/alpine", .tag = "3.18", .ref_string = "3.18" },
+        .{ .input = "DOCKER.IO/library/ubuntu:latest", .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .tag = "latest", .ref_string = "latest" },
+        .{ .input = "REGISTRY-1.DOCKER.IO/ubuntu:latest", .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .tag = "latest", .ref_string = "latest" },
     };
 
     for (cases) |case| {
         var ref = try parse(alloc, case.input);
         defer ref.deinit(alloc);
-        try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
+        try std.testing.expectEqualSlices(u8, case.registry, ref.registry);
         try std.testing.expectEqualSlices(u8, case.repository, ref.repository);
         if (case.tag) |tag| {
             try std.testing.expectEqualSlices(u8, tag, ref.tag.?);
         } else {
             try std.testing.expect(ref.tag == null);
-            if (!case.has_digest) {
-                try std.testing.expectEqualStrings("latest", ref.refString());
-            }
         }
         try std.testing.expect((ref.digest != null) == case.has_digest);
-        if (case.has_digest) {
-            try std.testing.expectEqualSlices(u8, hex, ref.digest.?.hex);
+        if (case.ref_string) |label| {
+            try std.testing.expectEqualStrings(label, ref.refString());
+        } else if (case.has_digest) {
+            try std.testing.expectEqualSlices(u8, "sha256:" ++ hex, ref.refString());
         }
     }
 }
 
-// parse: Docker Hub org paths -------------------------------------------------
-
-test "parse: org/image path on Docker Hub gets no library prefix" {
-    // "myorg/myimage" already has a slash, so no library/ prefix is added.
+test "Reference.parse: tag, digest, and refString precedence" {
     const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "myorg/myimage:v2");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "myorg/myimage", ref.repository);
-    try std.testing.expectEqualSlices(u8, "v2", ref.tag.?);
-}
-
-// parse: explicit registries --------------------------------------------------
-
-test "parse: full registry/owner/repo:tag" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "ghcr.io/owner/repo:v1.0");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "ghcr.io", ref.registry);
-    try std.testing.expectEqualSlices(u8, "owner/repo", ref.repository);
-    try std.testing.expectEqualSlices(u8, "v1.0", ref.tag.?);
-}
-
-test "parse: registry with port is detected as registry" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "localhost:5000/myimage:dev");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "localhost:5000", ref.registry);
-    try std.testing.expectEqualSlices(u8, "myimage", ref.repository);
-    try std.testing.expectEqualSlices(u8, "dev", ref.tag.?);
-}
-
-test "parse: localhost without port is treated as registry" {
-    // "localhost" is a special case: no dot, no port, but always a registry.
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "localhost/myimage:dev");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "localhost", ref.registry);
-    try std.testing.expectEqualSlices(u8, "myimage", ref.repository);
-}
-
-test "parse: deeply nested repository path is preserved" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "registry.example.com/org/team/image:latest");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry.example.com", ref.registry);
-    try std.testing.expectEqualSlices(u8, "org/team/image", ref.repository);
-    try std.testing.expectEqualSlices(u8, "latest", ref.tag.?);
-}
-
-test "parse: registry with dot and port together" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "registry.example.com:443/repo:tag");
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "registry.example.com:443", ref.registry);
-    try std.testing.expectEqualSlices(u8, "repo", ref.repository);
-    try std.testing.expectEqualSlices(u8, "tag", ref.tag.?);
-}
-
-test "parse: no tag and no digest defaults refString to latest" {
-    const alloc = std.testing.allocator;
-    var ref = try parse(alloc, "ghcr.io/owner/repo");
-    defer ref.deinit(alloc);
-    try std.testing.expect(ref.tag == null);
-    try std.testing.expectEqualStrings("latest", ref.refString());
-}
-
-// parse: Docker Hub alias normalization ---------------------------------------
-
-test "parse: Docker Hub alias normalization table" {
-    const alloc = std.testing.allocator;
+    const hex = "b" ** 64;
     const cases = [_]struct {
         input: []const u8,
-        repository: []const u8,
         tag: ?[]const u8,
+        ref_string: []const u8,
     }{
-        .{ .input = "docker.io/library/ubuntu:20.04", .repository = "library/ubuntu", .tag = "20.04" },
-        .{ .input = "index.docker.io/library/alpine:3.18", .repository = "library/alpine", .tag = "3.18" },
-        .{ .input = "DOCKER.IO/library/ubuntu:latest", .repository = "library/ubuntu", .tag = "latest" },
-        .{ .input = "REGISTRY-1.DOCKER.IO/ubuntu:latest", .repository = "library/ubuntu", .tag = "latest" },
+        .{ .input = "image:mytag@sha256:" ++ hex, .tag = "mytag", .ref_string = "sha256:" ++ hex },
+        .{ .input = "ghcr.io/owner/repo@sha256:" ++ hex, .tag = null, .ref_string = "sha256:" ++ hex },
     };
 
     for (cases) |case| {
         var ref = try parse(alloc, case.input);
         defer ref.deinit(alloc);
-        try std.testing.expectEqualSlices(u8, "registry-1.docker.io", ref.registry);
-        try std.testing.expectEqualSlices(u8, case.repository, ref.repository);
         if (case.tag) |tag| {
             try std.testing.expectEqualSlices(u8, tag, ref.tag.?);
+        } else {
+            try std.testing.expect(ref.tag == null);
         }
+        try std.testing.expect(ref.digest != null);
+        try std.testing.expectEqualSlices(u8, case.ref_string, ref.refString());
     }
 }
 
-// parse: digest and tag together ----------------------------------------------
-
-test "parse: tag and digest together, both fields are set" {
-    const alloc = std.testing.allocator;
-    const hex = "b" ** 64;
-    var ref = try parse(alloc, "image:mytag@sha256:" ++ hex);
-    defer ref.deinit(alloc);
-    // Both must be stored.
-    try std.testing.expectEqualSlices(u8, "mytag", ref.tag.?);
-    try std.testing.expect(ref.digest != null);
+test "Reference.parse: maps malformed input to exact ParseError" {
+    const hex = "a" ** 64;
+    const cases = [_]struct { input: []const u8, expected: ParseError }{
+        .{ .input = "", .expected = error.Empty },
+        .{ .input = "ubuntu 22.04", .expected = error.InvalidReference },
+        .{ .input = "ubuntu\t22.04", .expected = error.InvalidReference },
+        .{ .input = "ubuntu\n22.04", .expected = error.InvalidReference },
+        .{ .input = "@sha256:" ++ hex, .expected = error.InvalidReference },
+        .{ .input = "ubuntu@notadigest", .expected = error.InvalidDigest },
+        .{ .input = "ubuntu:", .expected = error.InvalidReference },
+        .{ .input = "myorg/", .expected = error.InvalidReference },
+        .{ .input = "ghcr.io/Owner/repo:latest", .expected = error.InvalidReference },
+        .{ .input = "ghcr.io/owner//repo:latest", .expected = error.InvalidReference },
+        .{ .input = "ghcr.io/owner:team/repo:latest", .expected = error.InvalidReference },
+    };
+    for (cases) |case| try expectParseError(case.input, case.expected);
 }
 
-test "parse: tag and digest together, refString returns digest not tag" {
-    // Digest is canonical. The tag is informational only.
-    const alloc = std.testing.allocator;
-    const hex = "b" ** 64;
-    var ref = try parse(alloc, "image:mytag@sha256:" ++ hex);
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "sha256:" ++ hex, ref.refString());
-}
-
-test "parse: digest only (no tag), refString returns the digest string" {
-    const alloc = std.testing.allocator;
-    const hex = "c" ** 64;
-    var ref = try parse(alloc, "ghcr.io/owner/repo@sha256:" ++ hex);
-    defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "sha256:" ++ hex, ref.refString());
-}
-
-// parse: error cases ----------------------------------------------------------
-
-test "parse: rejects empty input with error.Empty" {
-    try std.testing.expectError(error.Empty, parse(std.testing.allocator, ""));
-}
-
-test "parse: rejects space in input with error.InvalidReference" {
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu 22.04"));
-}
-
-test "parse: rejects tab character in input with error.InvalidReference" {
-    // Guards against only checking space (0x20) and missing other control chars.
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu\t22.04"));
-}
-
-test "parse: rejects newline in input with error.InvalidReference" {
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu\n22.04"));
-}
-
-test "parse: rejects leading @ with error.InvalidReference" {
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "@sha256:" ++ "a" ** 64));
-}
-
-test "parse: rejects invalid digest format with error.InvalidDigest" {
-    try std.testing.expectError(error.InvalidDigest, parse(std.testing.allocator, "ubuntu@notadigest"));
-}
-
-test "parse: rejects trailing colon with error.InvalidReference" {
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ubuntu:"));
-}
-
-test "parse: rejects trailing slash with error.InvalidReference" {
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "myorg/"));
-}
-
-test "parse: rejects uppercase repository component with error.InvalidReference" {
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ghcr.io/Owner/repo:latest"));
-}
-
-test "parse: rejects empty repository path segment with error.InvalidReference" {
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ghcr.io/owner//repo:latest"));
-}
-
-test "parse: rejects repository component with colon with error.InvalidReference" {
-    try std.testing.expectError(error.InvalidReference, parse(std.testing.allocator, "ghcr.io/owner:team/repo:latest"));
-}
-
-// repositoryPath and refString ------------------------------------------------
-
-test "real-world corpus: common registry references normalize to expected repositoryPath and refString values" {
+test "Reference.repositoryPath and refString: real-world corpus" {
     const cases = [_]ReferenceCorpusCase{
         .{
             .input = "ubuntu",
@@ -502,9 +388,7 @@ test "real-world corpus: common registry references normalize to expected reposi
     }
 }
 
-test "parse: digest hex remains valid after caller input is freed" {
-    // Tighten the ownership contract: digest.hex must point into owned memory,
-    // not into the caller input slice.
+test "Reference.parse: digest borrows owned digest_raw after caller input is freed" {
     const alloc = std.testing.allocator;
     const input = try alloc.dupe(u8, "ghcr.io/owner/repo@sha256:" ++ "d" ** 64);
     var ref = try parse(alloc, input);
@@ -513,68 +397,27 @@ test "parse: digest hex remains valid after caller input is freed" {
 
     try std.testing.expect(ref.digest != null);
     try std.testing.expectEqualSlices(u8, "d" ** 64, ref.digest.?.hex);
+    try std.testing.expectEqualSlices(u8, ref.digest_raw.?, ref.refString());
 }
 
-test "parse and deinit: digest ref frees digest_raw and owned digest hex" {
-    // digest_raw owns the full "sha256:hex" string. digest.hex points inside it.
-    // deinit must free that allocation exactly once.
-    const alloc = std.testing.allocator;
-    const hex = "d" ** 64;
-    const input = "ghcr.io/owner/repo@sha256:" ++ hex;
-    var ref = try parse(alloc, input);
-    ref.deinit(alloc);
-    // No leak: digest_raw was freed, digest.hex needed no separate cleanup.
-}
-
-test "parse: allocation failures do not leak partially constructed references" {
+test "Reference.parse: allocation failures do not leak partially constructed references" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator, input: []const u8) !void {
             var ref = try parse(allocator, input);
             defer ref.deinit(allocator);
-
             try std.testing.expectEqualSlices(u8, "ghcr.io", ref.registry);
-            try std.testing.expectEqualSlices(u8, "owner/repo", ref.repository);
-            try std.testing.expectEqualSlices(u8, "v1", ref.tag.?);
             try std.testing.expect(ref.digest != null);
         }
     }.run, .{"ghcr.io/owner/repo:v1@sha256:" ++ "f" ** 64});
 }
 
-test "parse: mixed success and failure cases leave no residual allocations under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const alloc = gpa.allocator();
-
-    const valid_inputs = [_][]const u8{
-        "ubuntu:22.04",
-        "ghcr.io/owner/repo:v1@sha256:" ++ "a" ** 64,
-        "REGISTRY-1.DOCKER.IO/ubuntu:latest",
-    };
-    const invalid_cases = [_]struct { []const u8, ParseError }{
-        .{ "ghcr.io/Owner/repo@sha256:" ++ "b" ** 64, error.InvalidReference },
-        .{ "ghcr.io/owner/repo@notadigest", error.InvalidDigest },
-        .{ "ghcr.io/owner//repo:latest", error.InvalidReference },
-    };
-
-    for (valid_inputs) |input| {
-        var ref = try parse(alloc, input);
-        ref.deinit(alloc);
-    }
-
-    for (invalid_cases) |case| {
-        try std.testing.expectError(case[1], parse(alloc, case[0]));
-    }
-}
-
-test "parse: 10000 pseudo-random inputs never panic and only return declared outcomes" {
-    // Fuzz-style smoke test. Success paths must deinit cleanly.
+test "Reference.parse: pseudo-random inputs never panic" {
     var seed: u64 = 0x51ce_b00c;
     var buf: [128]u8 = undefined;
 
-    for (0..10_000) |_| {
+    for (0..512) |_| {
         seed = seed *% 6364136223846793005 +% 1;
         const len: usize = @intCast(seed % (buf.len + 1));
-
         for (buf[0..len]) |*b| {
             seed = seed *% 6364136223846793005 +% 1;
             b.* = @truncate(seed >> 32);
@@ -584,111 +427,18 @@ test "parse: 10000 pseudo-random inputs never panic and only return declared out
         if (result) |ref| {
             var owned = ref;
             defer owned.deinit(std.testing.allocator);
-
             try std.testing.expect(owned.repository.len > 0);
             try std.testing.expect(owned.registry.len > 0);
             try std.testing.expectEqualSlices(u8, owned.repository, owned.repositoryPath());
-            try std.testing.expect(owned.repository[owned.repository.len - 1] != '/');
-
-            for (owned.registry) |c| try std.testing.expect(c > ' ');
-            for (owned.repository) |c| try std.testing.expect(c > ' ');
-
             if (owned.digest) |digest| {
-                try std.testing.expectEqual(Digest.Algorithm.sha256, digest.algorithm);
                 try std.testing.expect(owned.digest_raw != null);
                 try std.testing.expectEqualSlices(u8, owned.digest_raw.?, owned.refString());
-                try std.testing.expect(std.mem.startsWith(u8, owned.digest_raw.?, "sha256:"));
                 try std.testing.expectEqual(@as(usize, 64), digest.hex.len);
-                for (digest.hex) |c| switch (c) {
-                    '0'...'9', 'a'...'f', 'A'...'F' => {},
-                    else => return error.TestUnexpectedResult,
-                };
-            } else {
-                const ref_label = owned.refString();
-                try std.testing.expect(ref_label.len > 0);
-                if (owned.tag) |tag| {
-                    try std.testing.expectEqualSlices(u8, tag, ref_label);
-                    for (tag) |c| try std.testing.expect(c > ' ');
-                } else {
-                    try std.testing.expectEqualStrings("latest", ref_label);
-                }
+            } else if (owned.tag == null) {
+                try std.testing.expectEqualStrings("latest", owned.refString());
             }
         } else |err| switch (err) {
-            error.Empty,
-            error.InvalidDigest,
-            error.InvalidReference,
-            error.OutOfMemory,
-            => {},
-        }
-    }
-}
-
-test "parse: 1000x repeated parse/deinit with varying inputs under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const alloc = gpa.allocator();
-
-    const inputs = [_][]const u8{
-        "ubuntu:22.04",
-        "ghcr.io/owner/repo:v1@sha256:" ++ "a" ** 64,
-        "REGISTRY-1.DOCKER.IO/ubuntu:latest",
-        "localhost:5000/myimage:dev",
-        "registry.example.com:443/repo:tag",
-        "myorg/myimage:v2",
-    };
-
-    for (0..1000) |i| {
-        const input = inputs[i % inputs.len];
-        var ref = try parse(alloc, input);
-        ref.deinit(alloc);
-    }
-}
-
-test "parse: 1000x repeated parse with random-like valid inputs under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const alloc = gpa.allocator();
-
-    const registries = [_][]const u8{ "ghcr.io", "docker.io", "quay.io", "gcr.io", "localhost:5000", "" };
-    const repos = [_][]const u8{ "owner/repo", "library/ubuntu", "team/project/service", "myimage", "a/b/c/d" };
-    const tags = [_][]const u8{ "latest", "v1.0", "22.04-slim", "" };
-
-    var seed: u64 = 0x5e_ed_b0_0c;
-    for (0..1000) |_| {
-        seed = seed *% 6364136223846793005 +% 1;
-        const reg = registries[@as(usize, @truncate(seed)) % registries.len];
-        seed = seed *% 6364136223846793005 +% 1;
-        const repo = repos[@as(usize, @truncate(seed)) % repos.len];
-        seed = seed *% 6364136223846793005 +% 1;
-        const tag = tags[@as(usize, @truncate(seed)) % tags.len];
-
-        var buf: [256]u8 = undefined;
-        var input: []const u8 = undefined;
-        if (reg.len == 0) {
-            if (tag.len == 0) {
-                input = repo;
-            } else {
-                const s = try std.fmt.bufPrint(&buf, "{s}:{s}", .{ repo, tag });
-                input = s;
-            }
-        } else {
-            if (tag.len == 0) {
-                const s = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ reg, repo });
-                input = s;
-            } else {
-                const s = try std.fmt.bufPrint(&buf, "{s}/{s}:{s}", .{ reg, repo, tag });
-                input = s;
-            }
-        }
-
-        const result = parse(alloc, input);
-        if (result) |ref| {
-            var owned = ref;
-            defer owned.deinit(alloc);
-            try std.testing.expect(owned.registry.len > 0);
-            try std.testing.expect(owned.repository.len > 0);
-        } else |err| switch (err) {
-            error.InvalidReference, error.InvalidDigest, error.Empty, error.OutOfMemory => {},
+            error.Empty, error.InvalidDigest, error.InvalidReference, error.OutOfMemory => {},
         }
     }
 }

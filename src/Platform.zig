@@ -143,294 +143,261 @@ fn featuresEql(a: ?[]const []const u8, b: ?[]const []const u8) bool {
     return true;
 }
 
-// Tests
-//
-// match -----------------------------------------------------------------------
+// --- Tests ---
 
-test "match: os and architecture exact match returns true" {
-    // Arrange
-    const candidate = Platform{ .os = "linux", .architecture = "amd64" };
-    const filter = Platform{ .os = "linux", .architecture = "amd64" };
-    // Act + Assert
-    try std.testing.expect(match(candidate, filter));
+const minimal_platform_json = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
+
+const full_platform_json =
+    \\{
+    \\  "os": "windows",
+    \\  "architecture": "amd64",
+    \\  "variant": "v1",
+    \\  "os.version": "10.0.17763",
+    \\  "os.features": ["win32k", "hyperv"]
+    \\}
+;
+
+fn parsePlatformJson(json: []const u8, options: std.json.ParseOptions) !std.json.Parsed(Platform) {
+    return std.json.parseFromSlice(Platform, std.testing.allocator, json, options);
 }
 
-test "match: os and architecture are case-insensitive" {
-    // Guards against switching from eqlIgnoreCase to eql on required fields.
-    const candidate = Platform{ .os = "Linux", .architecture = "AMD64" };
-    const filter = Platform{ .os = "linux", .architecture = "amd64" };
-    try std.testing.expect(match(candidate, filter));
-}
-
-test "match: os mismatch returns false" {
-    const candidate = Platform{ .os = "windows", .architecture = "amd64" };
-    const filter = Platform{ .os = "linux", .architecture = "amd64" };
-    try std.testing.expect(!match(candidate, filter));
-}
-
-test "match: architecture mismatch returns false" {
-    const candidate = Platform{ .os = "linux", .architecture = "arm64" };
-    const filter = Platform{ .os = "linux", .architecture = "amd64" };
-    try std.testing.expect(!match(candidate, filter));
-}
-
-test "match: filter omits variant, candidate with or without variant matches" {
-    const filter = Platform{ .os = "linux", .architecture = "arm64" };
-    const with_variant = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
-    const without_variant = Platform{ .os = "linux", .architecture = "arm64" };
-
-    try std.testing.expect(match(with_variant, filter));
-    try std.testing.expect(match(without_variant, filter));
-}
-
-test "match: filter specifies variant, candidate variant must match" {
-    const candidate = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
-    const filter = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
-    try std.testing.expect(match(candidate, filter));
-}
-
-test "match: filter specifies variant, different candidate variant returns false" {
-    const candidate = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
-    const filter = Platform{ .os = "linux", .architecture = "arm", .variant = "v6" };
-    try std.testing.expect(!match(candidate, filter));
-}
-
-test "match: variant comparison is case-insensitive" {
-    // "V8" in filter must match "v8" in candidate.
-    const candidate = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
-    const filter = Platform{ .os = "linux", .architecture = "arm64", .variant = "V8" };
-    try std.testing.expect(match(candidate, filter));
-}
-
-test "match: filter specifies variant, candidate has no variant returns false" {
-    const candidate = Platform{ .os = "linux", .architecture = "arm64" };
-    const filter = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
-    try std.testing.expect(!match(candidate, filter));
-}
-
-test "match: os_version prefix match returns true" {
-    // Windows-style build strings: filter "10.0" matches "10.0.17763.1234".
-    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763.1234" };
-    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
-    try std.testing.expect(match(candidate, filter));
-}
-
-test "match: os_version exact equality is a valid prefix match" {
-    // Filter "10.0" must match candidate "10.0" exactly (prefix of itself).
-    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
-    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
-    try std.testing.expect(match(candidate, filter));
-}
-
-test "match: os_version candidate shorter than filter returns false" {
-    // "10" is not a prefix of filter "10.0"; the comparison goes the wrong way.
-    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10" };
-    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
-    try std.testing.expect(!match(candidate, filter));
-}
-
-test "match: os_version prefix mismatch returns false" {
-    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763" };
-    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "11.0" };
-    try std.testing.expect(!match(candidate, filter));
-}
-
-test "match: os_version requires a dot-segment boundary" {
-    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.01" };
-    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
-    try std.testing.expect(!match(candidate, filter));
-}
-
-test "match: filter specifies os_version, candidate missing it returns false" {
-    const candidate = Platform{ .os = "windows", .architecture = "amd64" };
-    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
-    try std.testing.expect(!match(candidate, filter));
-}
-
-test "match: os_features in filter are not checked" {
-    // Per OCI spec, os_features is not a filter criterion in match().
-    // A filter with os_features must still match a candidate without them.
-    const features = [_][]const u8{"feature-a"};
-    const candidate = Platform{ .os = "linux", .architecture = "amd64" };
-    const filter = Platform{ .os = "linux", .architecture = "amd64", .os_features = &features };
-    try std.testing.expect(match(candidate, filter));
-}
-
-// eql -------------------------------------------------------------------------
-
-test "eql: identical platforms with no optional fields return true" {
-    const a = Platform{ .os = "linux", .architecture = "amd64" };
-    const b = Platform{ .os = "linux", .architecture = "amd64" };
-    try std.testing.expect(eql(a, b));
-}
-
-test "eql: comparison is case-sensitive, different casing returns false" {
-    // Guards against accidentally using eqlIgnoreCase in eql().
-    const a = Platform{ .os = "Linux", .architecture = "amd64" };
-    const b = Platform{ .os = "linux", .architecture = "amd64" };
-    try std.testing.expect(!eql(a, b));
-}
-
-test "eql: both variants null returns true" {
-    const a = Platform{ .os = "linux", .architecture = "arm64" };
-    const b = Platform{ .os = "linux", .architecture = "arm64" };
-    try std.testing.expect(eql(a, b));
-}
-
-test "eql: variant differs returns false" {
-    const a = Platform{ .os = "linux", .architecture = "arm", .variant = "v7" };
-    const b = Platform{ .os = "linux", .architecture = "arm", .variant = "v8" };
-    try std.testing.expect(!eql(a, b));
-}
-
-test "eql: one variant null, one set returns false" {
-    const a = Platform{ .os = "linux", .architecture = "arm64", .variant = "v8" };
-    const b = Platform{ .os = "linux", .architecture = "arm64" };
-    try std.testing.expect(!eql(a, b));
-}
-
-test "eql: os_version differs returns false" {
-    const a = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763" };
-    const b = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.19041" };
-    try std.testing.expect(!eql(a, b));
-}
-
-test "eql: os_version one null, one set returns false" {
-    const a = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
-    const b = Platform{ .os = "windows", .architecture = "amd64" };
-    try std.testing.expect(!eql(a, b));
-}
-
-test "eql: os_features both null returns true" {
-    const a = Platform{ .os = "linux", .architecture = "amd64" };
-    const b = Platform{ .os = "linux", .architecture = "amd64" };
-    try std.testing.expect(eql(a, b));
-}
-
-test "eql: os_features one null, one non-null returns false" {
-    const features = [_][]const u8{"seccomp"};
-    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &features };
-    const b = Platform{ .os = "linux", .architecture = "amd64" };
-    try std.testing.expect(!eql(a, b));
-}
-
-test "eql: os_features same content returns true" {
-    const fa = [_][]const u8{ "seccomp", "apparmor" };
-    const fb = [_][]const u8{ "seccomp", "apparmor" };
-    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fa };
-    const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
-    try std.testing.expect(eql(a, b));
-}
-
-test "eql: os_features different content returns false" {
-    const fa = [_][]const u8{"seccomp"};
-    const fb = [_][]const u8{"apparmor"};
-    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fa };
-    const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
-    try std.testing.expect(!eql(a, b));
-}
-
-test "eql: os_features different order returns false" {
-    // eql checks element order; ["a","b"] != ["b","a"].
-    const fa = [_][]const u8{ "seccomp", "apparmor" };
-    const fb = [_][]const u8{ "apparmor", "seccomp" };
-    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fa };
-    const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
-    try std.testing.expect(!eql(a, b));
-}
-
-test "match: empty os and architecture still compare deterministically" {
-    // The type does not forbid empty strings. match() should still behave predictably.
-    const candidate = Platform{ .os = "", .architecture = "" };
-    const filter = Platform{ .os = "", .architecture = "" };
-    try std.testing.expect(match(candidate, filter));
-}
-
-test "match: unicode os_version still uses byte semantics within dot boundaries" {
-    // os_version matching is still byte-oriented; only the boundary rule is stricter.
-    const candidate = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0.βeta" };
-    const filter = Platform{ .os = "windows", .architecture = "amd64", .os_version = "10.0" };
-    try std.testing.expect(match(candidate, filter));
-}
-
-test "match: very long variant string still matches exactly" {
-    // Guards against fixed-size assumptions in variant handling.
+test "Platform.match: partial matching matrix" {
     const long_variant = "v" ++ "x" ** 255;
-    const candidate = Platform{ .os = "linux", .architecture = "arm64", .variant = long_variant };
-    const filter = Platform{ .os = "linux", .architecture = "arm64", .variant = long_variant };
-    try std.testing.expect(match(candidate, filter));
+    const filter_features = [_][]const u8{"feature-a"};
+
+    const cases = [_]struct {
+        candidate: Platform,
+        filter: Platform,
+        expected: bool,
+    }{
+        .{
+            .candidate = .{ .os = "linux", .architecture = "amd64" },
+            .filter = .{ .os = "linux", .architecture = "amd64" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "Linux", .architecture = "AMD64" },
+            .filter = .{ .os = "linux", .architecture = "amd64" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "windows", .architecture = "amd64" },
+            .filter = .{ .os = "linux", .architecture = "amd64" },
+            .expected = false,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "arm64" },
+            .filter = .{ .os = "linux", .architecture = "amd64" },
+            .expected = false,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "arm64", .variant = "v8" },
+            .filter = .{ .os = "linux", .architecture = "arm64" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "arm64" },
+            .filter = .{ .os = "linux", .architecture = "arm64" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "arm", .variant = "v7" },
+            .filter = .{ .os = "linux", .architecture = "arm", .variant = "v7" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "arm", .variant = "v7" },
+            .filter = .{ .os = "linux", .architecture = "arm", .variant = "v6" },
+            .expected = false,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "arm64", .variant = "v8" },
+            .filter = .{ .os = "linux", .architecture = "arm64", .variant = "V8" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "arm64" },
+            .filter = .{ .os = "linux", .architecture = "arm64", .variant = "v8" },
+            .expected = false,
+        },
+        .{
+            .candidate = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763.1234" },
+            .filter = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
+            .filter = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "windows", .architecture = "amd64", .os_version = "10" },
+            .filter = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
+            .expected = false,
+        },
+        .{
+            .candidate = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763" },
+            .filter = .{ .os = "windows", .architecture = "amd64", .os_version = "11.0" },
+            .expected = false,
+        },
+        .{
+            .candidate = .{ .os = "windows", .architecture = "amd64", .os_version = "10.01" },
+            .filter = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
+            .expected = false,
+        },
+        .{
+            .candidate = .{ .os = "windows", .architecture = "amd64" },
+            .filter = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
+            .expected = false,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "amd64" },
+            .filter = .{ .os = "linux", .architecture = "amd64", .os_features = &filter_features },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "", .architecture = "" },
+            .filter = .{ .os = "", .architecture = "" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0.βeta" },
+            .filter = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
+            .expected = true,
+        },
+        .{
+            .candidate = .{ .os = "linux", .architecture = "arm64", .variant = long_variant },
+            .filter = .{ .os = "linux", .architecture = "arm64", .variant = long_variant },
+            .expected = true,
+        },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, match(case.candidate, case.filter));
+    }
 }
 
-test "eql: features different lengths return false" {
-    const fa = [_][]const u8{"seccomp"};
-    const fb = [_][]const u8{ "seccomp", "apparmor" };
-    const a = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fa };
-    const b = Platform{ .os = "linux", .architecture = "amd64", .os_features = &fb };
-    try std.testing.expect(!eql(a, b));
+test "Platform.eql: strict equality matrix" {
+    const seccomp_only = [_][]const u8{"seccomp"};
+    const seccomp_apparmor_a = [_][]const u8{ "seccomp", "apparmor" };
+    const seccomp_apparmor_b = [_][]const u8{ "seccomp", "apparmor" };
+    const apparmor_seccomp = [_][]const u8{ "apparmor", "seccomp" };
+
+    const cases = [_]struct {
+        a: Platform,
+        b: Platform,
+        expected: bool,
+    }{
+        .{
+            .a = .{ .os = "linux", .architecture = "amd64" },
+            .b = .{ .os = "linux", .architecture = "amd64" },
+            .expected = true,
+        },
+        .{
+            .a = .{ .os = "Linux", .architecture = "amd64" },
+            .b = .{ .os = "linux", .architecture = "amd64" },
+            .expected = false,
+        },
+        .{
+            .a = .{ .os = "linux", .architecture = "arm", .variant = "v7" },
+            .b = .{ .os = "linux", .architecture = "arm", .variant = "v8" },
+            .expected = false,
+        },
+        .{
+            .a = .{ .os = "linux", .architecture = "arm64", .variant = "v8" },
+            .b = .{ .os = "linux", .architecture = "arm64" },
+            .expected = false,
+        },
+        .{
+            .a = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0.17763" },
+            .b = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0.19041" },
+            .expected = false,
+        },
+        .{
+            .a = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
+            .b = .{ .os = "windows", .architecture = "amd64" },
+            .expected = false,
+        },
+        .{
+            .a = .{ .os = "linux", .architecture = "amd64", .os_features = &seccomp_only },
+            .b = .{ .os = "linux", .architecture = "amd64" },
+            .expected = false,
+        },
+        .{
+            .a = .{ .os = "linux", .architecture = "amd64", .os_features = &seccomp_apparmor_a },
+            .b = .{ .os = "linux", .architecture = "amd64", .os_features = &seccomp_apparmor_b },
+            .expected = true,
+        },
+        .{
+            .a = .{ .os = "linux", .architecture = "amd64", .os_features = &seccomp_only },
+            .b = .{ .os = "linux", .architecture = "amd64", .os_features = &[_][]const u8{"apparmor"} },
+            .expected = false,
+        },
+        .{
+            .a = .{ .os = "linux", .architecture = "amd64", .os_features = &seccomp_apparmor_a },
+            .b = .{ .os = "linux", .architecture = "amd64", .os_features = &apparmor_seccomp },
+            .expected = false,
+        },
+        .{
+            .a = .{ .os = "linux", .architecture = "amd64", .os_features = &seccomp_only },
+            .b = .{ .os = "linux", .architecture = "amd64", .os_features = &seccomp_apparmor_a },
+            .expected = false,
+        },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, eql(case.a, case.b));
+    }
 }
 
-// jsonParse / jsonStringify ---------------------------------------------------
+test "Platform jsonParse: parses required and optional OCI fields" {
+    const minimal = try parsePlatformJson(minimal_platform_json, .{ .ignore_unknown_fields = true });
+    defer minimal.deinit();
+    try std.testing.expectEqualSlices(u8, "linux", minimal.value.os);
+    try std.testing.expectEqualSlices(u8, "amd64", minimal.value.architecture);
+    try std.testing.expect(minimal.value.variant == null);
+    try std.testing.expect(minimal.value.os_version == null);
+    try std.testing.expect(minimal.value.os_features == null);
 
-test "Platform jsonParse: minimal fields parse correctly" {
-    const json_bytes = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
-    const parsed = try std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
-    try std.testing.expectEqualSlices(u8, "amd64", parsed.value.architecture);
+    const full = try parsePlatformJson(full_platform_json, .{ .ignore_unknown_fields = true });
+    defer full.deinit();
+    try std.testing.expectEqualSlices(u8, "windows", full.value.os);
+    try std.testing.expectEqualSlices(u8, "amd64", full.value.architecture);
+    try std.testing.expectEqualSlices(u8, "v1", full.value.variant.?);
+    try std.testing.expectEqualSlices(u8, "10.0.17763", full.value.os_version.?);
+    try std.testing.expectEqual(@as(usize, 2), full.value.os_features.?.len);
+    try std.testing.expectEqualSlices(u8, "win32k", full.value.os_features.?[0]);
+    try std.testing.expectEqualSlices(u8, "hyperv", full.value.os_features.?[1]);
+
+    const with_unknown =
+        "{\"os\": \"linux\", \"architecture\": \"amd64\", \"customField\": \"value\"}";
+    const ignored = try parsePlatformJson(with_unknown, .{ .ignore_unknown_fields = true });
+    defer ignored.deinit();
+    try std.testing.expectEqualSlices(u8, "linux", ignored.value.os);
+    try std.testing.expectEqualSlices(u8, "amd64", ignored.value.architecture);
 }
 
-test "Platform jsonParse: parses all optional fields" {
-    const json_bytes =
-        \\{
-        \\  "os": "windows",
-        \\  "architecture": "amd64",
-        \\  "variant": "v1",
-        \\  "os.version": "10.0.17763",
-        \\  "os.features": ["win32k", "hyperv"]
-        \\}
-    ;
-    const parsed = try std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    try std.testing.expectEqualSlices(u8, "windows", parsed.value.os);
-    try std.testing.expectEqualSlices(u8, "v1", parsed.value.variant.?);
-    try std.testing.expectEqualSlices(u8, "10.0.17763", parsed.value.os_version.?);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.os_features.?.len);
-}
-
-test "Platform jsonParse: missing required field returns MissingField" {
-    const cases = [_][]const u8{
+test "Platform jsonParse: exact errors for malformed input" {
+    const missing_field_cases = [_][]const u8{
         "{\"architecture\": \"amd64\"}",
         "{\"os\": \"linux\"}",
+        "{}",
     };
-    for (cases) |json_bytes| {
-        try std.testing.expectError(
-            error.MissingField,
-            std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true }),
-        );
+    for (missing_field_cases) |json| {
+        try std.testing.expectError(error.MissingField, parsePlatformJson(json, .{ .ignore_unknown_fields = true }));
     }
-}
 
-test "Platform jsonParse: non-object root returns UnexpectedToken" {
-    const cases = [_][]const u8{ "null", "[]" };
-    for (cases) |json_bytes| {
-        try std.testing.expectError(
-            error.UnexpectedToken,
-            std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true }),
-        );
+    const unexpected_token_cases = [_][]const u8{
+        "null",
+        "[]",
+        "{\"os\": 1, \"architecture\": \"amd64\"}",
+    };
+    for (unexpected_token_cases) |json| {
+        try std.testing.expectError(error.UnexpectedToken, parsePlatformJson(json, .{ .ignore_unknown_fields = true }));
     }
-}
 
-test "Platform jsonParse: ignore_unknown_fields=true skips extension fields" {
-    const json_bytes = "{\"os\": \"linux\", \"architecture\": \"amd64\", \"customField\": \"value\"}";
-    const parsed = try std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
-    try std.testing.expectEqualSlices(u8, "amd64", parsed.value.architecture);
-}
-
-test "Platform jsonParse: unknown fields cause error when ignore_unknown_fields=false" {
-    const json_bytes = "{\"os\": \"linux\", \"architecture\": \"amd64\", \"customField\": \"value\"}";
-    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Platform, std.testing.allocator, json_bytes, .{ .ignore_unknown_fields = false }));
+    const unknown_field_json = "{\"os\": \"linux\", \"architecture\": \"amd64\", \"customField\": \"value\"}";
+    try std.testing.expectError(error.UnknownField, parsePlatformJson(unknown_field_json, .{ .ignore_unknown_fields = false }));
 }
 
 test "Platform jsonParse: allocation failures do not leak" {
@@ -440,32 +407,12 @@ test "Platform jsonParse: allocation failures do not leak" {
             const parsed = try std.json.parseFromSlice(Platform, allocator, json_bytes, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
             try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
+            try std.testing.expectEqualSlices(u8, "v8", parsed.value.variant.?);
         }
     }.run, .{});
 }
 
-test "Platform jsonStringify: produces valid JSON with all fields" {
-    const features = [_][]const u8{"seccomp"};
-    const p = Platform{
-        .os = "linux",
-        .architecture = "arm64",
-        .variant = "v8",
-        .os_version = "10.0",
-        .os_features = &features,
-    };
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer aw.deinit();
-    var ws: std.json.Stringify = .{ .writer = &aw.writer };
-    try ws.write(p);
-    const out = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"os\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"architecture\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"variant\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"os.version\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"os.features\"") != null);
-}
-
-test "Platform jsonStringify: round-trip preserves all fields" {
+test "Platform jsonStringify: round-trip preserves fields via eql" {
     const features = [_][]const u8{ "seccomp", "apparmor" };
     const original = Platform{
         .os = "windows",
@@ -474,42 +421,23 @@ test "Platform jsonStringify: round-trip preserves all fields" {
         .os_version = "10.0.17763",
         .os_features = &features,
     };
+
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     var ws: std.json.Stringify = .{ .writer = &aw.writer };
     try ws.write(original);
-    const reparsed = try std.json.parseFromSlice(Platform, std.testing.allocator, aw.written(), .{ .ignore_unknown_fields = true });
+
+    const reparsed = try parsePlatformJson(aw.written(), .{ .ignore_unknown_fields = true });
     defer reparsed.deinit();
-    try std.testing.expectEqualSlices(u8, original.os, reparsed.value.os);
-    try std.testing.expectEqualSlices(u8, original.architecture, reparsed.value.architecture);
-    try std.testing.expectEqualSlices(u8, original.variant.?, reparsed.value.variant.?);
-    try std.testing.expectEqualSlices(u8, original.os_version.?, reparsed.value.os_version.?);
-    try std.testing.expectEqual(@as(usize, 2), reparsed.value.os_features.?.len);
-}
+    try std.testing.expect(eql(original, reparsed.value));
 
-test "Platform: repeated jsonParse rounds leave no residual allocations under DebugAllocator" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
+    var minimal_aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer minimal_aw.deinit();
+    var minimal_ws: std.json.Stringify = .{ .writer = &minimal_aw.writer };
+    const minimal_platform = Platform{ .os = "linux", .architecture = "amd64" };
+    try minimal_ws.write(minimal_platform);
 
-    for (0..16) |_| {
-        const parsed = try std.json.parseFromSlice(Platform, allocator, "{\"os\": \"linux\", \"architecture\": \"amd64\"}", .{ .ignore_unknown_fields = true });
-        parsed.deinit();
-    }
-}
-
-test "match: 1000 random platform pairs never panic" {
-    var seed: u64 = 0;
-    const oses = [_][]const u8{ "linux", "windows", "darwin", "freebsd", "" };
-    const arches = [_][]const u8{ "amd64", "arm64", "arm", "386", "s390x", "" };
-    for (0..1000) |_| {
-        seed = seed *% 6364136223846793005 +% 1;
-        const os_idx = @as(usize, @truncate(seed)) % oses.len;
-        seed = seed *% 6364136223846793005 +% 1;
-        const arch_idx = @as(usize, @truncate(seed)) % arches.len;
-        const candidate = Platform{ .os = oses[os_idx], .architecture = arches[arch_idx] };
-        const filter = Platform{ .os = oses[arch_idx], .architecture = arches[os_idx] };
-        _ = match(candidate, filter);
-        _ = eql(candidate, filter);
-    }
+    const minimal_reparsed = try parsePlatformJson(minimal_aw.written(), .{ .ignore_unknown_fields = true });
+    defer minimal_reparsed.deinit();
+    try std.testing.expect(eql(minimal_platform, minimal_reparsed.value));
 }

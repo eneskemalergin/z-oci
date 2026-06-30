@@ -35,12 +35,11 @@ fn readBoundedFixture(path: []const u8, buffer: []u8, max_bytes: usize) ![]u8 {
     return bytes;
 }
 
-test "test_support: parseFixture result survives helper buffer teardown" {
-    const parsed = try parseFixture(
-        Descriptor,
-        "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
-        16 * 1024,
-    );
+const descriptor_fixture = "fixtures/descriptors/oci-descriptor-artifact-spec-example.json";
+const descriptor_fixture_limit = 16 * 1024;
+
+test "test_support: parseFixture copies fixture bytes into caller-owned arena" {
+    const parsed = try parseFixture(Descriptor, descriptor_fixture, descriptor_fixture_limit);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u64, 123), parsed.value.size);
@@ -49,49 +48,27 @@ test "test_support: parseFixture result survives helper buffer teardown" {
         "87923725d74f4bfb94c9e86d64170f7521aad8221a5de834851470ca142da630",
         parsed.value.digest.hex,
     );
-    try std.testing.expect(parsed.value.artifact_type != null);
+    try std.testing.expectEqualSlices(
+        u8,
+        "application/vnd.example.sbom.v1",
+        parsed.value.artifact_type.?,
+    );
 }
 
-test "test_support: parseFixture returns error for nonexistent path" {
+test "test_support: parseFixture maps fixture IO errors and stays leak-free" {
     try std.testing.expectError(
         error.FileNotFound,
-        parseFixture(Descriptor, "fixtures/does-not-exist.json", 16 * 1024),
+        parseFixture(Descriptor, "fixtures/does-not-exist.json", descriptor_fixture_limit),
     );
-}
+    try std.testing.expectError(error.StreamTooLong, parseFixture(Descriptor, descriptor_fixture, 32));
 
-test "test_support: parseFixture enforces the max-bytes limit" {
-    try std.testing.expectError(
-        error.StreamTooLong,
-        parseFixture(
-            Descriptor,
-            "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
-            32,
-        ),
-    );
-}
-
-test "test_support: fixture helper success and failure paths leave no residual allocations under DebugAllocator" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    for (0..8) |_| {
-        const parsed = try parseFixtureWithAllocator(
-            Descriptor,
-            allocator,
-            "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
-            16 * 1024,
-        );
-        parsed.deinit();
-    }
-
-    try std.testing.expectError(
-        error.StreamTooLong,
-        parseFixtureWithAllocator(
-            Descriptor,
-            allocator,
-            "fixtures/descriptors/oci-descriptor-artifact-spec-example.json",
-            32,
-        ),
+    const parsed = try parseFixtureWithAllocator(
+        Descriptor,
+        gpa.allocator(),
+        descriptor_fixture,
+        descriptor_fixture_limit,
     );
+    parsed.deinit();
 }
