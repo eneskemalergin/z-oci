@@ -2218,10 +2218,6 @@ fn isChallengeStart(raw: []const u8) bool {
 fn isAuthWhitespace(char: u8) bool {
     return char == ' ' or char == '\t';
 }
-// Tests
-// Fuzz tests for the WWW-Authenticate parser ----------------------------------
-// Memory stress tests ---------------------------------------------------------
-
 // --- Tests ---
 
 test "auth: types compile with representative values" {
@@ -2294,7 +2290,7 @@ test "auth: authConfigView keeps only auth-relevant fields" {
     try std.testing.expectEqualStrings("/tmp/custom-ca.pem", view.ca_bundle_path.?);
 }
 test "auth: provider credentials borrow provider-owned storage" {
-    const State = struct {
+    const MockHarness = struct {
         var username = [_]u8{ 'u', 's', 'e', 'r' };
         var secret = [_]u8{ 't', 'o', 'k', 'e', 'n' };
 
@@ -2307,15 +2303,15 @@ test "auth: provider credentials borrow provider-owned storage" {
         }
     };
 
-    const provider = CredentialProvider{ .getCredentialFn = State.get };
+    const provider = CredentialProvider{ .getCredentialFn = MockHarness.get };
     const cred = provider.getCredential("ghcr.io").?.credential;
 
-    try std.testing.expectEqual(@intFromPtr(cred.username.ptr), @intFromPtr(&State.username[0]));
-    try std.testing.expectEqual(@intFromPtr(cred.secret.ptr), @intFromPtr(&State.secret[0]));
+    try std.testing.expectEqual(@intFromPtr(cred.username.ptr), @intFromPtr(&MockHarness.username[0]));
+    try std.testing.expectEqual(@intFromPtr(cred.secret.ptr), @intFromPtr(&MockHarness.secret[0]));
 
-    State.secret[0] = 'T';
+    MockHarness.secret[0] = 'T';
     try std.testing.expectEqual(@as(u8, 'T'), cred.secret[0]);
-    State.secret[0] = 't';
+    MockHarness.secret[0] = 't';
 }
 test "auth: engine resolves credential handle for registry" {
     const provider = CredentialProvider{
@@ -2340,7 +2336,7 @@ test "auth: authConfigView records env credential variable names" {
     try std.testing.expectEqualStrings("Z_OCI_REGISTRY_TOKEN", view.env_registry_token);
 }
 test "AuthEngine.credentialForRegistry: explicit config provider wins before env" {
-    const State = struct {
+    const MockHarness = struct {
         fn get(registry: []const u8) ?CredentialHandle {
             if (!std.mem.eql(u8, registry, "ghcr.io")) return null;
             return .{ .credential = .{ .username = "config-user", .secret = "config-token" } };
@@ -2353,7 +2349,7 @@ test "AuthEngine.credentialForRegistry: explicit config provider wins before env
     try environ_map.put(ENV_REGISTRY_USER, "env-user");
     try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
-    const provider = CredentialProvider{ .getCredentialFn = State.get };
+    const provider = CredentialProvider{ .getCredentialFn = MockHarness.get };
     var engine = AuthEngine.initWithEnvironmentMap(std.testing.allocator, .{ .credential_provider = &provider }, &environ_map);
     const handle = (try engine.credentialForRegistry("ghcr.io")).?;
 
@@ -2391,14 +2387,14 @@ test "envCredentialForRegistry: returns owned copies independent of environ map"
     try std.testing.expectEqualStrings("env-token", handle.credential.secret);
 }
 test "ownedCredentialHandle: allocation failures do not leak username or secret" {
-    const State = struct {
+    const MockHarness = struct {
         fn run(allocator: std.mem.Allocator) !void {
             const handle = try ownedCredentialHandle(allocator, "user", "secret");
             handle.release();
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "envCredentialForRegistry: allocation failures do not leak" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
@@ -2407,7 +2403,7 @@ test "envCredentialForRegistry: allocation failures do not leak" {
     try environ_map.put(ENV_REGISTRY_USER, "env-user");
     try environ_map.put(ENV_REGISTRY_TOKEN, "env-token");
 
-    const State = struct {
+    const MockHarness = struct {
         fn run(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) !void {
             const handle = (try envCredentialForRegistry(allocator, env_map, "ghcr.io")) orelse
                 return;
@@ -2415,10 +2411,10 @@ test "envCredentialForRegistry: allocation failures do not leak" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{&environ_map});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{&environ_map});
 }
 test "AuthEngine.credentialForRegistry: env allocation failures propagate without leaking" {
-    const State = struct {
+    const MockHarness = struct {
         fn run(allocator: std.mem.Allocator) !void {
             var environ_map = std.process.Environ.Map.init(allocator);
             defer environ_map.deinit();
@@ -2434,7 +2430,7 @@ test "AuthEngine.credentialForRegistry: env allocation failures propagate withou
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "ownedCredentialHandle: release_allocator matches dup allocator" {
     const handle = try ownedCredentialHandle(std.testing.allocator, "user", "secret");
@@ -2573,7 +2569,7 @@ test "parseDockerConfig: rejects malformed auth entries at lookup time" {
 test "decodeDockerConfigAuthCredential: allocation failures do not leak username or secret" {
     const encoded_auth = "b2N0b2NhdDpnaHBfZXhhbXBsZQ==";
 
-    const State = struct {
+    const MockHarness = struct {
         fn run(allocator: std.mem.Allocator) !void {
             const credential = try decodeDockerConfigAuthCredential(allocator, encoded_auth);
             defer {
@@ -2587,7 +2583,7 @@ test "decodeDockerConfigAuthCredential: allocation failures do not leak username
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "parseDockerConfig: authCredentialForRegistry allocation failures do not leak on cache insert" {
     // Index is built with std.testing.allocator; only lookup/insert runs under failing allocator.
@@ -2601,7 +2597,7 @@ test "parseDockerConfig: authCredentialForRegistry allocation failures do not le
         \\}
     ;
 
-    const State = struct {
+    const MockHarness = struct {
         fn run(failing_allocator: std.mem.Allocator) !void {
             var docker_config = try parseDockerConfig(std.testing.allocator, docker_config_json);
             defer docker_config.deinit(std.testing.allocator);
@@ -2613,7 +2609,7 @@ test "parseDockerConfig: authCredentialForRegistry allocation failures do not le
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "parseDockerConfig: parse and deinit stay safe under allocation failures" {
     const docker_config_json =
@@ -2633,14 +2629,14 @@ test "parseDockerConfig: parse and deinit stay safe under allocation failures" {
         \\}
     ;
 
-    const State = struct {
+    const MockHarness = struct {
         fn run(allocator: std.mem.Allocator) !void {
             var docker_config = try parseDockerConfig(allocator, docker_config_json);
             defer docker_config.deinit(allocator);
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "parseDockerConfig: single-registry lookup ignores malformed auths for other registries" {
     var docker_config = try parseDockerConfig(std.testing.allocator,
@@ -3184,7 +3180,7 @@ test "runDockerCredentialHelperCommand: failed helper does not poison the next h
     try std.testing.expectEqualStrings("secret", handle.credential.secret);
 }
 test "AuthEngine.dockerCredentialForRegistry: helper path beats inline auth when helper context exists" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn runner(allocator: std.mem.Allocator, _: std.Io, helper_suffix: []const u8, server_url: []const u8, timeout: std.Io.Timeout) AuthError!CredentialHandle {
@@ -3217,18 +3213,18 @@ test "AuthEngine.dockerCredentialForRegistry: helper path beats inline auth when
     defer engine.deinit();
     engine.docker_helper_config = .{
         .io = std.testing.io,
-        .runner = State.runner,
+        .runner = MockHarness.runner,
     };
 
     const handle = (try engine.dockerCredentialForRegistry("ghcr.io")).?;
     defer handle.release();
 
-    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.calls);
     try std.testing.expectEqualStrings("helper-user", handle.credential.username);
     try std.testing.expectEqualStrings("helper-secret", handle.credential.secret);
 }
 test "AuthEngine.dockerCredentialForRegistry: Quay global helper canonicalizes mixed-case registry host" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn runner(allocator: std.mem.Allocator, _: std.Io, helper_suffix: []const u8, server_url: []const u8, _: std.Io.Timeout) AuthError!CredentialHandle {
@@ -3245,12 +3241,12 @@ test "AuthEngine.dockerCredentialForRegistry: Quay global helper canonicalizes m
         \\}
     );
     defer engine.deinit();
-    engine.docker_helper_config = .{ .io = std.testing.io, .runner = State.runner };
+    engine.docker_helper_config = .{ .io = std.testing.io, .runner = MockHarness.runner };
 
     const handle = (try engine.dockerCredentialForRegistry("QuAy.IO")).?;
     defer handle.release();
 
-    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.calls);
     try std.testing.expectEqualStrings("quay-user", handle.credential.username);
     try std.testing.expectEqualStrings("quay-secret", handle.credential.secret);
 }
@@ -3542,7 +3538,7 @@ test "ownedCredentialHandle.release: exercises secureZero-on-free path" {
     handle.release();
 }
 test "TokenHttpRequest.deinit: post teardown stays leak-free under allocation failure" {
-    const State = struct {
+    const MockHarness = struct {
         fn run(allocator: std.mem.Allocator) !void {
             const request = try AuthenticateRequest.init(
                 "ghcr.io",
@@ -3567,7 +3563,7 @@ test "TokenHttpRequest.deinit: post teardown stays leak-free under allocation fa
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "parseTokenResponse: accepts matching duplicate token fields and preserves refresh token" {
     var response = try parseTokenResponse(std.testing.allocator,
@@ -3620,7 +3616,7 @@ test "parseTokenResponse: malformed payloads are rejected" {
     }
 }
 test "parseTokenResponse: allocation failures do not leak owned token fields" {
-    const State = struct {
+    const MockHarness = struct {
         fn run(allocator: std.mem.Allocator) !void {
             var response = try parseTokenResponse(allocator,
                 \\{
@@ -3636,10 +3632,10 @@ test "parseTokenResponse: allocation failures do not leak owned token fields" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "buildTokenHttpRequest: allocation failures do not leak request-owned buffers" {
-    const State = struct {
+    const MockHarness = struct {
         fn run(allocator: std.mem.Allocator) !void {
             const request = try AuthenticateRequest.init(
                 "ghcr.io",
@@ -3666,10 +3662,10 @@ test "buildTokenHttpRequest: allocation failures do not leak request-owned buffe
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "AuthEngine.authenticate: uses post fallback after get failure" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -3697,8 +3693,8 @@ test "AuthEngine.authenticate: uses post fallback after get failure" {
         }
     };
 
-    State.calls = 0;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -3713,12 +3709,12 @@ test "AuthEngine.authenticate: uses post fallback after get failure" {
     var response = (try engine.authenticate(&client, request)).?;
     defer response.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqualStrings("post-token", response.access_token.value);
     try std.testing.expectEqual(@as(?u64, 120), response.access_token.expires_in_seconds);
 }
 test "AuthEngine.authenticate: retries transient 503 on token exchange then succeeds" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -3736,10 +3732,10 @@ test "AuthEngine.authenticate: retries transient 503 on token exchange then succ
         }
     };
 
-    defer State.calls = 0;
+    defer MockHarness.calls = 0;
     var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_network_retries = 1,
-    }, State.exchange);
+    }, MockHarness.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -3754,11 +3750,11 @@ test "AuthEngine.authenticate: retries transient 503 on token exchange then succ
     var response = (try engine.authenticate(&client, request)).?;
     defer response.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqualStrings("retry-token", response.access_token.value);
 }
 test "AuthEngine.authenticate: retries connection reset on token exchange then succeeds" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -3776,10 +3772,10 @@ test "AuthEngine.authenticate: retries connection reset on token exchange then s
         }
     };
 
-    defer State.calls = 0;
+    defer MockHarness.calls = 0;
     var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_network_retries = 1,
-    }, State.exchange);
+    }, MockHarness.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -3794,7 +3790,7 @@ test "AuthEngine.authenticate: retries connection reset on token exchange then s
     var response = (try engine.authenticate(&client, request)).?;
     defer response.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqualStrings("reset-token", response.access_token.value);
 }
 test "AuthEngine.authenticate: maps token transport Timeout ConnectionRefused and UnknownHostName" {
@@ -3807,7 +3803,7 @@ test "AuthEngine.authenticate: maps token transport Timeout ConnectionRefused an
     };
 
     for (cases) |case| {
-        const State = struct {
+        const MockHarness = struct {
             var transport_err: AuthError = undefined;
 
             fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -3816,8 +3812,8 @@ test "AuthEngine.authenticate: maps token transport Timeout ConnectionRefused an
             }
         };
 
-        State.transport_err = case.transport_err;
-        var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.exchange);
+        MockHarness.transport_err = case.transport_err;
+        var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.exchange);
         defer engine.deinit();
         var client: std.http.Client = undefined;
         const request = try AuthenticateRequest.init(
@@ -3833,7 +3829,7 @@ test "AuthEngine.authenticate: maps token transport Timeout ConnectionRefused an
     }
 }
 test "AuthEngine.authenticate: remembers POST-first realm preference after successful POST" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -3860,8 +3856,8 @@ test "AuthEngine.authenticate: remembers POST-first realm preference after succe
         }
     };
 
-    State.calls = 0;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
     const request_a = try AuthenticateRequest.init(
@@ -3884,12 +3880,12 @@ test "AuthEngine.authenticate: remembers POST-first realm preference after succe
     var first = (try engine.authenticate(&client, request_a)).?;
     defer first.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("post-first-token", first.access_token.value);
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
 
     var second = (try engine.authenticate(&client, request_b)).?;
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("post-first-token-2", second.access_token.value);
-    try std.testing.expectEqual(@as(usize, 3), State.calls);
+    try std.testing.expectEqual(@as(usize, 3), MockHarness.calls);
 }
 test "liveTokenHttpExchanger: invalid URL maps to TokenExchangeFailed" {
     const request = TokenHttpRequest{
@@ -3898,6 +3894,21 @@ test "liveTokenHttpExchanger: invalid URL maps to TokenExchangeFailed" {
     };
     var client: std.http.Client = undefined;
     try std.testing.expectError(error.TokenExchangeFailed, liveTokenHttpExchanger(std.testing.allocator, &client, request));
+}
+
+test "liveTokenHttpExchanger: valid URL reaches transport layer" {
+    const request = TokenHttpRequest{
+        .method = .get,
+        .url = try std.testing.allocator.dupe(u8, "http://127.0.0.1:1/"),
+    };
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const result = liveTokenHttpExchanger(std.testing.allocator, &client, request);
+    try std.testing.expectError(error.ConnectionRefused, result);
 }
 
 test "mapLiveTokenTransportError: maps transport and oversize errors without erasure" {
@@ -3996,7 +4007,7 @@ test "AuthEngine.loadDockerConfigFromEnvironment: oversize config file is a clea
 }
 test "AuthEngine.authenticate: max_token_cache_entries zero disables LRU eviction" {
     // limit == 0 skips evictLruTokenCacheEntriesUntilWithinLimit; cache may grow without bound.
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4012,10 +4023,10 @@ test "AuthEngine.authenticate: max_token_cache_entries zero disables LRU evictio
         }
     };
 
-    State.calls = 0;
+    MockHarness.calls = 0;
     var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_token_cache_entries = 0,
-    }, State.exchange);
+    }, MockHarness.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
 
@@ -4035,7 +4046,7 @@ test "AuthEngine.authenticate: max_token_cache_entries zero disables LRU evictio
     try std.testing.expectEqual(@as(usize, 3), engine.token_cache.count());
 }
 test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4051,10 +4062,10 @@ test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
         }
     };
 
-    defer State.calls = 0;
+    defer MockHarness.calls = 0;
     var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_rate_limit_retries = 0,
-    }, State.exchange);
+    }, MockHarness.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4067,10 +4078,10 @@ test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
     );
 
     try std.testing.expectError(error.RateLimited, engine.authenticate(&client, request));
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
 }
 test "AuthEngine.authenticate: GET 429 then POST auth failure stays TokenExchangeFailed" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4089,10 +4100,10 @@ test "AuthEngine.authenticate: GET 429 then POST auth failure stays TokenExchang
         }
     };
 
-    defer State.calls = 0;
+    defer MockHarness.calls = 0;
     var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_rate_limit_retries = 0,
-    }, State.exchange);
+    }, MockHarness.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4105,11 +4116,11 @@ test "AuthEngine.authenticate: GET 429 then POST auth failure stays TokenExchang
     );
 
     try std.testing.expectError(error.TokenExchangeFailed, engine.authenticate(&client, request));
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
 }
 test "AuthEngine.authenticate: oversize token transport body maps to TokenResponseTooLarge" {
     const custom_cap: usize = 4096;
-    const State = struct {
+    const MockHarness = struct {
         var seen_cap: ?usize = null;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4119,10 +4130,10 @@ test "AuthEngine.authenticate: oversize token transport body maps to TokenRespon
         }
     };
 
-    State.seen_cap = null;
+    MockHarness.seen_cap = null;
     var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_token_response_bytes = custom_cap,
-    }, State.exchange);
+    }, MockHarness.exchange);
     defer engine.deinit();
 
     var client: std.http.Client = undefined;
@@ -4136,10 +4147,10 @@ test "AuthEngine.authenticate: oversize token transport body maps to TokenRespon
     );
 
     try std.testing.expectError(error.TokenResponseTooLarge, engine.authenticate(&client, request));
-    try std.testing.expectEqual(custom_cap, State.seen_cap.?);
+    try std.testing.expectEqual(custom_cap, MockHarness.seen_cap.?);
 }
 test "AuthEngine.authenticate: rate-limit retry path stays leak-free under DebugAllocator" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4169,7 +4180,7 @@ test "AuthEngine.authenticate: rate-limit retry path stays leak-free under Debug
 
     var engine = AuthEngine.initWithTokenHttpExchanger(allocator, .{
         .max_rate_limit_retries = 1,
-    }, State.exchange);
+    }, MockHarness.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
 
@@ -4191,7 +4202,7 @@ test "AuthEngine.authenticate: rate-limit retry path stays leak-free under Debug
     }
 }
 test "AuthEngine.authenticate: cache hit reuses valid token response" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -4212,11 +4223,11 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
         }
     };
 
-    State.calls = 0;
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4230,9 +4241,9 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
 
     var first = (try engine.authenticate(&client, request)).?;
     defer first.deinit(std.testing.allocator);
-    State.fake_now = 1_002;
+    MockHarness.fake_now = 1_002;
     var second = (try engine.authenticate(&client, request)).?;
-    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.calls);
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("cached-token", first.access_token.value);
     try std.testing.expectEqualStrings("cached-token", second.access_token.value);
@@ -4250,7 +4261,7 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
     try std.testing.expectEqualStrings("cached-token", third.access_token.value);
 }
 test "AuthEngine.authenticate: cache miss borrows stored token without duplicate buffer" {
-    const State = struct {
+    const MockHarness = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
             defer request.deinit(std.testing.allocator);
             return .{ .status = .ok, .body =
@@ -4266,9 +4277,9 @@ test "AuthEngine.authenticate: cache miss borrows stored token without duplicate
         }
     };
 
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4289,7 +4300,7 @@ test "AuthEngine.authenticate: cache miss borrows stored token without duplicate
     );
 }
 test "AuthEngine.authenticate: token without expires_in expires after default cache TTL" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -4308,11 +4319,11 @@ test "AuthEngine.authenticate: token without expires_in expires after default ca
         }
     };
 
-    State.calls = 0;
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4326,22 +4337,22 @@ test "AuthEngine.authenticate: token without expires_in expires after default ca
 
     var first = (try engine.authenticate(&client, request)).?;
     defer first.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.calls);
     try std.testing.expectEqualStrings("no-expiry-token", first.access_token.value);
 
-    State.fake_now = 1_000 + DEFAULT_TOKEN_CACHE_TTL_SECONDS - TOKEN_REFRESH_WINDOW_SECONDS - 1;
+    MockHarness.fake_now = 1_000 + DEFAULT_TOKEN_CACHE_TTL_SECONDS - TOKEN_REFRESH_WINDOW_SECONDS - 1;
     var second = (try engine.authenticate(&client, request)).?;
     defer second.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), State.calls);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.calls);
 
-    State.fake_now += 1;
+    MockHarness.fake_now += 1;
     var third = (try engine.authenticate(&client, request)).?;
     defer third.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqualStrings("no-expiry-token", third.access_token.value);
 }
 test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -4361,13 +4372,13 @@ test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
         }
     };
 
-    State.calls = 0;
-    State.fake_now = 1_000;
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
     var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_token_cache_entries = 2,
-    }, State.exchange);
+    }, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const request_a = try AuthenticateRequest.init(
@@ -4397,12 +4408,12 @@ test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
 
     var first_a = (try engine.authenticate(&client, request_a)).?;
     defer first_a.deinit(std.testing.allocator);
-    State.fake_now += 1;
+    MockHarness.fake_now += 1;
     var first_b = (try engine.authenticate(&client, request_b)).?;
     defer first_b.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), engine.token_cache.count());
 
-    State.fake_now += 1;
+    MockHarness.fake_now += 1;
     var first_c = (try engine.authenticate(&client, request_c)).?;
     defer first_c.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), engine.token_cache.count());
@@ -4410,14 +4421,14 @@ test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
     try std.testing.expectEqualStrings("token-b", engine.token_cache.getAdapted(request_b, TokenCacheRequestContext{}).?.token.value);
     try std.testing.expectEqualStrings("token-c", engine.token_cache.getAdapted(request_c, TokenCacheRequestContext{}).?.token.value);
 
-    State.fake_now += 1;
+    MockHarness.fake_now += 1;
     var hit_b = (try engine.authenticate(&client, request_b)).?;
     defer hit_b.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 3), State.calls);
+    try std.testing.expectEqual(@as(usize, 3), MockHarness.calls);
     try std.testing.expectEqualStrings("token-b", hit_b.access_token.value);
 }
 test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -4446,11 +4457,11 @@ test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
         }
     };
 
-    State.calls = 0;
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4466,18 +4477,18 @@ test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
     defer first.deinit(std.testing.allocator);
     const first_token_value = try std.testing.allocator.dupe(u8, first.access_token.value);
     defer std.testing.allocator.free(first_token_value);
-    State.fake_now = 1_006;
+    MockHarness.fake_now = 1_006;
     var second = (try engine.authenticate(&client, request)).?;
     defer second.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("second-token", engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value);
     try std.testing.expectEqualStrings("first-token", first_token_value);
     try std.testing.expectEqualStrings("second-token", second.access_token.value);
 }
 test "AuthEngine.cachedTokenResponseForRequest: expired entry is dropped before cache miss" {
-    const State = struct {
+    const MockHarness = struct {
         fn now(_: *std.http.Client) u64 {
             return 2_000;
         }
@@ -4485,7 +4496,7 @@ test "AuthEngine.cachedTokenResponseForRequest: expired entry is dropped before 
 
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     const request = try AuthenticateRequest.init(
         "registry.example.test",
@@ -4512,7 +4523,7 @@ test "AuthEngine.cachedTokenResponseForRequest: expired entry is dropped before 
     try std.testing.expectEqual(@as(usize, 0), engine.token_cache.count());
 }
 test "AuthEngine.cachedTokenResponseForRequest: missing valid_until is treated as expired" {
-    const State = struct {
+    const MockHarness = struct {
         fn now(_: *std.http.Client) u64 {
             return 2_000;
         }
@@ -4520,7 +4531,7 @@ test "AuthEngine.cachedTokenResponseForRequest: missing valid_until is treated a
 
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     const request = try AuthenticateRequest.init(
         "registry.example.test",
@@ -4546,7 +4557,7 @@ test "AuthEngine.cachedTokenResponseForRequest: missing valid_until is treated a
     try std.testing.expectEqual(@as(usize, 0), engine.token_cache.count());
 }
 test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: invalidates exact cached entry and refetches" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -4575,11 +4586,11 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: invalidates exact cac
         }
     };
 
-    State.calls = 0;
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4598,12 +4609,12 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: invalidates exact cac
     var retried = (try engine.retryAuthenticateAfterCachedUnauthorized(&client, request)).?;
     defer retried.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("retried-token", retried.access_token.value);
 }
 test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: max_retries zero disables retry" {
-    const State = struct {
+    const MockHarness = struct {
         var fake_now: u64 = 1_000;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
@@ -4621,10 +4632,10 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: max_retries zero disa
         }
     };
 
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{ .max_retries = 0 }, State.exchange);
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{ .max_retries = 0 }, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4643,7 +4654,7 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: max_retries zero disa
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
 }
 test "AuthEngine.authenticate: different scopes keep separate cache entries" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -4673,11 +4684,11 @@ test "AuthEngine.authenticate: different scopes keep separate cache entries" {
         }
     };
 
-    State.calls = 0;
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const first_request = try AuthenticateRequest.init(
@@ -4702,13 +4713,13 @@ test "AuthEngine.authenticate: different scopes keep separate cache entries" {
     var second = (try engine.authenticate(&client, second_request)).?;
     defer second.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqual(@as(usize, 2), engine.token_cache.count());
     try std.testing.expectEqualStrings("scope-one-token", first.access_token.value);
     try std.testing.expectEqualStrings("scope-two-token", second.access_token.value);
 }
 test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: replacement keeps one exact entry" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -4737,11 +4748,11 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: replacement keeps one
         }
     };
 
-    State.calls = 0;
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
 
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -4758,12 +4769,12 @@ test "AuthEngine.retryAuthenticateAfterCachedUnauthorized: replacement keeps one
     var replaced = (try engine.retryAuthenticateAfterCachedUnauthorized(&client, request)).?;
     defer replaced.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("replacement-token", engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value);
 }
 test "AuthEngine.authenticate: allocation failures do not leak during cache insertion" {
-    const State = struct {
+    const MockHarness = struct {
         fn now(_: *std.http.Client) u64 {
             return 1_000;
         }
@@ -4795,7 +4806,7 @@ test "AuthEngine.authenticate: allocation failures do not leak during cache inse
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 test "AuthEngine.authenticate: optional basic auth credential matrix" {
     const cases = [_]struct {
@@ -4995,7 +5006,7 @@ test "AuthEngine.authenticate: env-owned credentials stay leak-free under DebugA
     }
 }
 test "AuthEngine.authenticate: repeated success and failure runs stay leak-free" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -5021,11 +5032,11 @@ test "AuthEngine.authenticate: repeated success and failure runs stay leak-free"
         }
     };
 
-    State.calls = 0;
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
         "registry.example.test",
@@ -5045,7 +5056,7 @@ test "AuthEngine.authenticate: repeated success and failure runs stay leak-free"
             else => try std.testing.expectError(error.TokenExchangeFailed, result),
         }
 
-        State.fake_now += 100;
+        MockHarness.fake_now += 100;
     }
 }
 test "token response: refresh window policy is fixed for short-lived cli use" {
@@ -5410,7 +5421,7 @@ test "parseChallengeChunk: 10000 pseudo-random challenge chunks never panic" {
     }
 }
 test "probe/authenticate: repeated success and failure runs leave no residual allocations under DebugAllocator" {
-    const State = struct {
+    const MockHarness = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
             defer request.deinit(allocator);
             return .{ .status = .ok, .body =
@@ -5427,7 +5438,7 @@ test "probe/authenticate: repeated success and failure runs leave no residual al
     const allocator = gpa.allocator();
 
     for (0..8) |_| {
-        var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, State.exchange);
+        var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, MockHarness.exchange);
         defer engine.deinit();
         var client: std.http.Client = undefined;
         const request = try AuthenticateRequest.init(
@@ -5495,7 +5506,7 @@ test "classifyProbeResponse: unsupported status code returns error" {
     );
 }
 test "AuthEngine: 1000x repeated authenticate (cache miss then hit) under DebugAllocator" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
         var fake_now: u64 = 1_000;
 
@@ -5519,11 +5530,11 @@ test "AuthEngine: 1000x repeated authenticate (cache miss then hit) under DebugA
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
     const allocator = gpa.allocator();
 
-    State.calls = 0;
-    State.fake_now = 1_000;
-    var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, State.exchange);
+    MockHarness.calls = 0;
+    MockHarness.fake_now = 1_000;
+    var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
         "registry.example.test",
@@ -5535,17 +5546,17 @@ test "AuthEngine: 1000x repeated authenticate (cache miss then hit) under DebugA
     );
 
     for (0..1000) |_| {
-        State.fake_now += 1;
+        MockHarness.fake_now += 1;
         var response = (try engine.authenticate(&client, request)).?;
         defer response.deinit(allocator);
         try std.testing.expectEqualStrings("stress-token", response.access_token.value);
     }
 
-    try std.testing.expect(State.calls >= 1);
+    try std.testing.expect(MockHarness.calls >= 1);
     try std.testing.expect(engine.token_cache.count() >= 1);
 }
 test "AuthEngine: 1000x authenticate with short-lived tokens under DebugAllocator" {
-    const State = struct {
+    const MockHarness = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
             defer request.deinit(allocator);
             return .{ .status = .ok, .body =
@@ -5565,9 +5576,9 @@ test "AuthEngine: 1000x authenticate with short-lived tokens under DebugAllocato
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
     const allocator = gpa.allocator();
 
-    var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, State.exchange);
+    var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, MockHarness.exchange);
     defer engine.deinit();
-    engine.now_unix_seconds_fn = State.now;
+    engine.now_unix_seconds_fn = MockHarness.now;
     var client: std.http.Client = undefined;
 
     for (0..1000) |_| {
@@ -5581,7 +5592,7 @@ test "AuthEngine: 1000x authenticate with short-lived tokens under DebugAllocato
     }
 }
 test "AuthEngine: 1000x fresh engine per authenticate stays leak-free under DebugAllocator" {
-    const State = struct {
+    const MockHarness = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
             defer request.deinit(allocator);
             return .{ .status = .ok, .body =
@@ -5598,7 +5609,7 @@ test "AuthEngine: 1000x fresh engine per authenticate stays leak-free under Debu
     const allocator = gpa.allocator();
 
     for (0..1000) |_| {
-        var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, State.exchange);
+        var engine = AuthEngine.initWithTokenHttpExchanger(allocator, Config{}, MockHarness.exchange);
         defer engine.deinit();
         var client: std.http.Client = undefined;
         const request = try AuthenticateRequest.init(

@@ -307,10 +307,19 @@ test "Manifest JSON: stringifies with camelCase field names" {
     defer aw.deinit();
     const out = aw.written();
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"schemaVersion\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"mediaType\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"config\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"layers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"schemaVersion\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"config\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"layers\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") != null);
+
+    const reparsed = try json.parse(Manifest, std.testing.allocator, out);
+    defer reparsed.deinit();
+    try std.testing.expectEqual(m.schema_version, reparsed.value.schema_version);
+    try std.testing.expectEqual(m.media_type, reparsed.value.media_type);
+    try std.testing.expectEqual(m.config.size, reparsed.value.config.size);
+    try std.testing.expectEqual(m.layers.len, reparsed.value.layers.len);
 }
 
 test "Manifest JSON: stringify/reparse preserves annotations leak-free" {
@@ -502,4 +511,29 @@ test "Manifest JSON: missing layers returns MissingField" {
         \\}
     ;
     try std.testing.expectError(error.MissingField, json.parse(Manifest, std.testing.allocator, json_bytes));
+}
+
+test "Manifest JSON: 10000 pseudo-random inputs never panic and only return declared outcomes" {
+    var seed: u64 = 0x51ce_b00c;
+    var buf: [256]u8 = undefined;
+
+    for (0..10_000) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const result = json.parse(Manifest, std.testing.allocator, buf[0..len]);
+        if (result) |parsed| {
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+            switch (parsed.value.media_type) {
+                .oci_manifest_v1, .docker_manifest_v2 => {},
+                else => return error.TestUnexpectedResult,
+            }
+        } else |_| {}
+    }
 }

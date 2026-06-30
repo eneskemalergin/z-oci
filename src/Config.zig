@@ -453,7 +453,7 @@ test "Config: credential_provider returns credentials for a registry" {
 }
 
 test "Config: credential handle release hook can tear down secrets" {
-    const State = struct {
+    const MockHarness = struct {
         var released = false;
 
         fn release(_: std.mem.Allocator, _: Credential) void {
@@ -470,11 +470,11 @@ test "Config: credential handle release hook can tear down secrets" {
         }
     };
 
-    const provider = CredentialProvider{ .getCredentialFn = State.get };
+    const provider = CredentialProvider{ .getCredentialFn = MockHarness.get };
     const handle = provider.getCredential("ghcr.io").?;
-    try std.testing.expect(!State.released);
+    try std.testing.expect(!MockHarness.released);
     handle.release();
-    try std.testing.expect(State.released);
+    try std.testing.expect(MockHarness.released);
 }
 
 test "Config: applyToClient is no-op when ca_bundle_path is null" {
@@ -580,7 +580,7 @@ test "Config: applyToClient allocation failures do not leak" {
     const abs_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
     defer std.testing.allocator.free(abs_path);
 
-    const State = struct {
+    const MockHarness = struct {
         fn run(failing_allocator: std.mem.Allocator, path: [:0]const u8) !void {
             var client = std.http.Client{
                 .allocator = failing_allocator,
@@ -593,7 +593,7 @@ test "Config: applyToClient allocation failures do not leak" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{abs_path});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{abs_path});
 }
 
 test "Config: applyToClient repeated loads stay leak-free under DebugAllocator" {

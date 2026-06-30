@@ -1591,10 +1591,6 @@ fn bodySha256DigestHex(body: []const u8) [Digest.Algorithm.sha256.hexLen()]u8 {
 fn digestMatchesSha256Hex(expected_digest: Digest, actual_hex: []const u8) bool {
     return expected_digest.algorithm == .sha256 and std.ascii.eqlIgnoreCase(expected_digest.hex, actual_hex);
 }
-fn sha256DigestStringAlloc(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    const digest_hex = bodySha256DigestHex(body);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{digest_hex[0..]});
-}
 fn failureOutcome(comptime Outcome: type, failure: ResolveError) Outcome {
     return .{ .failure = failure };
 }
@@ -1709,6 +1705,9 @@ fn testHttpHeadFromLines(allocator: std.mem.Allocator, status_line: []const u8, 
 }
 
 // --- Tests ---
+
+const test_matrix = @import("test_matrix.zig");
+const sha256DigestStringAlloc = test_matrix.sha256DigestStringAlloc;
 
 test "resolveRedirectUrlAlloc resolves relative redirect against manifest URL" {
     const base_url = "https://registry.example.test/v2/library/ubuntu/manifests/latest";
@@ -2258,6 +2257,22 @@ test "liveManifestHttpExchanger: invalid URL maps to TransportFailed" {
     try std.testing.expectError(error.TransportFailed, liveManifestHttpExchanger(std.testing.allocator, &client, request));
 }
 
+test "liveManifestHttpExchanger: valid URL reaches transport layer" {
+    const request = ManifestHttpRequest{
+        .method = .head,
+        .url = try std.testing.allocator.dupe(u8, "http://127.0.0.1:1/"),
+        .accept = &.{},
+    };
+    var client = std.http.Client{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    const result = liveManifestHttpExchanger(std.testing.allocator, &client, request);
+    try std.testing.expectError(error.ConnectionRefused, result);
+}
+
 test "mapLiveManifestTransportError: maps transport and oversize errors without erasure" {
     const cases = [_]struct { err: anyerror, expected: ManifestExchangeError }{
         .{ .err = error.OutOfMemory, .expected = error.OutOfMemory },
@@ -2287,12 +2302,11 @@ test "resolver error helpers keep registry, reference, and status" {
     try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(unsupported_algorithm_err));
 }
 test "performManifestHead retries transient 502 then succeeds" {
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2312,12 +2326,12 @@ test "performManifestHead retries transient 502 then succeeds" {
         }
     };
 
-    defer State.attempts = 0;
+    defer MockHarness.attempts = 0;
 
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_network_retries = 1,
-    }, State.tokenExchange);
+    }, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const ctx = ResolverParams.init(
@@ -2329,10 +2343,10 @@ test "performManifestHead retries transient 502 then succeeds" {
         .resolve,
     );
 
-    var outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), State.attempts);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
     switch (outcome) {
         .success => |metadata| {
             try std.testing.expectEqualStrings("application/vnd.oci.image.manifest.v1+json", metadata.content_type.?);
@@ -2341,12 +2355,11 @@ test "performManifestHead retries transient 502 then succeeds" {
     }
 }
 test "performManifestGet maps exhausted 504 to network_error" {
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2358,12 +2371,12 @@ test "performManifestGet maps exhausted 504 to network_error" {
         }
     };
 
-    defer State.attempts = 0;
+    defer MockHarness.attempts = 0;
 
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_network_retries = 1,
-    }, State.tokenExchange);
+    }, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const ctx = ResolverParams.init(
@@ -2375,12 +2388,12 @@ test "performManifestGet maps exhausted 504 to network_error" {
         .resolve,
     );
 
-    const outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestGet(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .failure => |failure| {
             try std.testing.expectEqualStrings("network_error", @tagName(failure));
             try std.testing.expectEqual(true, failure.network_error.transport_retries_exhausted);
-            try std.testing.expectEqual(@as(usize, 2), State.attempts);
+            try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
             failure.deinitOwned(std.testing.allocator);
         },
         else => return error.TestUnexpectedResult,
@@ -2407,13 +2420,12 @@ test "ManifestResponseMetadata.releaseOwned: clears owned slices in place" {
     try std.testing.expect(metadata.resilience_headers.len == 0);
 }
 test "performManifestGet repeated GET runs leave no residual allocations under DebugAllocator" {
-    const State = struct {
+    const MockHarness = struct {
         var body: []u8 = undefined;
         var digest: []u8 = undefined;
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2426,17 +2438,17 @@ test "performManifestGet repeated GET runs leave no residual allocations under D
         }
     };
 
-    State.body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
-    defer std.testing.allocator.free(State.body);
-    State.digest = try sha256DigestStringAlloc(std.testing.allocator, State.body);
-    defer std.testing.allocator.free(State.digest);
+    MockHarness.body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
+    defer std.testing.allocator.free(MockHarness.body);
+    MockHarness.digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.body);
+    defer std.testing.allocator.free(MockHarness.digest);
 
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
     const allocator = gpa.allocator();
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const ctx = ResolverParams.init(
@@ -2449,7 +2461,7 @@ test "performManifestGet repeated GET runs leave no residual allocations under D
     );
 
     for (0..32) |_| {
-        var outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        var outcome = try performManifestGet(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
         defer outcome.deinit(allocator);
         switch (outcome) {
             .success => |success| try std.testing.expect(success.backing_body == null),
@@ -2458,14 +2470,13 @@ test "performManifestGet repeated GET runs leave no residual allocations under D
     }
 }
 test "performManifestGet retry path leaves no residual allocations under DebugAllocator" {
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
         var body: []u8 = undefined;
         var digest: []u8 = undefined;
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2485,10 +2496,10 @@ test "performManifestGet retry path leaves no residual allocations under DebugAl
         }
     };
 
-    State.body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
-    defer std.testing.allocator.free(State.body);
-    State.digest = try sha256DigestStringAlloc(std.testing.allocator, State.body);
-    defer std.testing.allocator.free(State.digest);
+    MockHarness.body = try fixtureBodyAlloc(std.testing.allocator, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 16 * 1024);
+    defer std.testing.allocator.free(MockHarness.body);
+    MockHarness.digest = try sha256DigestStringAlloc(std.testing.allocator, MockHarness.body);
+    defer std.testing.allocator.free(MockHarness.digest);
 
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
@@ -2497,7 +2508,7 @@ test "performManifestGet retry path leaves no residual allocations under DebugAl
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{
         .max_network_retries = 1,
-    }, State.tokenExchange);
+    }, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const ctx = ResolverParams.init(
@@ -2510,23 +2521,22 @@ test "performManifestGet retry path leaves no residual allocations under DebugAl
     );
 
     for (0..16) |_| {
-        State.attempts = 0;
-        var outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        MockHarness.attempts = 0;
+        var outcome = try performManifestGet(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
         defer outcome.deinit(allocator);
         switch (outcome) {
             .success => |success| try std.testing.expect(success.backing_body == null),
             else => return error.TestUnexpectedResult,
         }
-        try std.testing.expectEqual(@as(usize, 2), State.attempts);
+        try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
     }
 }
 test "performManifestHead retry path leaves no residual allocations under DebugAllocator" {
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2553,7 +2563,7 @@ test "performManifestHead retry path leaves no residual allocations under DebugA
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(allocator, .{
         .max_network_retries = 1,
-    }, State.tokenExchange);
+    }, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const ctx = ResolverParams.init(
@@ -2566,7 +2576,7 @@ test "performManifestHead retry path leaves no residual allocations under DebugA
     );
 
     for (0..32) |_| {
-        var outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        var outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
         defer outcome.deinit(allocator);
 
         switch (outcome) {
@@ -2576,12 +2586,11 @@ test "performManifestHead retry path leaves no residual allocations under DebugA
     }
 }
 test "performManifestHead marks transport_retries_exhausted after rate-limit retries" {
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2596,12 +2605,12 @@ test "performManifestHead marks transport_retries_exhausted after rate-limit ret
         }
     };
 
-    defer State.attempts = 0;
+    defer MockHarness.attempts = 0;
 
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_rate_limit_retries = 1,
-    }, State.tokenExchange);
+    }, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const ctx = ResolverParams.init(
@@ -2613,19 +2622,19 @@ test "performManifestHead marks transport_retries_exhausted after rate-limit ret
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .failure => |failure| {
             try std.testing.expectEqualStrings("rate_limited", @tagName(failure));
             try std.testing.expectEqual(true, failure.rate_limited.transport_retries_exhausted);
-            try std.testing.expectEqual(@as(usize, 2), State.attempts);
+            try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
             failure.deinitOwned(std.testing.allocator);
         },
         else => return error.TestUnexpectedResult,
     }
 }
 test "performManifestGet preemptive sleep before request when engine carries exhausted registry rate limit" {
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
         var preemptive_sleep_ms: u32 = 0;
         var now_unix_seconds: i64 = 1_700_000_000;
@@ -2634,9 +2643,8 @@ test "performManifestGet preemptive sleep before request when engine carries exh
             return now_unix_seconds;
         }
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2658,14 +2666,14 @@ test "performManifestGet preemptive sleep before request when engine carries exh
         }
     };
     defer {
-        State.attempts = 0;
-        State.preemptive_sleep_ms = 0;
-        State.now_unix_seconds = 1_700_000_000;
+        MockHarness.attempts = 0;
+        MockHarness.preemptive_sleep_ms = 0;
+        MockHarness.now_unix_seconds = 1_700_000_000;
     }
 
     const hooks = resilience.TransportHooks{
-        .sleeper = State.sleeper,
-        .clock = .{ .now_unix_seconds = State.now },
+        .sleeper = MockHarness.sleeper,
+        .clock = .{ .now_unix_seconds = MockHarness.now },
     };
 
     var client: std.http.Client = undefined;
@@ -2679,7 +2687,7 @@ test "performManifestGet preemptive sleep before request when engine carries exh
     };
     var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(std.testing.allocator, .{
         .rate_limit_enabled = true,
-    }, State.tokenExchange, hooks);
+    }, MockHarness.tokenExchange, hooks);
     defer engine.deinit();
 
     const ctx = ResolverParams.initWithTransportHooks(
@@ -2692,23 +2700,22 @@ test "performManifestGet preemptive sleep before request when engine carries exh
         hooks,
     ).withManifestThrottle(&manifest_throttle);
 
-    var outcome = try performManifestGet(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), State.attempts);
-    try std.testing.expectEqual(@as(u32, 30_000), State.preemptive_sleep_ms);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.attempts);
+    try std.testing.expectEqual(@as(u32, 30_000), MockHarness.preemptive_sleep_ms);
     switch (outcome) {
         .success => {},
         else => return error.TestUnexpectedResult,
     }
 }
 test "performManifestHead does not retry not found" {
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2720,12 +2727,12 @@ test "performManifestHead does not retry not found" {
         }
     };
 
-    defer State.attempts = 0;
+    defer MockHarness.attempts = 0;
 
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_network_retries = 2,
-    }, State.tokenExchange);
+    }, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const ctx = ResolverParams.init(
@@ -2737,21 +2744,20 @@ test "performManifestHead does not retry not found" {
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .not_found => {
-            try std.testing.expectEqual(@as(usize, 1), State.attempts);
+            try std.testing.expectEqual(@as(usize, 1), MockHarness.attempts);
         },
         else => return error.TestUnexpectedResult,
     }
 }
 test "performManifestHead exhausts repeated 429 on rate limit budget" {
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
 
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2766,12 +2772,12 @@ test "performManifestHead exhausts repeated 429 on rate limit budget" {
         }
     };
 
-    defer State.attempts = 0;
+    defer MockHarness.attempts = 0;
 
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_rate_limit_retries = 1,
-    }, State.tokenExchange);
+    }, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const ctx = ResolverParams.init(
@@ -2783,10 +2789,10 @@ test "performManifestHead exhausts repeated 429 on rate limit budget" {
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestHead(ctx, &engine, MockHarness.manifestExchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .failure => |failure| {
-            try std.testing.expectEqual(@as(usize, 2), State.attempts);
+            try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
             try std.testing.expectEqualStrings("rate_limited", @tagName(failure));
             failure.deinitOwned(std.testing.allocator);
         },
@@ -2824,10 +2830,9 @@ test "acceptsManifestMediaType matches normalized exact entries and wildcard" {
     try std.testing.expect(!acceptsManifestMediaType(&.{"application/vnd.oci.image.index.v1+json"}, .docker_manifest_v2));
 }
 test "performManifestHead returns validate_single_arch_ok for validate operation" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2841,7 +2846,7 @@ test "performManifestHead returns validate_single_arch_ok for validate operation
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -2852,17 +2857,16 @@ test "performManifestHead returns validate_single_arch_ok for validate operation
         .validate,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     try std.testing.expectEqual(
         HeadRequestOutcome{ .validate_manifest_ok = MediaType.oci_manifest_v1 },
         outcome,
     );
 }
 test "performManifestHead rejects mismatched pinned digest on validate" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2878,7 +2882,7 @@ test "performManifestHead rejects mismatched pinned digest on validate" {
     const pinned_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -2889,7 +2893,7 @@ test "performManifestHead rejects mismatched pinned digest on validate" {
         .validate,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .failure => |failure| {
             switch (failure) {
@@ -2902,10 +2906,9 @@ test "performManifestHead rejects mismatched pinned digest on validate" {
     }
 }
 test "performManifestHead returns success for anonymous usable HEAD metadata" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2920,7 +2923,7 @@ test "performManifestHead returns success for anonymous usable HEAD metadata" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -2931,7 +2934,7 @@ test "performManifestHead returns success for anonymous usable HEAD metadata" {
         .resolve,
     );
 
-    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .success => |metadata| {
@@ -2945,10 +2948,9 @@ test "performManifestHead returns success for anonymous usable HEAD metadata" {
     }
 }
 test "performManifestHead falls back to GET when usable HEAD metadata is incomplete" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2961,7 +2963,7 @@ test "performManifestHead falls back to GET when usable HEAD metadata is incompl
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -2972,7 +2974,7 @@ test "performManifestHead falls back to GET when usable HEAD metadata is incompl
         .resolve,
     );
 
-    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .use_get_fallback => {},
@@ -2980,10 +2982,9 @@ test "performManifestHead falls back to GET when usable HEAD metadata is incompl
     }
 }
 test "performManifestHead returns not_found for missing manifest" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2993,7 +2994,7 @@ test "performManifestHead returns not_found for missing manifest" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3004,7 +3005,7 @@ test "performManifestHead returns not_found for missing manifest" {
         .resolve,
     );
 
-    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{});
     defer outcome.deinit(std.testing.allocator);
     switch (outcome) {
         .not_found => {},
@@ -3015,10 +3016,9 @@ test "performManifestHead maps transport failures into resolver failures" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3028,7 +3028,7 @@ test "performManifestHead maps transport failures into resolver failures" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3039,7 +3039,7 @@ test "performManifestHead maps transport failures into resolver failures" {
         .resolve,
     );
 
-    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{});
     defer outcome.deinit(arena.allocator());
     switch (outcome) {
         .failure => |err| try std.testing.expectEqualStrings("network_error", @tagName(err)),
@@ -3050,10 +3050,9 @@ test "performManifestHead rejects unsupported content type on HEAD success" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3067,7 +3066,7 @@ test "performManifestHead rejects unsupported content type on HEAD success" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3078,7 +3077,7 @@ test "performManifestHead rejects unsupported content type on HEAD success" {
         .resolve,
     );
 
-    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{});
     defer outcome.deinit(arena.allocator());
     switch (outcome) {
         .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
@@ -3089,10 +3088,9 @@ test "performManifestHead rejects known non-manifest content type on HEAD succes
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3106,7 +3104,7 @@ test "performManifestHead rejects known non-manifest content type on HEAD succes
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3117,7 +3115,7 @@ test "performManifestHead rejects known non-manifest content type on HEAD succes
         .resolve,
     );
 
-    var outcome = try performManifestHead(ctx, &engine, State.exchange, &.{});
+    var outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{});
     defer outcome.deinit(arena.allocator());
     switch (outcome) {
         .failure => |err| try std.testing.expectEqualStrings("content_type_mismatch", @tagName(err)),
@@ -3125,10 +3123,9 @@ test "performManifestHead rejects known non-manifest content type on HEAD succes
     }
 }
 test "performManifestGet parses OCI manifest fixture with normalized content type" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3148,7 +3145,7 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3162,7 +3159,7 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
     var outcome = try performManifestGet(
         ctx,
         &engine,
-        State.exchange,
+        MockHarness.exchange,
         &.{
             "application/vnd.oci.image.manifest.v1+json",
             "application/vnd.docker.distribution.manifest.v2+json",
@@ -3187,10 +3184,9 @@ test "performManifestGet parses OCI manifest fixture with normalized content typ
     }
 }
 test "performManifestGet parses Docker manifest fixture" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3206,7 +3202,7 @@ test "performManifestGet parses Docker manifest fixture" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3217,7 +3213,7 @@ test "performManifestGet parses Docker manifest fixture" {
         .get_manifest,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.docker.distribution.manifest.v2+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.docker.distribution.manifest.v2+json"});
     defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
@@ -3232,10 +3228,9 @@ test "performManifestGet parses Docker manifest fixture" {
     }
 }
 test "performManifestGet parses OCI index fixture" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3251,7 +3246,7 @@ test "performManifestGet parses OCI index fixture" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3262,7 +3257,7 @@ test "performManifestGet parses OCI index fixture" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.index.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.index.v1+json"});
     defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
@@ -3277,10 +3272,9 @@ test "performManifestGet parses OCI index fixture" {
     }
 }
 test "performManifestGet parses Docker manifest list fixture" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3296,7 +3290,7 @@ test "performManifestGet parses Docker manifest list fixture" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3307,7 +3301,7 @@ test "performManifestGet parses Docker manifest list fixture" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.docker.distribution.manifest.list.v2+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.docker.distribution.manifest.list.v2+json"});
     defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
@@ -3325,10 +3319,9 @@ test "performManifestGet maps missing body into manifest parse error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3341,7 +3334,7 @@ test "performManifestGet maps missing body into manifest parse error" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3352,7 +3345,7 @@ test "performManifestGet maps missing body into manifest parse error" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3364,10 +3357,9 @@ test "performManifestGet maps empty body into manifest parse error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3382,7 +3374,7 @@ test "performManifestGet maps empty body into manifest parse error" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3393,7 +3385,7 @@ test "performManifestGet maps empty body into manifest parse error" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3405,10 +3397,9 @@ test "performManifestGet maps unsupported content type into resolver failure" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3424,7 +3415,7 @@ test "performManifestGet maps unsupported content type into resolver failure" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3435,7 +3426,7 @@ test "performManifestGet maps unsupported content type into resolver failure" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3444,10 +3435,9 @@ test "performManifestGet maps unsupported content type into resolver failure" {
     }
 }
 test "performManifestGet rejects body whose declared mediaType disagrees with Content-Type" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3466,7 +3456,7 @@ test "performManifestGet rejects body whose declared mediaType disagrees with Co
     defer arena.deinit();
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3477,7 +3467,7 @@ test "performManifestGet rejects body whose declared mediaType disagrees with Co
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3486,10 +3476,9 @@ test "performManifestGet rejects body whose declared mediaType disagrees with Co
     }
 }
 test "performManifestGet verifies matching pinned digest reference" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3509,7 +3498,7 @@ test "performManifestGet verifies matching pinned digest reference" {
     defer std.testing.allocator.free(pinned_digest);
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3520,7 +3509,7 @@ test "performManifestGet verifies matching pinned digest reference" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
@@ -3532,10 +3521,9 @@ test "performManifestGet rejects mismatched response digest header" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3551,7 +3539,7 @@ test "performManifestGet rejects mismatched response digest header" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3562,7 +3550,7 @@ test "performManifestGet rejects mismatched response digest header" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3574,10 +3562,9 @@ test "performManifestGet rejects mismatched pinned digest reference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3592,7 +3579,7 @@ test "performManifestGet rejects mismatched pinned digest reference" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3603,7 +3590,7 @@ test "performManifestGet rejects mismatched pinned digest reference" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3615,10 +3602,9 @@ test "performManifestGet rejects unsupported digest algorithm in response header
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3634,7 +3620,7 @@ test "performManifestGet rejects unsupported digest algorithm in response header
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3645,7 +3631,7 @@ test "performManifestGet rejects unsupported digest algorithm in response header
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3654,10 +3640,9 @@ test "performManifestGet rejects unsupported digest algorithm in response header
     }
 }
 test "performManifestGet maps oversize transport body to response_too_large" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3667,7 +3652,7 @@ test "performManifestGet maps oversize transport body to response_too_large" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3678,7 +3663,7 @@ test "performManifestGet maps oversize transport body to response_too_large" {
         .resolve,
     );
 
-    const outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .failure => |failure| {
             defer failure.deinitOwned(std.testing.allocator);
@@ -3688,10 +3673,9 @@ test "performManifestGet maps oversize transport body to response_too_large" {
     }
 }
 test "performManifestGet maps oversize response headers to response_too_large" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3701,7 +3685,7 @@ test "performManifestGet maps oversize response headers to response_too_large" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3712,7 +3696,7 @@ test "performManifestGet maps oversize response headers to response_too_large" {
         .resolve,
     );
 
-    const outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .failure => |failure| {
             defer failure.deinitOwned(std.testing.allocator);
@@ -3723,7 +3707,7 @@ test "performManifestGet maps oversize response headers to response_too_large" {
 }
 test "performManifestGet maps oversize token response to auth_failed" {
     const custom_cap: usize = 4096;
-    const State = struct {
+    const MockHarness = struct {
         var seen_cap: ?usize = null;
 
         fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
@@ -3741,11 +3725,11 @@ test "performManifestGet maps oversize token response to auth_failed" {
         }
     };
 
-    State.seen_cap = null;
+    MockHarness.seen_cap = null;
     var client: std.http.Client = undefined;
     var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{
         .max_token_response_bytes = custom_cap,
-    }, State.tokenExchange);
+    }, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3756,7 +3740,7 @@ test "performManifestGet maps oversize token response to auth_failed" {
         .resolve,
     );
 
-    const outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .failure => |failure| {
             defer failure.deinitOwned(std.testing.allocator);
@@ -3764,16 +3748,15 @@ test "performManifestGet maps oversize token response to auth_failed" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectEqual(custom_cap, State.seen_cap.?);
+    try std.testing.expectEqual(custom_cap, MockHarness.seen_cap.?);
 }
 test "classifyGetManifestBody maps invalid JSON syntax to manifest_parse_error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3787,7 +3770,7 @@ test "classifyGetManifestBody maps invalid JSON syntax to manifest_parse_error" 
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3798,7 +3781,7 @@ test "classifyGetManifestBody maps invalid JSON syntax to manifest_parse_error" 
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3810,10 +3793,9 @@ test "classifyGetManifestBody maps header digest mismatch to digest_mismatch" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3828,7 +3810,7 @@ test "classifyGetManifestBody maps header digest mismatch to digest_mismatch" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(arena.allocator(), .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         arena.allocator(),
@@ -3839,7 +3821,7 @@ test "classifyGetManifestBody maps header digest mismatch to digest_mismatch" {
         .resolve,
     );
 
-    var outcome = try performManifestGet(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    var outcome = try performManifestGet(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     defer outcome.deinit(arena.allocator());
 
     switch (outcome) {
@@ -3848,10 +3830,9 @@ test "classifyGetManifestBody maps header digest mismatch to digest_mismatch" {
     }
 }
 test "performManifestHead: validate with platform falls back to GET" {
-    const State = struct {
-        fn tokenExchange(_: std.mem.Allocator, _: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
-            defer request.deinit(std.testing.allocator);
-            return error.TokenExchangeFailed;
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: auth.TokenHttpRequest) auth.AuthError!auth.TokenExchangeResponse {
+            return test_matrix.refuseTokenExchange(allocator, client, request);
         }
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -3865,7 +3846,7 @@ test "performManifestHead: validate with platform falls back to GET" {
     };
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3876,7 +3857,7 @@ test "performManifestHead: validate with platform falls back to GET" {
         .validate,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{
+    const outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{
         "application/vnd.oci.image.index.v1+json",
         "application/vnd.oci.image.manifest.v1+json",
     });
@@ -3890,7 +3871,7 @@ test "performManifestHead: validate with platform falls back to GET" {
     }
 }
 test "performManifestHead: second 401 after cached retry maps to auth_failed" {
-    const State = struct {
+    const MockHarness = struct {
         var manifest_call_count: usize = 0;
         var token_call_count: usize = 0;
         const stale_token_body = "{\"access_token\":\"stale-token\",\"expires_in\":3600}";
@@ -3923,12 +3904,12 @@ test "performManifestHead: second 401 after cached retry maps to auth_failed" {
     };
 
     defer {
-        State.manifest_call_count = 0;
-        State.token_call_count = 0;
+        MockHarness.manifest_call_count = 0;
+        MockHarness.token_call_count = 0;
     }
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
     const ctx = ResolverParams.init(
         std.testing.allocator,
@@ -3939,7 +3920,7 @@ test "performManifestHead: second 401 after cached retry maps to auth_failed" {
         .resolve,
     );
 
-    const outcome = try performManifestHead(ctx, &engine, State.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+    const outcome = try performManifestHead(ctx, &engine, MockHarness.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
     switch (outcome) {
         .failure => |failure| {
             try std.testing.expectEqualStrings("auth_failed", @tagName(failure));
@@ -3948,11 +3929,11 @@ test "performManifestHead: second 401 after cached retry maps to auth_failed" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectEqual(@as(usize, 3), State.manifest_call_count);
-    try std.testing.expectEqual(@as(usize, 2), State.token_call_count);
+    try std.testing.expectEqual(@as(usize, 3), MockHarness.manifest_call_count);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.token_call_count);
 }
 test "performManifestHead: allow_cached_auth_retry false skips token refresh" {
-    const State = struct {
+    const MockHarness = struct {
         var manifest_call_count: usize = 0;
         var token_call_count: usize = 0;
         const stale_token_body = "{\"access_token\":\"stale-token\",\"expires_in\":3600}";
@@ -3979,12 +3960,12 @@ test "performManifestHead: allow_cached_auth_retry false skips token refresh" {
     };
 
     defer {
-        State.manifest_call_count = 0;
-        State.token_call_count = 0;
+        MockHarness.manifest_call_count = 0;
+        MockHarness.token_call_count = 0;
     }
 
     var client: std.http.Client = undefined;
-    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, State.tokenExchange);
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, MockHarness.tokenExchange);
     defer engine.deinit();
 
     const request = ManifestRequest{
@@ -4003,14 +3984,14 @@ test "performManifestHead: allow_cached_auth_retry false skips token refresh" {
         request.operation,
     );
 
-    const exchange_outcome = exchangeManifestRequest(ctx, &engine, State.exchange, request, null);
+    const exchange_outcome = exchangeManifestRequest(ctx, &engine, MockHarness.exchange, request, null);
     const ok = switch (exchange_outcome) {
         .ok => |value| value,
         .transport_failed => return error.TestUnexpectedResult,
     };
     defer ok.response.deinit(std.testing.allocator);
 
-    const outcome = try classifyHeadResponse(ctx, &engine, State.exchange, request, ok.response.metadata, true, ok.budget);
+    const outcome = try classifyHeadResponse(ctx, &engine, MockHarness.exchange, request, ok.response.metadata, true, ok.budget);
     switch (outcome) {
         .failure => |failure| {
             try std.testing.expectEqualStrings("auth_failed", @tagName(failure));
@@ -4019,8 +4000,8 @@ test "performManifestHead: allow_cached_auth_retry false skips token refresh" {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectEqual(@as(usize, 2), State.manifest_call_count);
-    try std.testing.expectEqual(@as(usize, 1), State.token_call_count);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.manifest_call_count);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.token_call_count);
 }
 test "performManifestHead/Get: shared transport and classification matrix" {
     const Scenario = enum {

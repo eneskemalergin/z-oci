@@ -1491,14 +1491,14 @@ test "ManifestThrottle records trustworthy headers and rejects partial API heade
     try std.testing.expect(state.prior == null);
 }
 test "ManifestThrottle sleepBeforeManifestRequestIfNeeded uses transport hooks" {
-    const State = struct {
+    const MockHarness = struct {
         var slept_ms: u32 = 0;
 
         fn sleeper(delay_ms: u32) void {
             slept_ms = delay_ms;
         }
     };
-    defer State.slept_ms = 0;
+    defer MockHarness.slept_ms = 0;
 
     test_policy_now_unix_seconds = 1_700_000_000;
     var state: ManifestThrottle = .{
@@ -1513,16 +1513,16 @@ test "ManifestThrottle sleepBeforeManifestRequestIfNeeded uses transport hooks" 
     var client: std.http.Client = undefined;
     const config = Config{ .rate_limit_enabled = true };
     state.sleepBeforeManifestRequestIfNeeded(config, &client, .{
-        .sleeper = State.sleeper,
+        .sleeper = MockHarness.sleeper,
         .clock = .{ .now_unix_seconds = testPolicyNowUnixSeconds },
     });
-    try std.testing.expectEqual(@as(u32, 30_000), State.slept_ms);
+    try std.testing.expectEqual(@as(u32, 30_000), MockHarness.slept_ms);
 
     state.sleepBeforeManifestRequestIfNeeded(.{ .rate_limit_enabled = false }, &client, .{
-        .sleeper = State.sleeper,
+        .sleeper = MockHarness.sleeper,
         .clock = .{ .now_unix_seconds = testPolicyNowUnixSeconds },
     });
-    try std.testing.expectEqual(@as(u32, 30_000), State.slept_ms);
+    try std.testing.expectEqual(@as(u32, 30_000), MockHarness.slept_ms);
 }
 test "retryPolicyConfig projects only budget fields from Config" {
     const config = Config{
@@ -1699,7 +1699,7 @@ test "exponential backoff caps delay and applies full jitter deterministically" 
     try std.testing.expectEqual(@as(u32, 0), first_attempt);
 }
 test "sleepForTransportRetry invokes injected sleeper with delay" {
-    const State = struct {
+    const MockHarness = struct {
         var recorded_ms: u32 = 0;
 
         fn sleeper(delay_ms: u32) void {
@@ -1707,10 +1707,10 @@ test "sleepForTransportRetry invokes injected sleeper with delay" {
         }
     };
 
-    State.recorded_ms = 0;
+    MockHarness.recorded_ms = 0;
     var client: std.http.Client = undefined;
-    sleepForTransportRetry(&client, .{ .sleeper = State.sleeper }, 250);
-    try std.testing.expectEqual(@as(u32, 250), State.recorded_ms);
+    sleepForTransportRetry(&client, .{ .sleeper = MockHarness.sleeper }, 250);
+    try std.testing.expectEqual(@as(u32, 250), MockHarness.recorded_ms);
 }
 test "readHttpResponseBodyAlloc accepts bodies below the limit" {
     const payload = "abc";
@@ -1777,7 +1777,7 @@ test "runHttpRetryLoop: transport and HTTP retries stay leak-free under DebugAll
         body: ?[]u8 = null,
     };
 
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
 
         fn exchangeOnce(_: *anyopaque) ExchangeError!TestResponse {
@@ -1808,7 +1808,7 @@ test "runHttpRetryLoop: transport and HTTP retries stay leak-free under DebugAll
     const transport_hooks = TransportHooks{ .sleeper = noopTransportSleeper };
 
     for (0..16) |_| {
-        State.attempts = 0;
+        MockHarness.attempts = 0;
         var policy = retryPolicyFromConfig(.{ .max_network_retries = 2 }, transport_hooks);
         var loop_ctx: usize = 0;
 
@@ -1822,22 +1822,22 @@ test "runHttpRetryLoop: transport and HTTP retries stay leak-free under DebugAll
             @ptrCast(&loop_ctx),
             struct {
                 fn call(ctx_ptr: *anyopaque) ExchangeError!TestResponse {
-                    return State.exchangeOnce(ctx_ptr);
+                    return MockHarness.exchangeOnce(ctx_ptr);
                 }
             }.call,
             struct {
                 fn call(response: TestResponse) std.http.Status {
-                    return State.responseStatus(response);
+                    return MockHarness.responseStatus(response);
                 }
             }.call,
             struct {
                 fn call(response: TestResponse) []const HttpHeader {
-                    return State.responseHeaders(response);
+                    return MockHarness.responseHeaders(response);
                 }
             }.call,
             struct {
                 fn call(alloc: std.mem.Allocator, response: TestResponse) void {
-                    State.deinitResponse(alloc, response);
+                    MockHarness.deinitResponse(alloc, response);
                 }
             }.call,
             allocator,
@@ -1845,8 +1845,8 @@ test "runHttpRetryLoop: transport and HTTP retries stay leak-free under DebugAll
 
         switch (result) {
             .ok => |ok| {
-                try std.testing.expectEqual(std.http.Status.ok, State.responseStatus(ok.response));
-                try std.testing.expectEqual(@as(usize, 3), State.attempts);
+                try std.testing.expectEqual(std.http.Status.ok, MockHarness.responseStatus(ok.response));
+                try std.testing.expectEqual(@as(usize, 3), MockHarness.attempts);
             },
             else => return error.TestUnexpectedResult,
         }
@@ -1860,7 +1860,7 @@ test "runHttpRetryLoop: 429 with Retry-After sleeps then succeeds" {
         headers: []const HttpHeader = &.{},
     };
 
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
         var sleep_count: usize = 0;
         var last_sleep_ms: u32 = 0;
@@ -1883,14 +1883,14 @@ test "runHttpRetryLoop: 429 with Retry-After sleeps then succeeds" {
         }
     };
 
-    State.attempts = 0;
-    State.sleep_count = 0;
-    State.last_sleep_ms = 0;
+    MockHarness.attempts = 0;
+    MockHarness.sleep_count = 0;
+    MockHarness.last_sleep_ms = 0;
     test_policy_now_unix_seconds = 1_700_000_000;
 
     var client: std.http.Client = undefined;
     const transport_hooks = TransportHooks{
-        .sleeper = State.sleeper,
+        .sleeper = MockHarness.sleeper,
         .clock = .{ .now_unix_seconds = testPolicyNowUnixSeconds },
     };
     var policy = retryPolicyFromConfig(.{ .max_rate_limit_retries = 1 }, transport_hooks);
@@ -1906,7 +1906,7 @@ test "runHttpRetryLoop: 429 with Retry-After sleeps then succeeds" {
         @ptrCast(&loop_ctx),
         struct {
             fn call(ctx_ptr: *anyopaque) ExchangeError!LoopResponse {
-                return State.exchangeOnce(ctx_ptr);
+                return MockHarness.exchangeOnce(ctx_ptr);
             }
         }.call,
         struct {
@@ -1928,9 +1928,9 @@ test "runHttpRetryLoop: 429 with Retry-After sleeps then succeeds" {
     switch (result) {
         .ok => |ok| {
             try std.testing.expectEqual(std.http.Status.ok, ok.response.status);
-            try std.testing.expectEqual(@as(usize, 2), State.attempts);
-            try std.testing.expectEqual(@as(usize, 1), State.sleep_count);
-            try std.testing.expectEqual(@as(u32, 30_000), State.last_sleep_ms);
+            try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
+            try std.testing.expectEqual(@as(usize, 1), MockHarness.sleep_count);
+            try std.testing.expectEqual(@as(u32, 30_000), MockHarness.last_sleep_ms);
             try std.testing.expectEqual(@as(u8, 1), ok.budget.rate_limit_attempts_used);
         },
         else => return error.TestUnexpectedResult,
@@ -1944,7 +1944,7 @@ test "runHttpRetryLoop: malformed Retry-After on 429 uses policy backoff" {
         headers: []const HttpHeader = &.{},
     };
 
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
         var last_sleep_ms: u32 = 0;
 
@@ -1963,13 +1963,13 @@ test "runHttpRetryLoop: malformed Retry-After on 429 uses policy backoff" {
         }
     };
 
-    State.attempts = 0;
-    State.last_sleep_ms = 0;
+    MockHarness.attempts = 0;
+    MockHarness.last_sleep_ms = 0;
     test_policy_random_u64 = 999;
 
     var client: std.http.Client = undefined;
     const transport_hooks = TransportHooks{
-        .sleeper = State.sleeper,
+        .sleeper = MockHarness.sleeper,
         .random_u64 = testPolicyRandomU64,
     };
     var policy = retryPolicyFromConfig(.{ .max_rate_limit_retries = 1 }, transport_hooks);
@@ -1985,7 +1985,7 @@ test "runHttpRetryLoop: malformed Retry-After on 429 uses policy backoff" {
         @ptrCast(&loop_ctx),
         struct {
             fn call(ctx_ptr: *anyopaque) ExchangeError!LoopResponse {
-                return State.exchangeOnce(ctx_ptr);
+                return MockHarness.exchangeOnce(ctx_ptr);
             }
         }.call,
         struct {
@@ -2007,8 +2007,8 @@ test "runHttpRetryLoop: malformed Retry-After on 429 uses policy backoff" {
     switch (result) {
         .ok => |ok| {
             try std.testing.expectEqual(std.http.Status.ok, ok.response.status);
-            try std.testing.expectEqual(@as(usize, 2), State.attempts);
-            try std.testing.expectEqual(@as(u32, 999), State.last_sleep_ms);
+            try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
+            try std.testing.expectEqual(@as(u32, 999), MockHarness.last_sleep_ms);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2022,7 +2022,7 @@ test "runHttpRetryLoop: transport give-up returns transport_failed when budget e
         status: std.http.Status,
     };
 
-    const State = struct {
+    const MockHarness = struct {
         var attempts: usize = 0;
 
         fn exchangeOnce(_: *anyopaque) ExchangeError!LoopResponse {
@@ -2031,7 +2031,7 @@ test "runHttpRetryLoop: transport give-up returns transport_failed when budget e
         }
     };
 
-    State.attempts = 0;
+    MockHarness.attempts = 0;
 
     var client: std.http.Client = undefined;
     const transport_hooks = TransportHooks{ .sleeper = noopTransportSleeper };
@@ -2048,7 +2048,7 @@ test "runHttpRetryLoop: transport give-up returns transport_failed when budget e
         @ptrCast(&loop_ctx),
         struct {
             fn call(ctx_ptr: *anyopaque) ExchangeError!LoopResponse {
-                return State.exchangeOnce(ctx_ptr);
+                return MockHarness.exchangeOnce(ctx_ptr);
             }
         }.call,
         struct {
@@ -2070,7 +2070,7 @@ test "runHttpRetryLoop: transport give-up returns transport_failed when budget e
     switch (result) {
         .transport_failed => |failed| {
             try std.testing.expectEqual(error.ConnectionResetByPeer, failed.err);
-            try std.testing.expectEqual(@as(usize, 2), State.attempts);
+            try std.testing.expectEqual(@as(usize, 2), MockHarness.attempts);
             try std.testing.expectEqual(@as(u8, 1), failed.budget.network_attempts_used);
         },
         else => return error.TestUnexpectedResult,

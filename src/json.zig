@@ -184,7 +184,7 @@ test "json: promoteParsed allocation failures preserve input parsed value" {
         \\}
     ;
 
-    const State = struct {
+    const MockHarness = struct {
         fn run(caller_allocator: std.mem.Allocator) !void {
             var transient_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer transient_arena.deinit();
@@ -198,7 +198,7 @@ test "json: promoteParsed allocation failures preserve input parsed value" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, State.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.run, .{});
 }
 
 // Unknown fields are ignored (spec extensions allowed by OCI)

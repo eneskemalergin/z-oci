@@ -247,10 +247,12 @@ test "Descriptor JSON: stringifies with camelCase field names" {
     defer aw.deinit();
     const out = aw.written();
 
-    // Assert
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"mediaType\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"digest\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"size\"") != null);
+    const reparsed = try json.parse(Descriptor, std.testing.allocator, out);
+    defer reparsed.deinit();
+
+    try std.testing.expectEqual(d.media_type, reparsed.value.media_type);
+    try std.testing.expectEqual(d.size, reparsed.value.size);
+    try std.testing.expectEqualSlices(u8, d.digest.hex, reparsed.value.digest.hex);
 }
 
 test "Descriptor JSON: parses platform fields" {
@@ -301,15 +303,15 @@ test "Descriptor JSON: stringify/reparse preserves optional fields leak-free" {
     const reparsed = try json.parse(Descriptor, std.testing.allocator, out);
     defer reparsed.deinit();
 
-    // Assert
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"urls\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"artifactType\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "org.opencontainers.image.source") != null);
     try std.testing.expectEqual(@as(usize, 1), reparsed.value.urls.?.len);
     try std.testing.expectEqualSlices(u8, "https://example.com/blob", reparsed.value.urls.?[0]);
     try std.testing.expect(reparsed.value.annotations != null);
     try std.testing.expectEqualSlices(u8, "application/vnd.example.sbom.v1", reparsed.value.artifact_type.?);
+    try std.testing.expectEqualSlices(
+        u8,
+        "https://github.com/example/repo",
+        reparsed.value.annotations.?.object.get("org.opencontainers.image.source").?.string,
+    );
 }
 
 test "Descriptor JSON: parses upstream OCI descriptor fixture" {
