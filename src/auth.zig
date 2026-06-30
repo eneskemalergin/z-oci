@@ -1030,6 +1030,7 @@ pub fn liveTokenHttpExchanger(
         resilience.deinitOwnedHttpHeaders(allocator, resilience_headers.items);
         resilience_headers.deinit(allocator);
     }
+    try resilience_headers.ensureTotalCapacity(allocator, 8);
 
     var header_it = response.head.iterateHeaders();
     while (header_it.next()) |header| {
@@ -1985,6 +1986,19 @@ const TokenExchangeLoop = struct {
     cached_body: ?[]u8 = null,
     exchange_attempt: usize = 0,
 };
+fn cacheTokenExchangeBuiltRequest(loop_ctx: *TokenExchangeLoop, built: *const TokenHttpRequest) !void {
+    if (loop_ctx.cached_url != null) return;
+    const allocator = loop_ctx.engine.allocator;
+    loop_ctx.cached_url = try allocator.dupe(u8, built.url);
+    loop_ctx.cached_authorization = if (built.authorization) |authorization|
+        try allocator.dupe(u8, authorization)
+    else
+        null;
+    loop_ctx.cached_content_type = built.content_type;
+    if (built.body) |body| {
+        loop_ctx.cached_body = try allocator.dupe(u8, body);
+    }
+}
 fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse {
     const loop_ctx: *TokenExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
     const allocator = loop_ctx.engine.allocator;
@@ -2027,18 +2041,7 @@ fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse 
         loop_ctx.credential,
     );
     built.max_response_body_bytes = loop_ctx.engine.config.max_token_response_bytes;
-
-    if (loop_ctx.exchange_attempt > 1) {
-        loop_ctx.cached_url = try allocator.dupe(u8, built.url);
-        loop_ctx.cached_authorization = if (built.authorization) |authorization|
-            try allocator.dupe(u8, authorization)
-        else
-            null;
-        loop_ctx.cached_content_type = built.content_type;
-        if (built.body) |body| {
-            loop_ctx.cached_body = try allocator.dupe(u8, body);
-        }
-    }
+    try cacheTokenExchangeBuiltRequest(loop_ctx, &built);
 
     return exchanger(allocator, loop_ctx.client, built);
 }

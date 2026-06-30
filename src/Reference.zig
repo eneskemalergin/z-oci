@@ -115,7 +115,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
         std.mem.indexOfScalar(u8, repo_str, '/') == null;
 
     if (tag_str == null and digest == null) {
-        tag_str = "latest";
+        // Implicit `latest`: leave `tag` null; `refString()` returns `"latest"`.
     }
 
     const registry_owned = try allocator.dupe(u8, registry_str);
@@ -164,10 +164,10 @@ pub fn repositoryPath(self: Reference) []const u8 {
 }
 
 /// Ref string for the manifest URL. Digest wins when both tag and digest are set.
-/// Returns "sha256:hex" for digest refs, or the tag string otherwise.
+/// Returns "sha256:hex" for digest refs, the tag string when set, or `"latest"`.
 pub fn refString(self: Reference) []const u8 {
     if (self.digest_raw) |dr| return dr;
-    return self.tag.?; // parse() guarantees at least one is set
+    return self.tag orelse "latest";
 }
 
 fn looksLikeRegistry(segment: []const u8) bool {
@@ -234,7 +234,7 @@ test "parse: Docker Hub bare name defaults table" {
         tag: ?[]const u8,
         has_digest: bool,
     }{
-        .{ .input = "ubuntu", .repository = "library/ubuntu", .tag = "latest", .has_digest = false },
+        .{ .input = "ubuntu", .repository = "library/ubuntu", .tag = null, .has_digest = false },
         .{ .input = "ubuntu:22.04", .repository = "library/ubuntu", .tag = "22.04", .has_digest = false },
         .{ .input = "ubuntu@sha256:" ++ hex, .repository = "library/ubuntu", .tag = null, .has_digest = true },
         .{ .input = "ubuntu:20.04-slim", .repository = "library/ubuntu", .tag = "20.04-slim", .has_digest = false },
@@ -249,6 +249,9 @@ test "parse: Docker Hub bare name defaults table" {
             try std.testing.expectEqualSlices(u8, tag, ref.tag.?);
         } else {
             try std.testing.expect(ref.tag == null);
+            if (!case.has_digest) {
+                try std.testing.expectEqualStrings("latest", ref.refString());
+            }
         }
         try std.testing.expect((ref.digest != null) == case.has_digest);
         if (case.has_digest) {
@@ -316,11 +319,12 @@ test "parse: registry with dot and port together" {
     try std.testing.expectEqualSlices(u8, "tag", ref.tag.?);
 }
 
-test "parse: no tag and no digest defaults tag to latest" {
+test "parse: no tag and no digest defaults refString to latest" {
     const alloc = std.testing.allocator;
     var ref = try parse(alloc, "ghcr.io/owner/repo");
     defer ref.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, "latest", ref.tag.?);
+    try std.testing.expect(ref.tag == null);
+    try std.testing.expectEqualStrings("latest", ref.refString());
 }
 
 // parse: Docker Hub alias normalization ---------------------------------------
@@ -600,10 +604,14 @@ test "parse: 10000 pseudo-random inputs never panic and only return declared out
                     else => return error.TestUnexpectedResult,
                 };
             } else {
-                try std.testing.expect(owned.tag != null);
-                try std.testing.expect(owned.tag.?.len > 0);
-                try std.testing.expectEqualSlices(u8, owned.tag.?, owned.refString());
-                for (owned.tag.?) |c| try std.testing.expect(c > ' ');
+                const ref_label = owned.refString();
+                try std.testing.expect(ref_label.len > 0);
+                if (owned.tag) |tag| {
+                    try std.testing.expectEqualSlices(u8, tag, ref_label);
+                    for (tag) |c| try std.testing.expect(c > ' ');
+                } else {
+                    try std.testing.expectEqualStrings("latest", ref_label);
+                }
             }
         } else |err| switch (err) {
             error.Empty,

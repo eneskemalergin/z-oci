@@ -589,8 +589,8 @@ fn resolveWithEngine(
             const caller_digest_raw = try allocator.dupe(u8, detached.resolved_digest_raw);
             errdefer allocator.free(caller_digest_raw);
 
-            const caller_platform: ?Platform = if (detached.platform) |value|
-                try clonePlatformAlloc(allocator, value)
+            const caller_platform: ?Platform = if (platform) |requested|
+                try clonePlatformAlloc(allocator, requested)
             else
                 null;
             errdefer if (caller_platform) |value| deinitOwnedPlatform(value, allocator);
@@ -994,12 +994,6 @@ fn recurseIntoMultiArchDocument(
         return .{ .failure = try platformNotFoundErrorAlloc(allocator, ref_view) };
     };
 
-    var selected_child_platform: ?Platform = null;
-    if (child_descriptor.platform) |child_platform| {
-        selected_child_platform = try clonePlatformAlloc(allocator, child_platform);
-        errdefer if (selected_child_platform) |owned_platform| deinitOwnedPlatform(owned_platform, allocator);
-    }
-
     var child_ref_string_buffer: [128]u8 = undefined;
     const child_ref_string = std.fmt.bufPrint(
         &child_ref_string_buffer,
@@ -1010,7 +1004,7 @@ fn recurseIntoMultiArchDocument(
     owned_parent_document.deinit();
     parent_document_live = false;
 
-    var child_outcome = try fetchResolvedManifestWithExchangers(
+    const child_outcome = try fetchResolvedManifestWithExchangers(
         allocator,
         client,
         config,
@@ -1027,30 +1021,6 @@ fn recurseIntoMultiArchDocument(
         transport_hooks,
         manifest_throttle,
     );
-
-    switch (child_outcome) {
-        .success => |*child_success| {
-            if (child_success.platform == null) {
-                if (selected_child_platform) |child_platform| {
-                    child_success.platform = child_platform;
-                    selected_child_platform = null;
-                }
-            } else if (selected_child_platform) |child_platform| {
-                deinitOwnedPlatform(child_platform, allocator);
-                selected_child_platform = null;
-            }
-        },
-        .failure => {
-            if (selected_child_platform) |child_platform| {
-                deinitOwnedPlatform(child_platform, allocator);
-                selected_child_platform = null;
-            }
-        },
-    }
-
-    if (selected_child_platform) |child_platform| {
-        deinitOwnedPlatform(child_platform, allocator);
-    }
 
     return child_outcome;
 }

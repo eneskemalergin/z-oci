@@ -136,6 +136,8 @@ pub const ManifestHttpRequest = struct {
     url: []u8,
     authorization: ?[]u8 = null,
     accept: []const []const u8 = &.{},
+    /// When set, `liveManifestHttpExchanger` borrows this slice instead of rebuilding Accept headers.
+    prebuilt_accept_headers: ?[]const std.http.Header = null,
     max_response_body_bytes: usize = config_module.DEFAULT_MAX_MANIFEST_BYTES,
 
     /// Free owned URL and Authorization header (zeroes bearer token bytes when present).
@@ -578,7 +580,7 @@ pub fn buildManifestHttpRequestAlloc(
     errdefer allocator.free(url);
 
     const authorization = if (bearer_token) |token|
-        try std.fmt.allocPrint(allocator, "Bearer {s}", .{token})
+        try buildBearerAuthorizationAlloc(allocator, token)
     else
         null;
     errdefer auth.freeOwnedOptionalSecretSlice(allocator, authorization);
@@ -597,8 +599,9 @@ pub fn liveManifestHttpExchanger(
     request: ManifestHttpRequest,
 ) ManifestExchangeError!ManifestHttpResponse {
     defer request.deinit(allocator);
-    const accept_headers = try buildAcceptHeadersAlloc(allocator, request.accept);
-    defer allocator.free(accept_headers);
+    const owned_accept_headers = request.prebuilt_accept_headers == null;
+    const accept_headers = if (request.prebuilt_accept_headers) |headers| headers else try buildAcceptHeadersAlloc(allocator, request.accept);
+    defer if (owned_accept_headers) allocator.free(accept_headers);
 
     const redirect_hop_limit: u8 = 2;
     var current_url = request.url;
@@ -737,22 +740,24 @@ fn mapLiveManifestTransportError(err: anyerror) ManifestExchangeError {
 }
 fn resolveRedirectUrlAlloc(
     allocator: std.mem.Allocator,
-    base_url: []const u8,
+    _: []const u8,
     base_uri: std.Uri,
     location: []const u8,
 ) ManifestExchangeError![]u8 {
-    var buffer = try allocator.alloc(u8, base_url.len + location.len + 16);
-    defer allocator.free(buffer);
-
-    @memcpy(buffer[0..location.len], location);
-    var aux_buf = buffer;
+    var resolve_buf: [4096]u8 = undefined;
+    if (location.len > resolve_buf.len) return error.OutOfMemory;
+    @memcpy(resolve_buf[0..location.len], location);
+    var aux_buf: []u8 = resolve_buf[0..];
     const resolved = std.Uri.resolveInPlace(base_uri, location.len, &aux_buf) catch |err| switch (err) {
         error.NoSpaceLeft => return error.OutOfMemory,
         else => return error.TransportFailed,
     };
-    return std.fmt.allocPrint(allocator, "{f}", .{std.Uri.fmt(&resolved, .all)}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-    };
+
+    var out_buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buf);
+    std.Uri.writeToStream(&resolved, &writer, .all) catch return error.TransportFailed;
+    const formatted = writer.buffered();
+    return allocator.dupe(u8, formatted) catch error.OutOfMemory;
 }
 fn shouldKeepAuthorizationOnRedirect(base_uri: std.Uri, next_url: []const u8) !bool {
     const next_uri = std.Uri.parse(next_url) catch return false;
@@ -807,6 +812,12 @@ fn buildAcceptHeadersAlloc(
     }
     return headers;
 }
+fn buildBearerAuthorizationAlloc(allocator: std.mem.Allocator, token: []const u8) error{OutOfMemory}![]u8 {
+    var stack_buf: [512]u8 = undefined;
+    const written = std.fmt.bufPrint(&stack_buf, "Bearer {s}", .{token}) catch
+        return std.fmt.allocPrint(allocator, "Bearer {s}", .{token}) catch error.OutOfMemory;
+    return allocator.dupe(u8, written) catch error.OutOfMemory;
+}
 fn shouldCollectManifestAuthHeaders(status: std.http.Status) bool {
     return status == .unauthorized;
 }
@@ -831,12 +842,14 @@ fn ownedManifestResponseMetadataFromHead(
         for (www_authenticate_headers.items) |header| allocator.free(header);
         www_authenticate_headers.deinit(allocator);
     }
+    try www_authenticate_headers.ensureTotalCapacity(allocator, MAX_WWW_AUTHENTICATE_HEADERS);
 
     var resilience_headers = std.ArrayList(resilience.HttpHeader).empty;
     errdefer {
         resilience.deinitOwnedHttpHeaders(allocator, resilience_headers.items);
         resilience_headers.deinit(allocator);
     }
+    try resilience_headers.ensureTotalCapacity(allocator, MAX_RESILIENCE_HEADERS);
 
     const content_type = if (head.content_type) |content_type|
         try dupeManifestHeaderValueAlloc(allocator, content_type)
@@ -1051,6 +1064,8 @@ const ManifestExchangeLoop = struct {
     request: ManifestRequest,
     bearer_token: ?[]const u8,
     cached_url: ?[]u8 = null,
+    cached_authorization: ?[]u8 = null,
+    cached_accept_headers: ?[]std.http.Header = null,
     exchange_attempt: usize = 0,
 };
 fn exchangeManifestRequestOnce(
@@ -1063,18 +1078,20 @@ fn exchangeManifestRequestOnce(
     var handed_to_exchanger = false;
     const url = if (loop_ctx.cached_url) |cached|
         try allocator.dupe(u8, cached)
-    else
-        try loop_ctx.request.uriAlloc(allocator);
+    else blk: {
+        const built = try loop_ctx.request.uriAlloc(allocator);
+        loop_ctx.cached_url = try allocator.dupe(u8, built);
+        break :blk built;
+    };
     errdefer if (!handed_to_exchanger) allocator.free(url);
 
-    if (loop_ctx.cached_url == null and loop_ctx.exchange_attempt > 1) {
-        loop_ctx.cached_url = try allocator.dupe(u8, url);
-    }
-
-    const authorization = if (loop_ctx.bearer_token) |token|
-        try std.fmt.allocPrint(allocator, "Bearer {s}", .{token})
-    else
-        null;
+    const authorization = if (loop_ctx.bearer_token) |token| blk: {
+        if (loop_ctx.cached_authorization) |cached|
+            break :blk try allocator.dupe(u8, cached);
+        const built = try buildBearerAuthorizationAlloc(allocator, token);
+        loop_ctx.cached_authorization = try allocator.dupe(u8, built);
+        break :blk built;
+    } else null;
     errdefer if (!handed_to_exchanger) auth.freeOwnedOptionalSecretSlice(allocator, authorization);
 
     const http_request = ManifestHttpRequest{
@@ -1082,6 +1099,7 @@ fn exchangeManifestRequestOnce(
         .url = url,
         .authorization = authorization,
         .accept = loop_ctx.request.accept,
+        .prebuilt_accept_headers = loop_ctx.cached_accept_headers,
         .max_response_body_bytes = loop_ctx.resolver_ctx.config.max_manifest_bytes,
     };
     handed_to_exchanger = true;
@@ -1103,7 +1121,13 @@ fn exchangeManifestRequest(
         .request = request,
         .bearer_token = bearer_token,
     };
+    loop_ctx.cached_accept_headers = buildAcceptHeadersAlloc(ctx.allocator, request.accept) catch {
+        return .{ .transport_failed = .{ .err = error.OutOfMemory, .budget = policy.budget } };
+    };
+    defer if (loop_ctx.cached_accept_headers) |headers| ctx.allocator.free(headers);
     defer if (loop_ctx.cached_url) |cached_url| ctx.allocator.free(cached_url);
+    defer if (loop_ctx.cached_authorization) |authorization|
+        auth.freeOwnedOptionalSecretSlice(ctx.allocator, authorization);
 
     const hooks: resilience.HttpRetryLoopHooks = if (ctx.config.rate_limit_enabled)
         .{
