@@ -1,7 +1,11 @@
 //! Build-time guard: reject private-key PEM blocks in tracked repo material.
 //!
-//! This tool is not linked into the z-oci library. It scans the working tree
-//! during `zig build security-check` / `zig build test` only.
+//! This tool is not linked into the z-oci library. It walks only the roots listed
+//! in `SCAN_ROOTS` during `zig build security-check` / `zig build test`.
+//!
+//! Scanned extensions: `.pem`, `.key`, `.crt`. Files larger than `MAX_SCAN_BYTES`
+//! (10 MiB) are rejected. Any file whose body contains a private-key PEM marker is
+//! rejected; empty files are allowed.
 const std = @import("std");
 
 const PRIVATE_KEY_MARKERS = [_][]const u8{
@@ -37,6 +41,7 @@ const MAX_MARKER_LEN = blk: {
 
 const MARKER_OVERLAP = MAX_MARKER_LEN - 1;
 
+/// CI security-check entrypoint; scans `SCAN_ROOTS` for private-key PEM markers.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
@@ -84,7 +89,6 @@ fn containsPrivateKeyMarker(body: []const u8) bool {
     return false;
 }
 
-// Returns `true` when the file must be rejected.
 fn scanFile(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
     var file = try dir.openFile(io, name, .{});
     defer file.close(io);

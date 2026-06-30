@@ -18,6 +18,7 @@ const USAGE_TEXT =
     \\
 ;
 
+/// Reference normalization example; parsed `Reference` uses `init.gpa`.
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -37,7 +38,6 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
 
-    // The parsed reference borrows from arena-owned allocations for this short-lived CLI.
     const reference = try z_oci.Reference.parse(arena, args[1]);
 
     try stdout.print("registry: {s}\n", .{reference.registry});

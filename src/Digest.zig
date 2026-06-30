@@ -18,6 +18,7 @@ pub const Algorithm = enum {
     }
 };
 
+/// Errors from [`parse`].
 pub const ParseError = error{
     MissingColon,
     UnsupportedAlgorithm,

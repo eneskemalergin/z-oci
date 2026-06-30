@@ -1,5 +1,11 @@
 //! Resolve a live image reference to a pinned manifest digest.
 //!
+//! Uses a bare `Config{}` for anonymous public-registry access. Defaults apply for
+//! retry budgets, body-size limits, and TLS trust via the caller-owned
+//! `std.http.Client` (OS trust roots on first HTTPS when `ca_bundle_path` is unset).
+//! Set `ca_bundle_path`, `credential_provider`, or `rate_limit_enabled` on `Config`
+//! when enterprise TLS, auth, or pre-emptive throttling is required.
+//!
 //! Ownership notes:
 //! - CLI args and the parsed input Reference live in `init.arena`, which is
 //!   sufficient for this short-lived example.
@@ -20,6 +26,7 @@ const USAGE_TEXT =
     \\
 ;
 
+/// Live resolve example; see file header for `Config` and ownership.
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -52,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.deinit();
 
+    // Anonymous defaults: OS TLS trust, retry budgets, and body-size limits from Config{}.
     const outcome = try z_oci.resolve(init.gpa, &client, z_oci.Config{}, reference, platform);
     switch (outcome) {
         .success => |result| {

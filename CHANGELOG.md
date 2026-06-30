@@ -31,6 +31,10 @@ Production resilience for live registry traffic: reactive retries and rate-limit
     - Manifest and token HTTP wrappers share one reactive retry loop in `resilience.zig` instead of duplicating sleep/retry logic in `auth.zig` and `resolver.zig`.
     - Manifest and token retry loops cache built request fields lazily (attempt 2+) so single-shot paths pay no cache overhead.
     - Single-attempt paths no longer allocate retry caches up front; retryable GET failures keep the downloaded body for the next attempt.
+- **Docs**
+    - Comment and docstring pass across library, examples, and tools: removed internal roadmap language from public docs, fixed scrambled auth API docs, and filled missing public API doc comments.
+    - Public docs (`README.md`, `Config.zig`, `resilience.zig`) describe live retry budgets, CA bundle behavior, and registry header assumptions.
+    - `examples/resolve-reference` documents default `Config` behavior and when to set `ca_bundle_path`, credentials, and rate-limit flags.
 - **TLS**
     - `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, rejects private-key PEM markers in CA bundles, and skips reload when path and mtime are unchanged for the same client.
 - **Auth and credentials**
@@ -42,8 +46,6 @@ Production resilience for live registry traffic: reactive retries and rate-limit
     - Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; uses stack SHA-256 hex before digest string allocation; drops wasted GET metadata clones.
     - Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
     - Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
-- **Documentation**
-    - Public docs (`README.md`, `Config.zig`, `resilience.zig`) describe live retry budgets, CA bundle behavior, and registry header assumptions.
 
 ### Fixed
 

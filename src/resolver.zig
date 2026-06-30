@@ -1,8 +1,11 @@
-//! Internal manifest resolver helpers.
+//! Internal manifest resolver: HEAD/GET transport, response classification, and error mapping.
 //!
-//! This module keeps request intent, transport metadata, and error-mapping
-//! rules local to the resolver layer so auth and manifest fetch
-//! do not collapse into one large implementation.
+//! Owned by the resolve/validate/get pipeline in `root.zig`; not re-exported from the
+//! public package root. Integrators inject mock transports via `root.testing` exchanger
+//! types that mirror the shapes defined here.
+//!
+//! This module keeps request intent, transport metadata, and registry outcome mapping
+//! local to manifest fetch so auth token exchange stays in `auth.zig`.
 const std = @import("std");
 const auth = @import("auth.zig");
 const config_module = @import("Config.zig");
@@ -17,10 +20,12 @@ const Platform = @import("Platform.zig");
 const ResolveError = @import("ResolveError.zig").ResolveError;
 const json = @import("json.zig");
 
+/// HTTP verb for manifest transport (`HEAD` for existence/digest probes, `GET` for bodies).
 pub const ManifestRequestMethod = enum {
     head,
     get,
 };
+/// Which public API entry built the resolver params (drives Accept headers and auth scope).
 pub const ResolverOperation = enum {
     resolve,
     validate,
@@ -43,6 +48,7 @@ pub const ResolverParams = struct {
     /// Optional manifest pre-emptive throttle state shared across HEAD/GET in one resolve session.
     manifest_throttle: ?*resilience.ManifestThrottle = null,
 
+    /// Build resolver context with noop transport hooks (tests and offline exchangers).
     pub fn init(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -54,6 +60,7 @@ pub const ResolverParams = struct {
         return initWithTransportHooks(allocator, client, config, reference, platform, operation, .{});
     }
 
+    /// Build resolver context with caller-supplied clock, sleep, and jitter hooks.
     pub fn initWithTransportHooks(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -74,6 +81,7 @@ pub const ResolverParams = struct {
         };
     }
 
+    /// Build resolver context with live `std.http.Client` sleep wiring for production paths.
     pub fn initLive(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -93,6 +101,7 @@ pub const ResolverParams = struct {
         );
     }
 
+    /// Attach shared pre-emptive throttle state for HEAD/GET in one resolve session.
     pub fn withManifestThrottle(self: ResolverParams, throttle: *resilience.ManifestThrottle) ResolverParams {
         var copy = self;
         copy.manifest_throttle = throttle;
@@ -112,6 +121,7 @@ pub const ManifestRequest = struct {
     accept: []const []const u8 = &.{},
     allow_cached_auth_retry: bool = true,
 
+    /// Build the registry manifest URL (`https://{registry}/v2/{repo}/manifests/{ref}`).
     pub fn uriAlloc(self: ManifestRequest, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(
             allocator,
@@ -128,6 +138,7 @@ pub const ManifestHttpRequest = struct {
     accept: []const []const u8 = &.{},
     max_response_body_bytes: usize = config_module.DEFAULT_MAX_MANIFEST_BYTES,
 
+    /// Free owned URL and Authorization header (zeroes bearer token bytes when present).
     pub fn deinit(self: ManifestHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
         auth.freeOwnedOptionalSecretSlice(allocator, self.authorization);
@@ -142,6 +153,7 @@ pub const ManifestHttpResponse = struct {
     owned_metadata: ?OwnedManifestResponseMetadata = null,
     body: ?[]u8 = null,
 
+    /// Free owned metadata clones and GET body buffer when present.
     pub fn deinit(self: ManifestHttpResponse, allocator: std.mem.Allocator) void {
         if (self.owned_metadata) |owned_metadata| owned_metadata.deinit(allocator);
         if (self.body) |body| allocator.free(body);
@@ -154,6 +166,7 @@ pub const ManifestHttpResponse = struct {
         self.metadata.resilience_headers = &.{};
     }
 
+    /// Copy wire metadata (and optional body) into an owned response for retry/redirect paths.
     pub fn initOwnedAlloc(
         allocator: std.mem.Allocator,
         metadata: ManifestResponseMetadata,
@@ -175,6 +188,7 @@ pub const ManifestHttpResponse = struct {
         };
     }
 };
+/// Transport-layer failures surfaced before registry status classification.
 pub const ManifestExchangeError = error{
     OutOfMemory,
     ResponseBodyTooLarge,
@@ -206,10 +220,12 @@ pub const ManifestResponseMetadata = struct {
     www_authenticate_headers: []const []const u8 = &.{},
     resilience_headers: []const resilience.HttpHeader = &.{},
 
+    /// Numeric HTTP status for error payloads and logging.
     pub fn httpStatus(self: ManifestResponseMetadata) u16 {
         return @intCast(@intFromEnum(self.status));
     }
 
+    /// Reuse auth probe rules on manifest response metadata (WWW-Authenticate handling).
     pub fn probeClassification(self: ManifestResponseMetadata) auth.AuthError!auth.ProbeResult {
         const response = auth.ProbeHttpResponse{
             .status = self.status,
@@ -218,6 +234,7 @@ pub const ManifestResponseMetadata = struct {
         return response.classify();
     }
 
+    /// Deep-copy all metadata slices so the value can outlive the wire buffer.
     pub fn cloneAlloc(self: ManifestResponseMetadata, allocator: std.mem.Allocator) !ManifestResponseMetadata {
         const owned_resilience_headers = try resilience.duplicateHttpHeadersAlloc(allocator, self.resilience_headers);
         errdefer resilience.deinitOwnedHttpHeaders(allocator, owned_resilience_headers);
@@ -282,6 +299,7 @@ pub const ManifestResponseMetadata = struct {
         };
     }
 
+    /// Minimal metadata retained when HEAD classification needs only the status code.
     pub fn headFallbackMetadata(status: std.http.Status) ManifestResponseMetadata {
         return .{ .status = status };
     }
@@ -310,11 +328,13 @@ pub const ManifestResponseMetadata = struct {
         }
     }
 
+    /// Release owned slices without mutating a const view (convenience for stack values).
     pub fn deinitOwned(self: ManifestResponseMetadata, allocator: std.mem.Allocator) void {
         var owned = self;
         owned.releaseOwned(allocator);
     }
 };
+/// Owned backing storage for `ManifestResponseMetadata` wire slices.
 pub const OwnedManifestResponseMetadata = struct {
     content_type: ?[]u8 = null,
     docker_content_digest: ?[]u8 = null,
@@ -322,6 +342,7 @@ pub const OwnedManifestResponseMetadata = struct {
     www_authenticate_headers: []const []const u8 = &.{},
     resilience_headers: []resilience.HttpHeader = &.{},
 
+    /// Duplicate borrowed metadata into owned slices for retry and redirect follow-up.
     pub fn initAlloc(allocator: std.mem.Allocator, metadata: ManifestResponseMetadata) !OwnedManifestResponseMetadata {
         return .{
             .content_type = if (metadata.content_type) |content_type|
@@ -341,6 +362,7 @@ pub const OwnedManifestResponseMetadata = struct {
         };
     }
 
+    /// Free all owned header and digest slices held by this wrapper.
     pub fn deinit(self: OwnedManifestResponseMetadata, allocator: std.mem.Allocator) void {
         if (self.content_type) |content_type| allocator.free(content_type);
         if (self.docker_content_digest) |digest| allocator.free(digest);
@@ -351,6 +373,7 @@ pub const OwnedManifestResponseMetadata = struct {
         }
     }
 
+    /// Drop auth and retry headers while keeping success fields for GET fallback.
     pub fn dropEphemeralHeaders(self: *OwnedManifestResponseMetadata, allocator: std.mem.Allocator) void {
         freeHeaderSlices(allocator, self.www_authenticate_headers);
         self.www_authenticate_headers = &.{};
@@ -360,6 +383,7 @@ pub const OwnedManifestResponseMetadata = struct {
         }
     }
 
+    /// Borrow owned slices as a metadata view tagged with the response status.
     pub fn view(self: OwnedManifestResponseMetadata, status: std.http.Status) ManifestResponseMetadata {
         return .{
             .status = status,
@@ -378,6 +402,7 @@ pub const ParsedManifestDocument = union(enum) {
     oci_index: std.json.Parsed(OciImageIndex),
     docker_manifest_list: std.json.Parsed(DockerManifestList),
 
+    /// Release JSON arena storage for whichever document variant is active.
     pub fn deinit(self: *ParsedManifestDocument) void {
         switch (self.*) {
             .manifest => |parsed| parsed.deinit(),
@@ -387,6 +412,7 @@ pub const ParsedManifestDocument = union(enum) {
         }
     }
 
+    /// Extract the declared media type without inspecting nested manifest fields.
     pub fn mediaType(self: ParsedManifestDocument) MediaType {
         return switch (self) {
             .manifest => |parsed| parsed.value.media_type,
@@ -405,6 +431,7 @@ pub const ManifestGetSuccess = struct {
     /// When set, JSON strings in `document` may borrow from this buffer.
     backing_body: ?[]u8 = null,
 
+    /// Free digest buffer, parsed document arena, and optional backing body.
     pub fn deinit(self: *ManifestGetSuccess, allocator: std.mem.Allocator) void {
         allocator.free(self.resolved_digest_raw);
         self.document.deinit();
@@ -418,6 +445,7 @@ pub const GetRequestOutcome = union(enum) {
     redirect: ManifestResponseMetadata,
     failure: ResolveError,
 
+    /// Release owned arms (success payload, redirect metadata, or failure reference).
     pub fn deinit(self: *GetRequestOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .success => |*success| success.deinit(allocator),
@@ -437,6 +465,7 @@ pub const HeadRequestOutcome = union(enum) {
     redirect: ManifestResponseMetadata,
     failure: ResolveError,
 
+    /// Release owned metadata or failure reference arms; no-op for terminal status arms.
     pub fn deinit(self: *HeadRequestOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .success => |*metadata| metadata.releaseOwned(allocator),
@@ -530,6 +559,7 @@ pub fn ownedResolveErrorAlloc(
         }),
     };
 }
+/// Format `registry/repo@digest` or `registry/repo:tag` for `ResolveError.reference`.
 pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.AuthReferenceView) ![]u8 {
     const separator: []const u8 = if (Digest.parse(reference.ref_string)) |_| "@" else |_| ":";
     return std.fmt.allocPrint(

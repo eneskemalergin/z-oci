@@ -94,6 +94,7 @@ pub fn parseMediaTypeShallow(allocator: std.mem.Allocator, bytes: []const u8) !M
 const ManifestMediaTypeProbe = struct {
     media_type: MediaType,
 
+    /// Parse only the `mediaType` field from a manifest JSON object.
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ManifestMediaTypeProbe {
         if (.object_begin != try source.next()) return error.UnexpectedToken;
         var seen_media_type = false;

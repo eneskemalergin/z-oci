@@ -3,6 +3,8 @@
 //! Ownership notes:
 //! - CLI args come from `init.arena` and are treated as borrowed configuration
 //!   inputs for the duration of main.
+//! - Parsed index/list values use `init.gpa` for the parse arena because the
+//!   selected descriptor borrows from that arena until `parsed.deinit()`.
 //! - The raw JSON bytes live in a bounded stack buffer and are discarded after parsing.
 //! - Each parsed index/list is a std.json.Parsed(T); its arena owns all string
 //!   slices exposed through descriptors(), so the selected Descriptor must not
@@ -20,12 +22,16 @@ const USAGE_TEXT =
     \\  select-platform <os> <arch>
     \\  select-platform <index-json-path> <os> <arch> [variant]
     \\
+    \\Example:
+    \\  zig build example-select-platform
+    \\
     \\Defaults:
     \\  path    fixtures/indexes/busybox-latest-live-oci-index.json
     \\  filter  linux amd64
     \\
 ;
 
+/// Multi-arch platform selection example; see file header for allocator split.
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
@@ -78,7 +84,6 @@ pub fn main(init: std.process.Init) !void {
     if (z_oci.json.parse(z_oci.OciImageIndex, init.gpa, bytes)) |parsed| {
         defer parsed.deinit();
         const multi = z_oci.MultiArchManifest{ .oci = parsed.value };
-        // `selected` borrows from `parsed`, so it is only used within this scope.
         const selected = multi.filterByPlatform(filter) orelse {
             try printNoMatch(stderr, parsed.value.media_type.toString(), multi.descriptors(), filter);
             return error.NoMatchingPlatform;
@@ -88,7 +93,6 @@ pub fn main(init: std.process.Init) !void {
         const parsed = try z_oci.json.parse(z_oci.DockerManifestList, init.gpa, bytes);
         defer parsed.deinit();
         const multi = z_oci.MultiArchManifest{ .docker = parsed.value };
-        // `selected` borrows from `parsed`, so it is only used within this scope.
         const selected = multi.filterByPlatform(filter) orelse {
             try printNoMatch(stderr, parsed.value.media_type.toString(), multi.descriptors(), filter);
             return error.NoMatchingPlatform;

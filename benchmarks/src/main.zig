@@ -2,6 +2,9 @@
 //!
 //! Uses an optional counting allocator and mock transport fixtures for
 //! authenticate/resolve operations that need injected exchangers.
+//!
+//! Run with `zig build bench -- <operation> [options]`. Supported flags are listed
+//! in the embedded `USAGE` string: `--iterations <n>` and `--counting`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -33,6 +36,7 @@ const USAGE =
     \\
 ;
 
+/// Performance benchmark driver; see embedded `USAGE` and file header for flags.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -418,7 +422,6 @@ fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
         .scope = "repository:bench/image:pull",
     });
 
-    // First call: populate cache
     {
         var response = (try engine.authenticate(&client, request)).?;
         response.deinit(alloc);

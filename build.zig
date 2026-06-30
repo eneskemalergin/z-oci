@@ -1,6 +1,16 @@
 //! Build graph for z-oci: library module, CLI scaffold, tests, examples, and bench.
 //!
-//! Primary steps: `test`, `run`, `workflow-smoke`, `examples`, `bench`, `security-check`.
+//! Primary steps:
+//! - `test`: library tests, executable tests, workflow smoke, security-check, and
+//!   `examples-smoke` (offline examples only; live `resolve-reference` is excluded).
+//! - `run`: installed CLI scaffold.
+//! - `workflow-smoke`: offline workflow smoke tests only.
+//! - `examples`: build all packaged example programs.
+//! - `example-normalize-reference`, `example-inspect-manifest`, `example-select-platform`,
+//!   and `example-resolve-reference`: run one example with forwarded CLI args.
+//! - `examples-smoke`: run offline examples with fixed fixture inputs.
+//! - `bench`: build the benchmark CLI.
+//! - `security-check`: reject private-key PEM blocks in tracked repo material.
 
 const std = @import("std");
 
@@ -8,7 +18,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Library module: the importable z-oci package
     const mod = b.addModule("z_oci", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -29,14 +38,14 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    // zig build run
     const run_step = b.step("run", "Run the CLI");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    // Tests
+    // --- Tests ---
+
     const lib_tests = b.addTest(.{ .root_module = mod });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
@@ -83,7 +92,8 @@ pub fn build(b: *std.Build) void {
     const workflow_smoke_step = b.step("workflow-smoke", "Run offline workflow smoke tests");
     workflow_smoke_step.dependOn(&run_workflow_smoke_tests.step);
 
-    // Offline example programs
+    // --- Offline example programs ---
+
     const normalize_reference_example = b.addExecutable(.{
         .name = "normalize-reference",
         .root_module = b.createModule(.{
@@ -162,7 +172,8 @@ pub fn build(b: *std.Build) void {
     run_resolve_reference_step.dependOn(&run_resolve_reference.step);
     if (b.args) |args| run_resolve_reference.addArgs(args);
 
-    // Benchmark CLI
+    // --- Benchmark CLI ---
+
     const bench = b.addExecutable(.{
         .name = "z-oci-bench",
         .root_module = b.createModule(.{
@@ -180,6 +191,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&bench.step);
 
     const smoke_examples_step = b.step("examples-smoke", "Run a minimal smoke pass over the offline examples");
+    // resolve-reference hits live registries, so it stays out of the offline smoke gate.
 
     const smoke_normalize_reference = b.addRunArtifact(normalize_reference_example);
     smoke_normalize_reference.addArg("ubuntu:22.04");

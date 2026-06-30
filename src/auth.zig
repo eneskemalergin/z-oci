@@ -1,7 +1,7 @@
 //! Auth engine for registry token exchange and credential resolution.
 //!
 //! Live resolve/validate/getManifest traffic probes registries through manifest
-//! `HEAD`/`GET` (see `root.zig` auth handoff docs). A `401` with
+//! `HEAD`/`GET` (see `root.zig` ownership and resolver integration notes). A `401` with
 //! `WWW-Authenticate` triggers bearer challenge parsing, token exchange (GET +
 //! POST fallback), credential-provider chain, and per-scope token caching.
 //!
@@ -63,10 +63,15 @@ pub const AuthError = error{
     ConnectionRefused,
     UnknownHostName,
 };
+/// Token exchange HTTP verb. Realms may prefer GET query strings or POST bodies;
+/// the engine tries both and remembers the last success per realm.
 pub const TokenRequestMethod = enum {
     get,
     post,
 };
+/// Owned buffers for one token HTTP round trip.
+///
+/// The exchanger takes ownership and must call `deinit()` on every return path.
 pub const TokenHttpRequest = struct {
     method: TokenRequestMethod,
     url: []u8,
@@ -83,6 +88,7 @@ pub const TokenHttpRequest = struct {
         freeOwnedOptionalSecretSlice(allocator, self.body);
     }
 };
+/// Token HTTP response. `body` may borrow wire storage or point at `owned_body`.
 pub const TokenExchangeResponse = struct {
     status: std.http.Status,
     body: []const u8,
@@ -90,6 +96,7 @@ pub const TokenExchangeResponse = struct {
     resilience_headers: []const resilience.HttpHeader = &.{},
     owned_resilience_headers: ?[]resilience.HttpHeader = null,
 
+    /// Frees owned body bytes (zeroed) and any owned resilience header copies.
     pub fn deinit(self: TokenExchangeResponse, allocator: std.mem.Allocator) void {
         if (self.owned_resilience_headers) |headers| {
             resilience.deinitOwnedHttpHeaders(allocator, headers);
@@ -109,13 +116,21 @@ pub const TokenHttpExchanger = *const fn (
     client: *std.http.Client,
     request: TokenHttpRequest,
 ) AuthError!TokenExchangeResponse;
+/// Registry host override for `envCredentialForRegistry`.
 pub const ENV_REGISTRY_HOST = "Z_OCI_REGISTRY_HOST";
+/// Username for `envCredentialForRegistry` when `ENV_REGISTRY_HOST` matches.
 pub const ENV_REGISTRY_USER = "Z_OCI_REGISTRY_USER";
+/// Password or token for `envCredentialForRegistry` when the host matches.
 pub const ENV_REGISTRY_TOKEN = "Z_OCI_REGISTRY_TOKEN";
+/// Overrides the default `~/.docker` config directory.
 pub const DOCKER_CONFIG_DIR_VAR = "DOCKER_CONFIG";
+/// Home directory for default Docker config path resolution on Unix.
 pub const HOME_DIR_VAR = "HOME";
+/// Home directory for default Docker config path resolution on Windows.
 pub const USERPROFILE_DIR_VAR = "USERPROFILE";
+/// Docker Hub `auths` key in `config.json`.
 pub const DOCKER_HUB_AUTH_KEY = "https://index.docker.io/v1/";
+/// Runs a `docker-credential-*` helper and returns an owned `CredentialHandle`.
 pub const DockerCredentialHelperRunner = *const fn (
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -138,11 +153,13 @@ pub const AuthChallenge = union(enum) {
     bearer: BearerChallenge,
     other: []const u8,
 };
+/// Manifest or registry probe classification for auth routing.
 pub const ProbeResult = union(enum) {
     ok,
     auth_required: AuthChallenge,
     not_found,
 };
+/// Borrowed bearer token value before cache storage.
 pub const Token = struct {
     /// Borrowed token bytes for transient auth operations.
     ///
@@ -151,13 +168,16 @@ pub const Token = struct {
     value: []const u8,
     expires_in_seconds: ?u64 = null,
 };
+/// Seconds before expiry when a cached token is treated as stale.
 pub const TOKEN_REFRESH_WINDOW_SECONDS: u64 = 5;
+/// Default cache TTL when the token response omits `expires_in`.
 pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: u64 = 60;
+/// Owned or borrowed token exchange result.
 pub const TokenResponse = struct {
     /// Owned token-response payload.
     access_token: Token,
-    /// Explicit non-goal for `v0.2.0`; parsed only so later phases can choose
-    /// to ignore or surface it deliberately.
+    /// Parsed when present; not used for refresh today. Call `deinit()` to release
+    /// owned refresh token bytes when the response owns them.
     refresh_token: ?[]const u8 = null,
     /// When false, `access_token.value` is borrowed from the engine token cache.
     /// The borrow is valid only while that cache entry remains and before
@@ -166,6 +186,7 @@ pub const TokenResponse = struct {
     /// `deinit()` does not free or zero borrowed bytes.
     owns_access_token: bool = true,
 
+    /// Zeroes and frees owned access and refresh token bytes only.
     pub fn deinit(self: *TokenResponse, allocator: std.mem.Allocator) void {
         if (self.owns_access_token) {
             std.crypto.secureZero(u8, @constCast(self.access_token.value));
@@ -186,6 +207,7 @@ pub const TokenCacheKey = struct {
     service: ?[]const u8 = null,
     scope: ?[]const u8 = null,
 
+    /// Duplicates lookup fields onto the caller-owned allocator for cache storage.
     pub fn initOwned(
         allocator: std.mem.Allocator,
         realm: []const u8,
@@ -214,6 +236,7 @@ pub const TokenCacheKey = struct {
         };
     }
 
+    /// Builds an owned cache key from a classified authenticate request.
     pub fn initOwnedFromRequest(
         allocator: std.mem.Allocator,
         request: AuthenticateRequest,
@@ -221,6 +244,7 @@ pub const TokenCacheKey = struct {
         return initOwned(allocator, request.challenge.realm, request.service(), request.scope());
     }
 
+    /// Frees owned realm, service, and scope strings.
     pub fn deinit(self: *TokenCacheKey, allocator: std.mem.Allocator) void {
         allocator.free(self.realm);
         if (self.service) |s| allocator.free(s);
@@ -236,6 +260,7 @@ pub const CachedToken = struct {
     valid_until_unix_seconds: ?u64 = null,
     last_used_unix_seconds: u64 = 0,
 
+    /// Duplicates token bytes onto the caller-owned allocator for cache storage.
     pub fn initOwned(
         allocator: std.mem.Allocator,
         token: Token,
@@ -252,6 +277,7 @@ pub const CachedToken = struct {
         };
     }
 
+    /// Zeroes and frees owned token bytes.
     pub fn deinit(self: *CachedToken, allocator: std.mem.Allocator) void {
         std.crypto.secureZero(u8, @constCast(self.token.value));
         allocator.free(self.token.value);
@@ -275,39 +301,33 @@ pub const AuthConfigView = struct {
 };
 /// Borrowed view of the normalized reference data auth consumes.
 ///
-/// This codifies the Phase 1/Phase 2 boundary: auth does not re-parse raw
-/// image strings. It uses the canonical registry, repository path, and ref
-/// string already produced by `Reference.parse`.
-///
-/// Phase 3 handoff contract:
-/// - manifest resolution derives this view exactly once from the caller-owned
-///   `Reference`
-/// - auth only consumes the borrowed normalized fields in this view; it does
-///   not mutate or retain the `Reference`
-/// - `registry` is the registry identity used for credential lookup
-/// - `repository_path` and `ref_string` stay under resolver ownership for
-///   manifest URLs and follow-up HEAD/GET requests
+/// Auth does not re-parse raw image strings; it uses the registry, repository
+/// path, and ref string from `Reference.parse`. The resolver builds this view
+/// once and keeps the underlying `Reference` for manifest URLs and follow-up
+/// HEAD/GET requests. `registry` drives credential lookup; `repository_path`
+/// and `ref_string` stay borrowed for the resolve call lifetime.
 pub const AuthReferenceView = struct {
     registry: []const u8,
     repository_path: []const u8,
     ref_string: []const u8,
 
+    /// Builds `https://{registry}/v2/` for tests and helpers only. Live resolve
+    /// probes registries through manifest `HEAD`/`GET`, not this URI.
     pub fn probeUriAlloc(self: AuthReferenceView, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "https://{s}/v2/", .{self.registry});
     }
 };
+/// Borrowed registry host plus bearer challenge for one token exchange.
 pub const AuthenticateRequest = struct {
     registry: []const u8,
     challenge: BearerChallenge,
 
-    /// Build the auth request Phase 3 passes into token exchange.
+    /// Build a token-exchange request from a classified bearer challenge.
     ///
-    /// Contract:
-    /// - `registry` must be the normalized registry host from `AuthReferenceView`
-    /// - `challenge` must come from a `401` bearer challenge on the target
-    ///   registry or token-requiring manifest request
-    /// - the request borrows its inputs; callers keep the challenge/header
-    ///   storage alive for the duration of `authenticate()`
+    /// `registry` must be the normalized registry host from `AuthReferenceView`.
+    /// `challenge` must come from a `401` bearer challenge on the target
+    /// registry or token-requiring manifest request. Inputs are borrowed; keep
+    /// challenge/header storage alive for the duration of `authenticate()`.
     pub fn init(registry: []const u8, challenge: BearerChallenge) AuthError!AuthenticateRequest {
         try validateRealmUrl(challenge.realm);
         return .{
@@ -316,27 +336,26 @@ pub const AuthenticateRequest = struct {
         };
     }
 
+    /// Bearer challenge scope, when the registry included one.
     pub fn scope(self: AuthenticateRequest) ?[]const u8 {
         return self.challenge.scope;
     }
 
+    /// Bearer challenge service, when the registry included one.
     pub fn service(self: AuthenticateRequest) ?[]const u8 {
         return self.challenge.service;
     }
 };
+/// HTTP status and authenticate headers from a manifest or registry probe.
 pub const ProbeHttpResponse = struct {
     status: std.http.Status,
     www_authenticate_headers: []const []const u8 = &.{},
 
-    /// Classify a registry probe or manifest response for Phase 3.
+    /// Classify a manifest or registry probe HTTP response for auth routing.
     ///
-    /// Contract:
-    /// - `.ok` means the registry/manifest request succeeded without an auth
-    ///   challenge and resolver code should continue anonymously
-    /// - `.auth_required` yields the bearer challenge Phase 3 turns into an
-    ///   `AuthenticateRequest`
-    /// - `.not_found` is a terminal resolution result and must not be retried
-    ///   through auth
+    /// `.ok` means continue without auth. `.auth_required` yields the bearer
+    /// challenge for `AuthenticateRequest.init`. `.not_found` is terminal for
+    /// resolution and must not enter the auth retry path.
     pub fn classify(self: ProbeHttpResponse) AuthError!ProbeResult {
         return classifyProbeResponse(self.status, self.www_authenticate_headers);
     }
@@ -354,10 +373,10 @@ pub const DockerHelperConfig = struct {
     io: std.Io,
     runner: DockerCredentialHelperRunner = runDockerCredentialHelperBySuffix,
 };
-/// Phase 2 auth engine.
+/// Registry token exchange, credential resolution, and per-scope token cache.
 ///
-/// HTTP requests carry `io` through `std.http.Client`. Helper execution
-/// passes an explicit `std.Io` boundary through `DockerHelperConfig`.
+/// HTTP requests carry `io` through `std.http.Client`. Helper execution passes
+/// an explicit `std.Io` boundary through `DockerHelperConfig`.
 pub const AuthEngine = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -379,6 +398,7 @@ pub const AuthEngine = struct {
     /// by the resolver when mapping `AuthError` to `ResolveError`.
     token_transport_retries_exhausted: bool = false,
 
+    /// Default engine with config and an empty token cache.
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
         return .{
             .allocator = allocator,
@@ -387,6 +407,7 @@ pub const AuthEngine = struct {
         };
     }
 
+    /// Engine with an explicit Docker credential-helper `std.Io` boundary.
     pub fn initWithDockerHelperConfig(
         allocator: std.mem.Allocator,
         config: Config,
@@ -400,6 +421,7 @@ pub const AuthEngine = struct {
         };
     }
 
+    /// Engine with an injected token HTTP exchanger for tests or live transport.
     pub fn initWithTokenHttpExchanger(
         allocator: std.mem.Allocator,
         config: Config,
@@ -424,6 +446,7 @@ pub const AuthEngine = struct {
         };
     }
 
+    /// Live token exchanger with production transport hooks and retry budgets.
     pub fn initWithTokenHttpExchangerLive(
         allocator: std.mem.Allocator,
         config: Config,
@@ -437,6 +460,7 @@ pub const AuthEngine = struct {
         );
     }
 
+    /// Engine that reads credential env vars from a caller-owned environ map.
     pub fn initWithEnvironmentMap(
         allocator: std.mem.Allocator,
         config: Config,
@@ -450,6 +474,7 @@ pub const AuthEngine = struct {
         };
     }
 
+    /// Parses and stores Docker config JSON for lazy per-registry credential lookup.
     pub fn initWithDockerConfigBytes(
         allocator: std.mem.Allocator,
         config: Config,
@@ -460,6 +485,7 @@ pub const AuthEngine = struct {
         return engine;
     }
 
+    /// Frees cached tokens, preferred-method map entries, and parsed Docker config.
     pub fn deinit(self: *AuthEngine) void {
         var it = self.token_cache.iterator();
         while (it.next()) |entry| {
@@ -482,6 +508,7 @@ pub const AuthEngine = struct {
         }
     }
 
+    /// Replaces parsed Docker config used for lazy credential and helper lookup.
     pub fn setDockerConfigBytes(self: *AuthEngine, docker_config_json: []const u8) AuthError!void {
         const docker_config = try parseDockerConfig(self.allocator, docker_config_json);
 
@@ -489,6 +516,8 @@ pub const AuthEngine = struct {
         self.docker_config = docker_config;
     }
 
+    /// Loads Docker config from the environment when `DOCKER_CONFIG` or the
+    /// default path exists. Returns false when no config file is available.
     pub fn loadDockerConfigFromEnvironment(self: *AuthEngine, io: std.Io) AuthError!bool {
         const environ_map = self.environ_map orelse return false;
         const config_path = try dockerConfigPathFromEnvironmentAlloc(self.allocator, environ_map) orelse return false;
@@ -512,38 +541,41 @@ pub const AuthEngine = struct {
         return true;
     }
 
+    /// Optional helper runner context configured at engine init.
     pub fn dockerHelperConfig(self: AuthEngine) ?DockerHelperConfig {
         return self.docker_helper_config;
     }
 
+    /// Auth-relevant subset of the engine config for credential and retry policy.
     pub fn configView(self: AuthEngine) AuthConfigView {
         return authConfigView(self.config);
     }
 
-    /// Exchange a bearer token for a single normalized registry/challenge pair.
+    /// Read and clear the token HTTP transport retry exhaustion flag.
     ///
-    /// Phase 3 handoff contract:
-    /// - call this only after a registry or manifest request returns a bearer
-    ///   challenge that has been classified into an `AuthenticateRequest`
-    /// - credential precedence is explicit config provider -> env -> Docker
-    ///   config/helper -> anonymous token request
-    /// - helper failures and helper timeouts are terminal; auth does not silently
-    ///   downgrade them to anonymous requests
-    /// - successful responses borrow the cached access token
-    ///   (`owns_access_token == false`); call `deinit()` to release any owned
-    ///   refresh token only. The access token borrow is invalidated by
-    ///   `AuthEngine.deinit()`, cache eviction, or another auth call that
-    ///   replaces the same `realm + service + scope` entry
-    /// - successful responses are cached inside the engine by
-    ///   `realm + service + scope` for reuse across later manifest requests
-    /// Returns whether the last token HTTP transport failure exhausted reactive
-    /// retries. Clears the flag after read.
+    /// Set when the reactive retry loop on token exchange gives up on a transport
+    /// error. The resolver reads this when mapping `AuthError` to
+    /// `ResolveError.transport_retries_exhausted`.
     pub fn takeTokenTransportRetriesExhausted(self: *AuthEngine) bool {
         const exhausted = self.token_transport_retries_exhausted;
         self.token_transport_retries_exhausted = false;
         return exhausted;
     }
 
+    /// Exchange a bearer token for one registry challenge.
+    ///
+    /// Call after a manifest `HEAD`/`GET` returns a bearer challenge classified
+    /// into an `AuthenticateRequest`. Credential precedence is config provider,
+    /// then environment, Docker config/helper, then anonymous token request.
+    /// Helper failures and timeouts are terminal; auth does not downgrade them
+    /// to anonymous requests.
+    ///
+    /// Successful responses borrow the cached access token
+    /// (`owns_access_token == false`). Call `deinit()` to release any owned
+    /// refresh token only. The access token borrow is invalidated by
+    /// `AuthEngine.deinit()`, cache eviction, or another auth call that replaces
+    /// the same `realm + service + scope` entry. Responses are cached inside
+    /// the engine for reuse on later manifest requests.
     pub fn authenticate(
         self: *AuthEngine,
         client: *std.http.Client,
@@ -574,17 +606,14 @@ pub const AuthEngine = struct {
         return self.borrowedCachedTokenResponseForRequest(request) orelse error.TokenExchangeFailed;
     }
 
-    /// Retry auth exactly once after an upstream request rejects a cached token.
+    /// Retry auth once after the registry rejects a cached bearer token.
     ///
-    /// Phase 3 handoff contract:
-    /// - call this only after the resolver already used a bearer token from this
-    ///   engine for the same `AuthenticateRequest` and the registry responded
-    ///   `401 Unauthorized`
-    /// - retry scope is exact-key only: auth invalidates the cached entry for the
-    ///   same `realm + service + scope` and leaves unrelated cached tokens intact
-    /// - when `config.max_retries == 0`, this returns `error.TokenExchangeFailed`
-    ///   and Phase 3 must surface the auth failure instead of looping
-    /// - the returned response follows the same ownership rules as `authenticate()`
+    /// Call after the resolver used a bearer token from this engine for the same
+    /// `AuthenticateRequest` and the registry returned `401 Unauthorized`.
+    /// Invalidates only the cache entry matching `realm + service + scope`.
+    /// When `config.max_retries == 0`, returns `error.TokenExchangeFailed` so
+    /// the caller surfaces auth failure instead of retrying indefinitely.
+    /// Ownership matches `authenticate()`.
     pub fn retryAuthenticateAfterCachedUnauthorized(
         self: *AuthEngine,
         client: *std.http.Client,
@@ -844,6 +873,7 @@ pub const AuthEngine = struct {
 };
 // --- Credential and token request helpers ---
 
+/// Auth-relevant subset of a full `Config` for credential and retry policy.
 pub fn authConfigView(config: Config) AuthConfigView {
     return .{
         .credential_provider = config.credential_provider,
@@ -852,6 +882,7 @@ pub fn authConfigView(config: Config) AuthConfigView {
         .ca_bundle_path = config.ca_bundle_path,
     };
 }
+/// Resolves env-based credentials when `ENV_REGISTRY_HOST` matches the registry.
 pub fn envCredentialForRegistry(
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
@@ -866,6 +897,7 @@ pub fn envCredentialForRegistry(
 
     return try ownedCredentialHandle(allocator, username, token);
 }
+/// Builds the borrowed auth view from a parsed `Reference`.
 pub fn referenceView(ref: Reference) AuthReferenceView {
     return .{
         .registry = ref.registry,
@@ -873,6 +905,7 @@ pub fn referenceView(ref: Reference) AuthReferenceView {
         .ref_string = ref.refString(),
     };
 }
+/// Builds an owned GET or POST token request from a classified challenge.
 pub fn buildTokenHttpRequest(
     allocator: std.mem.Allocator,
     request: AuthenticateRequest,
@@ -913,6 +946,7 @@ pub fn buildTokenHttpRequest(
         .body = body,
     };
 }
+/// Allocates the URL-encoded `service` and `scope` query for token requests.
 pub fn buildTokenQueryAlloc(allocator: std.mem.Allocator, request: AuthenticateRequest) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -930,6 +964,7 @@ pub fn buildTokenQueryAlloc(allocator: std.mem.Allocator, request: AuthenticateR
 
     return aw.toOwnedSlice() catch return error.OutOfMemory;
 }
+/// Allocates a `Basic` Authorization header value from username and secret.
 pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: ConfigModule.Credential) ![]u8 {
     const joined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ credential.username, credential.secret });
     defer {
@@ -1017,6 +1052,7 @@ pub fn liveTokenHttpExchanger(
         .owned_resilience_headers = owned_headers,
     };
 }
+/// Parses a token JSON body into an owned `TokenResponse`.
 pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) AuthError!TokenResponse {
     const parsed = json.parse(ParsedTokenBody, allocator, body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1056,6 +1092,7 @@ pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) AuthEr
         .refresh_token = owned_refresh_token,
     };
 }
+/// Classifies probe HTTP status and authenticate headers without a wrapper struct.
 pub fn classifyProbeResponse(
     status: std.http.Status,
     www_authenticate_headers: []const []const u8,
@@ -1067,6 +1104,7 @@ pub fn classifyProbeResponse(
         else => error.UnsupportedProbeStatus,
     };
 }
+/// Parses one bearer challenge from raw `WWW-Authenticate` header values.
 pub fn parseAuthenticateHeaders(raw_headers: []const []const u8) AuthError!AuthChallenge {
     if (raw_headers.len == 0) return error.MissingAuthenticateHeader;
 
@@ -1086,6 +1124,7 @@ pub fn parseAuthenticateHeaders(raw_headers: []const []const u8) AuthError!AuthC
     if (saw_unsupported) return error.UnsupportedAuthenticateScheme;
     return error.MissingAuthenticateHeader;
 }
+/// Parses one `WWW-Authenticate` header value, preferring the first bearer challenge.
 pub fn parseAuthenticateHeader(raw: []const u8) AuthError!AuthChallenge {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0) return error.MissingAuthenticateHeader;
@@ -1106,6 +1145,7 @@ pub fn parseAuthenticateHeader(raw: []const u8) AuthError!AuthChallenge {
     return error.UnsupportedAuthenticateScheme;
 }
 
+/// Zeroes and frees an owned secret slice when present.
 pub fn freeOwnedOptionalSecretSlice(allocator: std.mem.Allocator, bytes: ?[]u8) void {
     const slice = bytes orelse return;
     std.crypto.secureZero(u8, slice);
@@ -2184,7 +2224,7 @@ fn isAuthWhitespace(char: u8) bool {
 
 // --- Tests ---
 
-test "auth scaffolding: types compile with representative values" {
+test "auth: types compile with representative values" {
     const bearer = BearerChallenge{
         .realm = "https://auth.example.test/token",
         .service = "registry.example.test",
@@ -2210,7 +2250,7 @@ test "auth scaffolding: types compile with representative values" {
     try std.testing.expectEqual(@as(?u64, 1_700_000_000), cached.valid_until_unix_seconds);
     _ = docker_helper_config;
 }
-test "auth scaffolding: engine authenticate remains a stub without exchanger" {
+test "auth: authenticate returns NotYetImplemented without exchanger" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     defer engine.deinit();
     var client: std.http.Client = undefined;
@@ -2221,7 +2261,7 @@ test "auth scaffolding: engine authenticate remains a stub without exchanger" {
 
     try std.testing.expectError(error.NotYetImplemented, engine.authenticate(&client, request));
 }
-test "auth scaffolding: explicit helper process context is optional" {
+test "auth: docker helper config is optional at init" {
     const engine = AuthEngine.initWithDockerHelperConfig(
         std.testing.allocator,
         Config{},
@@ -2230,7 +2270,7 @@ test "auth scaffolding: explicit helper process context is optional" {
 
     try std.testing.expect(engine.dockerHelperConfig() != null);
 }
-test "auth scaffolding: authConfigView keeps only auth-relevant fields" {
+test "auth: authConfigView keeps only auth-relevant fields" {
     const provider = CredentialProvider{
         .getCredentialFn = struct {
             fn get(_: []const u8) ?CredentialHandle {
@@ -2253,7 +2293,7 @@ test "auth scaffolding: authConfigView keeps only auth-relevant fields" {
     try std.testing.expectEqual(@as(u32, 60_000), view.read_timeout_ms);
     try std.testing.expectEqualStrings("/tmp/custom-ca.pem", view.ca_bundle_path.?);
 }
-test "auth scaffolding: provider credentials borrow provider-owned storage" {
+test "auth: provider credentials borrow provider-owned storage" {
     const State = struct {
         var username = [_]u8{ 'u', 's', 'e', 'r' };
         var secret = [_]u8{ 't', 'o', 'k', 'e', 'n' };
@@ -2277,7 +2317,7 @@ test "auth scaffolding: provider credentials borrow provider-owned storage" {
     try std.testing.expectEqual(@as(u8, 'T'), cred.secret[0]);
     State.secret[0] = 't';
 }
-test "auth scaffolding: engine can request credential handle" {
+test "auth: engine resolves credential handle for registry" {
     const provider = CredentialProvider{
         .getCredentialFn = struct {
             fn get(registry: []const u8) ?CredentialHandle {
@@ -2292,7 +2332,7 @@ test "auth scaffolding: engine can request credential handle" {
     try std.testing.expectEqualStrings("user", handle.credential.username);
     try std.testing.expectEqualStrings("token", handle.credential.secret);
 }
-test "auth scaffolding: authConfigView records env credential variable names" {
+test "auth: authConfigView records env credential variable names" {
     const view = authConfigView(Config{});
 
     try std.testing.expectEqualStrings("Z_OCI_REGISTRY_HOST", view.env_registry_host);
@@ -4832,7 +4872,7 @@ test "AuthEngine.authenticate: repeated success and failure runs stay leak-free"
 test "token response: refresh window policy is fixed for short-lived cli use" {
     try std.testing.expectEqual(@as(u64, 5), TOKEN_REFRESH_WINDOW_SECONDS);
 }
-test "auth scaffolding: cached token owns duplicated secret bytes" {
+test "auth: cached token owns duplicated secret bytes" {
     var cached = try CachedToken.initOwned(
         std.testing.allocator,
         .{ .value = "opaque-token", .expires_in_seconds = 300 },
@@ -4843,7 +4883,7 @@ test "auth scaffolding: cached token owns duplicated secret bytes" {
     try std.testing.expectEqualStrings("opaque-token", cached.token.value);
     try std.testing.expect(cached.token.value.ptr != "opaque-token".ptr);
 }
-test "auth scaffolding: token cache key owns duplicated lookup fields" {
+test "auth: token cache key owns duplicated lookup fields" {
     var key = try TokenCacheKey.initOwned(
         std.testing.allocator,
         "https://auth.example.test/token",
@@ -4856,7 +4896,7 @@ test "auth scaffolding: token cache key owns duplicated lookup fields" {
     try std.testing.expectEqualStrings("registry.example.test", key.service.?);
     try std.testing.expectEqualStrings("repository:owner/image:pull", key.scope.?);
 }
-test "auth scaffolding: token cache key supports nil service and scope" {
+test "auth: token cache key supports nil service and scope" {
     var key = try TokenCacheKey.initOwned(
         std.testing.allocator,
         "https://auth.example.test/token",
@@ -4869,7 +4909,7 @@ test "auth scaffolding: token cache key supports nil service and scope" {
     try std.testing.expect(key.service == null);
     try std.testing.expect(key.scope == null);
 }
-test "auth scaffolding: token cache key can be built from auth request" {
+test "auth: token cache key can be built from auth request" {
     const request = try AuthenticateRequest.init(
         "registry.example.test",
         .{
@@ -4886,13 +4926,13 @@ test "auth scaffolding: token cache key can be built from auth request" {
     try std.testing.expectEqualStrings("registry.example.test", key.service.?);
     try std.testing.expectEqualStrings("repository:owner/image:pull", key.scope.?);
 }
-test "auth scaffolding: engine deinit handles empty token cache" {
+test "auth: engine deinit handles empty token cache" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     defer engine.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), engine.token_cache.count());
 }
-test "auth scaffolding: engine owns cached token entries" {
+test "auth: engine owns cached token entries" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});
     defer engine.deinit();
 
@@ -4918,7 +4958,7 @@ test "auth scaffolding: engine owns cached token entries" {
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("cached-token", engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value);
 }
-test "auth scaffolding: reference view consumes normalized Reference outputs" {
+test "auth: reference view consumes normalized Reference outputs" {
     var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:22.04");
     defer ref.deinit(std.testing.allocator);
 
@@ -4928,7 +4968,7 @@ test "auth scaffolding: reference view consumes normalized Reference outputs" {
     try std.testing.expectEqualStrings("library/ubuntu", view.repository_path);
     try std.testing.expectEqualStrings("22.04", view.ref_string);
 }
-test "auth scaffolding: probe uri uses normalized registry from reference view" {
+test "auth: probe uri uses normalized registry from reference view" {
     var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:22.04");
     defer ref.deinit(std.testing.allocator);
 

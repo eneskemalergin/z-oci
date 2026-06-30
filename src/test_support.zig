@@ -1,9 +1,9 @@
 //! Shared helpers for fixture-backed tests.
 //!
-//! Phase 1 keeps tests colocated with the owning source files, so small test
-//! helpers live in src/ as well. These helpers are intentionally narrow: they
-//! only cover the repeated fixture loading and parsing scaffolding used across
-//! the colocated descriptor, manifest, and index tests.
+//! Tests stay colocated with the owning source files, so small test helpers live
+//! in src/ as well. These helpers are intentionally narrow: they only cover the
+//! repeated fixture loading and parsing scaffolding used across the colocated
+//! descriptor, manifest, and index tests.
 
 const std = @import("std");
 const json = @import("json.zig");

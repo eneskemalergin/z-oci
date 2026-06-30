@@ -43,8 +43,11 @@
 
 const std = @import("std");
 
+/// Default maximum manifest or index GET body size for live HTTP transport.
 pub const DEFAULT_MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
+/// Default maximum token endpoint response body size for live HTTP transport.
 pub const DEFAULT_MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
+/// Default maximum cached bearer tokens per `AuthEngine`. `0` means unbounded.
 pub const DEFAULT_MAX_TOKEN_CACHE_ENTRIES: u32 = 128;
 
 /// A username/secret pair for HTTP Basic authentication.
@@ -53,6 +56,7 @@ pub const Credential = struct {
     secret: []const u8,
 };
 
+/// Credential returned by a provider, optionally with a custom release hook.
 pub const CredentialHandle = struct {
     credential: Credential,
     /// When set, `release_allocator` must be the allocator that owns `credential` slices.
@@ -61,6 +65,7 @@ pub const CredentialHandle = struct {
     release_fn: ?*const fn (allocator: std.mem.Allocator, credential: Credential) void = null,
     release_allocator: std.mem.Allocator = undefined,
 
+    /// Invoke the provider release hook when one was supplied.
     pub fn release(self: CredentialHandle) void {
         if (self.release_fn) |release_fn| release_fn(self.release_allocator, self.credential);
     }

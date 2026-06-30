@@ -38,6 +38,7 @@ digest_raw: ?[]const u8,
 
 const Reference = @This();
 
+/// Errors from [`parse`].
 pub const ParseError = error{
     Empty,
     InvalidDigest,
@@ -45,6 +46,7 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+/// Parse an image reference string into owned fields.
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Reference {
     if (input.len == 0) return error.Empty;
 
@@ -53,7 +55,6 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
         if (c <= ' ') return error.InvalidReference;
     }
 
-    // Step 1: split off @digest if present.
     var rest = input;
     var digest: ?Digest = null;
     var digest_raw: ?[]const u8 = null;
@@ -71,7 +72,6 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     }
     errdefer if (digest_raw) |dr| allocator.free(dr);
 
-    // Step 2: identify registry vs Docker Hub path.
     var registry_str: []const u8 = DOCKER_HUB_REGISTRY;
     var path_str: []const u8 = rest;
 
@@ -84,7 +84,6 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
         // else: first segment is an org name on Docker Hub, not a registry.
     }
 
-    // Normalize Docker Hub aliases to the canonical pull endpoint.
     for (DOCKER_HUB_ALIASES) |alias| {
         if (std.ascii.eqlIgnoreCase(registry_str, alias)) {
             registry_str = DOCKER_HUB_REGISTRY;
@@ -92,7 +91,6 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
         }
     }
 
-    // Step 3: extract tag from the last path segment.
     // Only the last segment can carry a tag. Earlier colons are registry ports.
     var tag_str: ?[]const u8 = null;
     var repo_str = path_str;
@@ -112,18 +110,14 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     if (repo_str.len == 0) return error.InvalidReference;
     try validateRepositoryPath(repo_str);
 
-    // Step 4: Docker Hub single-component names get "library/" prefix.
-    // "ubuntu" becomes "library/ubuntu"; "myorg/ubuntu" stays as-is.
     const needs_library_prefix =
         std.ascii.eqlIgnoreCase(registry_str, DOCKER_HUB_REGISTRY) and
         std.mem.indexOfScalar(u8, repo_str, '/') == null;
 
-    // Step 5: default tag "latest" when no tag and no digest.
     if (tag_str == null and digest == null) {
         tag_str = "latest";
     }
 
-    // Step 6: allocate all fields.
     const registry_owned = try allocator.dupe(u8, registry_str);
     errdefer allocator.free(registry_owned);
 
@@ -155,6 +149,7 @@ fn duplicateLibraryRepositoryPath(allocator: std.mem.Allocator, repository: []co
     return owned;
 }
 
+/// Free all owned fields. Safe to call exactly once per parsed value.
 pub fn deinit(self: *Reference, allocator: std.mem.Allocator) void {
     allocator.free(self.registry);
     allocator.free(self.repository);
@@ -175,13 +170,9 @@ pub fn refString(self: Reference) []const u8 {
     return self.tag.?; // parse() guarantees at least one is set
 }
 
-// Returns true when a path component looks like a registry hostname.
 fn looksLikeRegistry(segment: []const u8) bool {
-    // Dotted hostname: ghcr.io, registry.example.com
     if (std.mem.indexOfScalar(u8, segment, '.') != null) return true;
-    // localhost without a port
     if (std.ascii.eqlIgnoreCase(segment, "localhost")) return true;
-    // Any host with a port: colon followed by digits only
     if (std.mem.indexOfScalar(u8, segment, ':')) |colon| {
         const after = segment[colon + 1 ..];
         if (after.len == 0) return false;

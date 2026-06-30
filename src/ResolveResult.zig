@@ -35,7 +35,6 @@ const ResolveResult = @This();
 /// Use case: move a ResolveResult into a different allocator or keep it after
 /// a source arena teardown.
 pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
-    // Clone reference string fields.
     const registry = try allocator.dupe(u8, self.reference.registry);
     errdefer allocator.free(registry);
 
@@ -48,7 +47,6 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
         null;
     errdefer if (tag) |t| allocator.free(t);
 
-    // digest.hex borrows from caller input in the original, so clone it.
     const digest_hex = try allocator.dupe(u8, self.digest.hex);
     errdefer allocator.free(digest_hex);
 
@@ -64,7 +62,6 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
         null;
     errdefer if (digest_raw) |dr| allocator.free(dr);
 
-    // Clone platform string fields if present.
     var platform: ?Platform = null;
     var plat_os: ?[]const u8 = null;
     var plat_arch: ?[]const u8 = null;
@@ -90,7 +87,6 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
         errdefer if (plat_os_version) |s| allocator.free(s);
 
         if (p.os_features) |features| {
-            // Clone the outer slice, then clone each inner string.
             const outer = try allocator.alloc([]const u8, features.len);
             errdefer allocator.free(outer);
             var n_cloned: usize = 0;
@@ -371,8 +367,7 @@ test "ResolveResult.clone: os_features are deep copied" {
 }
 
 test "ResolveResult.clone: full smoke test survives arena teardown" {
-    // This is the Phase 1 memory-model smoke test: clone a fully populated value,
-    // tear the source arena down, then read every important field from the clone.
+    // Clone a fully populated value, tear the source arena down, then read every field.
     var cloned: ResolveResult = undefined;
     {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -11,10 +11,15 @@
 
 const std = @import("std");
 
+/// Operating system. Borrows from the parse arena, caller input, or a clone.
 os: []const u8,
+/// CPU architecture. Borrows from the parse arena, caller input, or a clone.
 architecture: []const u8,
+/// Optional CPU variant. Borrows from the parse arena, caller input, or a clone.
 variant: ?[]const u8 = null,
+/// Optional OS version string. Borrows from the parse arena, caller input, or a clone.
 os_version: ?[]const u8 = null,
+/// Optional OS feature list. Outer and inner slices borrow from the parse arena or a clone.
 os_features: ?[]const []const u8 = null,
 
 const Platform = @This();

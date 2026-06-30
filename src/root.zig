@@ -53,34 +53,61 @@ const std = @import("std");
 const resolver = @import("resolver.zig");
 const resilience = @import("resilience.zig");
 
+/// Content digest view and parser. See `Digest.zig` for ownership (`hex` may borrow).
 pub const Digest = @import("Digest.zig");
+/// OCI/Docker manifest media type enum. See `MediaType.zig`.
 pub const MediaType = @import("MediaType.zig").MediaType;
+/// Platform selector (OS/arch/variant slices). See `Platform.zig` for borrow rules.
 pub const Platform = @import("Platform.zig");
+/// OCI content descriptor. See `Descriptor.zig`.
 pub const Descriptor = @import("Descriptor.zig");
+/// Single-arch image manifest type and JSON helpers. See `Manifest.zig`.
 pub const Manifest = @import("Manifest.zig");
+/// Multi-arch index types and selection helpers. See `Index.zig`.
 pub const Index = @import("Index.zig");
+/// OCI image index (`application/vnd.oci.image.index.v1+json`). See `Index.zig`.
 pub const OciImageIndex = Index.OciImageIndex;
+/// Docker manifest list (`application/vnd.docker.distribution.manifest.list.v2+json`). See `Index.zig`.
 pub const DockerManifestList = Index.DockerManifestList;
+/// Union of supported multi-arch index/list document shapes. See `Index.zig`.
 pub const MultiArchManifest = Index.MultiArchManifest;
+/// Docker/OCI image reference parser and normalizer. See `Reference.zig`.
 pub const Reference = @import("Reference.zig");
 /// Full auth module for integrators and mock exchanger authors (`z_oci.auth.*`).
 pub const auth = @import("auth.zig");
+/// Shared JSON parse/serialize helpers for OCI types. See `json.zig`.
 pub const json = @import("json.zig");
+/// Token cache and manifest auth orchestration. See `auth.AuthEngine`.
 pub const AuthEngine = auth.AuthEngine;
+/// Parsed WWW-Authenticate challenge view. See `auth.AuthChallenge`.
 pub const AuthChallenge = auth.AuthChallenge;
+/// Borrowed registry/repository/ref view for auth and resolver paths. See `auth.AuthReferenceView`.
 pub const AuthReferenceView = auth.AuthReferenceView;
+/// Parsed Bearer challenge fields. See `auth.BearerChallenge`.
 pub const BearerChallenge = auth.BearerChallenge;
+/// Inputs for a single authenticate call. See `auth.AuthenticateRequest`.
 pub const AuthenticateRequest = auth.AuthenticateRequest;
+/// Outcome of classifying a manifest probe response. See `auth.ProbeResult`.
 pub const ProbeResult = auth.ProbeResult;
+/// Minimal HTTP response shape for auth probe classification. See `auth.ProbeHttpResponse`.
 pub const ProbeHttpResponse = auth.ProbeHttpResponse;
+/// Build a borrowed auth reference view from a parsed `Reference`. See `auth.referenceView`.
 pub const referenceView = auth.referenceView;
+/// Parsed bearer token metadata. See `auth.Token`.
 pub const Token = auth.Token;
+/// Token exchange response with optional refresh token ownership. See `auth.TokenResponse`.
 pub const TokenResponse = auth.TokenResponse;
+/// Structured registry failure at the public outcome boundary. See `ResolveError.zig`.
 pub const ResolveError = @import("ResolveError.zig").ResolveError;
+/// Successful resolve payload (digest, media type, platform). See `ResolveResult.zig`.
 pub const ResolveResult = @import("ResolveResult.zig");
+/// Transport, retry, TLS, and credential configuration. See `Config.zig`.
 pub const Config = @import("Config.zig").Config;
+/// Credential lookup strategy for token exchange. See `Config.zig`.
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
+/// Username/password pair for basic or token auth. See `Config.zig`.
 pub const Credential = @import("Config.zig").Credential;
+/// Opaque credential slot returned by a provider. See `Config.zig`.
 pub const CredentialHandle = @import("Config.zig").CredentialHandle;
 /// Errors returned directly from public entry points before an outcome is produced.
 ///
@@ -93,12 +120,18 @@ pub const PublicApiError = Config.ApplyError;
 /// This keeps workflow-level coverage on the same public resolver logic while
 /// still allowing injected transports instead of real network access.
 pub const testing = struct {
+    /// Injectable token HTTP exchanger for offline auth tests. See `auth.TokenHttpExchanger`.
     pub const TokenHttpExchanger = auth.TokenHttpExchanger;
+    /// Injectable manifest HTTP exchanger for offline resolver tests. See `resolver.ManifestHttpExchanger`.
     pub const ManifestHttpExchanger = resolver.ManifestHttpExchanger;
+    /// Concrete manifest request shape passed to mock exchangers. See `resolver.ManifestHttpRequest`.
     pub const ManifestHttpRequest = resolver.ManifestHttpRequest;
+    /// Concrete manifest response shape returned by mock exchangers. See `resolver.ManifestHttpResponse`.
     pub const ManifestHttpResponse = resolver.ManifestHttpResponse;
+    /// Transport errors mock manifest exchangers may return. See `resolver.ManifestExchangeError`.
     pub const ManifestExchangeError = resolver.ManifestExchangeError;
 
+    /// Resolve with injected token and manifest exchangers (fresh `AuthEngine` per call).
     pub fn resolveWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -146,6 +179,7 @@ pub const testing = struct {
         );
     }
 
+    /// Validate existence with injected exchangers (fresh `AuthEngine` per call).
     pub fn validateWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -168,6 +202,7 @@ pub const testing = struct {
         );
     }
 
+    /// Validate existence while reusing an existing `AuthEngine` for token cache warmth.
     pub fn validateWithEngine(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -192,6 +227,7 @@ pub const testing = struct {
         );
     }
 
+    /// Fetch parsed manifest while reusing an existing `AuthEngine` for token cache warmth.
     pub fn getManifestWithEngine(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -216,6 +252,7 @@ pub const testing = struct {
         );
     }
 
+    /// Fetch parsed manifest with injected exchangers (fresh `AuthEngine` per call).
     pub fn getManifestWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -238,6 +275,7 @@ pub const testing = struct {
         );
     }
 
+    /// Release owned fields inside a `ResolveError` (alias of `deinitResolveFailure`).
     pub fn deinitResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
         root.deinitResolveFailure(failure, allocator);
     }

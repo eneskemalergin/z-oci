@@ -17,11 +17,15 @@ const DEFAULT_MANIFEST_PATH = "fixtures/manifests/busybox-amd64-live-oci-manifes
 const USAGE_TEXT =
     \\usage: inspect-manifest [manifest-json-path]
     \\
+    \\Example:
+    \\  zig build example-inspect-manifest
+    \\
     \\Default path:
     \\  fixtures/manifests/busybox-amd64-live-oci-manifest.json
     \\
 ;
 
+/// Offline manifest inspect example; see file header for parse ownership.
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 

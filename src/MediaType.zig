@@ -1,11 +1,12 @@
 //! OCI and Docker media types for manifest negotiation.
 //!
-//! Covers all types the resolver needs to recognize and, later, negotiate.
+//! Covers all types the resolver needs to recognize today.
 //! Unknown content-types return null from fromString. The caller decides how to react.
 //! Legacy v1 signed manifests are recognized and flagged for rejection.
 
 const std = @import("std");
 
+/// Known OCI and Docker content types used by the resolver.
 pub const MediaType = enum {
     oci_manifest_v1,
     oci_index_v1,
