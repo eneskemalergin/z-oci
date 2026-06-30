@@ -15,21 +15,27 @@ const std = @import("std");
 
 /// Authentication failed. The registry rejected the request.
 pub const AuthFailed = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// The requested manifest or blob was not found.
 pub const NotFound = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// The resolution attempt hit a rate limit imposed by the registry.
 pub const RateLimited = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
     /// True when reactive transport retries were consumed before this `429`.
@@ -38,35 +44,45 @@ pub const RateLimited = struct {
 
 /// The pulled content digest does not match the requested digest.
 pub const DigestMismatch = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// No manifest in the index matched the requested platform.
 pub const PlatformNotFound = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// The manifest is multi-arch and the caller must provide a platform.
 pub const PlatformRequired = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// The manifest JSON could not be parsed or failed schema validation.
 pub const ManifestParseError = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// A network-level error: DNS failure, TCP timeout, TLS error, etc.
 pub const NetworkError = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
     /// True when reactive transport retries were consumed before this failure.
@@ -75,21 +91,27 @@ pub const NetworkError = struct {
 
 /// The digest algorithm in the response is not supported by the resolver.
 pub const UnsupportedAlgorithm = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// The server returned a Content-Type that does not match what was requested.
 pub const ContentTypeMismatch = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// The operation exceeded the configured timeout.
 pub const Timeout = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
     /// True when reactive transport retries were consumed before this timeout.
@@ -99,14 +121,18 @@ pub const Timeout = struct {
 /// Manifest index nesting exceeded the maximum allowed depth.
 /// Prevents unbounded recursion when indices point to other indices.
 pub const DepthLimitExceeded = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
 /// The server response exceeded configured size limits.
 pub const ResponseTooLarge = struct {
+    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
+    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };

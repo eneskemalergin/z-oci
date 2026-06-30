@@ -12,18 +12,9 @@
 //! - Functions returning `std.json.Parsed(T)` own an arena (pattern A): the caller
 //!   calls `parsed.deinit()` to free everything.
 //! - `AuthEngine` wraps persistent cache storage with its own `deinit()`.
-//!   Successful `authenticate()` responses borrow the cached access token
-//! - `Reference.parse` and `Digest.parse` errors stay outside `ResolveError`;
-//!   callers must parse references before calling `resolve`, `validate`, or `getManifest`.
-//!
-//! Error surfaces at the public boundary:
-//! - `PublicApiError` (`Config.ApplyError`): pre-flight config/TLS setup only (`applyToClient`).
-//!   Returned as the API error union, not inside `ResolveOutcome.failure`.
-//! - `Reference.ParseError` / `Digest.ParseError`: caller parses before invoking resolve APIs.
-//! - `ResolveError`: registry operation failures inside `ResolveOutcome.failure`,
-//!   `ValidateOutcome.failure`, or `ManifestOutcome.failure`.
-//!   (`owns_access_token == false`). The borrow ends when `AuthEngine.deinit()`
-//!   runs, the entry is evicted, or another auth call replaces the same
+//! - Successful `authenticate()` responses borrow the cached access token when
+//!   `owns_access_token == false`. The borrow ends when `AuthEngine.deinit()` runs,
+//!   the entry is evicted, or another auth call replaces the same
 //!   `realm + service + scope` slot. Copy the token before retaining it.
 //!   Call `TokenResponse.deinit(allocator)` to release any owned refresh token.
 //! - Batch workloads should reuse one `std.http.Client` and one `AuthEngine` across
@@ -31,22 +22,32 @@
 //!   Public `resolve`/`validate`/`getManifest` create a fresh engine per call; use
 //!   `testing.resolveWithEngine` (or the same pattern in application code) when
 //!   measuring or implementing session reuse.
-//! - Per-resolve transient arena (`resolveWithEngine`, `validateWithExchangers`,
-//!   and `getManifestWithExchangers`): one bump arena wraps the caller allocator
-//!   for a single resolution, validate GET attempt, or manifest fetch, including
-//!   multi-arch child fetches where applicable. Transient work (canonical error
-//!   references, HTTP request URLs, redirect targets, response metadata clones,
-//!   interim digest buffers, platform clones during multi-arch selection) uses the
-//!   arena. Success returns caller-owned results; `getManifest` promotes
-//!   `std.json.Parsed(Manifest)` via `ResolvedManifestSuccess.detachManifestForPromotion`
-//!   before arena teardown; `resolve` uses `detachForResolvePromotion` so digest
-//!   buffers are not freed while `Digest.hex` still aliases them.
-//!   Failure promotes `ResolveError.reference` to the caller allocator before
-//!   arena teardown. `AuthEngine`, the input `Reference`, and persistent token
-//!   cache storage stay on the caller allocator.
+//! - Per-operation transient arena (`resolveWithEngine`, `getManifestWithEngine`, and
+//!   the GET fallback inside `validateWithEngine`): one bump arena wraps the caller
+//!   allocator for manifest fetch work, including multi-arch child fetches where
+//!   applicable. Transient work (canonical error references, HTTP request URLs,
+//!   redirect targets, response metadata clones, interim digest buffers, platform
+//!   clones during multi-arch selection) uses the arena. Success returns
+//!   caller-owned results; `getManifest` promotes `std.json.Parsed(Manifest)` via
+//!   `ResolvedManifestSuccess.detachManifestForPromotion` before arena teardown;
+//!   `resolve` uses `detachForResolvePromotion` so digest buffers are not freed
+//!   while `Digest.hex` still aliases them. Failure promotes `ResolveError.reference`
+//!   to the caller allocator before arena teardown. `AuthEngine`, the input
+//!   `Reference`, and persistent token cache storage stay on the caller allocator.
+//! - `validateWithEngine` is asymmetric: the initial manifest `HEAD` phase allocates
+//!   `HeadRequestOutcome` metadata on the caller allocator (same as the public
+//!   `validate` contract). Only the optional GET fallback opens a transient arena,
+//!   matching `resolve`/`getManifest` fetch semantics for that phase.
 //! - Types that never allocate: `Digest` (borrowed view), `MediaType` (enum),
 //!   `Platform` (struct of slices), `AuthChallenge`/`BearerChallenge` (borrowed views).
 //!   These need no deinit.
+//!
+//! Error surfaces at the public boundary:
+//! - `PublicApiError` (`Config.ApplyError`): pre-flight config/TLS setup only (`applyToClient`).
+//!   Returned as the API error union, not inside `ResolveOutcome.failure`.
+//! - `Reference.ParseError` / `Digest.ParseError`: caller parses before invoking resolve APIs.
+//! - `ResolveError`: registry operation failures inside `ResolveOutcome.failure`,
+//!   `ValidateOutcome.failure`, or `ManifestOutcome.failure`.
 //!
 const std = @import("std");
 const resolver = @import("resolver.zig");
@@ -302,9 +303,14 @@ pub fn resolve(
 /// Validate that a manifest reference still exists and is fetchable.
 ///
 /// Ownership contract:
-/// - No owned data is returned from this API.
-/// - The caller still owns `allocator`; the resolver uses it for transient request shaping,
-///   parsing, and any structured failure context that must outlive internal temporaries.
+/// - No owned success payload is returned from this API.
+/// - The caller owns `allocator` for the HEAD phase: `performManifestHead` stores
+///   response metadata and structured failures on that allocator until the call
+///   returns. Failures promoted from HEAD use `promoteResolveErrorAlloc`.
+/// - When HEAD requires a GET fallback (405, missing digest header, etc.), the
+///   fallback fetch uses an internal transient arena like `resolve`/`getManifest`;
+///   only `ResolveError.reference` on failure is promoted back to the caller
+///   allocator before the arena is torn down.
 ///
 /// Auth: same manifest/auth pipeline as `resolve` (internal to resolver/auth).
 /// Validation treats `.not_found` as terminal. Multi-arch without `platform` returns
@@ -593,6 +599,7 @@ fn validateWithEngine(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ValidateOutcome {
+    // HEAD uses `allocator` (see `validate` doc). GET fallback below uses a transient arena.
     try ensureClientConfigured(config, client);
 
     const ref_view = referenceView(ref);
@@ -630,7 +637,7 @@ fn validateWithEngine(
 
     var validate_arena = std.heap.ArenaAllocator.init(allocator);
     defer validate_arena.deinit();
-    const transient = validate_arena.allocator();
+    const transient = validate_arena.allocator(); // GET fallback only; HEAD used `allocator` above.
 
     var outcome = try fetchResolvedManifestWithExchangers(
         transient,
@@ -946,6 +953,7 @@ fn recurseIntoMultiArchDocument(
     var selected_child_platform: ?Platform = null;
     if (child_descriptor.platform) |child_platform| {
         selected_child_platform = try clonePlatformAlloc(allocator, child_platform);
+        errdefer if (selected_child_platform) |owned_platform| deinitOwnedPlatform(owned_platform, allocator);
     }
 
     var child_ref_string_buffer: [128]u8 = undefined;

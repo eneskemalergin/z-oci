@@ -1,13 +1,8 @@
 //! OCI content descriptor. Points to a manifest, config blob, or layer.
 //!
-//! Used in Index.zig to list per-platform manifests, and in Manifest.zig
-//! for the config and layer entries.
-//!
-//! jsonParse and jsonStringify map camelCase JSON field names (mediaType,
-//! artifactType) to snake_case Zig fields.
-//!
-//! annotations stores the raw JSON value from the OCI spec annotations map.
-//! The value is a std.json.Value.object when present.
+//! Slice fields and nested `Platform` values borrow from their source unless
+//! explicitly duplicated. `jsonParse` results borrow from the parse arena.
+//! `Digest.hex` borrows from the parsed digest string (see `Digest.zig`).
 
 const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;

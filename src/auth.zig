@@ -241,9 +241,11 @@ pub const CachedToken = struct {
         token: Token,
         valid_until_unix_seconds: ?u64,
     ) !CachedToken {
+        const owned_value = try allocator.dupe(u8, token.value);
+        errdefer freeOwnedOptionalSecretSlice(allocator, owned_value);
         return .{
             .token = .{
-                .value = try allocator.dupe(u8, token.value),
+                .value = owned_value,
                 .expires_in_seconds = token.expires_in_seconds,
             },
             .valid_until_unix_seconds = valid_until_unix_seconds,
@@ -652,6 +654,7 @@ pub const AuthEngine = struct {
     ) AuthError!void {
         const gop = try self.preferred_token_method_by_realm.getOrPut(self.allocator, realm);
         if (!gop.found_existing) {
+            errdefer _ = self.preferred_token_method_by_realm.remove(realm);
             gop.key_ptr.* = try self.allocator.dupe(u8, realm);
         }
         gop.value_ptr.* = method;
@@ -677,11 +680,8 @@ pub const AuthEngine = struct {
         defer {
             const allocator = self.allocator;
             if (loop_ctx.cached_url) |url| allocator.free(url);
-            if (loop_ctx.cached_authorization) |authorization| {
-                std.crypto.secureZero(u8, authorization);
-                allocator.free(authorization);
-            }
-            if (loop_ctx.cached_body) |body| allocator.free(body);
+            if (loop_ctx.cached_authorization) |authorization| freeOwnedOptionalSecretSlice(allocator, authorization);
+            if (loop_ctx.cached_body) |body| freeOwnedOptionalSecretSlice(allocator, body);
         }
 
         const loop_outcome = resilience.runHttpRetryLoop(
@@ -897,12 +897,13 @@ pub fn buildTokenHttpRequest(
         try buildBasicAuthorizationAlloc(allocator, cred)
     else
         null;
-    errdefer if (authorization) |header| allocator.free(header);
+    errdefer freeOwnedOptionalSecretSlice(allocator, authorization);
 
     const body = switch (method) {
         .get => null,
         .post => try allocator.dupe(u8, query),
     };
+    errdefer freeOwnedOptionalSecretSlice(allocator, body);
 
     return .{
         .method = method,
@@ -998,10 +999,11 @@ pub fn liveTokenHttpExchanger(
     var header_it = response.head.iterateHeaders();
     while (header_it.next()) |header| {
         if (!resilience.isTrackedResilienceHeaderName(header.name)) continue;
-        try resilience_headers.append(allocator, .{
-            .name = try allocator.dupe(u8, header.name),
-            .value = try allocator.dupe(u8, header.value),
-        });
+        const name = try allocator.dupe(u8, header.name);
+        errdefer allocator.free(name);
+        const value = try allocator.dupe(u8, header.value);
+        errdefer allocator.free(value);
+        try resilience_headers.append(allocator, .{ .name = name, .value = value });
     }
 
     const owned_body = resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return mapLiveTokenTransportError(err);
@@ -1044,6 +1046,7 @@ pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) AuthEr
         try allocator.dupe(u8, refresh_token)
     else
         null;
+    errdefer freeOwnedOptionalSecretSlice(allocator, owned_refresh_token);
 
     return .{
         .access_token = .{
@@ -1103,9 +1106,7 @@ pub fn parseAuthenticateHeader(raw: []const u8) AuthError!AuthChallenge {
     return error.UnsupportedAuthenticateScheme;
 }
 
-// --- Private helpers ---
-
-fn freeOwnedOptionalSecretSlice(allocator: std.mem.Allocator, bytes: ?[]u8) void {
+pub fn freeOwnedOptionalSecretSlice(allocator: std.mem.Allocator, bytes: ?[]u8) void {
     const slice = bytes orelse return;
     std.crypto.secureZero(u8, slice);
     if (builtin.is_test) {
@@ -1951,17 +1952,31 @@ fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse 
     loop_ctx.exchange_attempt += 1;
 
     if (loop_ctx.cached_url) |cached_url| {
+        var handed_to_exchanger = false;
+        const url = try allocator.dupe(u8, cached_url);
+        errdefer if (!handed_to_exchanger) allocator.free(url);
+
+        const authorization = if (loop_ctx.cached_authorization) |authorization| blk: {
+            const owned = try allocator.dupe(u8, authorization);
+            errdefer if (!handed_to_exchanger) freeOwnedOptionalSecretSlice(allocator, owned);
+            break :blk owned;
+        } else null;
+
+        const body = if (loop_ctx.cached_body) |body| blk: {
+            const owned = try allocator.dupe(u8, body);
+            errdefer if (!handed_to_exchanger) freeOwnedOptionalSecretSlice(allocator, owned);
+            break :blk owned;
+        } else null;
+
         const http_request = TokenHttpRequest{
             .method = loop_ctx.method,
-            .url = try allocator.dupe(u8, cached_url),
-            .authorization = if (loop_ctx.cached_authorization) |authorization|
-                try allocator.dupe(u8, authorization)
-            else
-                null,
+            .url = url,
+            .authorization = authorization,
             .content_type = loop_ctx.cached_content_type,
-            .body = if (loop_ctx.cached_body) |body| try allocator.dupe(u8, body) else null,
+            .body = body,
             .max_response_body_bytes = loop_ctx.engine.config.max_token_response_bytes,
         };
+        handed_to_exchanger = true;
         return exchanger(allocator, loop_ctx.client, http_request);
     }
 

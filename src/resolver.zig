@@ -100,11 +100,15 @@ pub const ResolverParams = struct {
     }
 };
 /// Manifest request shape for resolver transport operations.
+///
+/// `reference` and `accept` borrow from the caller for the request lifetime.
 pub const ManifestRequest = struct {
     method: ManifestRequestMethod,
     operation: ResolverOperation,
+    /// Borrowed registry/repository/ref view from the caller's `Reference`.
     reference: auth.AuthReferenceView,
     platform: ?Platform = null,
+    /// Borrowed Accept header values; not copied until HTTP request build.
     accept: []const []const u8 = &.{},
     allow_cached_auth_retry: bool = true,
 
@@ -126,10 +130,7 @@ pub const ManifestHttpRequest = struct {
 
     pub fn deinit(self: ManifestHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
-        if (self.authorization) |authorization| {
-            std.crypto.secureZero(u8, authorization);
-            allocator.free(authorization);
-        }
+        auth.freeOwnedOptionalSecretSlice(allocator, self.authorization);
     }
 };
 /// Concrete HTTP response shape for the resolver transport seam.
@@ -221,21 +222,36 @@ pub const ManifestResponseMetadata = struct {
         const owned_resilience_headers = try resilience.duplicateHttpHeadersAlloc(allocator, self.resilience_headers);
         errdefer resilience.deinitOwnedHttpHeaders(allocator, owned_resilience_headers);
 
+        const content_type = if (self.content_type) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (content_type) |value| allocator.free(value);
+
+        const docker_content_digest = if (self.docker_content_digest) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (docker_content_digest) |value| allocator.free(value);
+
+        const location = if (self.location) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (location) |value| allocator.free(value);
+
+        const www_authenticate_headers = try duplicateHeaderSlicesAlloc(allocator, self.www_authenticate_headers);
+        errdefer {
+            for (www_authenticate_headers) |header| allocator.free(header);
+            allocator.free(www_authenticate_headers);
+        }
+
         return .{
             .status = self.status,
-            .content_type = if (self.content_type) |content_type|
-                try allocator.dupe(u8, content_type)
-            else
-                null,
-            .docker_content_digest = if (self.docker_content_digest) |digest|
-                try allocator.dupe(u8, digest)
-            else
-                null,
-            .location = if (self.location) |location|
-                try allocator.dupe(u8, location)
-            else
-                null,
-            .www_authenticate_headers = try duplicateHeaderSlicesAlloc(allocator, self.www_authenticate_headers),
+            .content_type = content_type,
+            .docker_content_digest = docker_content_digest,
+            .location = location,
+            .www_authenticate_headers = www_authenticate_headers,
             .resilience_headers = owned_resilience_headers,
         };
     }
@@ -453,14 +469,11 @@ pub fn classifyValidateManifestHead(
         .not_found => return .not_found,
         .failure => |failure| {
             const extracted = failure;
-            head_outcome.* = .not_found;
+            stubHeadOutcomeAfterExtract(head_outcome);
             return .{ .owned_failure = extracted };
         },
         .redirect => |*metadata| {
-            const http_status = metadata.httpStatus();
-            metadata.releaseOwned(allocator);
-            head_outcome.* = .not_found;
-            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .network_error, http_status, false) };
+            return .{ .owned_failure = try headMetadataOwnedFailure(allocator, ref_view, head_outcome, metadata, .network_error) };
         },
         .use_get_fallback => return .proceed_with_get,
         .success => return .inspect_multi_arch_head,
@@ -483,26 +496,17 @@ pub fn mapChildValidateHeadOutcome(
         .not_found => return .not_found,
         .failure => |failure| {
             const extracted = failure;
-            head_outcome.* = .not_found;
+            stubHeadOutcomeAfterExtract(head_outcome);
             return .{ .owned_failure = extracted };
         },
         .redirect => |*metadata| {
-            const http_status = metadata.httpStatus();
-            metadata.releaseOwned(allocator);
-            head_outcome.* = .not_found;
-            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .network_error, http_status, false) };
+            return .{ .owned_failure = try headMetadataOwnedFailure(allocator, ref_view, head_outcome, metadata, .network_error) };
         },
         .success => |*metadata| {
-            const http_status = metadata.httpStatus();
-            metadata.releaseOwned(allocator);
-            head_outcome.* = .not_found;
-            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .content_type_mismatch, http_status, false) };
+            return .{ .owned_failure = try headMetadataOwnedFailure(allocator, ref_view, head_outcome, metadata, .content_type_mismatch) };
         },
         .use_get_fallback => |*metadata| {
-            const http_status = metadata.httpStatus();
-            metadata.releaseOwned(allocator);
-            head_outcome.* = .not_found;
-            return .{ .owned_failure = try ownedResolveErrorAlloc(allocator, ref_view, .manifest_parse_error, http_status, false) };
+            return .{ .owned_failure = try headMetadataOwnedFailure(allocator, ref_view, head_outcome, metadata, .manifest_parse_error) };
         },
     }
 }
@@ -547,7 +551,7 @@ pub fn buildManifestHttpRequestAlloc(
         try std.fmt.allocPrint(allocator, "Bearer {s}", .{token})
     else
         null;
-    errdefer if (authorization) |header| allocator.free(header);
+    errdefer auth.freeOwnedOptionalSecretSlice(allocator, authorization);
 
     return .{
         .method = request.method,
@@ -1026,10 +1030,12 @@ fn exchangeManifestRequestOnce(
     const allocator = loop_ctx.resolver_ctx.allocator;
     loop_ctx.exchange_attempt += 1;
 
+    var handed_to_exchanger = false;
     const url = if (loop_ctx.cached_url) |cached|
         try allocator.dupe(u8, cached)
     else
         try loop_ctx.request.uriAlloc(allocator);
+    errdefer if (!handed_to_exchanger) allocator.free(url);
 
     if (loop_ctx.cached_url == null and loop_ctx.exchange_attempt > 1) {
         loop_ctx.cached_url = try allocator.dupe(u8, url);
@@ -1039,6 +1045,7 @@ fn exchangeManifestRequestOnce(
         try std.fmt.allocPrint(allocator, "Bearer {s}", .{token})
     else
         null;
+    errdefer if (!handed_to_exchanger) auth.freeOwnedOptionalSecretSlice(allocator, authorization);
 
     const http_request = ManifestHttpRequest{
         .method = loop_ctx.request.method,
@@ -1047,6 +1054,7 @@ fn exchangeManifestRequestOnce(
         .accept = loop_ctx.request.accept,
         .max_response_body_bytes = loop_ctx.resolver_ctx.config.max_manifest_bytes,
     };
+    handed_to_exchanger = true;
     return exchanger(allocator, loop_ctx.resolver_ctx.client, http_request);
 }
 fn exchangeManifestRequest(
@@ -1599,6 +1607,7 @@ fn mappedAuthFailureOutcome(
     http_status: ?u16,
 ) error{OutOfMemory}!Outcome {
     const reference = try canonicalReferenceAlloc(ctx.allocator, ctx.reference);
+    errdefer ctx.allocator.free(reference);
     const token_transport_retries_exhausted = engine.takeTokenTransportRetriesExhausted();
     return failureOutcome(Outcome, try resolveErrorFromAuthError(
         err,
@@ -1611,6 +1620,21 @@ fn mappedAuthFailureOutcome(
 fn isRedirectStatus(status: std.http.Status) bool {
     const code = @intFromEnum(status);
     return code >= 300 and code < 400;
+}
+fn stubHeadOutcomeAfterExtract(head_outcome: *HeadRequestOutcome) void {
+    head_outcome.* = .not_found;
+}
+fn headMetadataOwnedFailure(
+    allocator: std.mem.Allocator,
+    ref_view: auth.AuthReferenceView,
+    head_outcome: *HeadRequestOutcome,
+    metadata: *ManifestResponseMetadata,
+    comptime tag: std.meta.Tag(ResolveError),
+) error{OutOfMemory}!ResolveError {
+    const http_status = metadata.httpStatus();
+    metadata.releaseOwned(allocator);
+    stubHeadOutcomeAfterExtract(head_outcome);
+    return try ownedResolveErrorAlloc(allocator, ref_view, tag, http_status, false);
 }
 fn fixtureBodyAlloc(allocator: std.mem.Allocator, path: []const u8, comptime max_bytes: usize) ManifestExchangeError![]u8 {
     var buffer: [max_bytes + 1]u8 = undefined;

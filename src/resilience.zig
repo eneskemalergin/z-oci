@@ -95,9 +95,11 @@ pub const RetryKind = enum {
     rate_limit,
     network,
 };
-/// Borrowed HTTP header pair for parser tests and live response metadata.
+/// HTTP header pair. Borrowed on the wire; owned after `duplicateHttpHeadersAlloc`.
 pub const HttpHeader = struct {
+    /// Header name. Borrowed from the response unless duplicated.
     name: []const u8,
+    /// Header value. Borrowed from the response unless duplicated.
     value: []const u8,
 };
 /// Fields that actually drive `RetryBudget` on the live transport path.
@@ -403,11 +405,20 @@ pub fn duplicateHttpHeadersAlloc(
     const owned = try allocator.alloc(HttpHeader, headers.len);
     errdefer allocator.free(owned);
 
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        }
+    }
+
     for (headers, 0..) |header, index| {
         owned[index] = .{
             .name = try allocator.dupe(u8, header.name),
             .value = try allocator.dupe(u8, header.value),
         };
+        initialized += 1;
     }
 
     return owned;

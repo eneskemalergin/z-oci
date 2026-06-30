@@ -1,11 +1,8 @@
 //! OCI Image Manifest and Docker V2 Schema 2 manifest.
 //!
-//! Both spec formats share the same shape: schema version, media type,
-//! a config descriptor, and a list of layer descriptors. The media_type
-//! field tells them apart at runtime.
-//!
-//! jsonParse and jsonStringify map camelCase JSON field names (schemaVersion,
-//! mediaType) to snake_case Zig fields.
+//! `config` and `layers` descriptors borrow from the parse arena after
+//! `jsonParse`. Nested slice fields follow the same borrow rules as
+//! `Descriptor.zig`.
 
 const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;
