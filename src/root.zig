@@ -41,6 +41,9 @@
 //! - `ResolveManyResult` owns every item it returns. Deinit the batch result once
 //!   to release every successful `ResolveResult`, every failed `ResolveError`, and
 //!   the item array.
+//! - `resolveMany` borrows input `Reference` values. It deep-clones each item before
+//!   calling the existing single-resolve path so callers keep uniform ownership of
+//!   the input slice on success and failure.
 //! - Types that never allocate: `Digest` (borrowed view), `MediaType` (enum),
 //!   `Platform` (struct of slices), `AuthChallenge`/`BearerChallenge` (borrowed views).
 //!   These need no deinit.
@@ -282,6 +285,29 @@ pub const testing = struct {
         );
     }
 
+    /// Batch resolve with injected exchangers (fresh shared `AuthEngine` for the batch).
+    pub fn resolveManyWithExchangers(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        config: Config,
+        refs: []const Reference,
+        options: ResolveManyOptions,
+        token_exchanger: TokenHttpExchanger,
+        manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
+    ) PublicApiError!ResolveManyResult {
+        return root.resolveManyWithExchangers(
+            allocator,
+            client,
+            config,
+            refs,
+            options,
+            token_exchanger,
+            manifest_exchanger,
+            transport_hooks,
+        );
+    }
+
     /// Release owned fields inside a `ResolveError` (alias of `deinitResolveFailure`).
     pub fn deinitResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
         root.deinitResolveFailure(failure, allocator);
@@ -313,14 +339,15 @@ pub const ManifestOutcome = union(enum) {
 pub const ResolveManyItem = union(enum) {
     /// Owned successful resolve payload.
     success: ResolveResult,
-    /// Owned structured failure context.
+    /// Owned structured failure context. In batch results, both `registry` and
+    /// `reference` are owned because input references remain caller-owned.
     failure: ResolveError,
 
     /// Release owned storage in this item.
     pub fn deinit(self: *ResolveManyItem, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .success => |*result| result.deinit(allocator),
-            .failure => |failure| deinitResolveFailure(failure, allocator),
+            .failure => |failure| deinitResolveManyFailure(failure, allocator),
         }
     }
 };
@@ -404,6 +431,37 @@ pub fn resolve(
         config,
         ref,
         platform,
+        auth.liveTokenHttpExchanger,
+        resolver.liveManifestHttpExchanger,
+        resilience.liveTransportHooks(),
+    );
+}
+/// Resolve multiple image references in order using one auth/session context.
+///
+/// Ownership contract:
+/// - `refs` is borrowed for the duration of the call; this function never moves
+///   or frees caller-owned input references.
+/// - The returned `ResolveManyResult` owns every successful `ResolveResult`, every
+///   failed `ResolveError`, and the item array.
+/// - Call `result.deinit(allocator)` when using a non-arena allocator.
+/// - One item failure does not abort the batch. Only setup or allocation failures
+///   return through the outer error union.
+///
+/// Phase 5 intentionally resolves sequentially. The same caller-owned
+/// `std.http.Client` and one shared `AuthEngine` are reused across the batch.
+pub fn resolveMany(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    refs: []const Reference,
+    options: ResolveManyOptions,
+) PublicApiError!ResolveManyResult {
+    return resolveManyWithExchangers(
+        allocator,
+        client,
+        config,
+        refs,
+        options,
         auth.liveTokenHttpExchanger,
         resolver.liveManifestHttpExchanger,
         resilience.liveTransportHooks(),
@@ -616,6 +674,103 @@ fn resolveWithExchangers(
         manifest_exchanger,
         transport_hooks,
     );
+}
+fn resolveManyWithExchangers(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    refs: []const Reference,
+    options: ResolveManyOptions,
+    token_exchanger: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+) PublicApiError!ResolveManyResult {
+    try ensureClientConfigured(config, client);
+
+    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(
+        allocator,
+        config,
+        token_exchanger,
+        transport_hooks,
+    );
+    defer engine.deinit();
+
+    return resolveManyWithEngine(
+        allocator,
+        client,
+        config,
+        &engine,
+        refs,
+        options,
+        token_exchanger,
+        manifest_exchanger,
+        transport_hooks,
+    );
+}
+fn resolveManyWithEngine(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    refs: []const Reference,
+    options: ResolveManyOptions,
+    token_exchanger: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+) PublicApiError!ResolveManyResult {
+    if (refs.len == 0) return .{ .items = &.{} };
+
+    var items = try allocator.alloc(ResolveManyItem, refs.len);
+    var initialized_items: usize = 0;
+    errdefer {
+        for (items[0..initialized_items]) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+
+    for (refs, 0..) |input_ref, index| {
+        emitResolveManyProgress(options, .item_started, index, refs.len, input_ref);
+
+        var item_ref = try cloneReferenceAlloc(allocator, input_ref);
+        errdefer item_ref.deinit(allocator);
+
+        const outcome = try resolveWithEngine(
+            allocator,
+            client,
+            config,
+            engine,
+            item_ref,
+            options.platform,
+            token_exchanger,
+            manifest_exchanger,
+            transport_hooks,
+        );
+
+        switch (outcome) {
+            .success => |success| {
+                items[index] = .{ .success = success };
+                initialized_items += 1;
+                emitResolveManyProgress(
+                    options,
+                    .item_succeeded,
+                    index,
+                    refs.len,
+                    items[index].success.reference,
+                );
+            },
+            .failure => |failure| {
+                const batch_failure = cloneResolveErrorRegistryAlloc(allocator, failure) catch |err| {
+                    deinitResolveFailure(failure, allocator);
+                    return err;
+                };
+                item_ref.deinit(allocator);
+                items[index] = .{ .failure = batch_failure };
+                initialized_items += 1;
+                emitResolveManyProgress(options, .item_failed, index, refs.len, input_ref);
+            },
+        }
+    }
+
+    return .{ .items = items };
 }
 fn resolveWithEngine(
     allocator: std.mem.Allocator,
@@ -1206,8 +1361,71 @@ fn deinitOwnedPlatform(platform: Platform, allocator: std.mem.Allocator) void {
     if (platform.os_version) |os_version| allocator.free(os_version);
     if (platform.os_features) |features| freePlatformFeatures(features, allocator);
 }
+fn cloneReferenceAlloc(allocator: std.mem.Allocator, ref: Reference) !Reference {
+    const registry = try allocator.dupe(u8, ref.registry);
+    errdefer allocator.free(registry);
+
+    const repository = try allocator.dupe(u8, ref.repository);
+    errdefer allocator.free(repository);
+
+    const tag = if (ref.tag) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (tag) |value| allocator.free(value);
+
+    const digest_raw = if (ref.digest_raw) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (digest_raw) |value| allocator.free(value);
+
+    const digest = if (digest_raw) |value|
+        Digest.parse(value) catch unreachable
+    else
+        null;
+
+    return .{
+        .registry = registry,
+        .repository = repository,
+        .tag = tag,
+        .digest = digest,
+        .digest_raw = digest_raw,
+    };
+}
+fn resolveManyReferenceView(ref: Reference) ResolveManyReferenceView {
+    return .{
+        .registry = ref.registry,
+        .repository = ref.repository,
+        .ref_string = ref.refString(),
+    };
+}
+fn emitResolveManyProgress(
+    options: ResolveManyOptions,
+    event: ResolveManyProgress.Event,
+    index: usize,
+    total: usize,
+    ref: Reference,
+) void {
+    if (options.progress_fn) |progress_fn| {
+        progress_fn(.{
+            .event = event,
+            .index = index,
+            .total = total,
+            .reference = resolveManyReferenceView(ref),
+        }, options.progress_user_data);
+    }
+}
 fn deinitOwnedResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
     deinitResolveFailure(failure, allocator);
+}
+fn deinitResolveManyFailure(failure: ResolveError, allocator: std.mem.Allocator) void {
+    switch (failure) {
+        inline else => |value| {
+            allocator.free(value.registry);
+            allocator.free(value.reference);
+        },
+    }
 }
 fn promoteResolveErrorAlloc(allocator: std.mem.Allocator, failure: ResolveError) !ResolveError {
     const owned_reference = try allocator.dupe(u8, switch (failure) {
@@ -1215,6 +1433,83 @@ fn promoteResolveErrorAlloc(allocator: std.mem.Allocator, failure: ResolveError)
     });
     errdefer allocator.free(owned_reference);
     return failure.withOwnedReference(owned_reference);
+}
+fn cloneResolveErrorRegistryAlloc(allocator: std.mem.Allocator, failure: ResolveError) !ResolveError {
+    const owned_registry = try allocator.dupe(u8, switch (failure) {
+        inline else => |value| value.registry,
+    });
+    errdefer allocator.free(owned_registry);
+
+    return switch (failure) {
+        .auth_failed => |value| .{ .auth_failed = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .not_found => |value| .{ .not_found = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .rate_limited => |value| .{ .rate_limited = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+            .transport_retries_exhausted = value.transport_retries_exhausted,
+        } },
+        .digest_mismatch => |value| .{ .digest_mismatch = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .platform_not_found => |value| .{ .platform_not_found = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .platform_required => |value| .{ .platform_required = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .manifest_parse_error => |value| .{ .manifest_parse_error = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .network_error => |value| .{ .network_error = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+            .transport_retries_exhausted = value.transport_retries_exhausted,
+        } },
+        .unsupported_algorithm => |value| .{ .unsupported_algorithm = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .content_type_mismatch => |value| .{ .content_type_mismatch = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .timeout => |value| .{ .timeout = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+            .transport_retries_exhausted = value.transport_retries_exhausted,
+        } },
+        .depth_limit_exceeded => |value| .{ .depth_limit_exceeded = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+        .response_too_large => |value| .{ .response_too_large = .{
+            .registry = owned_registry,
+            .reference = value.reference,
+            .http_status = value.http_status,
+        } },
+    };
 }
 const expectResolveFailure = test_matrix.expectResolveFailure;
 const readFixtureAlloc = test_matrix.readFixtureAlloc;
@@ -1338,9 +1633,14 @@ fn testingResolveFailureAlloc(
     allocator: std.mem.Allocator,
     reference: []const u8,
 ) !ResolveError {
+    const registry_owned = try allocator.dupe(u8, "registry.example.test");
+    errdefer allocator.free(registry_owned);
+
     const reference_owned = try allocator.dupe(u8, reference);
+    errdefer allocator.free(reference_owned);
+
     return .{ .not_found = .{
-        .registry = "registry.example.test",
+        .registry = registry_owned,
         .reference = reference_owned,
         .http_status = 404,
     } };
@@ -1411,6 +1711,359 @@ test "ResolveManyResult.deinit: duplicate successes own independent storage" {
     items = &.{};
 
     try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+test "resolveManyWithExchangers: empty batch returns empty result" {
+    var client: std.http.Client = undefined;
+
+    var result = try testing.resolveManyWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        &.{},
+        .{},
+        refuseToken,
+        busyboxManifestExchange,
+        .{},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+test "resolveManyWithExchangers: empty batch emits no progress events" {
+    const MockHarness = struct {
+        var event_count: usize = 0;
+
+        fn progress(_: ResolveManyProgress, _: ?*anyopaque) void {
+            event_count += 1;
+        }
+    };
+    defer MockHarness.event_count = 0;
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        &.{},
+        .{ .progress_fn = MockHarness.progress },
+        refuseToken,
+        busyboxManifestExchange,
+        .{},
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), MockHarness.event_count);
+}
+
+test "resolveManyWithExchangers: all-success batch preserves order and input ownership" {
+    const allocator = std.testing.allocator;
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:first"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:second"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{},
+        refuseToken,
+        busyboxManifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.items.len);
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
+    try std.testing.expectEqualStrings("first", result.items[0].success.reference.tag.?);
+    try std.testing.expectEqualStrings("second", result.items[1].success.reference.tag.?);
+    try std.testing.expectEqualStrings("first", refs[0].tag.?);
+    try std.testing.expectEqualStrings("second", refs[1].tag.?);
+    try std.testing.expect(refs[0].registry.ptr != result.items[0].success.reference.registry.ptr);
+    try std.testing.expect(refs[1].repository.ptr != result.items[1].success.reference.repository.ptr);
+}
+
+test "resolveManyWithExchangers: mixed batch continues after per-item failure" {
+    const MockHarness = struct {
+        var manifest_attempts: usize = 0;
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            client: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            manifest_attempts += 1;
+            if (std.mem.endsWith(u8, request.url, "/missing")) {
+                defer request.deinit(allocator);
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .not_found,
+                }, null);
+            }
+            return busyboxManifestExchange(allocator, client, request);
+        }
+    };
+    defer MockHarness.manifest_attempts = 0;
+
+    const allocator = std.testing.allocator;
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:first"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:missing"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:second"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{},
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), result.items.len);
+    try std.testing.expectEqual(@as(usize, 3), MockHarness.manifest_attempts);
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[1]));
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[2]));
+    try expectResolveFailure(
+        result.items[1].failure,
+        "not_found",
+        "registry.example.test",
+        "registry.example.test/owner/repo:missing",
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("missing", refs[1].tag.?);
+}
+
+test "resolveManyWithExchangers: all-failure batch stores every failure" {
+    const MockHarness = struct {
+        var manifest_attempts: usize = 0;
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            manifest_attempts += 1;
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .not_found,
+            }, null);
+        }
+    };
+    defer MockHarness.manifest_attempts = 0;
+
+    const allocator = std.testing.allocator;
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:first"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:second"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{},
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.items.len);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.manifest_attempts);
+    try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[1]));
+    try expectResolveFailure(
+        result.items[0].failure,
+        "not_found",
+        "registry.example.test",
+        "registry.example.test/owner/repo:first",
+        null,
+        null,
+    );
+    try expectResolveFailure(
+        result.items[1].failure,
+        "not_found",
+        "registry.example.test",
+        "registry.example.test/owner/repo:second",
+        null,
+        null,
+    );
+}
+
+test "resolveManyWithExchangers: progress callback observes started success and failure events" {
+    const MockHarness = struct {
+        const RecordedEvent = struct {
+            event: ResolveManyProgress.Event,
+            index: usize,
+            ref_string: []const u8,
+        };
+
+        var events: [4]RecordedEvent = undefined;
+        var event_count: usize = 0;
+
+        fn progress(event: ResolveManyProgress, _: ?*anyopaque) void {
+            events[event_count] = .{
+                .event = event.event,
+                .index = event.index,
+                .ref_string = event.reference.ref_string,
+            };
+            event_count += 1;
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            client: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            if (std.mem.endsWith(u8, request.url, "/missing")) {
+                defer request.deinit(allocator);
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .not_found,
+                }, null);
+            }
+            return busyboxManifestExchange(allocator, client, request);
+        }
+    };
+    defer MockHarness.event_count = 0;
+
+    const allocator = std.testing.allocator;
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:ok"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:missing"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{ .progress_fn = MockHarness.progress },
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), MockHarness.event_count);
+    try std.testing.expectEqual(ResolveManyProgress.Event.item_started, MockHarness.events[0].event);
+    try std.testing.expectEqual(@as(usize, 0), MockHarness.events[0].index);
+    try std.testing.expectEqualStrings("ok", MockHarness.events[0].ref_string);
+    try std.testing.expectEqual(ResolveManyProgress.Event.item_succeeded, MockHarness.events[1].event);
+    try std.testing.expectEqual(@as(usize, 0), MockHarness.events[1].index);
+    try std.testing.expectEqualStrings(
+        "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+        MockHarness.events[1].ref_string,
+    );
+    try std.testing.expectEqual(ResolveManyProgress.Event.item_started, MockHarness.events[2].event);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.events[2].index);
+    try std.testing.expectEqualStrings("missing", MockHarness.events[2].ref_string);
+    try std.testing.expectEqual(ResolveManyProgress.Event.item_failed, MockHarness.events[3].event);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.events[3].index);
+    try std.testing.expectEqualStrings("missing", MockHarness.events[3].ref_string);
+}
+
+test "resolveManyWithExchangers: shared AuthEngine reuses cached token across items" {
+    const MockHarness = struct {
+        var token_exchanges: usize = 0;
+        var manifest_calls: usize = 0;
+        const token_body = "{\"access_token\":\"batch-token\",\"expires_in\":3600}";
+
+        fn tokenExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: auth.TokenHttpRequest,
+        ) auth.AuthError!auth.TokenExchangeResponse {
+            defer request.deinit(allocator);
+            token_exchanges += 1;
+            return .{ .status = .ok, .body = token_body };
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            manifest_calls += 1;
+
+            if (request.authorization == null) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{
+                        "Bearer realm=\"https://auth.example.test/token\",service=\"registry.example.test\",scope=\"repository:owner/repo:pull\"",
+                    },
+                }, null);
+            }
+
+            if (!std.mem.eql(u8, request.authorization.?, "Bearer batch-token")) {
+                return error.TransportFailed;
+            }
+
+            const body = readFixtureAlloc(allocator, busybox_fixture, 16 * 1024) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.TransportFailed,
+            };
+            defer allocator.free(body);
+
+            const digest = try sha256DigestStringAlloc(allocator, body);
+            defer allocator.free(digest);
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+    defer {
+        MockHarness.token_exchanges = 0;
+        MockHarness.manifest_calls = 0;
+    }
+
+    const allocator = std.testing.allocator;
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:first"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:second"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{},
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.items.len);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.token_exchanges);
+    try std.testing.expectEqual(@as(usize, 4), MockHarness.manifest_calls);
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
 }
 
 test "resolveWithExchangers: single-arch success pins digest and preserves parsed reference pointers" {
