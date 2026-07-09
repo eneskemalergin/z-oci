@@ -24,6 +24,8 @@ const USAGE =
     \\  authenticate-rate-limit AuthEngine.authenticate (429 then success per call)
     \\  resolve-single    public resolve() single-arch path via injected transports
     \\  resolve-session   resolve() reusing one AuthEngine across iterations
+    \\  resolve-many      public resolveMany() duplicate-heavy batch via injected transports
+    \\  resolve-many-unique public resolveMany() unique-reference batch via injected transports
     \\  resolve-single-retry public resolve() with one transient 503 retry per call
     \\  resolve-multi     public resolve() multi-arch child-selection path via injected transports
     \\  validate-single   public validate() single-arch path via injected transports
@@ -75,6 +77,8 @@ pub fn main(init: std.process.Init) !void {
         try benchAuthenticateRateLimit(io, iterations, counting);
         try benchResolveSingle(io, iterations, counting);
         try benchResolveSession(io, iterations, counting);
+        try benchResolveMany(io, iterations, counting);
+        try benchResolveManyUnique(io, iterations, counting);
         try benchResolveSingleRetry(io, iterations, counting);
         try benchResolveMulti(io, iterations, counting);
         try benchValidateSingle(io, iterations, counting);
@@ -99,6 +103,10 @@ pub fn main(init: std.process.Init) !void {
         try benchResolveSingle(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "resolve-session")) {
         try benchResolveSession(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "resolve-many")) {
+        try benchResolveMany(io, iterations, counting);
+    } else if (std.mem.eql(u8, operation, "resolve-many-unique")) {
+        try benchResolveManyUnique(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "resolve-single-retry")) {
         try benchResolveSingleRetry(io, iterations, counting);
     } else if (std.mem.eql(u8, operation, "resolve-multi")) {
@@ -590,6 +598,30 @@ const SingleManifestRetryBenchFixture = struct {
     }
 };
 
+const BatchManifestBenchFixture = struct {
+    var body: []const u8 = undefined;
+    var manifest_calls: usize = 0;
+
+    fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+        request.deinit(allocator);
+        return error.TokenExchangeFailed;
+    }
+
+    fn manifestExchange(
+        allocator: std.mem.Allocator,
+        _: *std.http.Client,
+        request: z_oci.testing.ManifestHttpRequest,
+    ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+        defer request.deinit(allocator);
+        manifest_calls += 1;
+        return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+            .status = .ok,
+            .content_type = OCI_MANIFEST_MEDIA_TYPE,
+            .docker_content_digest = BUSYBOX_MANIFEST_DIGEST,
+        }, body);
+    }
+};
+
 const MultiManifestBenchFixture = struct {
     var fixture_ref: *const ResolverBenchFixture = undefined;
 
@@ -727,6 +759,156 @@ fn benchResolveSession(io: Io, iterations: usize, counting: bool) !void {
     const elapsed = nanoTime() - start;
 
     printReport("resolve-session", "single-arch resolve with reused AuthEngine", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn benchResolveMany(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const manifest_body = try readFixtureAlloc(alloc, io, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 32 * 1024);
+    defer alloc.free(manifest_body);
+
+    BatchManifestBenchFixture.body = manifest_body;
+    BatchManifestBenchFixture.manifest_calls = 0;
+
+    const refs = [_]z_oci.Reference{
+        .{
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .tag = null,
+            .digest = null,
+            .digest_raw = null,
+        },
+        .{
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .tag = null,
+            .digest = null,
+            .digest_raw = null,
+        },
+        .{
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .tag = "latest",
+            .digest = null,
+            .digest_raw = null,
+        },
+        .{
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .tag = "latest",
+            .digest = null,
+            .digest_raw = null,
+        },
+    };
+
+    var client: std.http.Client = undefined;
+
+    try deinitResolveManySuccess(try z_oci.testing.resolveManyWithExchangers(
+        alloc,
+        &client,
+        z_oci.Config{},
+        refs[0..],
+        .{},
+        BatchManifestBenchFixture.tokenExchange,
+        BatchManifestBenchFixture.manifestExchange,
+        .{},
+    ), alloc);
+
+    ca.reset();
+    BatchManifestBenchFixture.manifest_calls = 0;
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        try deinitResolveManySuccess(try z_oci.testing.resolveManyWithExchangers(
+            alloc,
+            &client,
+            z_oci.Config{},
+            refs[0..],
+            .{},
+            BatchManifestBenchFixture.tokenExchange,
+            BatchManifestBenchFixture.manifestExchange,
+            .{},
+        ), alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    if (BatchManifestBenchFixture.manifest_calls != iterations) return error.UnexpectedBenchmarkFailure;
+    printReport("resolve-many", "4-item duplicate-heavy batch with one manifest fetch", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+}
+
+fn benchResolveManyUnique(io: Io, iterations: usize, counting: bool) !void {
+    var ca = CountingAllocator{ .inner = std.heap.page_allocator };
+    const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
+
+    const manifest_body = try readFixtureAlloc(alloc, io, "fixtures/manifests/busybox-amd64-live-oci-manifest.json", 32 * 1024);
+    defer alloc.free(manifest_body);
+
+    BatchManifestBenchFixture.body = manifest_body;
+    BatchManifestBenchFixture.manifest_calls = 0;
+
+    const refs = [_]z_oci.Reference{
+        .{
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .tag = "one",
+            .digest = null,
+            .digest_raw = null,
+        },
+        .{
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .tag = "two",
+            .digest = null,
+            .digest_raw = null,
+        },
+        .{
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .tag = "three",
+            .digest = null,
+            .digest_raw = null,
+        },
+        .{
+            .registry = "registry-1.docker.io",
+            .repository = "library/busybox",
+            .tag = "four",
+            .digest = null,
+            .digest_raw = null,
+        },
+    };
+
+    var client: std.http.Client = undefined;
+
+    try deinitResolveManySuccess(try z_oci.testing.resolveManyWithExchangers(
+        alloc,
+        &client,
+        z_oci.Config{},
+        refs[0..],
+        .{},
+        BatchManifestBenchFixture.tokenExchange,
+        BatchManifestBenchFixture.manifestExchange,
+        .{},
+    ), alloc);
+
+    ca.reset();
+    BatchManifestBenchFixture.manifest_calls = 0;
+    const start = nanoTime();
+    for (0..iterations) |_| {
+        try deinitResolveManySuccess(try z_oci.testing.resolveManyWithExchangers(
+            alloc,
+            &client,
+            z_oci.Config{},
+            refs[0..],
+            .{},
+            BatchManifestBenchFixture.tokenExchange,
+            BatchManifestBenchFixture.manifestExchange,
+            .{},
+        ), alloc);
+    }
+    const elapsed = nanoTime() - start;
+
+    if (BatchManifestBenchFixture.manifest_calls != iterations * refs.len) return error.UnexpectedBenchmarkFailure;
+    printReport("resolve-many-unique", "4-item unique-reference batch with four manifest fetches", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
 }
 
 fn benchResolveSingleRetry(io: Io, iterations: usize, counting: bool) !void {
@@ -919,6 +1101,18 @@ fn deinitResolveSuccess(outcome: z_oci.ResolveOutcome, allocator: std.mem.Alloca
             owned.deinitOwned(allocator);
             return error.UnexpectedBenchmarkFailure;
         },
+    }
+}
+
+fn deinitResolveManySuccess(result: z_oci.ResolveManyResult, allocator: std.mem.Allocator) !void {
+    var owned = result;
+    defer owned.deinit(allocator);
+
+    for (owned.items) |item| {
+        switch (item) {
+            .success => {},
+            .failure => return error.UnexpectedBenchmarkFailure,
+        }
     }
 }
 

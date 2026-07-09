@@ -483,3 +483,76 @@ test "workflow smoke: public resolve preemptively sleeps before child fetch when
         },
     }
 }
+
+test "workflow smoke: resolveMany caches implicit latest and preserves partial failures" {
+    const MockHarness = struct {
+        var manifest_calls: usize = 0;
+        var child: ChildArtifacts = undefined;
+
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            return tm.refuseTokenExchange(allocator, client, request);
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            manifest_calls += 1;
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/missing")) {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .not_found,
+                }, null);
+            }
+
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = child.digest,
+            }, child.body);
+        }
+    };
+
+    MockHarness.child = try ChildArtifacts.alloc(std.testing.allocator);
+    defer MockHarness.child.deinit(std.testing.allocator);
+    defer MockHarness.manifest_calls = 0;
+
+    const allocator = std.testing.allocator;
+    var refs = [_]z_oci.Reference{
+        try z_oci.Reference.parse(allocator, "registry-1.docker.io/library/busybox"),
+        try z_oci.Reference.parse(allocator, "registry-1.docker.io/library/busybox"),
+        try z_oci.Reference.parse(allocator, "registry-1.docker.io/library/busybox:missing"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try z_oci.testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        z_oci.Config{},
+        refs[0..],
+        .{},
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), result.items.len);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.manifest_calls);
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
+    try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[2]));
+    try std.testing.expectEqualStrings(result.items[0].success.digest.hex, result.items[1].success.digest.hex);
+    try std.testing.expect(result.items[0].success.digest.hex.ptr != result.items[1].success.digest.hex.ptr);
+    try tm.expectResolveFailure(
+        result.items[2].failure,
+        "not_found",
+        "registry-1.docker.io",
+        "registry-1.docker.io/library/busybox:missing",
+        null,
+        null,
+    );
+}

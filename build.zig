@@ -7,7 +7,7 @@
 //! - `workflow-smoke`: offline workflow smoke tests only.
 //! - `examples`: build all packaged example programs.
 //! - `example-normalize-reference`, `example-inspect-manifest`, `example-select-platform`,
-//!   and `example-resolve-reference`: run one example with forwarded CLI args.
+//!   `example-resolve-many`, and `example-resolve-reference`: run one example with forwarded CLI args.
 //! - `examples-smoke`: run offline examples with fixed fixture inputs.
 //! - `bench`: build and install the benchmark CLI to `zig-out/bin/z-oci-bench`.
 //! - `security-check`: reject private-key PEM blocks in tracked repo material.
@@ -130,6 +130,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const resolve_many_example = b.addExecutable(.{
+        .name = "resolve-many",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/resolve-many.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "z_oci", .module = mod },
+            },
+        }),
+    });
+
     const resolve_reference_example = b.addExecutable(.{
         .name = "resolve-reference",
         .root_module = b.createModule(.{
@@ -146,10 +158,12 @@ pub fn build(b: *std.Build) void {
     examples_step.dependOn(&normalize_reference_example.step);
     examples_step.dependOn(&inspect_manifest_example.step);
     examples_step.dependOn(&select_platform_example.step);
+    examples_step.dependOn(&resolve_many_example.step);
     examples_step.dependOn(&resolve_reference_example.step);
     b.installArtifact(normalize_reference_example);
     b.installArtifact(inspect_manifest_example);
     b.installArtifact(select_platform_example);
+    b.installArtifact(resolve_many_example);
     b.installArtifact(resolve_reference_example);
 
     const run_normalize_reference_step = b.step("example-normalize-reference", "Run the normalize-reference example");
@@ -166,6 +180,11 @@ pub fn build(b: *std.Build) void {
     const run_select_platform = b.addRunArtifact(select_platform_example);
     run_select_platform_step.dependOn(&run_select_platform.step);
     if (b.args) |args| run_select_platform.addArgs(args);
+
+    const run_resolve_many_step = b.step("example-resolve-many", "Run the offline resolve-many example");
+    const run_resolve_many = b.addRunArtifact(resolve_many_example);
+    run_resolve_many_step.dependOn(&run_resolve_many.step);
+    if (b.args) |args| run_resolve_many.addArgs(args);
 
     const run_resolve_reference_step = b.step("example-resolve-reference", "Run the live resolve-reference example");
     const run_resolve_reference = b.addRunArtifact(resolve_reference_example);
@@ -203,6 +222,9 @@ pub fn build(b: *std.Build) void {
 
     const smoke_select_platform = b.addRunArtifact(select_platform_example);
     smoke_examples_step.dependOn(&smoke_select_platform.step);
+
+    const smoke_resolve_many = b.addRunArtifact(resolve_many_example);
+    smoke_examples_step.dependOn(&smoke_resolve_many.step);
 
     test_step.dependOn(smoke_examples_step);
 }
