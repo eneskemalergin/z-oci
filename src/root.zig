@@ -358,7 +358,8 @@ pub const ResolveManyResult = struct {
     /// One item per input reference, preserving input order.
     items: []ResolveManyItem,
 
-    /// Release every item and the item array.
+    /// Release every item and the item array, including independently-owned
+    /// successes populated from the session cache.
     pub fn deinit(self: *ResolveManyResult, allocator: std.mem.Allocator) void {
         for (self.items) |*item| item.deinit(allocator);
         if (self.items.len != 0) allocator.free(self.items);
@@ -2278,6 +2279,69 @@ test "resolveManyWithExchangers: allocation failures clean up mixed batch state"
     );
 }
 
+test "resolveManyWithExchangers: targeted allocation failures clean up batch setup paths" {
+    const refs = [_]Reference{busybox_literal_ref};
+
+    const Case = enum {
+        result_array,
+        input_reference_clone,
+        cache_key,
+        cache_result_clone,
+    };
+    const cases = [_]Case{
+        .result_array,
+        .input_reference_clone,
+        .cache_key,
+        .cache_result_clone,
+    };
+
+    for (cases) |case| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = switch (case) {
+                .result_array, .cache_key => 0,
+                .input_reference_clone, .cache_result_clone => 1,
+            },
+        });
+        const allocator = failing.allocator();
+
+        switch (case) {
+            .result_array, .input_reference_clone => {
+                var client: std.http.Client = undefined;
+                const result = testing.resolveManyWithExchangers(
+                    allocator,
+                    &client,
+                    Config{},
+                    refs[0..],
+                    .{},
+                    refuseToken,
+                    busyboxManifestExchange,
+                    .{},
+                );
+
+                try std.testing.expectError(error.OutOfMemory, result);
+            },
+            .cache_key => {
+                const result = ResolveManySessionCache.cacheKeyAlloc(allocator, busybox_literal_ref);
+
+                try std.testing.expectError(error.OutOfMemory, result);
+            },
+            .cache_result_clone => {
+                var cache: ResolveManySessionCache = .{};
+                var result = try testingResolveResultAlloc(std.testing.allocator, "latest", 'c');
+                defer result.deinit(std.testing.allocator);
+
+                try std.testing.expectError(
+                    error.OutOfMemory,
+                    cache.storeSuccess(allocator, busybox_literal_ref, result),
+                );
+            },
+        }
+
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 test "resolveManyWithExchangers: all-failure batch stores every failure" {
     const MockHarness = struct {
         var manifest_attempts: usize = 0;
@@ -2380,6 +2444,55 @@ test "resolveManyWithExchangers: duplicate failures are not cached" {
     try std.testing.expectEqual(@as(usize, 2), MockHarness.manifest_attempts);
     try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[0]));
     try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[1]));
+}
+
+test "resolveManyWithExchangers: failure matrix preserves stored context" {
+    const MockHarness = struct {
+        var scenario: test_matrix.Scenario = .network_error;
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            return test_matrix.manifestExchange(scenario, allocator, request);
+        }
+    };
+    defer test_matrix.Fixtures.reset(std.testing.allocator);
+
+    var client: std.http.Client = undefined;
+
+    for (test_matrix.resolve_failure_scenarios) |scenario| {
+        MockHarness.scenario = scenario;
+        try test_matrix.prepareScenario(scenario, std.testing.allocator);
+
+        var result = try testing.resolveManyWithExchangers(
+            std.testing.allocator,
+            &client,
+            test_matrix.scenarioConfig(scenario),
+            &.{busybox_literal_ref},
+            .{ .platform = test_matrix.scenarioPlatform(scenario) },
+            refuseToken,
+            MockHarness.manifestExchange,
+            .{},
+        );
+        defer result.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), result.items.len);
+        try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[0]));
+        try expectResolveFailure(
+            result.items[0].failure,
+            @tagName(scenario),
+            "registry-1.docker.io",
+            test_matrix.expectedReference(scenario),
+            test_matrix.expectedHttpStatus(scenario),
+            switch (scenario) {
+                .rate_limited => false,
+                .timeout => true,
+                else => null,
+            },
+        );
+    }
 }
 
 test "resolveManyWithExchangers: progress callback observes started success and failure events" {
