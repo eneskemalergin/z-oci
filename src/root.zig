@@ -1713,6 +1713,55 @@ test "ResolveManyResult.deinit: duplicate successes own independent storage" {
     try std.testing.expectEqual(@as(usize, 0), result.items.len);
 }
 
+test "cloneReferenceAlloc: digest input owns independent digest alias" {
+    const allocator = std.testing.allocator;
+    var original = try Reference.parse(
+        allocator,
+        "registry.example.test/owner/repo:tag@sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+    );
+    defer original.deinit(allocator);
+
+    var cloned = try cloneReferenceAlloc(allocator, original);
+    defer cloned.deinit(allocator);
+
+    try std.testing.expectEqualStrings(original.registry, cloned.registry);
+    try std.testing.expectEqualStrings(original.repository, cloned.repository);
+    try std.testing.expectEqualStrings(original.tag.?, cloned.tag.?);
+    try std.testing.expectEqualStrings(original.digest_raw.?, cloned.digest_raw.?);
+    try std.testing.expectEqualStrings(original.digest.?.hex, cloned.digest.?.hex);
+    try std.testing.expect(original.registry.ptr != cloned.registry.ptr);
+    try std.testing.expect(original.repository.ptr != cloned.repository.ptr);
+    try std.testing.expect(original.tag.?.ptr != cloned.tag.?.ptr);
+    try std.testing.expect(original.digest_raw.?.ptr != cloned.digest_raw.?.ptr);
+    try std.testing.expect(@intFromPtr(cloned.digest.?.hex.ptr) >= @intFromPtr(cloned.digest_raw.?.ptr));
+    try std.testing.expect(
+        @intFromPtr(cloned.digest.?.hex.ptr) + cloned.digest.?.hex.len <=
+            @intFromPtr(cloned.digest_raw.?.ptr) + cloned.digest_raw.?.len,
+    );
+}
+
+test "cloneReferenceAlloc: allocation failures do not leak partially cloned reference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const original = try Reference.parse(
+        arena_allocator,
+        "registry.example.test/owner/repo:tag@sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+    );
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, ref: Reference) !void {
+            var cloned = try cloneReferenceAlloc(allocator, ref);
+            defer cloned.deinit(allocator);
+
+            try std.testing.expectEqualStrings(ref.registry, cloned.registry);
+            try std.testing.expectEqualStrings(ref.digest_raw.?, cloned.digest_raw.?);
+            try std.testing.expectEqualStrings(ref.digest.?.hex, cloned.digest.?.hex);
+        }
+    }.run, .{original});
+}
+
 test "resolveManyWithExchangers: empty batch returns empty result" {
     var client: std.http.Client = undefined;
 
