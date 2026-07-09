@@ -38,6 +38,9 @@
 //!   `HeadRequestOutcome` metadata on the caller allocator (same as the public
 //!   `validate` contract). Only the optional GET fallback opens a transient arena,
 //!   matching `resolve`/`getManifest` fetch semantics for that phase.
+//! - `ResolveManyResult` owns every item it returns. Deinit the batch result once
+//!   to release every successful `ResolveResult`, every failed `ResolveError`, and
+//!   the item array.
 //! - Types that never allocate: `Digest` (borrowed view), `MediaType` (enum),
 //!   `Platform` (struct of slices), `AuthChallenge`/`BearerChallenge` (borrowed views).
 //!   These need no deinit.
@@ -305,6 +308,70 @@ pub const ValidateOutcome = union(enum) {
 pub const ManifestOutcome = union(enum) {
     success: std.json.Parsed(Manifest),
     failure: ResolveError,
+};
+/// Per-image outcome stored in a batch resolve result.
+pub const ResolveManyItem = union(enum) {
+    /// Owned successful resolve payload.
+    success: ResolveResult,
+    /// Owned structured failure context.
+    failure: ResolveError,
+
+    /// Release owned storage in this item.
+    pub fn deinit(self: *ResolveManyItem, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .success => |*result| result.deinit(allocator),
+            .failure => |failure| deinitResolveFailure(failure, allocator),
+        }
+    }
+};
+/// Owned result container for a batch resolve call.
+pub const ResolveManyResult = struct {
+    /// One item per input reference, preserving input order.
+    items: []ResolveManyItem,
+
+    /// Release every item and the item array.
+    pub fn deinit(self: *ResolveManyResult, allocator: std.mem.Allocator) void {
+        for (self.items) |*item| item.deinit(allocator);
+        if (self.items.len != 0) allocator.free(self.items);
+        self.items = &.{};
+    }
+};
+/// Borrowed image reference view supplied to progress callbacks.
+pub const ResolveManyReferenceView = struct {
+    /// Registry hostname.
+    registry: []const u8,
+    /// Repository path under the registry.
+    repository: []const u8,
+    /// Tag, digest string, or `"latest"` according to `Reference.refString()`.
+    ref_string: []const u8,
+};
+/// Synchronous progress event for future batch resolution.
+pub const ResolveManyProgress = struct {
+    /// Event kind.
+    event: Event,
+    /// Zero-based item index.
+    index: usize,
+    /// Total number of input references.
+    total: usize,
+    /// Borrowed reference fields valid only for the callback duration.
+    reference: ResolveManyReferenceView,
+
+    /// Batch progress event kinds.
+    pub const Event = enum {
+        item_started,
+        cache_hit,
+        item_succeeded,
+        item_failed,
+    };
+};
+/// Optional knobs for future batch resolution behavior.
+pub const ResolveManyOptions = struct {
+    /// Batch-wide platform selector.
+    platform: ?Platform = null,
+    /// Optional synchronous progress callback.
+    progress_fn: ?*const fn (event: ResolveManyProgress, user_data: ?*anyopaque) void = null,
+    /// User pointer passed through to `progress_fn`.
+    progress_user_data: ?*anyopaque = null,
 };
 /// Release caller-owned storage inside a `ResolveError` from a public outcome `.failure` arm.
 pub fn deinitResolveFailure(failure: ResolveError, allocator: std.mem.Allocator) void {
@@ -1234,6 +1301,118 @@ test {
     _ = @import("test_support.zig");
     _ = @import("test_matrix.zig");
 }
+
+fn testingResolveResultAlloc(
+    allocator: std.mem.Allocator,
+    tag: []const u8,
+    digest_byte: u8,
+) !ResolveResult {
+    const digest_hex = try allocator.alloc(u8, 64);
+    errdefer allocator.free(digest_hex);
+    @memset(digest_hex, digest_byte);
+
+    const registry = try allocator.dupe(u8, "registry.example.test");
+    errdefer allocator.free(registry);
+
+    const repository = try allocator.dupe(u8, "owner/repo");
+    errdefer allocator.free(repository);
+
+    const tag_owned = try allocator.dupe(u8, tag);
+    errdefer allocator.free(tag_owned);
+
+    return .{
+        .digest = .{ .algorithm = .sha256, .hex = digest_hex },
+        .media_type = .oci_manifest_v1,
+        .platform = null,
+        .reference = .{
+            .registry = registry,
+            .repository = repository,
+            .tag = tag_owned,
+            .digest = null,
+            .digest_raw = null,
+        },
+    };
+}
+
+fn testingResolveFailureAlloc(
+    allocator: std.mem.Allocator,
+    reference: []const u8,
+) !ResolveError {
+    const reference_owned = try allocator.dupe(u8, reference);
+    return .{ .not_found = .{
+        .registry = "registry.example.test",
+        .reference = reference_owned,
+        .http_status = 404,
+    } };
+}
+
+test "ResolveManyResult.deinit: empty result is safe" {
+    var result = ResolveManyResult{ .items = &.{} };
+
+    result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+test "ResolveManyResult.deinit: releases single success item" {
+    const allocator = std.testing.allocator;
+    var items = try allocator.alloc(ResolveManyItem, 1);
+    errdefer if (items.len != 0) allocator.free(items);
+    items[0] = .{ .success = try testingResolveResultAlloc(allocator, "v1", 'a') };
+
+    var result = ResolveManyResult{ .items = items };
+    result.deinit(allocator);
+    items = &.{};
+
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+test "ResolveManyResult.deinit: releases single failure item" {
+    const allocator = std.testing.allocator;
+    var items = try allocator.alloc(ResolveManyItem, 1);
+    errdefer if (items.len != 0) allocator.free(items);
+    items[0] = .{ .failure = try testingResolveFailureAlloc(
+        allocator,
+        "registry.example.test/owner/repo:missing",
+    ) };
+
+    var result = ResolveManyResult{ .items = items };
+    result.deinit(allocator);
+    items = &.{};
+
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+test "ResolveManyResult.deinit: duplicate successes own independent storage" {
+    const allocator = std.testing.allocator;
+    var items = try allocator.alloc(ResolveManyItem, 2);
+    var initialized_items: usize = 0;
+    errdefer {
+        for (items[0..initialized_items]) |*item| item.deinit(allocator);
+        if (items.len != 0) allocator.free(items);
+    }
+
+    items[0] = .{ .success = try testingResolveResultAlloc(allocator, "latest", 'b') };
+    initialized_items += 1;
+
+    items[1] = .{ .success = try testingResolveResultAlloc(allocator, "latest", 'b') };
+    initialized_items += 1;
+
+    const first = &items[0].success;
+    const second = &items[1].success;
+    try std.testing.expect(first.digest.hex.ptr != second.digest.hex.ptr);
+    try std.testing.expect(first.reference.registry.ptr != second.reference.registry.ptr);
+    try std.testing.expect(first.reference.repository.ptr != second.reference.repository.ptr);
+    try std.testing.expect(first.reference.tag.?.ptr != second.reference.tag.?.ptr);
+
+    var result = ResolveManyResult{ .items = items };
+    result.deinit(allocator);
+    initialized_items = 0;
+    items = &.{};
+
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
 test "resolveWithExchangers: single-arch success pins digest and preserves parsed reference pointers" {
     const Case = enum { literal_ref, parsed_ref_moves };
     const cases = [_]Case{ .literal_ref, .parsed_ref_moves };
