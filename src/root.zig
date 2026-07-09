@@ -647,6 +647,53 @@ const ResolvedManifestOutcome = union(enum) {
     success: ResolvedManifestSuccess,
     failure: ResolveError,
 };
+const ResolveManySessionCache = struct {
+    fn deinit(self: *ResolveManySessionCache, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
+    }
+};
+const ResolveManySession = struct {
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: auth.AuthEngine,
+    token_exchanger: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+    cache: ResolveManySessionCache = .{},
+
+    fn init(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        config: Config,
+        token_exchanger: auth.TokenHttpExchanger,
+        manifest_exchanger: resolver.ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
+    ) PublicApiError!ResolveManySession {
+        try ensureClientConfigured(config, client);
+
+        return .{
+            .allocator = allocator,
+            .client = client,
+            .config = config,
+            .engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(
+                allocator,
+                config,
+                token_exchanger,
+                transport_hooks,
+            ),
+            .token_exchanger = token_exchanger,
+            .manifest_exchanger = manifest_exchanger,
+            .transport_hooks = transport_hooks,
+        };
+    }
+
+    fn deinit(self: *ResolveManySession) void {
+        self.cache.deinit(self.allocator);
+        self.engine.deinit();
+    }
+};
 fn ensureClientConfigured(config: Config, client: *std.http.Client) PublicApiError!void {
     return config.applyToClient(client);
 }
@@ -687,41 +734,26 @@ fn resolveManyWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ResolveManyResult {
-    try ensureClientConfigured(config, client);
-
-    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(
-        allocator,
-        config,
-        token_exchanger,
-        transport_hooks,
-    );
-    defer engine.deinit();
-
-    return resolveManyWithEngine(
+    var session = try ResolveManySession.init(
         allocator,
         client,
         config,
-        &engine,
-        refs,
-        options,
         token_exchanger,
         manifest_exchanger,
         transport_hooks,
     );
+    defer session.deinit();
+
+    return resolveManyWithSession(&session, refs, options);
 }
-fn resolveManyWithEngine(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    config: Config,
-    engine: *auth.AuthEngine,
+fn resolveManyWithSession(
+    session: *ResolveManySession,
     refs: []const Reference,
     options: ResolveManyOptions,
-    token_exchanger: auth.TokenHttpExchanger,
-    manifest_exchanger: resolver.ManifestHttpExchanger,
-    transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ResolveManyResult {
     if (refs.len == 0) return .{ .items = &.{} };
 
+    const allocator = session.allocator;
     var items = try allocator.alloc(ResolveManyItem, refs.len);
     var initialized_items: usize = 0;
     errdefer {
@@ -737,14 +769,14 @@ fn resolveManyWithEngine(
 
         const outcome = try resolveWithEngine(
             allocator,
-            client,
-            config,
-            engine,
+            session.client,
+            session.config,
+            &session.engine,
             item_ref,
             options.platform,
-            token_exchanger,
-            manifest_exchanger,
-            transport_hooks,
+            session.token_exchanger,
+            session.manifest_exchanger,
+            session.transport_hooks,
         );
 
         switch (outcome) {
