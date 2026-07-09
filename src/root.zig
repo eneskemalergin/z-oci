@@ -336,11 +336,13 @@ pub const ManifestOutcome = union(enum) {
     failure: ResolveError,
 };
 /// Per-image outcome stored in a batch resolve result.
+///
+/// Values produced by `resolveMany()` are owned by the enclosing `ResolveManyResult`.
 pub const ResolveManyItem = union(enum) {
     /// Owned successful resolve payload.
     success: ResolveResult,
-    /// Owned structured failure context. In batch results, both `registry` and
-    /// `reference` are owned because input references remain caller-owned.
+    /// Owned structured failure context. Batch failures own both `registry` and
+    /// `reference`, unlike ordinary public `ResolveError` values.
     failure: ResolveError,
 
     /// Release owned storage in this item.
@@ -805,7 +807,6 @@ fn resolveWithEngine(
         .success => |*success| {
             const detached = success.detachForResolvePromotion();
             defer success.deinit(transient);
-            errdefer allocator.free(detached.resolved_digest_raw);
             errdefer if (detached.platform) |value| deinitOwnedPlatform(value, transient);
 
             const caller_digest_raw = try allocator.dupe(u8, detached.resolved_digest_raw);
@@ -1838,6 +1839,106 @@ test "resolveManyWithExchangers: all-success batch preserves order and input own
     try std.testing.expect(refs[1].repository.ptr != result.items[1].success.reference.repository.ptr);
 }
 
+test "resolveManyWithExchangers: batch-wide platform selects child manifest for every item" {
+    const MockHarness = struct {
+        var index_body: []u8 = undefined;
+        var index_digest: []u8 = undefined;
+        var child_body: []u8 = undefined;
+        var child_digest: []u8 = undefined;
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest") or
+                std.mem.endsWith(u8, request.url, "/manifests/stable"))
+            {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = index_digest,
+                }, index_body);
+            }
+
+            if (std.mem.endsWith(u8, request.url, child_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_manifest_v1.toString(),
+                    .docker_content_digest = child_digest,
+                }, child_body);
+            }
+
+            return error.TransportFailed;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    MockHarness.child_body = try allocator.dupe(
+        u8,
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 123
+        \\  },
+        \\  "layers": []
+        \\}
+        ,
+    );
+    defer allocator.free(MockHarness.child_body);
+
+    MockHarness.child_digest = try sha256DigestStringAlloc(allocator, MockHarness.child_body);
+    defer allocator.free(MockHarness.child_digest);
+
+    MockHarness.index_body = try buildIndexBodyAlloc(
+        allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        MockHarness.child_digest,
+        "linux",
+        "arm64",
+    );
+    defer allocator.free(MockHarness.index_body);
+
+    MockHarness.index_digest = try sha256DigestStringAlloc(allocator, MockHarness.index_body);
+    defer allocator.free(MockHarness.index_digest);
+
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:latest"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:stable"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{ .platform = .{ .os = "linux", .architecture = "arm64" } },
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.items.len);
+    for (result.items, 0..) |item, index| {
+        try std.testing.expectEqual(.success, std.meta.activeTag(item));
+        try std.testing.expectEqual(MediaType.oci_manifest_v1, item.success.media_type);
+        try std.testing.expectEqualStrings(MockHarness.child_digest[("sha256:").len..], item.success.digest.hex);
+        try std.testing.expect(item.success.platform != null);
+        try std.testing.expectEqualStrings("linux", item.success.platform.?.os);
+        try std.testing.expectEqualStrings("arm64", item.success.platform.?.architecture);
+        try std.testing.expectEqualStrings(refs[index].tag.?, item.success.reference.tag.?);
+    }
+}
+
 test "resolveManyWithExchangers: mixed batch continues after per-item failure" {
     const MockHarness = struct {
         var manifest_attempts: usize = 0;
@@ -1894,6 +1995,93 @@ test "resolveManyWithExchangers: mixed batch continues after per-item failure" {
         null,
     );
     try std.testing.expectEqualStrings("missing", refs[1].tag.?);
+}
+
+test "resolveManyWithExchangers: allocation failures clean up mixed batch state" {
+    const MockHarness = struct {
+        var manifest_body: []const u8 = undefined;
+        var manifest_digest: []const u8 = undefined;
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (std.mem.endsWith(u8, request.url, "/missing")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .not_found,
+                }, null);
+            }
+
+            return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = manifest_digest,
+            }, manifest_body);
+        }
+
+        fn run(allocator: std.mem.Allocator, refs: []const Reference) !void {
+            var client: std.http.Client = undefined;
+            var result = try testing.resolveManyWithExchangers(
+                allocator,
+                &client,
+                Config{},
+                refs,
+                .{},
+                refuseToken,
+                manifestExchange,
+                .{},
+            );
+            defer result.deinit(allocator);
+
+            try std.testing.expectEqual(@as(usize, 3), result.items.len);
+            try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+            try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[1]));
+            try std.testing.expectEqual(.success, std.meta.activeTag(result.items[2]));
+            try expectResolveFailure(
+                result.items[1].failure,
+                "not_found",
+                "registry.example.test",
+                "registry.example.test/owner/repo:missing",
+                null,
+                null,
+            );
+        }
+    };
+
+    const manifest_body =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\    "size": 123
+        \\  },
+        \\  "layers": []
+        \\}
+    ;
+
+    MockHarness.manifest_body = manifest_body;
+    MockHarness.manifest_digest = try sha256DigestStringAlloc(std.testing.allocator, manifest_body);
+    defer std.testing.allocator.free(MockHarness.manifest_digest);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const refs = try arena_allocator.alloc(Reference, 3);
+    refs[0] = try Reference.parse(arena_allocator, "registry.example.test/owner/repo:first");
+    refs[1] = try Reference.parse(arena_allocator, "registry.example.test/owner/repo:missing");
+    refs[2] = try Reference.parse(arena_allocator, "registry.example.test/owner/repo:second");
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        MockHarness.run,
+        .{refs},
+    );
 }
 
 test "resolveManyWithExchangers: all-failure batch stores every failure" {
