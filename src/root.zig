@@ -1759,6 +1759,9 @@ test "ResolveManyResult.deinit: releases single success item" {
     errdefer if (items.len != 0) allocator.free(items);
     items[0] = .{ .success = try testingResolveResultAlloc(allocator, "v1", 'a') };
 
+    try std.testing.expectEqual(.success, std.meta.activeTag(items[0]));
+    try std.testing.expectEqualStrings("v1", items[0].success.reference.tag.?);
+
     var result = ResolveManyResult{ .items = items };
     result.deinit(allocator);
     items = &.{};
@@ -1774,6 +1777,16 @@ test "ResolveManyResult.deinit: releases single failure item" {
         allocator,
         "registry.example.test/owner/repo:missing",
     ) };
+
+    try std.testing.expectEqual(.failure, std.meta.activeTag(items[0]));
+    try expectResolveFailure(
+        items[0].failure,
+        "not_found",
+        "registry.example.test",
+        "registry.example.test/owner/repo:missing",
+        404,
+        null,
+    );
 
     var result = ResolveManyResult{ .items = items };
     result.deinit(allocator);
@@ -1905,6 +1918,84 @@ test "resolveManyWithExchangers: empty batch emits no progress events" {
     try std.testing.expectEqual(@as(usize, 0), MockHarness.event_count);
 }
 
+test "resolveManyWithExchangers: empty batch applies config before returning" {
+    try skipUnlessTls();
+
+    const MockHarness = struct {
+        var token_calls: usize = 0;
+        var manifest_calls: usize = 0;
+
+        fn tokenExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: auth.TokenHttpRequest,
+        ) auth.AuthError!auth.TokenExchangeResponse {
+            request.deinit(allocator);
+            token_calls += 1;
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            request.deinit(allocator);
+            manifest_calls += 1;
+            return error.TransportFailed;
+        }
+    };
+    defer {
+        MockHarness.token_calls = 0;
+        MockHarness.manifest_calls = 0;
+    }
+
+    var client = std.http.Client{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    const result = testing.resolveManyWithExchangers(
+        std.testing.allocator,
+        &client,
+        .{ .ca_bundle_path = "/nonexistent/z-oci-ca-bundle.pem" },
+        &.{},
+        .{},
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+
+    try std.testing.expectError(error.CaBundleFileNotFound, result);
+    try std.testing.expectEqual(@as(usize, 0), MockHarness.token_calls);
+    try std.testing.expectEqual(@as(usize, 0), MockHarness.manifest_calls);
+}
+
+test "resolveManyWithExchangers: single-item success owns output and preserves input" {
+    const allocator = std.testing.allocator;
+    var ref = try Reference.parse(allocator, "registry.example.test/owner/repo:single");
+    defer ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        &.{ref},
+        .{},
+        refuseToken,
+        busyboxManifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.items.len);
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqualStrings("single", result.items[0].success.reference.tag.?);
+    try std.testing.expectEqualStrings("single", ref.tag.?);
+    try std.testing.expect(ref.registry.ptr != result.items[0].success.reference.registry.ptr);
+    try std.testing.expect(ref.repository.ptr != result.items[0].success.reference.repository.ptr);
+    try std.testing.expect(ref.tag.?.ptr != result.items[0].success.reference.tag.?.ptr);
+}
+
 test "resolveManyWithExchangers: all-success batch preserves order and input ownership" {
     const allocator = std.testing.allocator;
     var refs = [_]Reference{
@@ -1935,6 +2026,49 @@ test "resolveManyWithExchangers: all-success batch preserves order and input own
     try std.testing.expectEqualStrings("second", refs[1].tag.?);
     try std.testing.expect(refs[0].registry.ptr != result.items[0].success.reference.registry.ptr);
     try std.testing.expect(refs[1].repository.ptr != result.items[1].success.reference.repository.ptr);
+}
+
+test "resolveManyWithExchangers: unique tags resolve independently without cache hit" {
+    const MockHarness = struct {
+        var manifest_attempts: usize = 0;
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            client: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            manifest_attempts += 1;
+            return busyboxManifestExchange(allocator, client, request);
+        }
+    };
+    defer MockHarness.manifest_attempts = 0;
+
+    const allocator = std.testing.allocator;
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:first"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:second"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{},
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.items.len);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.manifest_attempts);
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
+    try std.testing.expectEqualStrings("first", result.items[0].success.reference.tag.?);
+    try std.testing.expectEqualStrings("second", result.items[1].success.reference.tag.?);
 }
 
 test "resolveManyWithExchangers: duplicate tag uses session cache and clones independent results" {
@@ -2073,6 +2207,19 @@ test "resolveManyWithExchangers: digest-addressed references bypass tag cache" {
     try std.testing.expectEqual(@as(usize, 2), MockHarness.manifest_attempts);
     try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
     try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
+    try std.testing.expectEqualStrings(
+        "b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
+        result.items[0].success.digest.hex,
+    );
+    try std.testing.expectEqualStrings(
+        result.items[0].success.digest.hex,
+        result.items[1].success.digest.hex,
+    );
+    try std.testing.expect(result.items[0].success.digest.hex.ptr != result.items[1].success.digest.hex.ptr);
+    try std.testing.expect(result.items[0].success.reference.registry.ptr != result.items[1].success.reference.registry.ptr);
+    try std.testing.expect(result.items[0].success.reference.repository.ptr != result.items[1].success.reference.repository.ptr);
+    try std.testing.expect(result.items[0].success.reference.digest_raw.?.ptr != result.items[1].success.reference.digest_raw.?.ptr);
+    try std.testing.expect(result.items[0].success.reference.digest.?.hex.ptr != result.items[1].success.reference.digest.?.hex.ptr);
 }
 
 test "resolveManyWithExchangers: batch-wide platform selects child manifest for every item" {
@@ -2222,6 +2369,8 @@ test "resolveManyWithExchangers: mixed batch continues after per-item failure" {
     try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
     try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[1]));
     try std.testing.expectEqual(.success, std.meta.activeTag(result.items[2]));
+    try std.testing.expectEqualStrings("first", result.items[0].success.reference.tag.?);
+    try std.testing.expectEqualStrings("second", result.items[2].success.reference.tag.?);
     try expectResolveFailure(
         result.items[1].failure,
         "not_found",
@@ -2230,7 +2379,11 @@ test "resolveManyWithExchangers: mixed batch continues after per-item failure" {
         null,
         null,
     );
+    try std.testing.expectEqualStrings("first", refs[0].tag.?);
     try std.testing.expectEqualStrings("missing", refs[1].tag.?);
+    try std.testing.expectEqualStrings("second", refs[2].tag.?);
+    try std.testing.expect(refs[0].tag.?.ptr != result.items[0].success.reference.tag.?.ptr);
+    try std.testing.expect(refs[2].tag.?.ptr != result.items[2].success.reference.tag.?.ptr);
 }
 
 test "resolveManyWithExchangers: allocation failures clean up mixed batch state" {
@@ -2386,6 +2539,30 @@ test "resolveManyWithExchangers: targeted allocation failures clean up batch set
     }
 }
 
+test "ResolveManySessionCache: allocation failures clean up store and hit paths" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var source = try testingResolveResultAlloc(std.testing.allocator, "latest", 'd');
+            defer source.deinit(std.testing.allocator);
+
+            var cache: ResolveManySessionCache = .{};
+            defer cache.deinit(allocator);
+
+            try cache.storeSuccess(allocator, busybox_literal_ref, source);
+
+            var hit = try cache.cloneHit(allocator, busybox_literal_ref) orelse
+                return error.TestUnexpectedResult;
+            defer hit.deinit(allocator);
+
+            try std.testing.expectEqualStrings(source.digest.hex, hit.digest.hex);
+            try std.testing.expect(source.digest.hex.ptr != hit.digest.hex.ptr);
+            try std.testing.expect(source.reference.registry.ptr != hit.reference.registry.ptr);
+            try std.testing.expect(source.reference.repository.ptr != hit.reference.repository.ptr);
+            try std.testing.expect(source.reference.tag.?.ptr != hit.reference.tag.?.ptr);
+        }
+    }.run, .{});
+}
+
 test "resolveManyWithExchangers: all-failure batch stores every failure" {
     const MockHarness = struct {
         var manifest_attempts: usize = 0;
@@ -2488,6 +2665,24 @@ test "resolveManyWithExchangers: duplicate failures are not cached" {
     try std.testing.expectEqual(@as(usize, 2), MockHarness.manifest_attempts);
     try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[0]));
     try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[1]));
+    try expectResolveFailure(
+        result.items[0].failure,
+        "not_found",
+        "registry.example.test",
+        "registry.example.test/owner/repo:missing",
+        null,
+        null,
+    );
+    try expectResolveFailure(
+        result.items[1].failure,
+        "not_found",
+        "registry.example.test",
+        "registry.example.test/owner/repo:missing",
+        null,
+        null,
+    );
+    try std.testing.expect(result.items[0].failure.not_found.reference.ptr != result.items[1].failure.not_found.reference.ptr);
+    try std.testing.expect(result.items[0].failure.not_found.registry.ptr != result.items[1].failure.not_found.registry.ptr);
 }
 
 test "resolveManyWithExchangers: failure matrix preserves stored context" {
@@ -2539,24 +2734,30 @@ test "resolveManyWithExchangers: failure matrix preserves stored context" {
     }
 }
 
-test "resolveManyWithExchangers: progress callback observes started success and failure events" {
+test "resolveManyWithExchangers: progress callback preserves ordered events and user data" {
     const MockHarness = struct {
         const RecordedEvent = struct {
             event: ResolveManyProgress.Event,
             index: usize,
+            total: usize,
             ref_string: []const u8,
         };
 
-        var events: [4]RecordedEvent = undefined;
-        var event_count: usize = 0;
+        const Recorder = struct {
+            events: [7]RecordedEvent = undefined,
+            event_count: usize = 0,
+        };
 
-        fn progress(event: ResolveManyProgress, _: ?*anyopaque) void {
-            events[event_count] = .{
+        fn progress(event: ResolveManyProgress, user_data: ?*anyopaque) void {
+            const recorder: *Recorder = @ptrCast(@alignCast(user_data.?));
+            std.debug.assert(recorder.event_count < recorder.events.len);
+            recorder.events[recorder.event_count] = .{
                 .event = event.event,
                 .index = event.index,
+                .total = event.total,
                 .ref_string = event.reference.ref_string,
             };
-            event_count += 1;
+            recorder.event_count += 1;
         }
 
         fn manifestExchange(
@@ -2573,99 +2774,49 @@ test "resolveManyWithExchangers: progress callback observes started success and 
             return busyboxManifestExchange(allocator, client, request);
         }
     };
-    defer MockHarness.event_count = 0;
 
     const allocator = std.testing.allocator;
     var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:ok"),
         try Reference.parse(allocator, "registry.example.test/owner/repo:ok"),
         try Reference.parse(allocator, "registry.example.test/owner/repo:missing"),
     };
     defer for (&refs) |*ref| ref.deinit(allocator);
 
+    var recorder: MockHarness.Recorder = .{};
     var client: std.http.Client = undefined;
     var result = try testing.resolveManyWithExchangers(
         allocator,
         &client,
         Config{},
         refs[0..],
-        .{ .progress_fn = MockHarness.progress },
+        .{
+            .progress_fn = MockHarness.progress,
+            .progress_user_data = @ptrCast(&recorder),
+        },
         refuseToken,
         MockHarness.manifestExchange,
         .{},
     );
     defer result.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 4), MockHarness.event_count);
-    try std.testing.expectEqual(ResolveManyProgress.Event.item_started, MockHarness.events[0].event);
-    try std.testing.expectEqual(@as(usize, 0), MockHarness.events[0].index);
-    try std.testing.expectEqualStrings("ok", MockHarness.events[0].ref_string);
-    try std.testing.expectEqual(ResolveManyProgress.Event.item_succeeded, MockHarness.events[1].event);
-    try std.testing.expectEqual(@as(usize, 0), MockHarness.events[1].index);
-    try std.testing.expectEqualStrings("ok", MockHarness.events[1].ref_string);
-    try std.testing.expectEqual(ResolveManyProgress.Event.item_started, MockHarness.events[2].event);
-    try std.testing.expectEqual(@as(usize, 1), MockHarness.events[2].index);
-    try std.testing.expectEqualStrings("missing", MockHarness.events[2].ref_string);
-    try std.testing.expectEqual(ResolveManyProgress.Event.item_failed, MockHarness.events[3].event);
-    try std.testing.expectEqual(@as(usize, 1), MockHarness.events[3].index);
-    try std.testing.expectEqualStrings("missing", MockHarness.events[3].ref_string);
-}
-
-test "resolveManyWithExchangers: progress callback observes cache hit events" {
-    const MockHarness = struct {
-        const RecordedEvent = struct {
-            event: ResolveManyProgress.Event,
-            index: usize,
-            ref_string: []const u8,
-        };
-
-        var events: [5]RecordedEvent = undefined;
-        var event_count: usize = 0;
-
-        fn progress(event: ResolveManyProgress, _: ?*anyopaque) void {
-            events[event_count] = .{
-                .event = event.event,
-                .index = event.index,
-                .ref_string = event.reference.ref_string,
-            };
-            event_count += 1;
-        }
+    const expected = [_]MockHarness.RecordedEvent{
+        .{ .event = .item_started, .index = 0, .total = 3, .ref_string = "ok" },
+        .{ .event = .item_succeeded, .index = 0, .total = 3, .ref_string = "ok" },
+        .{ .event = .item_started, .index = 1, .total = 3, .ref_string = "ok" },
+        .{ .event = .cache_hit, .index = 1, .total = 3, .ref_string = "ok" },
+        .{ .event = .item_succeeded, .index = 1, .total = 3, .ref_string = "ok" },
+        .{ .event = .item_started, .index = 2, .total = 3, .ref_string = "missing" },
+        .{ .event = .item_failed, .index = 2, .total = 3, .ref_string = "missing" },
     };
-    defer MockHarness.event_count = 0;
 
-    const allocator = std.testing.allocator;
-    var refs = [_]Reference{
-        try Reference.parse(allocator, "registry.example.test/owner/repo:repeat"),
-        try Reference.parse(allocator, "registry.example.test/owner/repo:repeat"),
-    };
-    defer for (&refs) |*ref| ref.deinit(allocator);
-
-    var client: std.http.Client = undefined;
-    var result = try testing.resolveManyWithExchangers(
-        allocator,
-        &client,
-        Config{},
-        refs[0..],
-        .{ .progress_fn = MockHarness.progress },
-        refuseToken,
-        busyboxManifestExchange,
-        .{},
-    );
-    defer result.deinit(allocator);
-
-    try std.testing.expectEqual(@as(usize, 5), MockHarness.event_count);
-    try std.testing.expectEqual(ResolveManyProgress.Event.item_started, MockHarness.events[0].event);
-    try std.testing.expectEqual(@as(usize, 0), MockHarness.events[0].index);
-    try std.testing.expectEqual(ResolveManyProgress.Event.item_succeeded, MockHarness.events[1].event);
-    try std.testing.expectEqual(@as(usize, 0), MockHarness.events[1].index);
-    try std.testing.expectEqualStrings("repeat", MockHarness.events[1].ref_string);
-    try std.testing.expectEqual(ResolveManyProgress.Event.item_started, MockHarness.events[2].event);
-    try std.testing.expectEqual(@as(usize, 1), MockHarness.events[2].index);
-    try std.testing.expectEqual(ResolveManyProgress.Event.cache_hit, MockHarness.events[3].event);
-    try std.testing.expectEqual(@as(usize, 1), MockHarness.events[3].index);
-    try std.testing.expectEqualStrings("repeat", MockHarness.events[3].ref_string);
-    try std.testing.expectEqual(ResolveManyProgress.Event.item_succeeded, MockHarness.events[4].event);
-    try std.testing.expectEqual(@as(usize, 1), MockHarness.events[4].index);
-    try std.testing.expectEqualStrings("repeat", MockHarness.events[4].ref_string);
+    try std.testing.expectEqual(@as(usize, expected.len), recorder.event_count);
+    for (expected, recorder.events[0..recorder.event_count]) |want, got| {
+        try std.testing.expectEqual(want.event, got.event);
+        try std.testing.expectEqual(want.index, got.index);
+        try std.testing.expectEqual(want.total, got.total);
+        try std.testing.expectEqualStrings(want.ref_string, got.ref_string);
+    }
 }
 
 test "resolveManyWithExchangers: shared AuthEngine reuses cached token across items" {
@@ -2751,6 +2902,8 @@ test "resolveManyWithExchangers: shared AuthEngine reuses cached token across it
     try std.testing.expectEqual(@as(usize, 4), MockHarness.manifest_calls);
     try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
     try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
+    try std.testing.expectEqualStrings("first", result.items[0].success.reference.tag.?);
+    try std.testing.expectEqualStrings("second", result.items[1].success.reference.tag.?);
 }
 
 test "resolveWithExchangers: single-arch success pins digest and preserves parsed reference pointers" {
