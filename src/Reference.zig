@@ -329,7 +329,7 @@ test "Reference.parse: maps malformed input to exact ParseError" {
     for (cases) |case| try expectParseError(case.input, case.expected);
 }
 
-test "Reference.repositoryPath and refString: real-world corpus" {
+test "Reference: repositoryPath and refString match parse on real-world corpus" {
     const cases = [_]ReferenceCorpusCase{
         .{
             .input = "ubuntu",

@@ -208,7 +208,7 @@ test "workflow smoke: public validate follows selected multi-arch child" {
     try std.testing.expectEqual(z_oci.ValidateOutcome.valid, outcome);
 }
 
-test "workflow smoke: z_oci.testing public APIs propagate representative failures" {
+test "workflow smoke: z_oci.testing resolveWithExchangers propagates network_error" {
     defer tm.Fixtures.reset(std.testing.allocator);
 
     var client: std.http.Client = undefined;
@@ -229,6 +229,7 @@ test "workflow smoke: z_oci.testing public APIs propagate representative failure
         .{},
     );
     defer deinitResolveOutcome(resolve_outcome, allocator);
+
     switch (resolve_outcome) {
         .failure => |failure| try tm.expectResolveFailure(
             failure,
@@ -240,6 +241,13 @@ test "workflow smoke: z_oci.testing public APIs propagate representative failure
         ),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "workflow smoke: z_oci.testing validateWithExchangers propagates scenario failures" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+
+    var client: std.http.Client = undefined;
+    const allocator = std.testing.allocator;
 
     for (tm.validate_failure_scenarios) |scenario| {
         ScenarioHarness.scenario = scenario;
@@ -256,8 +264,16 @@ test "workflow smoke: z_oci.testing public APIs propagate representative failure
             .{},
         );
         defer deinitValidateOutcome(outcome, allocator);
+
         try expectWorkflowValidateFailure(outcome, scenario);
     }
+}
+
+test "workflow smoke: z_oci.testing getManifestWithExchangers propagates scenario failures" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+
+    var client: std.http.Client = undefined;
+    const allocator = std.testing.allocator;
 
     for (tm.get_manifest_failure_scenarios) |scenario| {
         ScenarioHarness.scenario = scenario;
@@ -274,11 +290,12 @@ test "workflow smoke: z_oci.testing public APIs propagate representative failure
             .{},
         );
         defer deinitManifestOutcome(outcome, allocator);
+
         try expectWorkflowGetManifestFailure(outcome, scenario);
     }
 }
 
-test "workflow smoke: public resolve maps token 429 exhaustion and missing CA bundle" {
+test "workflow smoke: public resolve maps exhausted token 429 to rate_limited" {
     const RateLimitHarness = struct {
         var manifest_calls: usize = 0;
 
@@ -326,6 +343,7 @@ test "workflow smoke: public resolve maps token 429 exhaustion and missing CA bu
         .{},
     );
     defer deinitResolveOutcome(rate_limited, std.testing.allocator);
+
     switch (rate_limited) {
         .failure => |failure| try tm.expectResolveFailure(
             failure,
@@ -337,7 +355,9 @@ test "workflow smoke: public resolve maps token 429 exhaustion and missing CA bu
         ),
         else => return error.TestUnexpectedResult,
     }
+}
 
+test "workflow smoke: public resolve maps missing CA bundle before manifest fetch" {
     if (comptime std.http.Client.disable_tls) return;
 
     const CaHarness = struct {
@@ -379,6 +399,7 @@ test "workflow smoke: public resolve maps token 429 exhaustion and missing CA bu
             .{},
         ),
     );
+
     try std.testing.expectEqual(@as(usize, 0), CaHarness.manifest_calls);
 }
 

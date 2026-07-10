@@ -87,7 +87,7 @@ pub fn jsonStringify(self: Digest, jw: anytype) !void {
 //
 // parse
 
-test "parse: valid inputs borrow hex slice and return expected fields" {
+test "Digest.parse: valid inputs borrow hex slice and return expected fields" {
     const hex_lower = "abcdef0123456789" ** 4;
     const cases = [_]struct {
         input: []const u8,
@@ -109,7 +109,7 @@ test "parse: valid inputs borrow hex slice and return expected fields" {
     try std.testing.expectEqual(@as(usize, 64), borrowed.hex.len);
 }
 
-test "parse: malformed inputs return specific errors" {
+test "Digest.parse: malformed inputs return specific errors" {
     const cases = [_]struct { input: []const u8, err: ParseError }{
         .{ .input = "", .err = error.MissingColon },
         .{ .input = ":" ++ "a" ** 64, .err = error.UnsupportedAlgorithm },
@@ -127,7 +127,7 @@ test "parse: malformed inputs return specific errors" {
     for (cases) |tc| try std.testing.expectError(tc.err, parse(tc.input));
 }
 
-test "parse: pseudo-random inputs never panic and only return declared errors" {
+test "Digest.parse: pseudo-random inputs never panic and only return declared errors" {
     var seed: u64 = 0x5eed_d1ce_57;
     var buf: [96]u8 = undefined;
     for (0..256) |_| {
@@ -149,7 +149,7 @@ test "parse: pseudo-random inputs never panic and only return declared errors" {
 
 // eql
 
-test "eql: compares algorithm and hex case-sensitively" {
+test "Digest.eql: compares algorithm and hex case-sensitively" {
     const hex = "d" ** 64;
     var other_buf: [7 + 64]u8 = undefined;
     @memcpy(other_buf[0..7], "sha256:");
@@ -172,7 +172,7 @@ test "eql: compares algorithm and hex case-sensitively" {
 
 // format / jsonStringify
 
-test "Digest format and jsonStringify emit canonical algorithm:hex" {
+test "Digest: format and jsonStringify emit canonical algorithm:hex" {
     const d = try parse("sha256:" ++ "b" ** 64);
     var buf: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -186,7 +186,7 @@ test "Digest format and jsonStringify emit canonical algorithm:hex" {
     try std.testing.expectEqualSlices(u8, "\"sha256:" ++ "b" ** 64 ++ "\"", aw.written());
 }
 
-test "Digest json round-trip preserves digest and arena-owns parsed hex" {
+test "Digest.jsonParse: round-trip preserves digest and arena-owns hex" {
     const hex = "d" ** 64;
     const d = try parse("sha256:" ++ hex);
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);

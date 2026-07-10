@@ -327,8 +327,9 @@ fn tmpFileAbsPath(tmp: std.testing.TmpDir, rel_path: []const u8, abs_buf: *[std.
 
 // --- Tests ---
 
-test "Config: defaults and connectIoTimeout" {
+test "Config: default field values" {
     const defaults = Config{};
+
     try std.testing.expect(defaults.credential_provider == null);
     try std.testing.expect(!defaults.rate_limit_enabled);
     try std.testing.expect(defaults.ca_bundle_path == null);
@@ -340,10 +341,14 @@ test "Config: defaults and connectIoTimeout" {
     try std.testing.expectEqual(DEFAULT_MAX_MANIFEST_BYTES, defaults.max_manifest_bytes);
     try std.testing.expectEqual(DEFAULT_MAX_TOKEN_RESPONSE_BYTES, defaults.max_token_response_bytes);
     try std.testing.expectEqual(DEFAULT_MAX_TOKEN_CACHE_ENTRIES, defaults.max_token_cache_entries);
-    try std.testing.expectEqual(std.Io.Timeout.none, defaults.connectIoTimeout());
+}
+
+test "Config.connectIoTimeout: maps connect_timeout_ms to std.Io.Timeout" {
+    try std.testing.expectEqual(std.Io.Timeout.none, (Config{}).connectIoTimeout());
 
     const timed = Config{ .connect_timeout_ms = 1 };
     const timeout = timed.connectIoTimeout();
+
     try std.testing.expect(timeout.duration.raw.toMilliseconds() == 1);
     try std.testing.expect(timeout.duration.clock == .real);
 }
@@ -373,7 +378,7 @@ test "Config: non-default field values are stored by value" {
     try std.testing.expectEqualStrings("/etc/ssl/certs/ca-certificates.crt", config.ca_bundle_path.?);
 }
 
-test "Config: CredentialProvider.getCredential and Config credential slot" {
+test "Config.CredentialProvider: getCredential and Config credential slot" {
     const selective_provider = CredentialProvider{
         .getCredentialFn = struct {
             fn get(registry: []const u8) ?CredentialHandle {
@@ -392,7 +397,7 @@ test "Config: CredentialProvider.getCredential and Config credential slot" {
     try std.testing.expectEqualSlices(u8, "token", cred.credential.secret);
 }
 
-test "Config: CredentialHandle.release invokes hook or is a no-op" {
+test "CredentialHandle.release: invokes release_fn when set" {
     const MockHarness = struct {
         var released = false;
 
@@ -410,12 +415,17 @@ test "Config: CredentialHandle.release invokes hook or is a no-op" {
         }
     };
 
+    MockHarness.released = false;
     const handle = (CredentialProvider{ .getCredentialFn = MockHarness.get }).getCredential("ghcr.io").?;
+
     try std.testing.expect(!MockHarness.released);
     handle.release();
     try std.testing.expect(MockHarness.released);
+}
 
+test "CredentialHandle.release: no-op when release_fn is null" {
     const noop = CredentialHandle{ .credential = .{ .username = "u", .secret = "s" } };
+
     noop.release();
 }
 
@@ -454,7 +464,7 @@ test "Config.applyToClient: loads PEM and skips reload when path and mtime are u
     }
 }
 
-test "Config.applyToClient: reloads when mtime changes and replaces when path changes" {
+test "Config.applyToClient: replaces CA bundle when ca_bundle_path changes" {
     try skipUnlessTls();
 
     const enterprise_path = try fixtureAbsPath(std.testing.allocator, "fixtures/tls/enterprise-test-ca.pem");
@@ -476,11 +486,19 @@ test "Config.applyToClient: reloads when mtime changes and replaces when path ch
     const test_ca_config = Config{ .ca_bundle_path = test_ca_path };
     try test_ca_config.applyToClient(&client);
     try client.ca_bundle_lock.lockShared(std.testing.io);
+    defer client.ca_bundle_lock.unlockShared(std.testing.io);
     const path_swap_len = client.ca_bundle.bytes.items.len;
     const path_swap_count = client.ca_bundle.map.count();
-    client.ca_bundle_lock.unlockShared(std.testing.io);
+
     try std.testing.expect(path_swap_count > 0);
     try std.testing.expect(enterprise_len != path_swap_len or enterprise_count != path_swap_count);
+}
+
+test "Config.applyToClient: reloads CA bundle when path unchanged but mtime changes" {
+    try skipUnlessTls();
+
+    var client = testClient();
+    defer client.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -516,6 +534,7 @@ test "Config.applyToClient: reloads when mtime changes and replaces when path ch
     try config.applyToClient(&client);
     try client.ca_bundle_lock.lockShared(std.testing.io);
     defer client.ca_bundle_lock.unlockShared(std.testing.io);
+
     try std.testing.expect(
         first_len != client.ca_bundle.bytes.items.len or
             first_count != client.ca_bundle.map.count(),

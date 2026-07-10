@@ -496,7 +496,7 @@ fn expectScenarioTagMatchesResolveError(scenario: Scenario) !void {
 
 // --- Tests ---
 
-test "test_matrix: failure scenarios align with ResolveError tags and C4 entry builders" {
+test "test_matrix: failure scenario tables align with ResolveError tags and C4 builders" {
     try std.testing.expectEqual(@typeInfo(ResolveError).@"union".fields.len, resolve_failure_scenarios.len);
 
     var resolve_errors: [resolve_failure_scenarios.len]C4Entry = undefined;
@@ -547,7 +547,7 @@ test "test_matrix: failure scenarios align with ResolveError tags and C4 entry b
     }
 }
 
-test "test_matrix: scenario metadata, digest helper, index builder, and expectResolveFailure" {
+test "test_matrix: scenario metadata helpers match expected HTTP status, reference, platform, and config" {
     const metadata_cases = [_]struct {
         scenario: Scenario,
         http_status: ?u16,
@@ -584,6 +584,7 @@ test "test_matrix: scenario metadata, digest helper, index builder, and expectRe
             .rate_limit_retries = 1,
         },
     };
+
     for (metadata_cases) |tc| {
         try std.testing.expectEqual(tc.http_status, expectedHttpStatus(tc.scenario));
         try std.testing.expectEqualStrings(tc.reference, expectedReference(tc.scenario));
@@ -596,13 +597,19 @@ test "test_matrix: scenario metadata, digest helper, index builder, and expectRe
             try std.testing.expect(platform == null);
         }
     }
+}
 
+test "test_matrix.sha256DigestStringAlloc: prefixes sha256 and sizes digest string" {
     const body = "fixture-bytes";
+
     const digest = try sha256DigestStringAlloc(std.testing.allocator, body);
     defer std.testing.allocator.free(digest);
+
     try std.testing.expect(std.mem.startsWith(u8, digest, "sha256:"));
     try std.testing.expectEqual(@as(usize, 71), digest.len);
+}
 
+test "test_matrix.buildIndexBodyAlloc: embeds child digest and platform fields" {
     const index_body = try buildIndexBodyAlloc(
         std.testing.allocator,
         MediaType.oci_index_v1.toString(),
@@ -612,14 +619,18 @@ test "test_matrix: scenario metadata, digest helper, index builder, and expectRe
         "arm64",
     );
     defer std.testing.allocator.free(index_body);
+
     try std.testing.expect(std.mem.indexOf(u8, index_body, index_child_digest) != null);
     try std.testing.expect(std.mem.indexOf(u8, index_body, "\"architecture\": \"arm64\"") != null);
+}
 
+test "test_matrix.expectResolveFailure: asserts tag, registry, reference, and HTTP status" {
     const failure = ResolveError{ .not_found = .{
         .registry = "registry-1.docker.io",
         .reference = "registry-1.docker.io/library/busybox:latest",
         .http_status = 404,
     } };
+
     try expectResolveFailure(
         failure,
         "not_found",

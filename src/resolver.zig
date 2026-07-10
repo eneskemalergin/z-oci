@@ -1685,7 +1685,7 @@ const ResolverTestHarness = struct {
     }
 };
 
-test "resolveRedirectUrlAlloc resolves relative redirect against manifest URL" {
+test "resolveRedirectUrlAlloc: relative Location resolves against manifest URL" {
     const base_url = "https://registry.example.test/v2/library/ubuntu/manifests/latest";
     const base_uri = try std.Uri.parse(base_url);
 
@@ -1723,7 +1723,7 @@ test "shouldKeepAuthorizationOnRedirect: same-origin and rejection matrix" {
         try std.testing.expectEqual(case.keep, try shouldKeepAuthorizationOnRedirect(case.base, case.redirect));
     }
 }
-test "ResolverParams init preserves normalized reference and operation" {
+test "ResolverParams.init: preserves normalized reference and operation" {
     var client: std.http.Client = undefined;
     const view = auth.AuthReferenceView{
         .registry = "registry-1.docker.io",
@@ -1746,7 +1746,7 @@ test "ResolverParams init preserves normalized reference and operation" {
     try std.testing.expectEqual(ResolverOperation.resolve, ctx.operation);
     try std.testing.expect(ctx.platform != null);
 }
-test "manifest request shaping: URI and HTTP request fields" {
+test "ManifestRequest.uriAlloc: builds HEAD resolve manifest URL" {
     const head_request = ManifestRequest{
         .method = .head,
         .operation = .resolve,
@@ -1756,10 +1756,14 @@ test "manifest request shaping: URI and HTTP request fields" {
             .ref_string = "v1.2.3",
         },
     };
+
     const head_uri = try head_request.uriAlloc(std.testing.allocator);
     defer std.testing.allocator.free(head_uri);
-    try std.testing.expectEqualStrings("https://ghcr.io/v2/owner/repo/manifests/v1.2.3", head_uri);
 
+    try std.testing.expectEqualStrings("https://ghcr.io/v2/owner/repo/manifests/v1.2.3", head_uri);
+}
+
+test "canonicalReferenceAlloc: formats tag- and digest-pinned references" {
     const digest_ref = auth.AuthReferenceView{
         .registry = "registry-1.docker.io",
         .repository_path = "library/busybox",
@@ -1767,6 +1771,7 @@ test "manifest request shaping: URI and HTTP request fields" {
     };
     const digest_text = try canonicalReferenceAlloc(std.testing.allocator, digest_ref);
     defer std.testing.allocator.free(digest_text);
+
     try std.testing.expectEqualStrings(
         "registry-1.docker.io/library/busybox@sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65",
         digest_text,
@@ -1779,24 +1784,33 @@ test "manifest request shaping: URI and HTTP request fields" {
     };
     const tag_text = try canonicalReferenceAlloc(std.testing.allocator, tag_ref);
     defer std.testing.allocator.free(tag_text);
-    try std.testing.expectEqualStrings("registry-1.docker.io/library/ubuntu:22.04", tag_text);
 
+    try std.testing.expectEqualStrings("registry-1.docker.io/library/ubuntu:22.04", tag_text);
+}
+
+test "buildManifestHttpRequestAlloc: sets method, URL, Authorization, and Accept" {
     const http_request = try buildManifestHttpRequestAlloc(
         std.testing.allocator,
         .{
             .method = .head,
             .operation = .resolve,
-            .reference = head_request.reference,
+            .reference = .{
+                .registry = "ghcr.io",
+                .repository_path = "owner/repo",
+                .ref_string = "v1.2.3",
+            },
             .accept = &.{"application/vnd.oci.image.manifest.v1+json"},
         },
         "token-123",
     );
     defer http_request.deinit(std.testing.allocator);
+
     try std.testing.expectEqual(ManifestRequestMethod.head, http_request.method);
     try std.testing.expectEqualStrings("https://ghcr.io/v2/owner/repo/manifests/v1.2.3", http_request.url);
     try std.testing.expectEqualStrings("Bearer token-123", http_request.authorization.?);
     try std.testing.expectEqual(@as(usize, 1), http_request.accept.len);
 }
+
 test "ManifestResponseMetadata.probeClassification: bearer challenge matrix" {
     const cases = [_]ManifestResponseMetadata{
         .{
@@ -1959,7 +1973,7 @@ test "ownedManifestResponseMetadataFromHead: allocation failure paths" {
         }
     }.run, .{});
 }
-test "ManifestResponseMetadata cloneAllocHeadSuccess omits auth and retry headers" {
+test "ManifestResponseMetadata.cloneAllocHeadSuccess: omits auth and retry headers" {
     const metadata = ManifestResponseMetadata{
         .status = .ok,
         .content_type = "application/vnd.oci.image.manifest.v1+json",
@@ -1975,7 +1989,7 @@ test "ManifestResponseMetadata cloneAllocHeadSuccess omits auth and retry header
     try std.testing.expect(cloned.resilience_headers.len == 0);
     try std.testing.expectEqualStrings("sha256:abc", cloned.docker_content_digest.?);
 }
-test "resolveErrorFromAuthError preserves OutOfMemory and maps resolver-visible variants" {
+test "resolveErrorFromAuthError: preserves OutOfMemory and maps resolver-visible variants" {
     try std.testing.expectError(
         error.OutOfMemory,
         resolveErrorFromAuthError(error.OutOfMemory, "r", "ref", null, false),
@@ -2192,7 +2206,7 @@ test "mapLiveManifestTransportError: maps transport and oversize errors without 
         try std.testing.expectEqual(tc.expected, mapLiveManifestTransportError(tc.err));
     }
 }
-test "resolver error helpers keep registry, reference, and status" {
+test "manifestParseError and helpers: error tags match ResolveError variants" {
     const parse_err = manifestParseError("ghcr.io", "ghcr.io/owner/repo:v1", 200);
     const network_err = networkError("ghcr.io", "ghcr.io/owner/repo:v1", 503, false);
     const content_type_err = contentTypeMismatchError("ghcr.io", "ghcr.io/owner/repo:v1", 415);
@@ -2205,7 +2219,7 @@ test "resolver error helpers keep registry, reference, and status" {
     try std.testing.expectEqualStrings("digest_mismatch", @tagName(digest_mismatch_err));
     try std.testing.expectEqualStrings("unsupported_algorithm", @tagName(unsupported_algorithm_err));
 }
-test "performManifestGet maps exhausted 504 to network_error" {
+test "performManifestGet: exhausted 504 maps to network_error" {
     const MockHarness = struct {
         var attempts: usize = 0;
 
@@ -2270,7 +2284,7 @@ test "ManifestResponseMetadata.releaseOwned: clears owned slices in place" {
     try std.testing.expect(metadata.www_authenticate_headers.len == 0);
     try std.testing.expect(metadata.resilience_headers.len == 0);
 }
-test "performManifestHead marks transport_retries_exhausted after rate-limit retries" {
+test "performManifestHead: marks transport_retries_exhausted after rate-limit retries" {
     const MockHarness = struct {
         var attempts: usize = 0;
 
@@ -2318,7 +2332,7 @@ test "performManifestHead marks transport_retries_exhausted after rate-limit ret
         else => return error.TestUnexpectedResult,
     }
 }
-test "performManifestGet preemptive sleep before request when engine carries exhausted registry rate limit" {
+test "performManifestGet: preemptive sleep when engine carries exhausted registry rate limit" {
     const MockHarness = struct {
         var attempts: usize = 0;
         var preemptive_sleep_ms: u32 = 0;
@@ -2395,7 +2409,7 @@ test "performManifestGet preemptive sleep before request when engine carries exh
         else => return error.TestUnexpectedResult,
     }
 }
-test "manifest media type classifiers: normalize, accept, and reject" {
+test "manifestMediaTypeClassifiers: normalize, accept, and reject matrix" {
     try std.testing.expectEqual(MediaType.oci_manifest_v1, manifestDocumentMediaType(" application/vnd.oci.image.manifest.v1+json; charset=utf-8 ").?);
     try std.testing.expectEqual(@as(?MediaType, null), manifestDocumentMediaType("application/vnd.oci.image.config.v1+json"));
     try std.testing.expectEqual(@as(?MediaType, null), manifestDocumentMediaType("application/vnd.docker.distribution.manifest.v1+prettyjws"));
@@ -2866,7 +2880,7 @@ test "performManifestGet: oversize transport maps to response_too_large" {
         }
     }
 }
-test "performManifestGet maps oversize token response to auth_failed" {
+test "performManifestGet: oversize token response maps to auth_failed" {
     const custom_cap: usize = 4096;
     const MockHarness = struct {
         var seen_cap: ?usize = null;

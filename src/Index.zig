@@ -20,11 +20,9 @@ const test_support = @import("test_support.zig");
 // --- Index types ---
 
 pub const OciImageIndex = struct {
-    /// Always `2`.
     schema_version: u8,
     media_type: MediaType,
     manifests: []const Descriptor,
-    /// `std.json.Value.object` when present.
     annotations: ?std.json.Value = null,
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !OciImageIndex {
@@ -87,7 +85,6 @@ pub const OciImageIndex = struct {
 };
 
 pub const DockerManifestList = struct {
-    /// Always `2`.
     schema_version: u8,
     media_type: MediaType,
     manifests: []const Descriptor,
@@ -399,14 +396,17 @@ test "MultiArchManifest.selectChildDescriptorByPlatform: resolvable child select
     }
 }
 
-test "OciImageIndex.jsonParse: happy path, annotations round-trip, and exact errors" {
+test "OciImageIndex.jsonParse: parses minimal index and platform fields" {
     const parsed = try json.parse(OciImageIndex, std.testing.allocator, minimal_oci_index_json);
     defer parsed.deinit();
+
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
     try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value.media_type);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.manifests.len);
     try std.testing.expectEqualSlices(u8, "linux", parsed.value.manifests[0].platform.?.os);
+}
 
+test "OciImageIndex.jsonParse: annotations round-trip through stringifyForTest" {
     const annotated_json =
         \\{
         \\  "schemaVersion": 2,
@@ -417,14 +417,20 @@ test "OciImageIndex.jsonParse: happy path, annotations round-trip, and exact err
     ;
     const annotated = try json.parse(OciImageIndex, std.testing.allocator, annotated_json);
     defer annotated.deinit();
+
     var aw = try json.stringifyForTest(annotated.value);
     defer aw.deinit();
     const out = aw.written();
+
     try std.testing.expect(std.mem.indexOf(u8, out, "\"annotations\"") != null);
+
     const reparsed = try json.parse(OciImageIndex, std.testing.allocator, out);
     defer reparsed.deinit();
-    try std.testing.expect(reparsed.value.annotations != null);
 
+    try std.testing.expect(reparsed.value.annotations != null);
+}
+
+test "OciImageIndex.jsonParse: malformed payloads return exact errors" {
     const errors = [_]struct { json_bytes: []const u8, expected: anyerror }{
         .{
             .json_bytes =
@@ -445,10 +451,14 @@ test "OciImageIndex.jsonParse: happy path, annotations round-trip, and exact err
             .expected = error.MissingField,
         },
     };
-    for (errors) |case| try expectJsonParseError(OciImageIndex, case.json_bytes, case.expected);
 
+    for (errors) |case| try expectJsonParseError(OciImageIndex, case.json_bytes, case.expected);
+}
+
+test "OciImageIndex.jsonParse: rejects unknown fields when ignore_unknown_fields is false" {
     var scanner = std.json.Scanner.initCompleteInput(std.testing.allocator, "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[],\"extra\":1}");
     defer scanner.deinit();
+
     try std.testing.expectError(error.UnknownField, OciImageIndex.jsonParse(std.testing.allocator, &scanner, .{
         .ignore_unknown_fields = false,
         .allocate = .alloc_always,
@@ -456,13 +466,16 @@ test "OciImageIndex.jsonParse: happy path, annotations round-trip, and exact err
     }));
 }
 
-test "DockerManifestList.jsonParse: happy path, stringify, and exact errors" {
+test "DockerManifestList.jsonParse: parses minimal manifest list" {
     const parsed = try json.parse(DockerManifestList, std.testing.allocator, minimal_docker_list_json);
     defer parsed.deinit();
+
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
     try std.testing.expectEqual(MediaType.docker_manifest_list_v2, parsed.value.media_type);
     try std.testing.expectEqualSlices(u8, "arm64", parsed.value.manifests[0].platform.?.architecture);
+}
 
+test "DockerManifestList.jsonStringify: emits schemaVersion, mediaType, and digest" {
     const arm64 = try makeDescriptor('a', "linux", "amd64");
     defer arm64.deinit(std.testing.allocator);
     const list = DockerManifestList{
@@ -470,15 +483,19 @@ test "DockerManifestList.jsonParse: happy path, stringify, and exact errors" {
         .media_type = .docker_manifest_list_v2,
         .manifests = &.{arm64.descriptor},
     };
+
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     var ws: std.json.Stringify = .{ .writer = &aw.writer };
     try ws.write(list);
     const out = aw.written();
+
     try std.testing.expect(std.mem.indexOf(u8, out, "\"schemaVersion\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"mediaType\":\"application/vnd.docker.distribution.manifest.list.v2+json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, arm64.descriptor.digest.hex) != null);
+}
 
+test "DockerManifestList.jsonParse: malformed payloads return exact errors" {
     const errors = [_]struct { json_bytes: []const u8, expected: anyerror }{
         .{
             .json_bytes =
@@ -499,10 +516,11 @@ test "DockerManifestList.jsonParse: happy path, stringify, and exact errors" {
             .expected = error.MissingField,
         },
     };
+
     for (errors) |case| try expectJsonParseError(DockerManifestList, case.json_bytes, case.expected);
 }
 
-test "index fixtures: spec examples and live registry platform selection" {
+test "MultiArchManifest.filterByPlatform: spec fixtures and live busybox/quay selection" {
     const oci = try test_support.parseFixture(
         OciImageIndex,
         "fixtures/indexes/oci-image-index-spec-example.json",
@@ -573,21 +591,24 @@ test "index fixtures: spec examples and live registry platform selection" {
     try std.testing.expectEqualSlices(u8, "35e7e430350711653810b2b3cc889fec2a6e0175c078e4114964c7252c411209", quay_amd64.?.digest.hex);
 }
 
-test "index JSON: allocation failures do not leak" {
-    const MockHarness = struct {
-        fn runOci(allocator: std.mem.Allocator, bytes: []const u8) !void {
+test "OciImageIndex.jsonParse: allocation failures do not leak" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
             const parsed = try json.parse(OciImageIndex, allocator, bytes);
             defer parsed.deinit();
             try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
         }
-        fn runDocker(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    }.run, .{minimal_oci_index_json});
+}
+
+test "DockerManifestList.jsonParse: allocation failures do not leak" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
             const parsed = try json.parse(DockerManifestList, allocator, bytes);
             defer parsed.deinit();
             try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
         }
-    };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.runOci, .{minimal_oci_index_json});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, MockHarness.runDocker, .{minimal_docker_list_json});
+    }.run, .{minimal_docker_list_json});
 }
 
 test "OciImageIndex.jsonParse: pseudo-random inputs never panic" {

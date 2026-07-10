@@ -114,8 +114,31 @@ const minimal_manifest_json =
 
 // --- Tests ---
 
-test "json: parse copies into arena, ignores unknown fields, and survives freeing input" {
+test "json.parse: arena-owned Manifest survives freeing input buffer" {
     const json_bytes = try std.testing.allocator.dupe(u8,
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        \\  "config": {
+        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
+        \\    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        \\    "size": 17
+        \\  },
+        \\  "layers": []
+        \\}
+    );
+
+    const parsed = try parse(Manifest, std.testing.allocator, json_bytes);
+    std.testing.allocator.free(json_bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
+    try std.testing.expectEqualSlices(u8, "c" ** 64, parsed.value.config.digest.hex);
+}
+
+test "json.parse: ignores unknown top-level fields on Manifest" {
+    const json_bytes =
         \\{
         \\  "schemaVersion": 2,
         \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -127,14 +150,13 @@ test "json: parse copies into arena, ignores unknown fields, and survives freein
         \\  "layers": [],
         \\  "io.zoci.extension": "allowed"
         \\}
-    );
+    ;
+
     const parsed = try parse(Manifest, std.testing.allocator, json_bytes);
-    std.testing.allocator.free(json_bytes);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
     try std.testing.expectEqual(MediaType.oci_manifest_v1, parsed.value.media_type);
-    try std.testing.expectEqualSlices(u8, "c" ** 64, parsed.value.config.digest.hex);
 }
 
 test "json: parse returns specific errors for malformed manifests and JSON" {
@@ -199,24 +221,32 @@ test "json: parse allocation failures do not leak partially parsed arena state" 
     }.run, .{json_bytes});
 }
 
-test "json: parseBorrowing aliases input buffer; stringifyForTest emits parseable JSON" {
+test "json.parseBorrowing: parsed Platform aliases input buffer after mutation" {
     var json_bytes: [64]u8 = undefined;
     const content = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
     @memcpy(json_bytes[0..content.len], content);
 
     const parsed = try parseBorrowing(Platform, std.testing.allocator, json_bytes[0..content.len]);
     defer parsed.deinit();
+
     try std.testing.expectEqualSlices(u8, "linux", parsed.value.os);
 
-    var aw = try stringifyForTest(parsed.value);
+    @memset(json_bytes[0..content.len], 'X');
+
+    try std.testing.expectEqual(@as(u8, 'X'), parsed.value.os[0]);
+}
+
+test "json.stringifyForTest: round-trips Platform through parseBorrowing" {
+    const platform = Platform{ .os = "linux", .architecture = "amd64" };
+
+    var aw = try stringifyForTest(platform);
     defer aw.deinit();
+
     const reparsed = try parseBorrowing(Platform, std.testing.allocator, aw.written());
     defer reparsed.deinit();
+
     try std.testing.expectEqualSlices(u8, "linux", reparsed.value.os);
     try std.testing.expectEqualSlices(u8, "amd64", reparsed.value.architecture);
-
-    @memset(json_bytes[0..content.len], 'X');
-    try std.testing.expectEqual(@as(u8, 'X'), parsed.value.os[0]);
 }
 
 test "json: promoteParsed matches direct parse on busybox fixture" {

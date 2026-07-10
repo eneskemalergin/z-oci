@@ -4307,7 +4307,7 @@ test "AuthEngine.authenticate: repeated success and failure runs stay leak-free"
 
 // --- Token cache keys and cached token ownership ---
 
-test "TokenCacheKey and CachedToken: ownership and equality matrix" {
+test "TokenCacheKey/CachedToken: ownership and equality matrix" {
     var cached = try CachedToken.initOwned(
         std.testing.allocator,
         .{ .value = "opaque-token", .expires_in_seconds = 300 },
@@ -4383,7 +4383,7 @@ test "TokenCacheKey and CachedToken: ownership and equality matrix" {
         try std.testing.expectEqual(case.expected, tokenCacheKeysEqual(case.a, case.b));
     }
 }
-test "auth: reference view normalizes registry and probe URI" {
+test "AuthReferenceView: normalizes registry and probe URI" {
     var ref = try Reference.parse(std.testing.allocator, "docker.io/ubuntu:22.04");
     defer ref.deinit(std.testing.allocator);
 

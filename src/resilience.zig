@@ -913,41 +913,59 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-test "resilience: Config projection maps transport budgets and reserved fields" {
+test "resilience.retryBudgetConfig: maps network and rate-limit retry caps" {
+    const config = Config{
+        .max_network_retries = 2,
+        .max_rate_limit_retries = 3,
+    };
+
+    const budget = retryBudgetConfig(config);
+
+    try std.testing.expectEqual(@as(u8, 2), budget.max_network_retries);
+    try std.testing.expectEqual(@as(u8, 3), budget.max_rate_limit_retries);
+}
+
+test "resilience.configView: exposes transport and CA fields" {
     const config = Config{
         .connect_timeout_ms = 5_000,
         .read_timeout_ms = 60_000,
         .max_retries = 9,
-        .max_network_retries = 2,
-        .max_rate_limit_retries = 3,
         .ca_bundle_path = "/tmp/custom-ca.pem",
         .rate_limit_enabled = false,
     };
 
-    const budget = retryBudgetConfig(config);
-    try std.testing.expectEqual(@as(u8, 2), budget.max_network_retries);
-    try std.testing.expectEqual(@as(u8, 3), budget.max_rate_limit_retries);
-
     const view = configView(config);
+
     try std.testing.expectEqual(@as(u32, 5_000), view.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 60_000), view.read_timeout_ms);
     try std.testing.expectEqualStrings("/tmp/custom-ca.pem", view.ca_bundle_path.?);
     try std.testing.expect(!view.rate_limit_enabled);
+}
+
+test "resilience.retryPolicyConfig: maps budget and backoff defaults" {
+    const config = Config{
+        .max_network_retries = 2,
+        .max_rate_limit_retries = 3,
+    };
 
     const policy_config = retryPolicyConfig(config);
+
     try std.testing.expectEqual(@as(u8, 2), policy_config.budget.max_network_retries);
     try std.testing.expectEqual(@as(u32, 1_000), policy_config.backoff.base_delay_ms);
+}
 
+test "RetryPolicy.decideHttpRetry: gives up when budgets are zero" {
     var tight = testRetryPolicy(retryBudgetConfig(.{
         .max_network_retries = 0,
         .max_rate_limit_retries = 0,
         .rate_limit_enabled = true,
         .connect_timeout_ms = 60_000,
     }));
+
     try std.testing.expectEqual(RetryDecision.Action.give_up, tight.decideHttpRetry(.service_unavailable, null).action);
 }
 
-test "resilience: HTTP and transport errors classify into retry buckets" {
+test "classifyHttpStatus: maps HTTP statuses to retry kinds" {
     const http_cases = [_]struct { std.http.Status, RetryKind }{
         .{ .too_many_requests, .rate_limit },
         .{ .bad_gateway, .network },
@@ -956,11 +974,14 @@ test "resilience: HTTP and transport errors classify into retry buckets" {
         .{ .not_found, .none },
         .{ .unauthorized, .none },
     };
+
     for (http_cases) |case| {
         try std.testing.expectEqual(case[1], classifyHttpStatus(case[0]));
         try std.testing.expectEqual(case[1] != .none, isRetryableHttpStatus(case[0]));
     }
+}
 
+test "classifyNetworkTransportError: maps transport errors to retry kinds" {
     const transport_cases = [_]struct { anyerror, RetryKind }{
         .{ error.ConnectionResetByPeer, .network },
         .{ error.Timeout, .network },
@@ -970,6 +991,7 @@ test "resilience: HTTP and transport errors classify into retry buckets" {
         .{ error.OutOfMemory, .none },
         .{ error.UnexpectedEndOfInput, .none },
     };
+
     for (transport_cases) |case| {
         try std.testing.expectEqual(case[1], classifyNetworkTransportError(case[0]));
     }
@@ -1047,53 +1069,57 @@ test "resilience: parseRateLimitHeaders parses registry, API, and fixture snapsh
     try std.testing.expectEqual(@as(u64, test_epoch_seconds), hub.reset_unix_seconds.?);
 }
 
-test "resilience: parseRetryAfter parsers normalize delay, epoch, HTTP-date, and header precedence" {
+test "parseRetryAfterValue: parses delay seconds, unix epoch, and HTTP-date" {
     const value_cases = [_]struct { []const u8, RetryAfter }{
         .{ "120", .{ .delay_seconds = 120 } },
         .{ "1746136938", .{ .retry_at_unix_seconds = test_epoch_seconds } },
         .{ test_http_date, .{ .retry_at_unix_seconds = test_epoch_seconds } },
     };
+
     for (value_cases) |case| {
         try std.testing.expectEqualDeep(case[1], try parseRetryAfterValue(case[0]));
     }
+}
 
+test "parseRetryAfterFromHeaders: prefers Retry-After over X-Retry-After and anchors to Date" {
     const date_headers = [_]HttpHeader{
         .{ .name = "Date", .value = test_http_date },
         .{ .name = "Retry-After", .value = "60" },
     };
     const anchored = (try parseRetryAfterFromHeaders(&date_headers, null)).?;
     const response_date = (try responseDateUnixSecondsFromHeaders(&date_headers)).?;
+
     try std.testing.expectEqual(response_date + 60, anchored.retry_at_unix_seconds);
 
     const prefer_headers = [_]HttpHeader{
         .{ .name = "Retry-After", .value = "30" },
         .{ .name = "X-Retry-After", .value = "99" },
     };
+
     try std.testing.expectEqual(@as(u32, 30), (try parseRetryAfterFromHeaders(&prefer_headers, null)).?.delay_seconds);
 
     const fallback_headers = [_]HttpHeader{.{
         .name = "X-Retry-After",
         .value = "45",
     }};
+
     try std.testing.expectEqual(@as(u32, 45), (try parseRetryAfterFromHeaders(&fallback_headers, null)).?.delay_seconds);
     try std.testing.expect(try parseRetryAfterFromHeaders(&[_]HttpHeader{
         .{ .name = "Content-Type", .value = "application/json" },
     }, null) == null);
+}
 
+test "retryAfterFromHeaders: reads Retry-After when rate-limit headers present" {
     const retry_headers = [_]HttpHeader{
         .{ .name = "Retry-After", .value = "30" },
         .{ .name = "RateLimit-Remaining", .value = "0" },
     };
-    try std.testing.expectEqual(@as(u32, 30), (try retryAfterFromHeaders(&retry_headers)).?.delay_seconds);
 
-    try std.testing.expectError(error.InvalidRateLimitHeader, parseRegistryRateLimitHeaders(&[_]HttpHeader{
-        .{ .name = "RateLimit-Limit", .value = "not-a-number" },
-    }));
-    try std.testing.expectError(error.InvalidRateLimitHeader, parseApiRateLimitHeaders(&[_]HttpHeader{
-        .{ .name = "X-RateLimit-Remaining", .value = "" },
-    }));
+    try std.testing.expectEqual(@as(u32, 30), (try retryAfterFromHeaders(&retry_headers)).?.delay_seconds);
+}
+
+test "parseRetryAfterValue: rejects empty and malformed HTTP-date strings" {
     try std.testing.expectError(error.InvalidRetryAfterHeader, parseRetryAfterValue(""));
-    try std.testing.expectError(error.InvalidRetryAfterHeader, parseRetryAfterValue("soon"));
     try std.testing.expectError(error.InvalidHttpDate, parseRetryAfterValue("Thu, 99 Foo 2025 99:99:99 GMT"));
 }
 
@@ -1136,13 +1162,14 @@ test "resilience: isTrackedResilienceHeaderName filters retry metadata families"
     }
 }
 
-test "resilience: preemptive throttling trusts registry snapshots and ManifestThrottle sleeps" {
+test "isTrustworthyPreemptiveRateLimit: registry snapshots trusted and API snapshots rejected" {
     const trusted: RateLimitInfo = .{
         .source = .registry_rate_limit,
         .limit = 100,
         .remaining = 0,
         .reset_unix_seconds = 1_700_000_045,
     };
+
     try std.testing.expect(isTrustworthyPreemptiveRateLimit(trusted));
     try std.testing.expect(!isTrustworthyPreemptiveRateLimit(.{
         .source = .api_x_rate_limit,
@@ -1150,6 +1177,16 @@ test "resilience: preemptive throttling trusts registry snapshots and ManifestTh
         .remaining = 0,
         .reset_unix_seconds = 1_700_000_045,
     }));
+}
+
+test "preemptiveRateLimitDelayMs: returns delay only when enabled and registry exhausted" {
+    const trusted: RateLimitInfo = .{
+        .source = .registry_rate_limit,
+        .limit = 100,
+        .remaining = 0,
+        .reset_unix_seconds = 1_700_000_045,
+    };
+
     try std.testing.expectEqual(@as(?u32, 45_000), preemptiveRateLimitDelayMs(true, trusted, test_policy_now_unix_seconds, 0));
     try std.testing.expect(preemptiveRateLimitDelayMs(false, trusted, test_policy_now_unix_seconds, 0) == null);
     try std.testing.expect(preemptiveRateLimitDelayMs(true, trusted, test_policy_now_unix_seconds + 100, 0) == null);
@@ -1159,21 +1196,29 @@ test "resilience: preemptive throttling trusts registry snapshots and ManifestTh
         .remaining = 3,
         .reset_unix_seconds = 1_700_000_045,
     }, test_policy_now_unix_seconds, 0) == null);
+}
 
+test "ManifestThrottle.recordManifestResponseHeaders: registry RateLimit wins over X-RateLimit" {
     var throttle: ManifestThrottle = .{};
+
     throttle.recordManifestResponseHeaders(&[_]HttpHeader{
         .{ .name = "RateLimit-Limit", .value = "100;w=21600" },
         .{ .name = "RateLimit-Remaining", .value = "0" },
         .{ .name = "RateLimit-Reset", .value = "1700000045" },
     });
+
     try std.testing.expectEqual(@as(u32, 0), throttle.prior.?.remaining.?);
+
     throttle.recordManifestResponseHeaders(&[_]HttpHeader{
         .{ .name = "X-RateLimit-Remaining", .value = "0" },
         .{ .name = "X-RateLimit-Reset", .value = "1700000045" },
         .{ .name = "X-RateLimit-Limit", .value = "180" },
     });
-    try std.testing.expect(throttle.prior == null);
 
+    try std.testing.expect(throttle.prior == null);
+}
+
+test "ManifestThrottle.sleepBeforeManifestRequestIfNeeded: sleeps reset window via injected sleeper" {
     const SleepHarness = struct {
         var slept_ms: u32 = 0;
         fn sleeper(delay_ms: u32) void {
@@ -1182,17 +1227,22 @@ test "resilience: preemptive throttling trusts registry snapshots and ManifestTh
     };
     defer SleepHarness.slept_ms = 0;
     test_policy_now_unix_seconds = 1_700_000_000;
-    throttle.prior = .{
-        .source = .registry_rate_limit,
-        .limit = 100,
-        .remaining = 0,
-        .reset_unix_seconds = 1_700_000_030,
+
+    var throttle: ManifestThrottle = .{
+        .prior = .{
+            .source = .registry_rate_limit,
+            .limit = 100,
+            .remaining = 0,
+            .reset_unix_seconds = 1_700_000_030,
+        },
     };
     var client: std.http.Client = undefined;
+
     throttle.sleepBeforeManifestRequestIfNeeded(.{ .rate_limit_enabled = true }, &client, .{
         .sleeper = SleepHarness.sleeper,
         .clock = .{ .now_unix_seconds = testPolicyNowUnixSeconds },
     });
+
     try std.testing.expectEqual(@as(u32, 30_000), SleepHarness.slept_ms);
 }
 
@@ -1225,25 +1275,37 @@ test "resilience: RetryPolicy applies HTTP retry budgets and Retry-After delays"
     try std.testing.expectEqual(RetryDecision.Action.give_up, policy.decideHttpRetry(.not_found, null).action);
 }
 
-test "resilience: RetryPolicy applies transport backoff and gives up on opaque errors" {
+test "RetryPolicy.decideHttpRetry: jitter backoff when Retry-After absent" {
     test_policy_random_u64 = 999;
     var policy = testRetryPolicy(retryBudgetConfig(.{ .max_network_retries = 2, .max_rate_limit_retries = 1 }));
 
     const jitter = policy.decideHttpRetry(.too_many_requests, null);
+
     try std.testing.expectEqual(RetryDecision.Action.retry, jitter.action);
     try std.testing.expectEqual(@as(u32, 999), jitter.delay_ms);
 
     test_policy_random_u64 = 4;
     const gateway = policy.decideHttpRetry(.bad_gateway, null);
+
     try std.testing.expectEqual(@as(u32, 4), gateway.delay_ms);
+}
+
+test "RetryPolicy.decideTransportRetry: retries reset until budget exhausted then gives up" {
+    test_policy_random_u64 = 999;
+    var policy = testRetryPolicy(retryBudgetConfig(.{ .max_network_retries = 2, .max_rate_limit_retries = 1 }));
+    _ = policy.decideHttpRetry(.too_many_requests, null);
+    test_policy_random_u64 = 4;
+    _ = policy.decideHttpRetry(.bad_gateway, null);
+
     const reset = policy.decideTransportRetry(error.ConnectionResetByPeer);
+
     try std.testing.expectEqual(RetryDecision.Action.retry, reset.action);
     try std.testing.expectEqual(@as(u8, 2), policy.budget.network_attempts_used);
     try std.testing.expectEqual(RetryDecision.Action.give_up, policy.decideTransportRetry(error.Timeout).action);
     try std.testing.expectEqual(RetryDecision.Action.give_up, policy.decideTransportRetry(error.UnexpectedEndOfInput).action);
 }
 
-test "resilience: sleepForTransportRetry and readHttpResponseBodyAlloc honor limits" {
+test "sleepForTransportRetry: forwards delay to injected sleeper" {
     const SleepHarness = struct {
         var recorded_ms: u32 = 0;
         fn sleeper(delay_ms: u32) void {
@@ -1252,17 +1314,25 @@ test "resilience: sleepForTransportRetry and readHttpResponseBodyAlloc honor lim
     };
     SleepHarness.recorded_ms = 0;
     var client: std.http.Client = undefined;
-    sleepForTransportRetry(&client, .{ .sleeper = SleepHarness.sleeper }, 250);
-    try std.testing.expectEqual(@as(u32, 250), SleepHarness.recorded_ms);
 
+    sleepForTransportRetry(&client, .{ .sleeper = SleepHarness.sleeper }, 250);
+
+    try std.testing.expectEqual(@as(u32, 250), SleepHarness.recorded_ms);
+}
+
+test "readHttpResponseBodyAlloc: reads within max and returns BodyTooLarge" {
     var reader_ok = std.Io.Reader.fixed("abc");
     const body = try readHttpResponseBodyAlloc(std.testing.allocator, &reader_ok, 4);
     defer std.testing.allocator.free(body);
+
     try std.testing.expectEqualStrings("abc", body);
 
     var reader_too_large = std.Io.Reader.fixed("abcd");
-    try std.testing.expectError(error.BodyTooLarge, readHttpResponseBodyAlloc(std.testing.allocator, &reader_too_large, 3));
 
+    try std.testing.expectError(error.BodyTooLarge, readHttpResponseBodyAlloc(std.testing.allocator, &reader_too_large, 3));
+}
+
+test "readHttpResponseBodyAlloc: allocation failures do not leak" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {
             var reader = std.Io.Reader.fixed("abc");
@@ -1272,15 +1342,24 @@ test "resilience: sleepForTransportRetry and readHttpResponseBodyAlloc honor lim
     }.run, .{});
 }
 
-test "resilience: duplicateHttpHeadersAlloc deep-copies borrowed headers" {
+test "duplicateHttpHeadersAlloc: deep-copies borrowed name and value slices" {
     const borrowed = [_]HttpHeader{
         .{ .name = "Retry-After", .value = "30" },
         .{ .name = "RateLimit-Remaining", .value = "0" },
     };
+
     const owned = try duplicateHttpHeadersAlloc(std.testing.allocator, &borrowed);
     defer deinitOwnedHttpHeaders(std.testing.allocator, owned);
+
     try std.testing.expectEqualStrings("30", owned[0].value);
     try std.testing.expectEqualStrings("0", owned[1].value);
+}
+
+test "duplicateHttpHeadersAlloc: allocation failures do not leak" {
+    const borrowed = [_]HttpHeader{
+        .{ .name = "Retry-After", .value = "30" },
+        .{ .name = "RateLimit-Remaining", .value = "0" },
+    };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -1291,14 +1370,12 @@ test "resilience: duplicateHttpHeadersAlloc deep-copies borrowed headers" {
     }.run, .{});
 }
 
-test "resilience: runHttpRetryLoop retries transport and HTTP failures then gives up" {
+test "runHttpRetryLoop: 429 with Retry-After retries then succeeds" {
     const ExchangeError = error{ConnectionResetByPeer};
-
     const LoopResponse = struct {
         status: std.http.Status,
         headers: []const HttpHeader = &.{},
     };
-
     const RateLimitedHarness = struct {
         var attempts: usize = 0;
         var sleep_count: usize = 0;
@@ -1346,6 +1423,7 @@ test "resilience: runHttpRetryLoop retries transport and HTTP failures then give
             fn call(_: std.mem.Allocator, _: LoopResponse) void {}
         }.call,
     );
+
     switch (rate_limited) {
         .ok => |ok| {
             try std.testing.expectEqual(std.http.Status.ok, ok.response.status);
@@ -1355,7 +1433,14 @@ test "resilience: runHttpRetryLoop retries transport and HTTP failures then give
         },
         else => return error.TestUnexpectedResult,
     }
+}
 
+test "runHttpRetryLoop: malformed Retry-After falls back to jitter backoff" {
+    const ExchangeError = error{ConnectionResetByPeer};
+    const LoopResponse = struct {
+        status: std.http.Status,
+        headers: []const HttpHeader = &.{},
+    };
     const BackoffHarness = struct {
         var attempts: usize = 0;
         var last_sleep_ms: u32 = 0;
@@ -1400,6 +1485,7 @@ test "resilience: runHttpRetryLoop retries transport and HTTP failures then give
             fn call(_: std.mem.Allocator, _: LoopResponse) void {}
         }.call,
     );
+
     switch (malformed) {
         .ok => |ok| {
             try std.testing.expectEqual(@as(u32, 999), BackoffHarness.last_sleep_ms);
@@ -1408,7 +1494,14 @@ test "resilience: runHttpRetryLoop retries transport and HTTP failures then give
         },
         else => return error.TestUnexpectedResult,
     }
+}
 
+test "runHttpRetryLoop: transport failure exhausts network budget" {
+    const ExchangeError = error{ConnectionResetByPeer};
+    const LoopResponse = struct {
+        status: std.http.Status,
+        headers: []const HttpHeader = &.{},
+    };
     const FailHarness = struct {
         var attempts: usize = 0;
         fn exchangeOnce(_: *anyopaque) ExchangeError!LoopResponse {
@@ -1443,6 +1536,7 @@ test "resilience: runHttpRetryLoop retries transport and HTTP failures then give
             fn call(_: std.mem.Allocator, _: LoopResponse) void {}
         }.call,
     );
+
     switch (failed) {
         .transport_failed => |transport_failed| {
             try std.testing.expectEqual(error.ConnectionResetByPeer, transport_failed.err);

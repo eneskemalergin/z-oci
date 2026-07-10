@@ -4,8 +4,9 @@
 //! `resolveMany`); `Client` is unused. Live callers need a real client.
 //!
 //! Ownership: input refs and `result` use `init.gpa`; never `deinitResolveFailure`
-//! on batch items. Progress views borrow for the callback only. Platform is
-//! batch-wide. Manifest body is a fixture.
+//! on batch items (use `result.deinit`). Progress views borrow for the callback
+//! only. Platform is batch-wide. In-call tag/`latest` session cache applies;
+//! digest refs bypass it. Manifest body is a fixture.
 
 const std = @import("std");
 const Io = std.Io;

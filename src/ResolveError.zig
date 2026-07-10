@@ -142,7 +142,8 @@ pub const ResolveError = union(enum) {
     }
 
     /// Single-resolve only: frees `reference`, not borrowed `registry`. Do not use on
-    /// batch item failures (those own `registry`; use `ResolveManyItem.deinit`).
+    /// batch item failures (those own `registry`; use `ResolveManyItem.deinit` /
+    /// `ResolveManyResult.deinit`, or `deinitResolveFailure` will leak `registry`).
     pub fn deinitOwned(self: ResolveError, allocator: std.mem.Allocator) void {
         switch (self) {
             inline else => |value| allocator.free(value.reference),
@@ -416,19 +417,28 @@ test "ResolveError.withOwnedReference: swaps reference on every variant preservi
     }
 }
 
-test "ResolveError lifecycle: deinitOwned frees and releaseOwnedReference clears reference" {
+test "ResolveError.deinitOwned: frees owned reference payload" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
     const alloc = gpa.allocator();
 
     const owned = try alloc.dupe(u8, "library/busybox:latest");
     var freed = testErr(.not_found, .{ .reference = "old" }).withOwnedReference(owned);
+
     freed.deinitOwned(alloc);
+}
+
+test "ResolveError.releaseOwnedReference: clears reference slice in place" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
 
     const owned2 = try alloc.dupe(u8, "library/alpine:latest");
     var cleared = testErr(.rate_limited, .{
         .transport_retries_exhausted = true,
     }).withOwnedReference(owned2);
+
     cleared.releaseOwnedReference(alloc);
+
     try std.testing.expectEqual(@as(usize, 0), cleared.rate_limited.reference.len);
 }
