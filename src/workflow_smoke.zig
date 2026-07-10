@@ -556,3 +556,628 @@ test "workflow smoke: resolveMany caches implicit latest and preserves partial f
         null,
     );
 }
+
+test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed registries" {
+    // Application-shaped coverage beyond unit tests: multi-arch platform selection in a
+    // pin list, per-registry auth isolation, digest verification (success + mismatch),
+    // duplicate tag cache without caller grouping, and lockfile-ready metadata.
+    const MockHarness = struct {
+        const RecordedEvent = struct {
+            event: z_oci.ResolveManyProgress.Event,
+            index: usize,
+            total: usize,
+            registry: []u8,
+            repository: []u8,
+            ref_string: []u8,
+        };
+
+        const Recorder = struct {
+            allocator: std.mem.Allocator,
+            events: [24]RecordedEvent = undefined,
+            event_count: usize = 0,
+
+            fn deinit(self: *Recorder) void {
+                for (self.events[0..self.event_count]) |event| {
+                    self.allocator.free(event.registry);
+                    self.allocator.free(event.repository);
+                    self.allocator.free(event.ref_string);
+                }
+                self.event_count = 0;
+            }
+        };
+
+        var docker_fetches: usize = 0;
+        var ghcr_fetches: usize = 0;
+        var docker_token_exchanges: usize = 0;
+        var ghcr_token_exchanges: usize = 0;
+        var child: ChildArtifacts = undefined;
+        var index_body: []u8 = undefined;
+        var index_digest: []u8 = undefined;
+
+        fn progress(event: z_oci.ResolveManyProgress, user_data: ?*anyopaque) void {
+            const recorder: *Recorder = @ptrCast(@alignCast(user_data.?));
+            std.debug.assert(recorder.event_count < recorder.events.len);
+            // Copy borrowed progress slices: they are valid for the callback only.
+            const registry = recorder.allocator.dupe(u8, event.reference.registry) catch unreachable;
+            const repository = recorder.allocator.dupe(u8, event.reference.repository) catch unreachable;
+            const ref_string = recorder.allocator.dupe(u8, event.reference.ref_string) catch unreachable;
+            recorder.events[recorder.event_count] = .{
+                .event = event.event,
+                .index = event.index,
+                .total = event.total,
+                .registry = registry,
+                .repository = repository,
+                .ref_string = ref_string,
+            };
+            recorder.event_count += 1;
+        }
+
+        fn tokenExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(allocator);
+            if (std.mem.indexOf(u8, request.url, "auth.docker.test") != null) {
+                docker_token_exchanges += 1;
+                return .{ .status = .ok, .body = "{\"access_token\":\"docker-token\",\"expires_in\":3600}" };
+            }
+            if (std.mem.indexOf(u8, request.url, "auth.ghcr.test") != null) {
+                ghcr_token_exchanges += 1;
+                return .{ .status = .ok, .body = "{\"access_token\":\"ghcr-token\",\"expires_in\":3600}" };
+            }
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const is_docker = std.mem.indexOf(u8, request.url, "://registry-1.docker.io/") != null;
+            const is_ghcr = std.mem.indexOf(u8, request.url, "://ghcr.io/") != null;
+            if (is_docker) {
+                docker_fetches += 1;
+            } else if (is_ghcr) {
+                ghcr_fetches += 1;
+            } else {
+                return error.TransportFailed;
+            }
+
+            if (request.authorization == null) {
+                const challenge = if (is_docker)
+                    "Bearer realm=\"https://auth.docker.test/token\",service=\"registry-1.docker.io\",scope=\"repository:library/busybox:pull\""
+                else
+                    "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/busybox:pull\"";
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{challenge},
+                }, null);
+            }
+
+            const expected_token = if (is_docker) "Bearer docker-token" else "Bearer ghcr-token";
+            if (!std.mem.eql(u8, request.authorization.?, expected_token)) {
+                return error.TransportFailed;
+            }
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/missing")) {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .not_found,
+                }, null);
+            }
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/rate-limited")) {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .too_many_requests,
+                    .resilience_headers = &.{
+                        .{ .name = "Retry-After", .value = "1" },
+                    },
+                }, null);
+            }
+
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest") or
+                std.mem.endsWith(u8, request.url, "/manifests/stable"))
+            {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = z_oci.MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = index_digest,
+                }, index_body);
+            }
+
+            if (std.mem.endsWith(u8, request.url, child.digest) or
+                std.mem.indexOf(u8, request.url, "/manifests/sha256:") != null)
+            {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                    .docker_content_digest = child.digest,
+                }, child.body);
+            }
+
+            return error.TransportFailed;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    MockHarness.child = try ChildArtifacts.alloc(allocator);
+    defer MockHarness.child.deinit(allocator);
+
+    MockHarness.index_body = try tm.buildIndexBodyAlloc(
+        allocator,
+        z_oci.MediaType.oci_index_v1.toString(),
+        z_oci.MediaType.oci_manifest_v1.toString(),
+        MockHarness.child.digest,
+        "linux",
+        "amd64",
+    );
+    defer allocator.free(MockHarness.index_body);
+
+    MockHarness.index_digest = try tm.sha256DigestStringAlloc(allocator, MockHarness.index_body);
+    defer allocator.free(MockHarness.index_digest);
+
+    defer {
+        MockHarness.docker_fetches = 0;
+        MockHarness.ghcr_fetches = 0;
+        MockHarness.docker_token_exchanges = 0;
+        MockHarness.ghcr_token_exchanges = 0;
+    }
+
+    const wrong_digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    var digest_image_buf: [128]u8 = undefined;
+    const digest_image = try std.fmt.bufPrint(
+        &digest_image_buf,
+        "registry-1.docker.io/library/busybox@{s}",
+        .{MockHarness.child.digest},
+    );
+    var wrong_digest_image_buf: [128]u8 = undefined;
+    const wrong_digest_image = try std.fmt.bufPrint(
+        &wrong_digest_image_buf,
+        "registry-1.docker.io/library/busybox@{s}",
+        .{wrong_digest},
+    );
+
+    // pipeline.toml-style image list: omitted tag, duplicate latest, unique tag,
+    // second registry, digest pin, digest mismatch, not-found, and rate-limited failure.
+    const image_strings = [_][]const u8{
+        "registry-1.docker.io/library/busybox",
+        "registry-1.docker.io/library/busybox:latest",
+        "registry-1.docker.io/library/busybox:stable",
+        "ghcr.io/owner/busybox:latest",
+        digest_image,
+        wrong_digest_image,
+        "registry-1.docker.io/library/busybox:missing",
+        "registry-1.docker.io/library/busybox:rate-limited",
+    };
+
+    var refs: [image_strings.len]z_oci.Reference = undefined;
+    var parsed_count: usize = 0;
+    defer for (refs[0..parsed_count]) |*ref| ref.deinit(allocator);
+    for (image_strings, 0..) |image, index| {
+        refs[index] = try z_oci.Reference.parse(allocator, image);
+        parsed_count += 1;
+    }
+
+    var recorder: MockHarness.Recorder = .{ .allocator = allocator };
+    defer recorder.deinit();
+
+    var client: std.http.Client = undefined;
+    var result = try z_oci.testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        // One reactive retry so the rate-limited item surfaces transport_retries_exhausted.
+        .{ .max_rate_limit_retries = 1 },
+        refs[0..],
+        .{
+            // Batch-wide only: callers that need per-item platforms must issue separate batches.
+            .platform = .{ .os = "linux", .architecture = "amd64" },
+            .progress_fn = MockHarness.progress,
+            .progress_user_data = @ptrCast(&recorder),
+        },
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 8), result.items.len);
+    // Each resolve probes without Authorization first (401), then retries with a
+    // cached per-registry token. Multi-arch pays index + child after auth.
+    // docker: latest(4) + stable(4) + digest_ok(2) + digest_bad(2) + missing(2) + rate-limited(3) = 17
+    // ghcr: latest(4)
+    try std.testing.expectEqual(@as(usize, 17), MockHarness.docker_fetches);
+    try std.testing.expectEqual(@as(usize, 4), MockHarness.ghcr_fetches);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.docker_token_exchanges);
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.ghcr_token_exchanges);
+
+    // Caller-owned inputs remain valid after success, cache hit, and failure paths.
+    try std.testing.expectEqualStrings("registry-1.docker.io", refs[0].registry);
+    try std.testing.expectEqualStrings("latest", refs[1].refString());
+    try std.testing.expectEqualStrings("ghcr.io", refs[3].registry);
+    try std.testing.expectEqualStrings(MockHarness.child.digest, refs[4].refString());
+    try std.testing.expectEqualStrings(wrong_digest, refs[5].refString());
+
+    const expected_events = [_]struct {
+        event: z_oci.ResolveManyProgress.Event,
+        index: usize,
+        registry: []const u8,
+        repository: []const u8,
+        ref_string: []const u8,
+    }{
+        .{ .event = .item_started, .index = 0, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "latest" },
+        .{ .event = .item_succeeded, .index = 0, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "latest" },
+        .{ .event = .item_started, .index = 1, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "latest" },
+        .{ .event = .cache_hit, .index = 1, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "latest" },
+        .{ .event = .item_succeeded, .index = 1, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "latest" },
+        .{ .event = .item_started, .index = 2, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "stable" },
+        .{ .event = .item_succeeded, .index = 2, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "stable" },
+        .{ .event = .item_started, .index = 3, .registry = "ghcr.io", .repository = "owner/busybox", .ref_string = "latest" },
+        .{ .event = .item_succeeded, .index = 3, .registry = "ghcr.io", .repository = "owner/busybox", .ref_string = "latest" },
+        .{ .event = .item_started, .index = 4, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = MockHarness.child.digest },
+        .{ .event = .item_succeeded, .index = 4, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = MockHarness.child.digest },
+        .{ .event = .item_started, .index = 5, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = wrong_digest },
+        .{ .event = .item_failed, .index = 5, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = wrong_digest },
+        .{ .event = .item_started, .index = 6, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "missing" },
+        .{ .event = .item_failed, .index = 6, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "missing" },
+        .{ .event = .item_started, .index = 7, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "rate-limited" },
+        .{ .event = .item_failed, .index = 7, .registry = "registry-1.docker.io", .repository = "library/busybox", .ref_string = "rate-limited" },
+    };
+    try std.testing.expectEqual(@as(usize, expected_events.len), recorder.event_count);
+    for (expected_events, recorder.events[0..recorder.event_count]) |want, got| {
+        try std.testing.expectEqual(want.event, got.event);
+        try std.testing.expectEqual(want.index, got.index);
+        try std.testing.expectEqual(@as(usize, 8), got.total);
+        try std.testing.expectEqualStrings(want.registry, got.registry);
+        try std.testing.expectEqualStrings(want.repository, got.repository);
+        try std.testing.expectEqualStrings(want.ref_string, got.ref_string);
+    }
+
+    var pinned_count: usize = 0;
+    for (result.items, 0..) |item, index| {
+        switch (item) {
+            .success => |resolved| {
+                pinned_count += 1;
+                try std.testing.expectEqual(z_oci.MediaType.oci_manifest_v1, resolved.media_type);
+                try std.testing.expectEqualStrings("linux", resolved.platform.?.os);
+                try std.testing.expectEqualStrings("amd64", resolved.platform.?.architecture);
+                try std.testing.expectEqualStrings(
+                    MockHarness.child.digest["sha256:".len..],
+                    resolved.digest.hex,
+                );
+
+                var pinned_buf: [256]u8 = undefined;
+                const pinned = try std.fmt.bufPrint(
+                    &pinned_buf,
+                    "{s}/{s}@{f}",
+                    .{ resolved.reference.registry, resolved.reference.repository, resolved.digest },
+                );
+                const expected_pinned = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}@{s}",
+                    .{ resolved.reference.registry, resolved.reference.repository, MockHarness.child.digest },
+                );
+                defer allocator.free(expected_pinned);
+                try std.testing.expectEqualStrings(expected_pinned, pinned);
+
+                if (index == 1) {
+                    try std.testing.expect(result.items[0].success.digest.hex.ptr != resolved.digest.hex.ptr);
+                }
+            },
+            .failure => |failure| {
+                var message_buf: [512]u8 = undefined;
+                var message_writer = std.Io.Writer.fixed(&message_buf);
+                try failure.format(&message_writer);
+                const message = message_writer.buffered();
+
+                switch (index) {
+                    5 => {
+                        const expected_ref = try std.fmt.allocPrint(
+                            allocator,
+                            "registry-1.docker.io/library/busybox@{s}",
+                            .{wrong_digest},
+                        );
+                        defer allocator.free(expected_ref);
+                        try tm.expectResolveFailure(
+                            failure,
+                            "digest_mismatch",
+                            "registry-1.docker.io",
+                            expected_ref,
+                            200,
+                            null,
+                        );
+                        try std.testing.expect(std.mem.indexOf(u8, message, "digest mismatch") != null);
+                    },
+                    6 => {
+                        try tm.expectResolveFailure(
+                            failure,
+                            "not_found",
+                            "registry-1.docker.io",
+                            "registry-1.docker.io/library/busybox:missing",
+                            null,
+                            null,
+                        );
+                        try std.testing.expect(std.mem.indexOf(u8, message, "registry-1.docker.io") != null);
+                        try std.testing.expect(std.mem.indexOf(u8, message, "busybox:missing") != null);
+                    },
+                    7 => {
+                        try tm.expectResolveFailure(
+                            failure,
+                            "rate_limited",
+                            "registry-1.docker.io",
+                            "registry-1.docker.io/library/busybox:rate-limited",
+                            429,
+                            true,
+                        );
+                        try std.testing.expect(std.mem.indexOf(u8, message, "HTTP 429") != null);
+                        try std.testing.expect(std.mem.indexOf(u8, message, "transport retries exhausted") != null);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), pinned_count);
+}
+
+test "workflow smoke: public resolveMany empty batch requires a live Client" {
+    // Proves the public entry point (not only testing.resolveManyWithExchangers) and that
+    // a real std.http.Client lifecycle is enough for the no-network empty-batch path.
+    // Non-empty live resolveMany still needs network or injected exchangers.
+    const allocator = std.testing.allocator;
+    var client = std.http.Client{
+        .allocator = allocator,
+        .io = std.testing.io,
+    };
+    defer client.deinit();
+
+    var result = try z_oci.resolveMany(allocator, &client, .{}, &.{}, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
+test "workflow smoke: batch failure registry outlives input Reference deinit" {
+    // Batch failures own registry storage. Zencelot must be able to deinit parsed inputs
+    // and still format/report failures from ResolveManyResult.
+    const MockHarness = struct {
+        fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            return tm.refuseTokenExchange(allocator, client, request);
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .not_found,
+            }, null);
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var ref = try z_oci.Reference.parse(allocator, "registry-1.docker.io/library/busybox:missing");
+    const input_registry_ptr = ref.registry.ptr;
+
+    var client: std.http.Client = undefined;
+    var result = try z_oci.testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        .{},
+        &.{ref},
+        .{},
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.items.len);
+    try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[0]));
+    const failure_registry = switch (result.items[0].failure) {
+        inline else => |value| value.registry,
+    };
+    try std.testing.expect(failure_registry.ptr != input_registry_ptr);
+
+    ref.deinit(allocator);
+
+    var message_buf: [256]u8 = undefined;
+    var message_writer = std.Io.Writer.fixed(&message_buf);
+    try result.items[0].failure.format(&message_writer);
+    const message = message_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, message, "registry-1.docker.io") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "busybox:missing") != null);
+}
+
+test "workflow smoke: warm token cache still probes without Authorization first" {
+    // Honest cost check: a warm AuthEngine token does not skip the unauthenticated
+    // manifest probe. Each item still pays a 401 before the authenticated GET.
+    const MockHarness = struct {
+        var unauthorized_probes: usize = 0;
+        var authorized_gets: usize = 0;
+        var token_exchanges: usize = 0;
+        var child: ChildArtifacts = undefined;
+        const token_body = "{\"access_token\":\"warm-token\",\"expires_in\":3600}";
+
+        fn tokenExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(allocator);
+            token_exchanges += 1;
+            return .{ .status = .ok, .body = token_body };
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            if (request.authorization == null) {
+                unauthorized_probes += 1;
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{
+                        "Bearer realm=\"https://auth.example.test/token\",service=\"registry-1.docker.io\",scope=\"repository:library/busybox:pull\"",
+                    },
+                }, null);
+            }
+
+            if (!std.mem.eql(u8, request.authorization.?, "Bearer warm-token")) {
+                return error.TransportFailed;
+            }
+            authorized_gets += 1;
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = child.digest,
+            }, child.body);
+        }
+    };
+
+    MockHarness.child = try ChildArtifacts.alloc(std.testing.allocator);
+    defer MockHarness.child.deinit(std.testing.allocator);
+    defer {
+        MockHarness.unauthorized_probes = 0;
+        MockHarness.authorized_gets = 0;
+        MockHarness.token_exchanges = 0;
+    }
+
+    const allocator = std.testing.allocator;
+    var refs = [_]z_oci.Reference{
+        try z_oci.Reference.parse(allocator, "registry-1.docker.io/library/busybox:one"),
+        try z_oci.Reference.parse(allocator, "registry-1.docker.io/library/busybox:two"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try z_oci.testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        .{},
+        refs[0..],
+        .{},
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.items.len);
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
+    try std.testing.expectEqual(@as(usize, 1), MockHarness.token_exchanges);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.unauthorized_probes);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.authorized_gets);
+}
+
+test "workflow smoke: CredentialProvider supplies Basic auth on per-registry token exchange" {
+    // Proves Config.credential_provider is on the live batch path, not storage-only.
+    const MockHarness = struct {
+        var docker_basic_seen: bool = false;
+        var ghcr_basic_seen: bool = false;
+        var child: ChildArtifacts = undefined;
+
+        fn getCredential(registry: []const u8) ?z_oci.CredentialHandle {
+            if (std.mem.eql(u8, registry, "registry-1.docker.io")) {
+                return .{ .credential = .{ .username = "docker-user", .secret = "docker-secret" } };
+            }
+            if (std.mem.eql(u8, registry, "ghcr.io")) {
+                return .{ .credential = .{ .username = "ghcr-user", .secret = "ghcr-secret" } };
+            }
+            return null;
+        }
+
+        fn tokenExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(allocator);
+            const authorization = request.authorization orelse return error.TokenExchangeFailed;
+            if (!std.mem.startsWith(u8, authorization, "Basic ")) return error.TokenExchangeFailed;
+
+            if (std.mem.indexOf(u8, request.url, "auth.docker.test") != null) {
+                docker_basic_seen = true;
+                return .{ .status = .ok, .body = "{\"access_token\":\"docker-token\",\"expires_in\":3600}" };
+            }
+            if (std.mem.indexOf(u8, request.url, "auth.ghcr.test") != null) {
+                ghcr_basic_seen = true;
+                return .{ .status = .ok, .body = "{\"access_token\":\"ghcr-token\",\"expires_in\":3600}" };
+            }
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+
+            const is_docker = std.mem.indexOf(u8, request.url, "://registry-1.docker.io/") != null;
+            const is_ghcr = std.mem.indexOf(u8, request.url, "://ghcr.io/") != null;
+            if (!is_docker and !is_ghcr) return error.TransportFailed;
+
+            if (request.authorization == null) {
+                const challenge = if (is_docker)
+                    "Bearer realm=\"https://auth.docker.test/token\",service=\"registry-1.docker.io\",scope=\"repository:library/busybox:pull\""
+                else
+                    "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/busybox:pull\"";
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{challenge},
+                }, null);
+            }
+
+            const expected = if (is_docker) "Bearer docker-token" else "Bearer ghcr-token";
+            if (!std.mem.eql(u8, request.authorization.?, expected)) return error.TransportFailed;
+
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = child.digest,
+            }, child.body);
+        }
+    };
+
+    MockHarness.child = try ChildArtifacts.alloc(std.testing.allocator);
+    defer MockHarness.child.deinit(std.testing.allocator);
+    defer {
+        MockHarness.docker_basic_seen = false;
+        MockHarness.ghcr_basic_seen = false;
+    }
+
+    const provider = z_oci.CredentialProvider{ .getCredentialFn = MockHarness.getCredential };
+    const allocator = std.testing.allocator;
+    var refs = [_]z_oci.Reference{
+        try z_oci.Reference.parse(allocator, "registry-1.docker.io/library/busybox:latest"),
+        try z_oci.Reference.parse(allocator, "ghcr.io/owner/busybox:latest"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try z_oci.testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        .{ .credential_provider = &provider },
+        refs[0..],
+        .{},
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.items.len);
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[0]));
+    try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
+    try std.testing.expect(MockHarness.docker_basic_seen);
+    try std.testing.expect(MockHarness.ghcr_basic_seen);
+}
