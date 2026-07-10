@@ -7,6 +7,55 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-10 - [Tagged]
+
+Session-oriented batch resolution for multi-image workflows: public `resolveMany`, in-call tag session cache, progress callbacks, an offline batch example, and matching `z-oci-bench` operations. Builds on the v0.4.0 single-call path (shared client and `AuthEngine`, reactive retries) without parallel registry traffic.
+
+### Added
+
+- **Batch resolve**
+    - Public `resolveMany(allocator, client, config, refs, options)` resolves references sequentially and returns one `ResolveManyItem` per input. One item failure does not abort the batch.
+    - `ResolveManyResult` owns the item slice and every item; call `deinit` once. Successful items own `ResolveResult`. Failed items own both `registry` and `reference` (unlike single-resolve failures, where `registry` still borrows the input).
+    - `ResolveManyOptions.platform` is batch-wide. Per-item platforms need separate batches.
+    - Input `Reference` values are borrowed; the batch path deep-clones per item so callers keep uniform ownership of the input slice.
+- **Session digest cache**
+    - Within one `resolveMany` call, successful tag pins and implicit `latest` pins can be reused for later duplicate inputs.
+    - Digest-addressed references bypass the session cache.
+    - The cache lives only for that call.
+- **Progress reporting**
+    - Optional `ResolveManyOptions.progress_fn` receives `item_started`, `cache_hit`, `item_succeeded`, and `item_failed`.
+    - Progress reference views borrow for the callback duration only. Callbacks are `void` and cannot cancel the batch.
+- **Examples and benchmarks**
+    - Offline `examples/resolve-many.zig` pin-flow demo, wired as `zig build example-resolve-many` and included in `examples-smoke`.
+    - New `z-oci-bench` operations: `resolve-many` (duplicate-heavy batch) and `resolve-many-unique` (unique-reference batch).
+
+### Changed
+
+- **Docs**
+    - README documents `resolveMany` ownership, sequential behavior, session-cache rules, progress semantics, and the offline batch example build step.
+    - Benchmark baseline docs list every current `z-oci-bench` operation name and record `benchmarks/baselines/v0.5.0.json` plus the Debug counting snapshot for batch ops.
+- **Public API clarity**
+    - `deinitResolveFailure` is documented as single-resolve only. Batch failures must tear down through `ResolveManyResult.deinit` or `ResolveManyItem.deinit`.
+- **Hot-path allocation**
+    - Manifest URI and canonical reference builders use exact-size allocation instead of `allocPrint` where the final length is known.
+    - Live token and manifest header collection paths add `errdefer` cleanup between multi-step dupes so OOM cannot leak partial header or body buffers.
+
+### Fixed
+
+- **Example ownership**
+    - Live `resolve-reference` success path no longer double-frees moved reference fields; failure path keeps input `registry` alive until after error formatting.
+- **Batch teardown**
+    - Partial batch construction and per-item failure promotion free owned registry/reference pairs without leaking or double-freeing under allocation failure.
+
+### Verified
+
+- `zig build test --summary all` passes (288/288 tests, examples-smoke, workflow-smoke, security-check).
+- Explicit `workflow-smoke`, `examples-smoke`, and `security-check` steps pass.
+- `zig fmt --check src/ examples/ benchmarks/ build.zig tools/` passes.
+- `zig build -Doptimize=ReleaseFast` and `zig build bench` pass.
+- `benchmarks/baselines/v0.5.0.json` records the ReleaseFast zebrac baseline (includes `resolve-many` and `resolve-many-unique`).
+- `benchmarks/baselines/v0.5.0-debug-counting.txt` records Debug `--counting` for `resolve-single`, `resolve-session`, `resolve-many`, and `resolve-many-unique`.
+
 ## [0.4.0] - 2026-06-30 - [Tagged]
 
 Production resilience for live registry traffic: reactive retries and rate-limit handling, custom CA trust bundles, tighter HTTP and cache limits, resolver performance improvements, and memory-ownership hardening across `resolve`, `validate`, and `getManifest`.
@@ -108,7 +157,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Added
 
-- Phase 2 auth engine: `/v2/` probe, Bearer challenge parsing, token exchange (GET + POST fallback), credential-provider chain (config → env → Docker config → anonymous), per-scope token cache with TTL expiry, 401 invalidation retry. Full mock-transport test suite with 299 auth tests covering Docker Hub, GHCR, Quay, and generic self-hosted registries.
+- Phase 2 auth engine: `/v2/` probe, Bearer challenge parsing, token exchange (GET + POST fallback), credential-provider chain (config -> env -> Docker config -> anonymous), per-scope token cache with TTL expiry, 401 invalidation retry. Full mock-transport test suite with 299 auth tests covering Docker Hub, GHCR, Quay, and generic self-hosted registries.
 - `benchmarks/` directory with `z-oci-bench` CLI (7 subcommands: `reference-parse`, `digest-parse`, `manifest-parse`, `challenge-parse`, `platform-match`, `authenticate-miss`, `authenticate-hit`), `CountingAllocator`, and `tools/zebrac` integration for statistical sampling.
 - Memory stress tests: 7 DebugAllocator tests at 1000x iterations each (auth engine 3 variants, Reference.parse 2 variants, all JSON types, parseDockerConfig). 358 total tests.
 - Token cache sizing documented in `AuthEngine` doc comment (unbounded by design for CLI use).
@@ -499,3 +548,4 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 [0.2.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.2.0
 [0.3.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.3.0
 [0.4.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.4.0
+[0.5.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.5.0

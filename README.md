@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.4.0-8B5CF6?style=flat-square" alt="v0.4.0">
-        <img src="https://img.shields.io/badge/status-phase--4%20resilience-2D7D46?style=flat-square" alt="Status: Phase 4 resilience">
+    <img src="https://img.shields.io/badge/version-v0.5.0-8B5CF6?style=flat-square" alt="v0.5.0">
+    <img src="https://img.shields.io/badge/status-batch%20resolve-2D7D46?style=flat-square" alt="Status: batch resolve">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -27,18 +27,19 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 
 - Parse and normalize Docker and OCI image references, including tags, digests, Docker Hub defaults, and host-plus-port registries.
 - Resolve a tag to a pinned digest with `resolve`.
+- Resolve many references in one call with `resolveMany` (sequential, partial success, in-call tag cache).
 - Check whether a manifest exists with `validate`.
 - Fetch and parse a manifest with `getManifest`.
 - Follow OCI indexes and Docker manifest lists when you provide a target platform.
-- Run packaged examples for offline parsing and live resolution.
-- Measure parser, auth, and resolver costs with `z-oci-bench`.
+- Run packaged examples for offline parsing, offline batch pinning, and live resolution.
+- Measure parser, auth, resolver, and batch costs with `z-oci-bench`.
 
 ### Capabilities
 
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
 - **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, and `MultiArchManifest`, all with JSON round-trip support.
 - **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Live auth starts from manifest `HEAD`/`GET` challenges (not a separate `/v2/` probe). It parses `WWW-Authenticate` headers, exchanges tokens, resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry.
-- **Public resolver path**: `resolve`, `validate`, and `getManifest` perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit.
+- **Public resolver path**: `resolve`, `validate`, `getManifest`, and `resolveMany` perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit. `resolveMany` is sequential over one shared client and auth engine; it does not parallelize registry traffic.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
 ### Current limitations
@@ -48,7 +49,7 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 - Windows is not a supported host for live HTTPS registry traffic. Offline parsing works cross-platform; TLS to registries is validated on Linux and macOS only.
 - User-facing CLI commands built on top of the live resolver surface are still future work.
 
-### Resilience (Phase 4)
+### Resilience
 
 Reactive transport retries are live on manifest `HEAD`/`GET` and token HTTP paths:
 
@@ -56,7 +57,7 @@ Reactive transport retries are live on manifest `HEAD`/`GET` and token HTTP path
 - `Config.max_rate_limit_retries` retries `429` responses using `Retry-After` / `X-Retry-After` (and response `Date` when present).
 - `Config.max_retries` stays auth-only: cached-token invalidation after a manifest `401`.
 - `Config.rate_limit_enabled` (default `false`) opts into pre-emptive manifest throttling when trustworthy registry `RateLimit-*` headers show `remaining == 0`.
-- `Config.ca_bundle_path` loads a PEM CA trust bundle at the public API boundary (`resolve`, `validate`, `getManifest`).
+- `Config.ca_bundle_path` loads a PEM CA trust bundle at the public API boundary (`resolve`, `validate`, `getManifest`, `resolveMany`).
 - `ResolveError.rate_limited`, `network_error`, and `timeout` carry `transport_retries_exhausted` so callers can distinguish immediate hard failures from post-retry exhaustion.
 
 See [CHANGELOG.md](CHANGELOG.md) and `src/resilience.zig` for registry header assumptions (Docker Hub epoch `Retry-After`, `X-RateLimit-Reset`, and related parser behavior).
@@ -73,7 +74,7 @@ Docker Hub, Quay, and GHCR are the main named targets in the current code and te
 
 ### Performance
 
-Representative Debug `--counting` snapshot for v0.4.0 (see `benchmarks/baselines/v0.4.0.json`):
+Representative Debug `--counting` snapshot for single-image ops from v0.4.0 (see `benchmarks/baselines/v0.4.0.json`):
 
 | Operation               | Mean per iteration | Allocs per call |
 | ----------------------- | ------------------ | --------------- |
@@ -84,7 +85,7 @@ Representative Debug `--counting` snapshot for v0.4.0 (see `benchmarks/baselines
 | `authenticate-miss`     | 109 μs             | 10              |
 | `authenticate-hit`      | 3 μs               | 0               |
 
-Full zebrac baselines, parser microbenchmarks, and wall-time summaries live in `benchmarks/baselines/`. Operation names match `z-oci-bench <operation>` (see `./zig-out/bin/z-oci-bench` with no args). Release notes live in [CHANGELOG.md](CHANGELOG.md).
+v0.5.0 batch Debug `--counting` (100 iterations; see `benchmarks/baselines/v0.5.0-debug-counting.txt`): `resolve-single` 5 allocs/call, `resolve-many` 27 allocs/batch, `resolve-many-unique` 50 allocs/batch. Full ReleaseFast zebrac numbers live in `benchmarks/baselines/v0.5.0.json`. Operation names match `z-oci-bench <operation>`. Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Getting started
 
@@ -93,7 +94,7 @@ Full zebrac baselines, parser microbenchmarks, and wall-time summaries live in `
 ### Add as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.4.0
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.5.0
 ```
 
 Then in `build.zig`, import the package:
@@ -147,6 +148,8 @@ On single-resolve `.failure`, keep the input `Reference` alive until after you f
 
 ### Batch resolve (`resolveMany`)
 
+`resolveMany` resolves a slice of references in order and returns one outcome per input. One item failure does not abort the rest. There is no parallel registry traffic in this API: one caller-owned `std.http.Client` and one shared `AuthEngine` serve the whole batch.
+
 ```zig
 var result = try z_oci.resolveMany(allocator, &client, config, refs[0..], .{
     .platform = .{ .os = "linux", .architecture = "amd64" },
@@ -166,7 +169,34 @@ for (result.items) |item| {
 }
 ```
 
-Progress callbacks (optional via `ResolveManyOptions.progress_fn`) receive borrowed reference views valid only for the callback duration. Copy any strings you need to keep. Never call `deinitResolveFailure` on `ResolveManyItem.failure` values; that helper is single-resolve only and would leak the batch-owned `registry`.
+Ownership:
+
+- Input `refs` are borrowed. Callers keep and free their own `Reference` values.
+- `ResolveManyResult` owns the item slice and every item. Call `result.deinit(allocator)` once.
+- Successful items own a `ResolveResult` (same teardown as single-resolve success).
+- Failed items own both `registry` and `reference`. Do not call `deinitResolveFailure` on them; that helper is single-resolve only and would leak `registry`.
+
+Platform is batch-wide via `ResolveManyOptions.platform`. Per-item platforms need separate batches.
+
+Session cache (in-call only):
+
+- Within one `resolveMany` call, successful tag pins and implicit `latest` pins can be reused for later duplicate inputs.
+- Digest-addressed references never hit the session cache.
+- The cache does not survive past the call. A second `resolveMany` starts empty.
+
+Progress callbacks (optional `ResolveManyOptions.progress_fn`):
+
+- Events are `item_started`, `cache_hit`, `item_succeeded`, and `item_failed`.
+- `event.reference` borrows input slices for the callback duration only. Copy any strings you need to keep.
+- Callbacks are `void`: they cannot fail or cancel the batch.
+
+Offline demo (injected exchangers, no live network):
+
+```sh
+zig build example-resolve-many
+```
+
+See [examples/resolve-many.zig](examples/resolve-many.zig). Live callers should use public `resolveMany` with a real `std.http.Client`.
 
 ### Normalize an image reference
 
@@ -245,7 +275,7 @@ Offline examples:
 - `zig build example-normalize-reference -- ubuntu:22.04`
 - `zig build example-inspect-manifest`
 - `zig build example-select-platform`
-- `zig build example-resolve-many`
+- `zig build example-resolve-many` (offline batch pin flow; see Batch resolve above)
 
 See [examples](examples) for the source of the packaged examples.
 
@@ -253,7 +283,6 @@ See [examples](examples) for the source of the packaged examples.
 
 - CLI for resolve, validate, and inspect
 - Registry compatibility testing beyond the current Docker Hub / GHCR / Quay coverage
-- Formal `v0.5.0` benchmark baseline (includes `resolve-many` / `resolve-many-unique`)
 
 ## References
 
