@@ -43,20 +43,16 @@
 
 const std = @import("std");
 
-/// Default maximum manifest or index GET body size for live HTTP transport.
 pub const DEFAULT_MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
-/// Default maximum token endpoint response body size for live HTTP transport.
 pub const DEFAULT_MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
-/// Default maximum cached bearer tokens per `AuthEngine`. `0` means unbounded.
+/// `0` means unbounded.
 pub const DEFAULT_MAX_TOKEN_CACHE_ENTRIES: u32 = 128;
 
-/// A username/secret pair for HTTP Basic authentication.
 pub const Credential = struct {
     username: []const u8,
     secret: []const u8,
 };
 
-/// Credential returned by a provider, optionally with a custom release hook.
 pub const CredentialHandle = struct {
     credential: Credential,
     /// When set, `release_allocator` must be the allocator that owns `credential` slices.
@@ -65,34 +61,21 @@ pub const CredentialHandle = struct {
     release_fn: ?*const fn (allocator: std.mem.Allocator, credential: Credential) void = null,
     release_allocator: std.mem.Allocator = undefined,
 
-    /// Invoke the provider release hook when one was supplied.
     pub fn release(self: CredentialHandle) void {
         if (self.release_fn) |release_fn| release_fn(self.release_allocator, self.credential);
     }
 };
 
-/// Interface for supplying credentials per registry.
-/// Callers implement getCredentialFn and plug it in via Config.
-///
-/// Example:
-///   const provider = CredentialProvider{ .getCredentialFn = myGetCred };
-///   const config = Config{ .credential_provider = &provider };
 pub const CredentialProvider = struct {
-    /// Returns credentials for the given registry hostname, or null for
-    /// anonymous access. The returned Credential slices must remain valid
-    /// for the duration of the resolve call.
+    /// Null = anonymous. Slices must outlive the resolve call.
     getCredentialFn: *const fn (registry: []const u8) ?CredentialHandle,
 
-    /// Convenience wrapper so callers do not need to reach into the function pointer.
     pub fn getCredential(self: CredentialProvider, registry: []const u8) ?CredentialHandle {
         return self.getCredentialFn(registry);
     }
 };
 
-/// Resolver configuration. All fields are optional with safe defaults.
-/// A bare Config{} compiles and works for anonymous public registry access.
 pub const Config = struct {
-    /// Errors from `applyToClient` when `ca_bundle_path` is set.
     pub const ApplyError = error{
         OutOfMemory,
         CaBundleFileNotFound,
@@ -103,65 +86,32 @@ pub const Config = struct {
         CaBundleContainsPrivateKey,
     };
 
-    /// Credential provider for authenticated registries. Null means anonymous.
     credential_provider: ?*const CredentialProvider = null,
 
-    /// Connect timeout in milliseconds for caller-owned TCP setup. `0` means unset.
-    ///
-    /// Use `connectIoTimeout` when calling `std.http.Client.connectTcpOptions`
-    /// yourself. Live manifest and token exchangers inside z-oci do not read this
-    /// field because `client.request` does not forward the timeout today (zig#31305).
+    /// Caller-owned TCP only; live exchangers ignore this (zig#31305). `0` = unset.
     connect_timeout_ms: u32 = 0,
 
-    /// Timeout in milliseconds for Docker credential helper subprocess I/O.
-    ///
-    /// Manifest and token HTTP reads do not consume this field. Auth applies it
-    /// when waiting on helper stdout/stderr.
+    /// Docker credential helper subprocess I/O only (not manifest/token HTTP).
     read_timeout_ms: u32 = 30_000,
 
-    /// Maximum auth retry count for the cached-401 invalidation path.
-    ///
-    /// Transport retries use `max_network_retries` and `max_rate_limit_retries`
-    /// instead. Auth and transport budgets stay separate on purpose.
+    /// Cached-401 auth invalidation only; transport uses the budgets below.
     max_retries: u8 = 1,
 
-    /// Maximum reactive retries for transient network failures on idempotent
-    /// manifest `HEAD`/`GET` and token HTTP traffic.
     max_network_retries: u8 = 1,
-
-    /// Maximum reactive retries for `429` / rate-limit responses on manifest
-    /// `HEAD`/`GET` and token HTTP traffic.
     max_rate_limit_retries: u8 = 1,
 
-    /// Custom CA bundle PEM path for caller-owned TLS trust.
-    ///
-    /// When non-null, `applyToClient` loads this file into `std.http.Client.ca_bundle`
-    /// before HTTPS traffic. Prefer an absolute path. The file must contain public CA
-    /// certificates only; private keys belong in auth/TLS identity paths,
-    /// not the trust store). On POSIX, the file must not be world-writable. When null,
-    /// the client keeps Zig's lazy OS trust scan on first HTTPS.
+    /// Public CA PEM only; see file header. Null = OS trust scan.
     ca_bundle_path: ?[]const u8 = null,
 
-    /// Opt-in pre-emptive throttling when prior manifest responses had trustworthy
-    /// registry `RateLimit-*` headers with `remaining` at zero.
-    ///
-    /// Defaults off. Reactive `429` backoff stays on regardless through the
-    /// transport retry budgets above.
+    /// Opt-in pre-emptive pause on `RateLimit-*` remaining=0. Reactive 429 stays on.
     rate_limit_enabled: bool = false,
 
-    /// Maximum manifest or index GET body size for live HTTP transport.
     max_manifest_bytes: usize = DEFAULT_MAX_MANIFEST_BYTES,
-
-    /// Maximum token endpoint response body size for live HTTP transport.
     max_token_response_bytes: usize = DEFAULT_MAX_TOKEN_RESPONSE_BYTES,
-
-    /// Maximum cached bearer tokens per `AuthEngine`. `0` means unbounded.
+    /// `0` means unbounded.
     max_token_cache_entries: u32 = DEFAULT_MAX_TOKEN_CACHE_ENTRIES,
 
-    /// Returns the `std.Io.Timeout` value for caller-owned `connectTcpOptions`.
-    ///
-    /// Live z-oci manifest and token traffic does not apply this until upstream Zig
-    /// wires `ConnectTcpOptions.timeout` into the host connect path.
+    /// For caller-owned `connectTcpOptions` only (not live exchangers yet).
     pub fn connectIoTimeout(self: Config) std.Io.Timeout {
         if (self.connect_timeout_ms == 0) return .none;
         return .{
@@ -172,19 +122,8 @@ pub const Config = struct {
         };
     }
 
-    /// Applies caller-owned client configuration that z-oci can honor today.
-    ///
-    /// When `ca_bundle_path` is set, loads that PEM file into `client.ca_bundle` and
-    /// pins `client.now` so Zig does not replace the bundle with an OS rescan on the
-    /// next HTTPS request. When `ca_bundle_path` is null, this is a no-op.
-    ///
-    /// `resolve`, `validate`, and `getManifest` call this when `ca_bundle_path` is set.
-    /// When the resolved path and file mtime match the last successful apply for the
-    /// same client, the PEM is not re-read from disk.
-    ///
-    /// Only `ca_bundle_path` is applied here. `connect_timeout_ms` is exposed via
-    /// `connectIoTimeout` for caller-owned TCP setup (zig#31305). `read_timeout_ms` is
-    /// consumed by auth helper subprocess I/O, not here.
+    /// Loads `ca_bundle_path` into `client.ca_bundle` and pins `client.now` so Zig
+    /// does not OS-rescan on the next HTTPS request. No-op when path is null.
     pub fn applyToClient(self: Config, client: *std.http.Client) ApplyError!void {
         const ca_path = self.ca_bundle_path orelse return;
         if (comptime std.http.Client.disable_tls) return error.CaBundleTlsDisabled;

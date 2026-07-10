@@ -13,11 +13,7 @@ const Manifest = @import("Manifest.zig");
 const Platform = @import("Platform.zig");
 const MediaType = @import("MediaType.zig").MediaType;
 
-/// Parse JSON bytes into T. Unknown fields are silently ignored so
-/// the caller handles spec extensions without error.
-///
-/// alloc_always: every string is copied into the arena so Parsed(T) is
-/// self-contained. Callers may free json_bytes as soon as parse returns.
+/// `alloc_always`: self-contained arena; caller may free `bytes` immediately.
 pub fn parse(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(T) {
     return std.json.parseFromSlice(T, allocator, bytes, .{
         .ignore_unknown_fields = true,
@@ -25,10 +21,7 @@ pub fn parse(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) 
     });
 }
 
-/// Parse JSON bytes into T with strings borrowed from `bytes` when possible.
-///
-/// `bytes` must outlive the returned `Parsed(T)` and any values read from it.
-/// Call `.deinit()` when done; it frees only arena-allocated storage.
+/// Strings may borrow from `bytes`; `bytes` must outlive the result.
 pub fn parseBorrowing(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(T) {
     return std.json.parseFromSlice(T, allocator, bytes, .{
         .ignore_unknown_fields = true,
@@ -36,10 +29,7 @@ pub fn parseBorrowing(comptime T: type, allocator: std.mem.Allocator, bytes: []c
     });
 }
 
-/// Deep-copy a `Parsed(T)` from a transient arena onto `caller_allocator`.
-///
-/// The input `parsed` is deinitialized; the returned value owns its own arena
-/// through `caller_allocator`.
+/// Moves a transient `Parsed(T)` onto `caller_allocator` (input is deinitialized).
 pub fn promoteParsed(
     comptime T: type,
     caller_allocator: std.mem.Allocator,
@@ -60,8 +50,7 @@ pub fn promoteParsed(
     return promoted;
 }
 
-/// Test helper: stringify any json-serializable value into an owned buffer.
-/// The caller owns the returned Allocating writer and must call .deinit().
+/// Caller owns the returned writer (`deinit` required).
 pub fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     errdefer aw.deinit();

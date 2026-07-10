@@ -60,88 +60,44 @@ const resolver = @import("resolver.zig");
 const resilience = @import("resilience.zig");
 pub const test_matrix = @import("test_matrix.zig");
 
-/// Content digest view and parser. See `Digest.zig` for ownership (`hex` may borrow).
 pub const Digest = @import("Digest.zig");
-/// OCI/Docker manifest media type enum. See `MediaType.zig`.
 pub const MediaType = @import("MediaType.zig").MediaType;
-/// Platform selector (OS/arch/variant slices). See `Platform.zig` for borrow rules.
 pub const Platform = @import("Platform.zig");
-/// OCI content descriptor. See `Descriptor.zig`.
 pub const Descriptor = @import("Descriptor.zig");
-/// Single-arch image manifest type and JSON helpers. See `Manifest.zig`.
 pub const Manifest = @import("Manifest.zig");
-/// Multi-arch index types and selection helpers. See `Index.zig`.
 pub const Index = @import("Index.zig");
-/// OCI image index (`application/vnd.oci.image.index.v1+json`). See `Index.zig`.
 pub const OciImageIndex = Index.OciImageIndex;
-/// Docker manifest list (`application/vnd.docker.distribution.manifest.list.v2+json`). See `Index.zig`.
 pub const DockerManifestList = Index.DockerManifestList;
-/// Union of supported multi-arch index/list document shapes. See `Index.zig`.
 pub const MultiArchManifest = Index.MultiArchManifest;
-/// Docker/OCI image reference parser and normalizer. See `Reference.zig`.
 pub const Reference = @import("Reference.zig");
-/// Full auth module for integrators and mock exchanger authors (`z_oci.auth.*`).
 pub const auth = @import("auth.zig");
-/// Shared JSON parse/serialize helpers for OCI types. See `json.zig`.
 pub const json = @import("json.zig");
-/// Token cache and manifest auth orchestration. See `auth.AuthEngine`.
 pub const AuthEngine = auth.AuthEngine;
-/// Parsed WWW-Authenticate challenge view. See `auth.AuthChallenge`.
 pub const AuthChallenge = auth.AuthChallenge;
-/// Borrowed registry/repository/ref view for auth and resolver paths. See `auth.AuthReferenceView`.
 pub const AuthReferenceView = auth.AuthReferenceView;
-/// Parsed Bearer challenge fields. See `auth.BearerChallenge`.
 pub const BearerChallenge = auth.BearerChallenge;
-/// Inputs for a single authenticate call. See `auth.AuthenticateRequest`.
 pub const AuthenticateRequest = auth.AuthenticateRequest;
-/// Outcome of classifying a manifest probe response. See `auth.ProbeResult`.
 pub const ProbeResult = auth.ProbeResult;
-/// Minimal HTTP response shape for auth probe classification. See `auth.ProbeHttpResponse`.
 pub const ProbeHttpResponse = auth.ProbeHttpResponse;
-/// Build a borrowed auth reference view from a parsed `Reference`. See `auth.referenceView`.
 pub const referenceView = auth.referenceView;
-/// Parsed bearer token metadata. See `auth.Token`.
 pub const Token = auth.Token;
-/// Token exchange response with optional refresh token ownership. See `auth.TokenResponse`.
 pub const TokenResponse = auth.TokenResponse;
-/// Structured registry failure at the public outcome boundary. See `ResolveError.zig`.
 pub const ResolveError = @import("ResolveError.zig").ResolveError;
-/// Successful resolve payload (digest, media type, platform). See `ResolveResult.zig`.
 pub const ResolveResult = @import("ResolveResult.zig");
-/// Transport, retry, TLS, and credential configuration. See `Config.zig`.
 pub const Config = @import("Config.zig").Config;
-/// Credential lookup strategy for token exchange. See `Config.zig`.
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
-/// Username/password pair for basic or token auth. See `Config.zig`.
 pub const Credential = @import("Config.zig").Credential;
-/// Opaque credential slot returned by a provider. See `Config.zig`.
 pub const CredentialHandle = @import("Config.zig").CredentialHandle;
-/// Errors returned directly from public entry points before an outcome is produced.
-///
-/// Covers `Config.applyToClient` failures and `OutOfMemory` during outcome promotion.
-/// Structured resolve failures use `ResolveError` inside outcome `.failure` arms; release
-/// those with `deinitResolveFailure`.
 pub const PublicApiError = Config.ApplyError;
-/// Narrow testing seam for repository smoke tests.
-///
-/// This keeps workflow-level coverage on the same public resolver logic while
-/// still allowing injected transports instead of real network access.
 pub const testing = struct {
-    /// Shared offline failure-matrix fixtures for T2/T3 tests. See `test_matrix.zig`.
     pub const FailureScenario = test_matrix.Scenario;
     pub const refuseTokenExchange = test_matrix.refuseTokenExchange;
-    /// Injectable token HTTP exchanger for offline auth tests. See `auth.TokenHttpExchanger`.
     pub const TokenHttpExchanger = auth.TokenHttpExchanger;
-    /// Injectable manifest HTTP exchanger for offline resolver tests. See `resolver.ManifestHttpExchanger`.
     pub const ManifestHttpExchanger = resolver.ManifestHttpExchanger;
-    /// Concrete manifest request shape passed to mock exchangers. See `resolver.ManifestHttpRequest`.
     pub const ManifestHttpRequest = resolver.ManifestHttpRequest;
-    /// Concrete manifest response shape returned by mock exchangers. See `resolver.ManifestHttpResponse`.
     pub const ManifestHttpResponse = resolver.ManifestHttpResponse;
-    /// Transport errors mock manifest exchangers may return. See `resolver.ManifestExchangeError`.
     pub const ManifestExchangeError = resolver.ManifestExchangeError;
 
-    /// Resolve with injected token and manifest exchangers (fresh `AuthEngine` per call).
     pub fn resolveWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -164,7 +120,6 @@ pub const testing = struct {
         );
     }
 
-    /// Same as `resolveWithExchangers`, but reuses an existing `AuthEngine` for token cache warmth.
     pub fn resolveWithEngine(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -189,7 +144,6 @@ pub const testing = struct {
         );
     }
 
-    /// Validate existence with injected exchangers (fresh `AuthEngine` per call).
     pub fn validateWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -212,7 +166,6 @@ pub const testing = struct {
         );
     }
 
-    /// Validate existence while reusing an existing `AuthEngine` for token cache warmth.
     pub fn validateWithEngine(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -237,7 +190,6 @@ pub const testing = struct {
         );
     }
 
-    /// Fetch parsed manifest while reusing an existing `AuthEngine` for token cache warmth.
     pub fn getManifestWithEngine(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -262,7 +214,6 @@ pub const testing = struct {
         );
     }
 
-    /// Fetch parsed manifest with injected exchangers (fresh `AuthEngine` per call).
     pub fn getManifestWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -285,7 +236,6 @@ pub const testing = struct {
         );
     }
 
-    /// Batch resolve with injected exchangers (fresh shared `AuthEngine` for the batch).
     pub fn resolveManyWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -308,47 +258,30 @@ pub const testing = struct {
         );
     }
 
-    /// Release owned fields inside a `ResolveError` (alias of `deinitResolveFailure`).
     pub fn deinitResolveError(failure: ResolveError, allocator: std.mem.Allocator) void {
         root.deinitResolveFailure(failure, allocator);
     }
 };
-/// Outcome of `resolve`: owned success payload or owned failure context.
-///
-/// On `.failure`, call `deinitResolveFailure(failure, allocator)`.
 pub const ResolveOutcome = union(enum) {
     success: ResolveResult,
     failure: ResolveError,
 };
-/// Outcome of `validate`: terminal status or owned failure context.
-///
-/// On `.failure`, call `deinitResolveFailure(failure, allocator)`.
 pub const ValidateOutcome = union(enum) {
     valid,
     not_found,
     failure: ResolveError,
 };
-/// Outcome of `getManifest`: arena-owned parsed manifest or owned failure context.
-///
-/// On `.success`, call `parsed.deinit()`. On `.failure`, call `deinitResolveFailure`.
+/// `.success` owns a JSON arena (`parsed.deinit()`).
 pub const ManifestOutcome = union(enum) {
     success: std.json.Parsed(Manifest),
     failure: ResolveError,
 };
-/// Per-image outcome stored in a batch resolve result.
-///
-/// Values produced by `resolveMany()` are owned by the enclosing `ResolveManyResult`.
-/// Prefer `ResolveManyResult.deinit` for the whole batch. If tearing down a single
-/// item, call `ResolveManyItem.deinit` — never `deinitResolveFailure`, which is
-/// for single-resolve failures and would leak batch-owned `registry` storage.
+/// Never tear down with `deinitResolveFailure` (leaks batch-owned `registry`).
 pub const ResolveManyItem = union(enum) {
-    /// Owned successful resolve payload.
     success: ResolveResult,
-    /// Owned structured failure context. Batch failures own both `registry` and
-    /// `reference`, unlike ordinary public `ResolveError` values from `resolve`.
+    /// Owns both `registry` and `reference`, unlike single-resolve failures.
     failure: ResolveError,
 
-    /// Release owned storage in this item (batch ownership rules).
     pub fn deinit(self: *ResolveManyItem, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .success => |*result| result.deinit(allocator),
@@ -356,44 +289,27 @@ pub const ResolveManyItem = union(enum) {
         }
     }
 };
-/// Owned result container for a batch resolve call.
 pub const ResolveManyResult = struct {
-    /// One item per input reference, preserving input order.
     items: []ResolveManyItem,
 
-    /// Release every item and the item array, including independently-owned
-    /// successes populated from the session cache.
     pub fn deinit(self: *ResolveManyResult, allocator: std.mem.Allocator) void {
         for (self.items) |*item| item.deinit(allocator);
         if (self.items.len != 0) allocator.free(self.items);
         self.items = &.{};
     }
 };
-/// Borrowed image reference view supplied to progress callbacks.
 pub const ResolveManyReferenceView = struct {
-    /// Registry hostname.
     registry: []const u8,
-    /// Repository path under the registry.
     repository: []const u8,
-    /// Tag, digest string, or `"latest"` according to `Reference.refString()`.
     ref_string: []const u8,
 };
-/// Synchronous progress event for batch resolution.
-///
-/// `reference` fields borrow the corresponding input `Reference` slices for the
-/// duration of the progress callback only. Do not store those pointers past
-/// return from the callback. The callback cannot fail the batch (`void`).
+/// `reference` borrows input slices for the callback only; do not retain. Callback is `void`.
 pub const ResolveManyProgress = struct {
-    /// Event kind.
     event: Event,
-    /// Zero-based item index.
     index: usize,
-    /// Total number of input references.
     total: usize,
-    /// Borrowed reference fields valid only for the callback duration.
     reference: ResolveManyReferenceView,
 
-    /// Batch progress event kinds.
     pub const Event = enum {
         item_started,
         cache_hit,
@@ -401,13 +317,10 @@ pub const ResolveManyProgress = struct {
         item_failed,
     };
 };
-/// Optional knobs for future batch resolution behavior.
 pub const ResolveManyOptions = struct {
-    /// Batch-wide platform selector.
+    /// Batch-wide; per-item platforms need separate batches.
     platform: ?Platform = null,
-    /// Optional synchronous progress callback.
     progress_fn: ?*const fn (event: ResolveManyProgress, user_data: ?*anyopaque) void = null,
-    /// User pointer passed through to `progress_fn`.
     progress_user_data: ?*anyopaque = null,
 };
 /// Release caller-owned storage inside a `ResolveError` from a **single-resolve**
@@ -424,18 +337,8 @@ pub fn deinitResolveFailure(failure: ResolveError, allocator: std.mem.Allocator)
 }
 // --- Public resolve API ---
 
-/// Resolve an image reference to a pinned manifest digest.
-///
-/// Ownership contract:
-/// - The returned ResolveResult is owned through the caller-provided allocator.
-/// - On success, `registry`, `repository`, and `tag` from the input `ref` are moved into
-///   `result.reference`; do not call `ref.deinit()` after a successful resolve.
-/// - Call `result.deinit(allocator)` when using a non-arena allocator.
-/// - If the allocator is an arena, tearing the arena down is also sufficient.
-/// - `ResolveResult.clone()` is only needed when moving the result into a different allocator.
-///
-/// Auth: manifest `HEAD`/`GET` drives registry probes; `401` bearer challenges, token
-/// exchange, and cached-401 retry are handled inside `resolver` + `auth` (see module filedocs).
+/// Ownership: success moves `ref` identity fields into the result (do not `ref.deinit`).
+/// Call `result.deinit(allocator)` unless the allocator is an arena.
 pub fn resolve(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -454,19 +357,8 @@ pub fn resolve(
         resilience.liveTransportHooks(),
     );
 }
-/// Resolve multiple image references in order using one auth/session context.
-///
-/// Ownership contract:
-/// - `refs` is borrowed for the duration of the call; this function never moves
-///   or frees caller-owned input references.
-/// - The returned `ResolveManyResult` owns every successful `ResolveResult`, every
-///   failed `ResolveError`, and the item array.
-/// - Call `result.deinit(allocator)` when using a non-arena allocator.
-/// - One item failure does not abort the batch. Only setup or allocation failures
-///   return through the outer error union.
-///
-/// Phase 5 intentionally resolves sequentially. The same caller-owned
-/// `std.http.Client` and one shared `AuthEngine` are reused across the batch.
+/// Ownership: `refs` borrowed; result owns every item. One item failure does not abort.
+/// Sequential so one `Client` + `AuthEngine` can be reused across the batch.
 pub fn resolveMany(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -485,23 +377,9 @@ pub fn resolveMany(
         resilience.liveTransportHooks(),
     );
 }
-/// Validate that a manifest reference still exists and is fetchable.
-///
-/// Ownership contract:
-/// - No owned success payload is returned from this API.
-/// - The caller owns `allocator` for the HEAD phase: `performManifestHead` stores
-///   response metadata and structured failures on that allocator until the call
-///   returns. Failures promoted from HEAD use `promoteResolveErrorAlloc`.
-/// - When HEAD requires a GET fallback (405, missing digest header, etc.), the
-///   fallback fetch uses an internal transient arena like `resolve`/`getManifest`;
-///   only `ResolveError.reference` on failure is promoted back to the caller
-///   allocator before the arena is torn down.
-/// - HEAD failures extracted by `classifyValidateManifestHead` (`.owned_failure`)
-///   already own `reference` on the caller allocator; return them directly.
-///
-/// Auth: same manifest/auth pipeline as `resolve` (internal to resolver/auth).
-/// Validation treats `.not_found` as terminal. Multi-arch without `platform` returns
-/// `ResolveError.platform_required`.
+/// Ownership: no success payload. HEAD uses the caller allocator; GET fallback uses a
+/// transient arena and promotes `ResolveError.reference` on failure. `.not_found` is terminal;
+/// multi-arch without `platform` → `platform_required`.
 pub fn validate(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -520,15 +398,7 @@ pub fn validate(
         resilience.liveTransportHooks(),
     );
 }
-/// Fetch and parse a manifest payload.
-///
-/// Ownership contract:
-/// - The returned std.json.Parsed(Manifest) owns an arena.
-/// - Call parsed.deinit() when finished.
-/// - Do not free the allocator backing that arena while the parsed value is still in use.
-///
-/// Auth: same manifest/auth pipeline as `resolve` (internal to resolver/auth).
-/// Multi-arch without `platform` returns `ResolveError.platform_required`.
+/// Ownership: `.success` is a JSON arena (`parsed.deinit()`). Multi-arch without `platform` → `platform_required`.
 pub fn getManifest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,

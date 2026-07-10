@@ -558,9 +558,7 @@ test "workflow smoke: resolveMany caches implicit latest and preserves partial f
 }
 
 test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed registries" {
-    // Application-shaped coverage beyond unit tests: multi-arch platform selection in a
-    // pin list, per-registry auth isolation, digest verification (success + mismatch),
-    // duplicate tag cache without caller grouping, and lockfile-ready metadata.
+    // Multi-arch, auth isolation, digest verify, cache, lockfile metadata.
     const MockHarness = struct {
         const RecordedEvent = struct {
             event: z_oci.ResolveManyProgress.Event,
@@ -597,7 +595,7 @@ test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed r
         fn progress(event: z_oci.ResolveManyProgress, user_data: ?*anyopaque) void {
             const recorder: *Recorder = @ptrCast(@alignCast(user_data.?));
             std.debug.assert(recorder.event_count < recorder.events.len);
-            // Copy borrowed progress slices: they are valid for the callback only.
+            // Progress views are callback-duration only.
             const registry = recorder.allocator.dupe(u8, event.reference.registry) catch unreachable;
             const repository = recorder.allocator.dupe(u8, event.reference.repository) catch unreachable;
             const ref_string = recorder.allocator.dupe(u8, event.reference.ref_string) catch unreachable;
@@ -739,8 +737,7 @@ test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed r
         .{wrong_digest},
     );
 
-    // pipeline.toml-style image list: omitted tag, duplicate latest, unique tag,
-    // second registry, digest pin, digest mismatch, not-found, and rate-limited failure.
+    // Mixed tag/digest/failure list shaped like a pipeline pin set.
     const image_strings = [_][]const u8{
         "registry-1.docker.io/library/busybox",
         "registry-1.docker.io/library/busybox:latest",
@@ -767,11 +764,11 @@ test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed r
     var result = try z_oci.testing.resolveManyWithExchangers(
         allocator,
         &client,
-        // One reactive retry so the rate-limited item surfaces transport_retries_exhausted.
+        // One reactive retry so rate_limited surfaces transport_retries_exhausted.
         .{ .max_rate_limit_retries = 1 },
         refs[0..],
         .{
-            // Batch-wide only: callers that need per-item platforms must issue separate batches.
+            // Batch-wide platform only.
             .platform = .{ .os = "linux", .architecture = "amd64" },
             .progress_fn = MockHarness.progress,
             .progress_user_data = @ptrCast(&recorder),
@@ -783,16 +780,13 @@ test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed r
     defer result.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 8), result.items.len);
-    // Each resolve probes without Authorization first (401), then retries with a
-    // cached per-registry token. Multi-arch pays index + child after auth.
-    // docker: latest(4) + stable(4) + digest_ok(2) + digest_bad(2) + missing(2) + rate-limited(3) = 17
-    // ghcr: latest(4)
+    // Unauthenticated probe then cached token retry. docker=17, ghcr=4 exchanges.
     try std.testing.expectEqual(@as(usize, 17), MockHarness.docker_fetches);
     try std.testing.expectEqual(@as(usize, 4), MockHarness.ghcr_fetches);
     try std.testing.expectEqual(@as(usize, 1), MockHarness.docker_token_exchanges);
     try std.testing.expectEqual(@as(usize, 1), MockHarness.ghcr_token_exchanges);
 
-    // Caller-owned inputs remain valid after success, cache hit, and failure paths.
+    // Input refs stay valid after success, cache hit, and failure.
     try std.testing.expectEqualStrings("registry-1.docker.io", refs[0].registry);
     try std.testing.expectEqualStrings("latest", refs[1].refString());
     try std.testing.expectEqualStrings("ghcr.io", refs[3].registry);
@@ -922,9 +916,7 @@ test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed r
 }
 
 test "workflow smoke: public resolveMany empty batch requires a live Client" {
-    // Proves the public entry point (not only testing.resolveManyWithExchangers) and that
-    // a real std.http.Client lifecycle is enough for the no-network empty-batch path.
-    // Non-empty live resolveMany still needs network or injected exchangers.
+    // Public resolveMany + real Client on the empty-batch path (no network).
     const allocator = std.testing.allocator;
     var client = std.http.Client{
         .allocator = allocator,
@@ -939,8 +931,7 @@ test "workflow smoke: public resolveMany empty batch requires a live Client" {
 }
 
 test "workflow smoke: batch failure registry outlives input Reference deinit" {
-    // Batch failures own registry storage. Zencelot must be able to deinit parsed inputs
-    // and still format/report failures from ResolveManyResult.
+    // Batch failures own registry; safe to deinit inputs then format failures.
     const MockHarness = struct {
         fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
             return tm.refuseTokenExchange(allocator, client, request);
@@ -993,8 +984,7 @@ test "workflow smoke: batch failure registry outlives input Reference deinit" {
 }
 
 test "workflow smoke: warm token cache still probes without Authorization first" {
-    // Honest cost check: a warm AuthEngine token does not skip the unauthenticated
-    // manifest probe. Each item still pays a 401 before the authenticated GET.
+    // Warm token does not skip the unauthenticated probe (still pays 401).
     const MockHarness = struct {
         var unauthorized_probes: usize = 0;
         var authorized_gets: usize = 0;
@@ -1078,7 +1068,7 @@ test "workflow smoke: warm token cache still probes without Authorization first"
 }
 
 test "workflow smoke: CredentialProvider supplies Basic auth on per-registry token exchange" {
-    // Proves Config.credential_provider is on the live batch path, not storage-only.
+    // credential_provider is on the live batch path, not storage-only.
     const MockHarness = struct {
         var docker_basic_seen: bool = false;
         var ghcr_basic_seen: bool = false;

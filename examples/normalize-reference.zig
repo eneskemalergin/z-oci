@@ -18,7 +18,6 @@ const USAGE_TEXT =
     \\
 ;
 
-/// Reference normalization example; parsed `Reference` uses `init.gpa`.
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);

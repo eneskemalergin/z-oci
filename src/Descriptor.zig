@@ -11,24 +11,17 @@ const Platform = @import("Platform.zig");
 const json = @import("json.zig");
 const test_support = @import("test_support.zig");
 
-/// OCI spec field: mediaType
 media_type: MediaType,
-/// OCI spec field: digest
 digest: Digest,
-/// OCI spec field: size (bytes)
 size: u64,
-/// OCI spec field: platform. Only present in index/manifest-list entries.
+/// Index / manifest-list entries only.
 platform: ?Platform = null,
-/// OCI spec field: urls. Optional list of download URLs for the blob.
 urls: ?[]const []const u8 = null,
-/// OCI spec field: annotations. Value is std.json.Value.object when present.
 annotations: ?std.json.Value = null,
-/// OCI spec field: artifactType. Present when descriptor points to an artifact.
 artifact_type: ?[]const u8 = null,
 
 const Descriptor = @This();
 
-/// Parse a JSON descriptor object. Maps camelCase JSON names to Zig fields.
 pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Descriptor {
     if (.object_begin != try source.next()) return error.UnexpectedToken;
     var result = Descriptor{
@@ -76,7 +69,6 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
     return result;
 }
 
-/// Stringify to a JSON descriptor object with camelCase OCI field names.
 pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
     try jw.beginObject();
     try jw.objectField("mediaType");

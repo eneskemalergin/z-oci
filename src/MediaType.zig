@@ -6,7 +6,6 @@
 
 const std = @import("std");
 
-/// Known OCI and Docker content types used by the resolver.
 pub const MediaType = enum {
     oci_manifest_v1,
     oci_index_v1,
@@ -22,7 +21,7 @@ pub const MediaType = enum {
     docker_container_image_v1,
     docker_layer_gzip,
     docker_layer_foreign_gzip,
-    /// Legacy schema 1. Recognized so the resolver can reject it cleanly.
+    /// Recognized so the resolver can reject it cleanly.
     docker_manifest_v1_signed,
 
     const mime_table = [_]struct { []const u8, MediaType }{
@@ -43,7 +42,6 @@ pub const MediaType = enum {
         .{ "application/vnd.docker.distribution.manifest.v1+prettyjws", .docker_manifest_v1_signed },
     };
 
-    /// Case-insensitive match against known MIME strings. Returns null for unknown types.
     pub fn fromString(content_type: []const u8) ?MediaType {
         for (mime_table) |entry| {
             if (std.ascii.eqlIgnoreCase(content_type, entry[0])) return entry[1];
@@ -51,8 +49,7 @@ pub const MediaType = enum {
         return null;
     }
 
-    /// Returns the canonical MIME string for this media type.
-    /// Derived from mime_table so both directions share one string per type.
+    /// Shares one table entry with `fromString` (no second string table).
     pub fn toString(self: MediaType) []const u8 {
         for (mime_table) |entry| {
             if (entry[1] == self) return entry[0];
@@ -60,7 +57,6 @@ pub const MediaType = enum {
         unreachable;
     }
 
-    /// True for index and manifest list types. Both carry a list of platform descriptors.
     pub fn isMultiArch(self: MediaType) bool {
         return switch (self) {
             .oci_index_v1, .docker_manifest_list_v2 => true,
@@ -68,12 +64,10 @@ pub const MediaType = enum {
         };
     }
 
-    /// True for the legacy v1 signed manifest. The resolver rejects these on receipt.
     pub fn isLegacy(self: MediaType) bool {
         return self == .docker_manifest_v1_signed;
     }
 
-    /// Parse a JSON media type string into a MediaType variant.
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !MediaType {
         const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         defer switch (tok) {
@@ -87,7 +81,6 @@ pub const MediaType = enum {
         return MediaType.fromString(s) orelse error.UnexpectedToken;
     }
 
-    /// Stringify as the canonical OCI/Docker MIME type string.
     pub fn jsonStringify(self: MediaType, jw: anytype) !void {
         try jw.write(self.toString());
     }

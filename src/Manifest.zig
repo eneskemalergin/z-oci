@@ -11,20 +11,14 @@ const json = @import("json.zig");
 const Digest = @import("Digest.zig");
 const test_support = @import("test_support.zig");
 
-/// OCI spec field: schemaVersion. Always 2 for current formats.
 schema_version: u8,
-/// OCI spec field: mediaType.
 media_type: MediaType,
-/// OCI spec field: config. Points to the image configuration blob.
 config: Descriptor,
-/// OCI spec field: layers. Ordered list of filesystem layer blobs.
 layers: []const Descriptor,
-/// OCI spec field: annotations. Value is std.json.Value.object when present.
 annotations: ?std.json.Value = null,
 
 const Manifest = @This();
 
-/// Parse a JSON manifest object. Maps camelCase JSON names to Zig fields.
 pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Manifest {
     if (.object_begin != try source.next()) return error.UnexpectedToken;
     var result = Manifest{
@@ -76,7 +70,6 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
     return result;
 }
 
-/// Parse only the `mediaType` field for resolve-depth workloads.
 pub fn parseMediaTypeShallow(allocator: std.mem.Allocator, bytes: []const u8) !MediaType {
     var parsed = try std.json.parseFromSlice(
         ManifestMediaTypeProbe,
@@ -94,7 +87,6 @@ pub fn parseMediaTypeShallow(allocator: std.mem.Allocator, bytes: []const u8) !M
 const ManifestMediaTypeProbe = struct {
     media_type: MediaType,
 
-    /// Parse only the `mediaType` field from a manifest JSON object.
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ManifestMediaTypeProbe {
         if (.object_begin != try source.next()) return error.UnexpectedToken;
         var seen_media_type = false;
@@ -122,7 +114,6 @@ const ManifestMediaTypeProbe = struct {
     }
 };
 
-/// Stringify to a JSON manifest object with camelCase OCI field names.
 pub fn jsonStringify(self: Manifest, jw: anytype) !void {
     try jw.beginObject();
     try jw.objectField("schemaVersion");

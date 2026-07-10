@@ -82,7 +82,6 @@ const Finding = enum {
     size_overflow,
 };
 
-/// CI security-check entrypoint; scans `SCAN_ROOTS` for credential material.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;

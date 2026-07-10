@@ -20,23 +20,17 @@ const Platform = @import("Platform.zig");
 const ResolveError = @import("ResolveError.zig").ResolveError;
 const json = @import("json.zig");
 
-/// HTTP verb for manifest transport (`HEAD` for existence/digest probes, `GET` for bodies).
 pub const ManifestRequestMethod = enum {
     head,
     get,
 };
-/// Which public API entry built the resolver params (drives Accept headers and auth scope).
 pub const ResolverOperation = enum {
     resolve,
     validate,
     get_manifest,
     resolve_child_manifest,
 };
-/// Internal resolver context built once at the public API boundary.
-///
-/// `config` must match the `Config` snapshot passed to `AuthEngine` on the same
-/// resolve/validate/get call so transport retry budgets stay aligned across
-/// manifest and token traffic.
+/// Built once at the public API boundary. `config` must match the `AuthEngine` snapshot.
 pub const ResolverParams = struct {
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -45,10 +39,9 @@ pub const ResolverParams = struct {
     platform: ?Platform,
     operation: ResolverOperation,
     transport_hooks: resilience.TransportHooks = .{},
-    /// Optional manifest pre-emptive throttle state shared across HEAD/GET in one resolve session.
+    /// Shared across HEAD/GET in one resolve session when pre-emptive throttling is on.
     manifest_throttle: ?*resilience.ManifestThrottle = null,
 
-    /// Build resolver context with noop transport hooks (tests and offline exchangers).
     pub fn init(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -60,7 +53,6 @@ pub const ResolverParams = struct {
         return initWithTransportHooks(allocator, client, config, reference, platform, operation, .{});
     }
 
-    /// Build resolver context with caller-supplied clock, sleep, and jitter hooks.
     pub fn initWithTransportHooks(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -81,7 +73,6 @@ pub const ResolverParams = struct {
         };
     }
 
-    /// Build resolver context with live `std.http.Client` sleep wiring for production paths.
     pub fn initLive(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -101,27 +92,21 @@ pub const ResolverParams = struct {
         );
     }
 
-    /// Attach shared pre-emptive throttle state for HEAD/GET in one resolve session.
     pub fn withManifestThrottle(self: ResolverParams, throttle: *resilience.ManifestThrottle) ResolverParams {
         var copy = self;
         copy.manifest_throttle = throttle;
         return copy;
     }
 };
-/// Manifest request shape for resolver transport operations.
-///
-/// `reference` and `accept` borrow from the caller for the request lifetime.
+/// `reference` and `accept` borrow for the request lifetime.
 pub const ManifestRequest = struct {
     method: ManifestRequestMethod,
     operation: ResolverOperation,
-    /// Borrowed registry/repository/ref view from the caller's `Reference`.
     reference: auth.AuthReferenceView,
     platform: ?Platform = null,
-    /// Borrowed Accept header values; not copied until HTTP request build.
     accept: []const []const u8 = &.{},
     allow_cached_auth_retry: bool = true,
 
-    /// Build the registry manifest URL (`https://{registry}/v2/{repo}/manifests/{ref}`).
     pub fn uriAlloc(self: ManifestRequest, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(
             allocator,
@@ -130,45 +115,37 @@ pub const ManifestRequest = struct {
         );
     }
 };
-/// Concrete HTTP request shape for the resolver transport seam.
 pub const ManifestHttpRequest = struct {
     method: ManifestRequestMethod,
     url: []u8,
     authorization: ?[]u8 = null,
     accept: []const []const u8 = &.{},
-    /// When set, `liveManifestHttpExchanger` borrows this slice instead of rebuilding Accept headers.
     prebuilt_accept_headers: ?[]const std.http.Header = null,
     max_response_body_bytes: usize = config_module.DEFAULT_MAX_MANIFEST_BYTES,
 
-    /// Free owned URL and Authorization header (zeroes bearer token bytes when present).
+    /// Zeroes bearer token bytes when present.
     pub fn deinit(self: ManifestHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
         auth.freeOwnedOptionalSecretSlice(allocator, self.authorization);
     }
 };
-/// Concrete HTTP response shape for the resolver transport seam.
-///
-/// GET responses may carry an owned body buffer. Callers must release it with
-/// `deinit()` after parsing or classification is complete.
+/// GET may own a body buffer; release via `deinit` after parse/classify.
 pub const ManifestHttpResponse = struct {
     metadata: ManifestResponseMetadata,
     owned_metadata: ?OwnedManifestResponseMetadata = null,
     body: ?[]u8 = null,
 
-    /// Free owned metadata clones and GET body buffer when present.
     pub fn deinit(self: ManifestHttpResponse, allocator: std.mem.Allocator) void {
         if (self.owned_metadata) |owned_metadata| owned_metadata.deinit(allocator);
         if (self.body) |body| allocator.free(body);
     }
 
-    /// Drops auth and retry header storage once classification no longer needs them.
     pub fn clearEphemeralMetadataHeaders(self: *ManifestHttpResponse, allocator: std.mem.Allocator) void {
         if (self.owned_metadata) |*owned_metadata| owned_metadata.dropEphemeralHeaders(allocator);
         self.metadata.www_authenticate_headers = &.{};
         self.metadata.resilience_headers = &.{};
     }
 
-    /// Copy wire metadata (and optional body) into an owned response for retry/redirect paths.
     pub fn initOwnedAlloc(
         allocator: std.mem.Allocator,
         metadata: ManifestResponseMetadata,
@@ -190,7 +167,6 @@ pub const ManifestHttpResponse = struct {
         };
     }
 };
-/// Transport-layer failures surfaced before registry status classification.
 pub const ManifestExchangeError = error{
     OutOfMemory,
     ResponseBodyTooLarge,
@@ -202,18 +178,13 @@ pub const ManifestExchangeError = error{
     ConnectionRefused,
     UnknownHostName,
 };
-/// Exchanges a resolver HTTP request for response metadata.
-///
-/// The exchanger owns request teardown and must call `request.deinit(allocator)`
-/// on every return path, including errors. The resolver does not deinit built
-/// requests when the exchanger returns an error.
+/// Exchanger must `request.deinit` on every path; resolver does not on exchanger error.
 pub const ManifestHttpExchanger = *const fn (
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     request: ManifestHttpRequest,
 ) ManifestExchangeError!ManifestHttpResponse;
 
-/// Metadata the resolver layer cares about before parsing a body.
 pub const ManifestResponseMetadata = struct {
     status: std.http.Status,
     content_type: ?[]const u8 = null,
@@ -222,12 +193,10 @@ pub const ManifestResponseMetadata = struct {
     www_authenticate_headers: []const []const u8 = &.{},
     resilience_headers: []const resilience.HttpHeader = &.{},
 
-    /// Numeric HTTP status for error payloads and logging.
     pub fn httpStatus(self: ManifestResponseMetadata) u16 {
         return @intCast(@intFromEnum(self.status));
     }
 
-    /// Reuse auth probe rules on manifest response metadata (WWW-Authenticate handling).
     pub fn probeClassification(self: ManifestResponseMetadata) auth.AuthError!auth.ProbeResult {
         const response = auth.ProbeHttpResponse{
             .status = self.status,
@@ -236,7 +205,6 @@ pub const ManifestResponseMetadata = struct {
         return response.classify();
     }
 
-    /// Deep-copy all metadata slices so the value can outlive the wire buffer.
     pub fn cloneAlloc(self: ManifestResponseMetadata, allocator: std.mem.Allocator) !ManifestResponseMetadata {
         const owned_resilience_headers = try resilience.duplicateHttpHeadersAlloc(allocator, self.resilience_headers);
         errdefer resilience.deinitOwnedHttpHeaders(allocator, owned_resilience_headers);
@@ -275,7 +243,7 @@ pub const ManifestResponseMetadata = struct {
         };
     }
 
-    /// Copies redirect follow-up fields only. Auth and retry headers are dropped.
+    /// Redirect follow-up only; auth/retry headers dropped.
     pub fn cloneAllocRedirect(self: ManifestResponseMetadata, allocator: std.mem.Allocator) !ManifestResponseMetadata {
         return .{
             .status = self.status,
@@ -286,7 +254,6 @@ pub const ManifestResponseMetadata = struct {
         };
     }
 
-    /// Copies HEAD success fields retained after classification.
     pub fn cloneAllocHeadSuccess(self: ManifestResponseMetadata, allocator: std.mem.Allocator) !ManifestResponseMetadata {
         return .{
             .status = self.status,
@@ -301,12 +268,10 @@ pub const ManifestResponseMetadata = struct {
         };
     }
 
-    /// Minimal metadata retained when HEAD classification needs only the status code.
     pub fn headFallbackMetadata(status: std.http.Status) ManifestResponseMetadata {
         return .{ .status = status };
     }
 
-    /// Free owned slices and clear pointers so the value cannot retain dangling aliases.
     pub fn releaseOwned(self: *ManifestResponseMetadata, allocator: std.mem.Allocator) void {
         if (self.content_type) |content_type| {
             allocator.free(content_type);
@@ -330,13 +295,11 @@ pub const ManifestResponseMetadata = struct {
         }
     }
 
-    /// Release owned slices without mutating a const view (convenience for stack values).
     pub fn deinitOwned(self: ManifestResponseMetadata, allocator: std.mem.Allocator) void {
         var owned = self;
         owned.releaseOwned(allocator);
     }
 };
-/// Owned backing storage for `ManifestResponseMetadata` wire slices.
 pub const OwnedManifestResponseMetadata = struct {
     content_type: ?[]u8 = null,
     docker_content_digest: ?[]u8 = null,
@@ -344,7 +307,6 @@ pub const OwnedManifestResponseMetadata = struct {
     www_authenticate_headers: []const []const u8 = &.{},
     resilience_headers: []resilience.HttpHeader = &.{},
 
-    /// Duplicate borrowed metadata into owned slices for retry and redirect follow-up.
     pub fn initAlloc(allocator: std.mem.Allocator, metadata: ManifestResponseMetadata) !OwnedManifestResponseMetadata {
         return .{
             .content_type = if (metadata.content_type) |content_type|
@@ -364,7 +326,6 @@ pub const OwnedManifestResponseMetadata = struct {
         };
     }
 
-    /// Free all owned header and digest slices held by this wrapper.
     pub fn deinit(self: OwnedManifestResponseMetadata, allocator: std.mem.Allocator) void {
         if (self.content_type) |content_type| allocator.free(content_type);
         if (self.docker_content_digest) |digest| allocator.free(digest);
@@ -375,7 +336,7 @@ pub const OwnedManifestResponseMetadata = struct {
         }
     }
 
-    /// Drop auth and retry headers while keeping success fields for GET fallback.
+    /// Drop auth/retry headers; keep success fields for GET fallback.
     pub fn dropEphemeralHeaders(self: *OwnedManifestResponseMetadata, allocator: std.mem.Allocator) void {
         freeHeaderSlices(allocator, self.www_authenticate_headers);
         self.www_authenticate_headers = &.{};
@@ -385,7 +346,6 @@ pub const OwnedManifestResponseMetadata = struct {
         }
     }
 
-    /// Borrow owned slices as a metadata view tagged with the response status.
     pub fn view(self: OwnedManifestResponseMetadata, status: std.http.Status) ManifestResponseMetadata {
         return .{
             .status = status,
@@ -397,14 +357,12 @@ pub const OwnedManifestResponseMetadata = struct {
         };
     }
 };
-/// Parsed manifest document owned by a JSON arena, or a resolve-depth media type tag.
 pub const ParsedManifestDocument = union(enum) {
     manifest: std.json.Parsed(Manifest),
     manifest_media_type: MediaType,
     oci_index: std.json.Parsed(OciImageIndex),
     docker_manifest_list: std.json.Parsed(DockerManifestList),
 
-    /// Release JSON arena storage for whichever document variant is active.
     pub fn deinit(self: *ParsedManifestDocument) void {
         switch (self.*) {
             .manifest => |parsed| parsed.deinit(),
@@ -414,7 +372,6 @@ pub const ParsedManifestDocument = union(enum) {
         }
     }
 
-    /// Extract the declared media type without inspecting nested manifest fields.
     pub fn mediaType(self: ParsedManifestDocument) MediaType {
         return switch (self) {
             .manifest => |parsed| parsed.value.media_type,
@@ -424,7 +381,6 @@ pub const ParsedManifestDocument = union(enum) {
         };
     }
 };
-/// Success payload for the internal GET path.
 pub const ManifestGetSuccess = struct {
     request: ManifestRequest,
     resolved_digest: Digest,
@@ -433,21 +389,18 @@ pub const ManifestGetSuccess = struct {
     /// When set, JSON strings in `document` may borrow from this buffer.
     backing_body: ?[]u8 = null,
 
-    /// Free digest buffer, parsed document arena, and optional backing body.
     pub fn deinit(self: *ManifestGetSuccess, allocator: std.mem.Allocator) void {
         allocator.free(self.resolved_digest_raw);
         self.document.deinit();
         if (self.backing_body) |body| allocator.free(body);
     }
 };
-/// Resolver-visible outcome for the GET path.
 pub const GetRequestOutcome = union(enum) {
     success: ManifestGetSuccess,
     not_found,
     redirect: ManifestResponseMetadata,
     failure: ResolveError,
 
-    /// Release owned arms (success payload, redirect metadata, or failure reference).
     pub fn deinit(self: *GetRequestOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .success => |*success| success.deinit(allocator),
@@ -457,17 +410,14 @@ pub const GetRequestOutcome = union(enum) {
         }
     }
 };
-/// Resolver-visible outcome for the HEAD path.
 pub const HeadRequestOutcome = union(enum) {
     success: ManifestResponseMetadata,
-    /// Single-arch HEAD satisfied `validate` without retaining response metadata.
     validate_manifest_ok: MediaType,
     use_get_fallback: ManifestResponseMetadata,
     not_found,
     redirect: ManifestResponseMetadata,
     failure: ResolveError,
 
-    /// Release owned metadata or failure reference arms; no-op for terminal status arms.
     pub fn deinit(self: *HeadRequestOutcome, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .success => |*metadata| metadata.releaseOwned(allocator),
@@ -478,7 +428,6 @@ pub const HeadRequestOutcome = union(enum) {
         }
     }
 };
-/// Resolver decision after the validate HEAD phase before optional GET fallback.
 pub const ValidateManifestHeadDecision = union(enum) {
     valid,
     not_found,
@@ -486,10 +435,7 @@ pub const ValidateManifestHeadDecision = union(enum) {
     inspect_multi_arch_head,
     proceed_with_get,
 };
-/// Classify a validate HEAD outcome for the public validate API.
-///
-/// On `.owned_failure`, the failure reference is extracted from `head_outcome`
-/// so `head_outcome.deinit` does not double-free it.
+/// On `.owned_failure`, extract the failure before `head_outcome.deinit` (avoids double-free).
 pub fn classifyValidateManifestHead(
     allocator: std.mem.Allocator,
     ref_view: auth.AuthReferenceView,
@@ -510,13 +456,11 @@ pub fn classifyValidateManifestHead(
         .success => return .inspect_multi_arch_head,
     }
 }
-/// Outcome of mapping a child-manifest validate HEAD before GET fallback.
 pub const ChildValidateHeadMappedOutcome = union(enum) {
     success_manifest_media_type: MediaType,
     not_found,
     owned_failure: ResolveError,
 };
-/// Map child-manifest validate HEAD outcomes into resolver-owned failure context.
 pub fn mapChildValidateHeadOutcome(
     allocator: std.mem.Allocator,
     ref_view: auth.AuthReferenceView,
@@ -541,7 +485,6 @@ pub fn mapChildValidateHeadOutcome(
         },
     }
 }
-/// Build a caller-owned `ResolveError` with canonical reference string.
 pub fn ownedResolveErrorAlloc(
     allocator: std.mem.Allocator,
     ref: auth.AuthReferenceView,
@@ -561,7 +504,6 @@ pub fn ownedResolveErrorAlloc(
         }),
     };
 }
-/// Format `registry/repo@digest` or `registry/repo:tag` for `ResolveError.reference`.
 pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.AuthReferenceView) ![]u8 {
     const separator: []const u8 = if (Digest.parse(reference.ref_string)) |_| "@" else |_| ":";
     return std.fmt.allocPrint(
@@ -570,7 +512,6 @@ pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.Aut
         .{ reference.registry, reference.repository_path, separator, reference.ref_string },
     );
 }
-/// Build a concrete transport request from resolver intent and an optional bearer token.
 pub fn buildManifestHttpRequestAlloc(
     allocator: std.mem.Allocator,
     request: ManifestRequest,
@@ -592,7 +533,6 @@ pub fn buildManifestHttpRequestAlloc(
         .accept = request.accept,
     };
 }
-/// Live HTTP exchanger for manifest HEAD and GET requests.
 pub fn liveManifestHttpExchanger(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -670,7 +610,6 @@ pub fn liveManifestHttpExchanger(
 }
 // --- Manifest HEAD/GET paths ---
 
-/// Execute the internal HEAD path through a mockable transport seam.
 pub fn performManifestHead(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,
@@ -696,7 +635,6 @@ pub fn performManifestHead(
         },
     }
 }
-/// Execute the internal GET path through the resolver transport seam.
 pub fn performManifestGet(
     ctx: ResolverParams,
     engine: *auth.AuthEngine,

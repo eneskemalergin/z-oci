@@ -38,7 +38,6 @@ const USAGE =
     \\
 ;
 
-/// Performance benchmark driver; see embedded `USAGE` and file header for flags.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();

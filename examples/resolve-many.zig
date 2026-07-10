@@ -1,30 +1,11 @@
 //! Offline Zencelot-style pin flow through injected exchangers.
 //!
-//! Simulates what a caller does with a list of image strings from a pipeline:
-//! parse references, resolve the batch with progress and a batch-wide platform,
-//! format pinned `registry/repo@sha256:...` lines for successes, and print
-//! actionable failure context for partial failures.
+//! Offline demo only: uses `testing.resolveManyWithExchangers` (not public
+//! `resolveMany`); `Client` is unused. Live callers need a real client.
 //!
-//! This is an offline demo, not a production template:
-//! - It calls `z_oci.testing.resolveManyWithExchangers`, not public `resolveMany`.
-//! - The `std.http.Client` value is intentionally unused because exchangers never
-//!   touch it. Live callers must construct a real client with `allocator` and `io`,
-//!   then call public `resolveMany` (with credentials/TLS as needed).
-//! - Progress callbacks must stay cheap; borrowed reference views are valid only
-//!   for the callback duration.
-//!
-//! Ownership notes:
-//! - Parsed input references use `init.gpa` and are deinitialized explicitly.
-//! - The returned `ResolveManyResult` is owned; this example calls
-//!   `result.deinit(init.gpa)` once after printing every item. Do not call
-//!   `z_oci.deinitResolveFailure` on batch item failures (that helper is
-//!   single-resolve only and would leak owned batch `registry` strings).
-//! - Progress `event.reference` fields borrow the input `Reference` for the
-//!   callback duration only; do not retain those pointers after return.
-//! - Platform is batch-wide. Callers that need per-item platforms must issue
-//!   separate `resolveMany` calls.
-//! - The manifest body comes from a checked-in fixture, so the example does not
-//!   perform network I/O.
+//! Ownership: input refs and `result` use `init.gpa`; never `deinitResolveFailure`
+//! on batch items. Progress views borrow for the callback only. Platform is
+//! batch-wide. Manifest body is a fixture.
 
 const std = @import("std");
 const Io = std.Io;
@@ -87,7 +68,6 @@ const ProgressPrinter = struct {
     }
 };
 
-/// Offline batch pin example; see file header for ownership and platform limits.
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -101,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
     MockRegistry.manifest_body = manifest_body;
     MockRegistry.manifest_calls = 0;
 
-    // Image strings shaped like pipeline.toml [[tasks]] image fields.
+    // Shaped like pipeline.toml [[tasks]] image fields.
     const image_strings = [_][]const u8{
         "registry-1.docker.io/library/busybox",
         "registry-1.docker.io/library/busybox:latest",
@@ -119,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var progress_printer = ProgressPrinter{ .stdout = stdout };
-    // Offline only: exchangers never use this client. Live callers need a real Client.
+    // Exchangers never use this client; live callers need a real Client.
     var client: std.http.Client = undefined;
     var result = try z_oci.testing.resolveManyWithExchangers(
         init.gpa,
@@ -162,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
     try stdout.print("failedCount: {d}\n", .{failed_count});
     try stdout.flush();
 
-    // Fail closed so examples-smoke catches silent regressions in the pin demo.
+    // Fail closed so examples-smoke catches silent pin-demo regressions.
     if (result.items.len != 5 or pinned_count != 4 or failed_count != 1 or MockRegistry.manifest_calls != 4) {
         return error.UnexpectedPinFlowCounts;
     }

@@ -25,7 +25,6 @@ const USAGE_TEXT =
     \\
 ;
 
-/// Offline manifest inspect example; see file header for parse ownership.
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
@@ -49,7 +48,6 @@ pub fn main(init: std.process.Init) !void {
     const bytes = try Io.Dir.cwd().readFile(init.io, manifest_path, &bytes_buffer);
     if (bytes.len > 32 * 1024) return error.StreamTooLong;
 
-    // Parsed(Manifest) is self-contained, so the temporary buffer can be discarded after parse.
     const parsed = try z_oci.json.parse(z_oci.Manifest, init.gpa, bytes);
     defer parsed.deinit();
 

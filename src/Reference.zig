@@ -28,20 +28,17 @@ const DOCKER_HUB_LIBRARY_PREFIX = "library/";
 const DOCKER_HUB_REGISTRY = "registry-1.docker.io";
 const DOCKER_HUB_ALIASES = [_][]const u8{ "docker.io", "index.docker.io", DOCKER_HUB_REGISTRY };
 
-/// Owned registry hostname.
 registry: []const u8,
-/// Owned repository path.
 repository: []const u8,
-/// Informational when digest is also present. refString() returns the digest then.
+/// Informational when digest is also present; `refString()` returns the digest then.
 tag: ?[]const u8,
-/// Parsed digest. .hex points into digest_raw when a digest is present.
+/// `.hex` points into `digest_raw` when set.
 digest: ?Digest,
-/// "sha256:hex" allocated copy used by refString(). Freed by deinit.
+/// `"sha256:hex"` for `refString()`; freed by `deinit`.
 digest_raw: ?[]const u8,
 
 const Reference = @This();
 
-/// Errors from [`parse`].
 pub const ParseError = error{
     Empty,
     InvalidDigest,
@@ -49,7 +46,6 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
-/// Parse an image reference string into owned fields.
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Reference {
     if (input.len == 0) return error.Empty;
 
@@ -152,10 +148,7 @@ fn duplicateLibraryRepositoryPath(allocator: std.mem.Allocator, repository: []co
     return owned;
 }
 
-/// Free all owned fields. Safe to call exactly once per parsed value.
-///
-/// Manual construction must keep `digest.hex` pointing into `digest_raw` when
-/// both are set (same contract as `Reference.parse`). Debug builds assert that.
+/// Manual construction must keep `digest.hex` inside `digest_raw` (Debug-asserted).
 pub fn deinit(self: *Reference, allocator: std.mem.Allocator) void {
     if (builtin.mode == .Debug) {
         if (self.digest) |d| {
@@ -179,13 +172,11 @@ fn slicePointsInto(inner: []const u8, outer: []const u8) bool {
     return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
 }
 
-/// Repository path for /v2/{name}/manifests/{ref} URL construction.
 pub fn repositoryPath(self: Reference) []const u8 {
     return self.repository;
 }
 
-/// Ref string for the manifest URL. Digest wins when both tag and digest are set.
-/// Returns "sha256:hex" for digest refs, the tag string when set, or `"latest"`.
+/// Digest wins when both tag and digest are set; otherwise tag or `"latest"`.
 pub fn refString(self: Reference) []const u8 {
     if (self.digest_raw) |dr| return dr;
     return self.tag orelse "latest";

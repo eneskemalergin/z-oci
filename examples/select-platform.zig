@@ -31,7 +31,6 @@ const USAGE_TEXT =
     \\
 ;
 
-/// Multi-arch platform selection example; see file header for allocator split.
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 

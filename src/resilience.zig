@@ -48,13 +48,9 @@ const std = @import("std");
 const Config = @import("Config.zig").Config;
 const json = @import("json.zig");
 
-/// Parsed rate-limit snapshot from response headers.
-///
-/// Populated by the rate-limit header parsers. Manifest transport records the
-/// last trustworthy registry snapshot via `ManifestThrottle` for opt-in
-/// pre-emptive throttling when `Config.rate_limit_enabled` is true.
+/// Last trustworthy registry snapshot is recorded via `ManifestThrottle` when pre-emption is on.
 pub const RateLimitInfo = struct {
-    /// Which header family populated this snapshot (registry pull vs API token bucket).
+    /// Registry pull vs API token-bucket header family.
     pub const Source = enum {
         none,
         registry_rate_limit,
@@ -67,31 +63,22 @@ pub const RateLimitInfo = struct {
     reset_unix_seconds: ?u64 = null,
     window_seconds: ?u32 = null,
 
-    /// True when any rate-limit header was parsed (not an empty default).
+    /// False for the empty default snapshot.
     pub fn isSet(self: RateLimitInfo) bool {
         return self.source != .none;
     }
 };
-/// Parsed retry delay instruction.
+/// Normalized delay; registries mix seconds, HTTP-date, and (Docker Hub) Unix timestamps.
 ///
-/// Registries mix seconds, HTTP-date, and (on Docker Hub) Unix timestamps in
-/// `Retry-After` / `X-Retry-After`. Store the normalized form, not raw bytes.
-///
-/// Registry assumptions encoded in the parsers:
-/// - Docker Hub may send large integer `Retry-After` values as Unix epoch seconds
-///   rather than delay seconds; values above `1_000_000_000` are treated as absolute
-///   retry instants.
-/// - `X-RateLimit-Reset` on Docker Hub token/API responses is a Unix epoch second.
-///   Registry `RateLimit-Reset` follows the same rule when present.
-/// - `Retry-After` wins over `X-Retry-After` when both are present.
-/// - Integer delay seconds anchor to the response `Date` header when available.
-/// - Pre-emptive throttling trusts registry `RateLimit-*` only, not `X-RateLimit-*`
-///   alone, and requires `limit`, `remaining`, and `RateLimit-Reset`.
+/// Parser assumptions:
+/// - Integer `Retry-After` above `1_000_000_000` is treated as a Unix instant (Docker Hub).
+/// - `RateLimit-Reset` / `X-RateLimit-Reset` are Unix epoch seconds when present.
+/// - `Retry-After` wins over `X-Retry-After`; integer delays anchor to response `Date` when available.
+/// - Pre-emptive throttling trusts complete registry `RateLimit-*` only, not API `X-RateLimit-*` alone.
 pub const RetryAfter = union(enum) {
     delay_seconds: u32,
     retry_at_unix_seconds: i64,
 };
-/// Which reactive retry bucket a failure belongs to.
 pub const RetryKind = enum {
     none,
     rate_limit,
@@ -99,9 +86,7 @@ pub const RetryKind = enum {
 };
 /// HTTP header pair. Borrowed on the wire; owned after `duplicateHttpHeadersAlloc`.
 pub const HttpHeader = struct {
-    /// Header name. Borrowed from the response unless duplicated.
     name: []const u8,
-    /// Header value. Borrowed from the response unless duplicated.
     value: []const u8,
 };
 /// Fields that actually drive `RetryBudget` on the live transport path.
@@ -118,31 +103,25 @@ pub const RetryBudgetConfig = struct {
 /// snapshot. Only `max_network_retries` and `max_rate_limit_retries` feed
 /// `RetryPolicy` today via `retryBudgetConfig`.
 pub const ResilienceConfigView = struct {
-    /// Connect timeout for caller recipes. `0` means unset. Projected in
-    /// `ResilienceConfigView` only; does not feed `RetryPolicy` directly.
+    /// Projected only; does not feed `RetryPolicy`. `0` = unset.
     connect_timeout_ms: u32,
-    /// Manifest/token HTTP read timeout. Helper subprocess I/O reads
-    /// `Config.read_timeout_ms` directly in auth instead of through this view.
+    /// Projected only; helper I/O reads `Config.read_timeout_ms` in auth instead.
     read_timeout_ms: u32,
-    /// Live: reactive retry budget for transient `5xx` and socket errors.
+    /// Live: reactive budget for transient `5xx` / socket errors.
     max_network_retries: u8,
-    /// Live: reactive retry budget for `429` responses.
+    /// Live: reactive budget for `429`.
     max_rate_limit_retries: u8,
-    /// Custom CA bundle path. Not applied by live transport wrappers today.
+    /// Not applied by live transport wrappers today.
     ca_bundle_path: ?[]const u8,
-    /// Pre-emptive throttling gate. When true, manifest transport may pause before
-    /// the next request when the prior response had trustworthy registry `RateLimit-*`
-    /// headers with `remaining` at zero. Reactive `429` backoff ignores this.
+    /// Opt-in pre-emptive pause on trusted `RateLimit-*` remaining=0; reactive `429` ignores this.
     rate_limit_enabled: bool,
 };
-/// Tracks transport retry attempts against separate budgets.
 pub const RetryBudget = struct {
     network_attempts_used: u8 = 0,
     rate_limit_attempts_used: u8 = 0,
     max_network_retries: u8,
     max_rate_limit_retries: u8,
 
-    /// Build a fresh budget from config limits (counters start at zero).
     pub fn init(config: RetryBudgetConfig) RetryBudget {
         return .{
             .max_network_retries = config.max_network_retries,
@@ -150,53 +129,42 @@ pub const RetryBudget = struct {
         };
     }
 
-    /// True while reactive network retries remain under `max_network_retries`.
     pub fn canRetryNetwork(self: RetryBudget) bool {
         return self.network_attempts_used < self.max_network_retries;
     }
 
-    /// True while reactive rate-limit retries remain under `max_rate_limit_retries`.
     pub fn canRetryRateLimit(self: RetryBudget) bool {
         return self.rate_limit_attempts_used < self.max_rate_limit_retries;
     }
 
-    /// Increment the network retry counter before sleeping and re-issuing the request.
     pub fn recordNetworkAttempt(self: *RetryBudget) void {
         self.network_attempts_used +%= 1;
     }
 
-    /// Increment the rate-limit retry counter before sleeping and re-issuing the request.
     pub fn recordRateLimitAttempt(self: *RetryBudget) void {
         self.rate_limit_attempts_used +%= 1;
     }
 
-    /// True when at least one reactive rate-limit retry was attempted.
+    /// True after at least one rate-limit retry was recorded (not "budget empty").
     pub fn rateLimitRetriesExhausted(self: RetryBudget) bool {
         return self.rate_limit_attempts_used > 0;
     }
 
-    /// True when at least one reactive network retry was attempted.
+    /// True after at least one network retry was recorded (not "budget empty").
     pub fn networkRetriesExhausted(self: RetryBudget) bool {
         return self.network_attempts_used > 0;
     }
 };
-/// Exponential backoff parameters for reactive transport retries.
-///
-/// Fixed defaults today. `Config` does not tune these yet; callers cannot mistake
-/// config fields for backoff control until a future milestone adds them.
+/// Fixed defaults; `Config` does not tune backoff yet.
 pub const RetryBackoffConfig = struct {
     base_delay_ms: u32 = 1_000,
     max_delay_ms: u32 = 30_000,
 };
-/// Injectable Unix clock for `RetryAfter` math and policy tests.
 pub const RetryClock = struct {
     now_unix_seconds: *const fn () i64,
 };
-/// Injectable jitter source. Transport wrappers pass a real RNG; tests pin values.
 pub const RetryRandomSource = *const fn () u64;
-/// Outcome of a single reactive retry policy evaluation.
 pub const RetryDecision = struct {
-    /// Whether the transport wrapper should sleep and retry or return the response/error.
     pub const Action = enum {
         retry,
         give_up,
@@ -206,17 +174,13 @@ pub const RetryDecision = struct {
     kind: RetryKind = .none,
     delay_ms: u32 = 0,
 };
-/// Pure reactive retry policy shared by manifest and token transport wrappers.
-///
-/// Evaluates one retry decision at a time. Transport wrappers own the sleep/retry
-/// loop; auth cached-401 retry stays on `Config.max_retries` outside this type.
+/// Shared by manifest and token wrappers. Auth cached-401 uses `Config.max_retries` instead.
 pub const RetryPolicy = struct {
     backoff: RetryBackoffConfig = .{},
     budget: RetryBudget,
     random_u64: RetryRandomSource,
     clock: RetryClock,
 
-    /// Build a policy from config budgets and injected clock/RNG hooks.
     pub fn init(
         policy_config: RetryPolicyConfig,
         random_u64: RetryRandomSource,
@@ -230,7 +194,6 @@ pub const RetryPolicy = struct {
         };
     }
 
-    /// Classify an HTTP status and optional `Retry-After` into one reactive retry decision.
     pub fn decideHttpRetry(
         self: *RetryPolicy,
         status: std.http.Status,
@@ -239,7 +202,6 @@ pub const RetryPolicy = struct {
         return self.decideRetry(classifyHttpStatus(status), retry_after);
     }
 
-    /// Classify a transport error into one reactive retry decision (no header delay).
     pub fn decideTransportRetry(self: *RetryPolicy, err: anyerror) RetryDecision {
         return self.decideRetry(classifyNetworkTransportError(err), null);
     }
@@ -278,9 +240,7 @@ pub const RetryPolicyConfig = struct {
     budget: RetryBudgetConfig,
     backoff: RetryBackoffConfig = .{},
 };
-/// Injectable sleep hook so unit tests avoid real delays.
 pub const TransportSleeper = *const fn (delay_ms: u32) void;
-/// Hooks transport wrappers inject for clock, jitter, and sleep.
 pub const TransportHooks = struct {
     sleeper: TransportSleeper = noopTransportSleeper,
     random_u64: RetryRandomSource = systemRetryRandomU64,
@@ -288,24 +248,18 @@ pub const TransportHooks = struct {
     /// When true, resolver/auth sleep through `std.http.Client.io` instead of `sleeper`.
     use_live_sleep: bool = false,
 };
-/// No-op sleep hook for unit tests that assert retry counts without delaying.
 pub fn noopTransportSleeper(_: u32) void {}
 
-/// Production transport hooks: real clock, jitter, and `std.http.Client` sleep.
 pub fn liveTransportHooks() TransportHooks {
     return .{ .use_live_sleep = true };
 }
-/// Default clock wired into transport hooks when callers do not inject one.
 pub const SYSTEM_RETRY_CLOCK: RetryClock = .{ .now_unix_seconds = systemNowUnixSeconds };
-/// Extract retry budget inputs from `Config` (backoff stays on fixed defaults).
 pub fn retryPolicyConfig(config: Config) RetryPolicyConfig {
     return .{ .budget = retryBudgetConfig(config) };
 }
-/// Build a `RetryPolicy` from config budgets and transport hook clock/RNG.
 pub fn retryPolicyFromConfig(config: Config, hooks: TransportHooks) RetryPolicy {
     return RetryPolicy.init(retryPolicyConfig(config), hooks.random_u64, hooks.clock);
 }
-/// Sleep for reactive or pre-emptive transport delays (live I/O or injected sleeper).
 pub fn sleepForTransportRetry(
     client: *std.http.Client,
     hooks: TransportHooks,
@@ -325,12 +279,10 @@ pub fn sleepForTransportRetry(
     }
     hooks.sleeper(delay_ms);
 }
-/// Optional hooks for the shared manifest/token transport retry loop.
 pub const HttpRetryLoopHooks = struct {
     before_first_attempt: ?*const fn (*anyopaque) void = null,
     after_successful_exchange: ?*const fn (*anyopaque, std.http.Status, []const HttpHeader) void = null,
 };
-/// Outcome of `runHttpRetryLoop` for manifest and token transport wrappers.
 pub fn HttpRetryLoopResult(comptime Response: type, comptime ExchangeError: type) type {
     return union(enum) {
         ok: struct {
@@ -343,11 +295,7 @@ pub fn HttpRetryLoopResult(comptime Response: type, comptime ExchangeError: type
         },
     };
 }
-/// Shared reactive retry loop for manifest and token HTTP exchangers.
-///
-/// Transport wrappers pass exchange-specific callbacks; manifest transport uses
-/// `before_first_attempt` for opt-in pre-emptive rate limiting and
-/// `after_successful_exchange` to record rate-limit headers.
+/// Manifest path uses `before_first_attempt` / `after_successful_exchange` for pre-emptive throttling.
 pub fn runHttpRetryLoop(
     client: *std.http.Client,
     transport_hooks: TransportHooks,
@@ -389,10 +337,7 @@ pub fn runHttpRetryLoop(
         sleepForTransportRetry(client, transport_hooks, decision.delay_ms);
     }
 }
-/// Header names the manifest/token transport layers retain for retry and throttle parsing.
-///
-/// Unlisted headers are dropped early so resilience parsers only see rate-limit and
-/// retry metadata the policy layer understands.
+/// Unlisted headers are dropped early; only retry/throttle metadata is retained.
 pub fn isTrackedResilienceHeaderName(name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "RateLimit-")) return true;
     if (std.ascii.startsWithIgnoreCase(name, "X-RateLimit-")) return true;
@@ -401,18 +346,15 @@ pub fn isTrackedResilienceHeaderName(name: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, "Date")) return true;
     return false;
 }
-/// Parse reactive retry delay from retained response headers (prefers `Retry-After`).
 pub fn retryAfterFromHeaders(
     headers: []const HttpHeader,
 ) ResilienceParseError!?RetryAfter {
     return parseRetryAfterFromHeaders(headers, null);
 }
-/// Parse the response `Date` header into Unix seconds when present.
 pub fn responseDateUnixSecondsFromHeaders(headers: []const HttpHeader) ResilienceParseError!?i64 {
     const raw = findHeaderValue(headers, "Date") orelse return null;
     return try parseImfFixdateHttpDate(std.mem.trim(u8, raw, " \t\r\n"));
 }
-/// Free header name/value pairs allocated by `duplicateHttpHeadersAlloc`.
 pub fn deinitOwnedHttpHeaders(allocator: std.mem.Allocator, headers: []HttpHeader) void {
     for (headers) |header| {
         allocator.free(header.name);
@@ -420,7 +362,7 @@ pub fn deinitOwnedHttpHeaders(allocator: std.mem.Allocator, headers: []HttpHeade
     }
     allocator.free(headers);
 }
-/// Deep-copy borrowed wire headers so retry loops can release the response buffer.
+/// Owned copy so retry loops can release the response buffer.
 pub fn duplicateHttpHeadersAlloc(
     allocator: std.mem.Allocator,
     headers: []const HttpHeader,
@@ -446,7 +388,6 @@ pub fn duplicateHttpHeadersAlloc(
 
     return owned;
 }
-/// Convert a parsed `Retry-After` value into milliseconds to sleep from `now`.
 pub fn retryAfterDelayMs(retry_after: RetryAfter, now_unix_seconds: i64) u32 {
     switch (retry_after) {
         .delay_seconds => |seconds| return seconds * 1000,
@@ -459,14 +400,12 @@ pub fn retryAfterDelayMs(retry_after: RetryAfter, now_unix_seconds: i64) u32 {
         },
     }
 }
-/// Map `Config` transport retry limits into a `RetryBudgetConfig` snapshot.
 pub fn retryBudgetConfig(config: Config) RetryBudgetConfig {
     return .{
         .max_network_retries = config.max_network_retries,
         .max_rate_limit_retries = config.max_rate_limit_retries,
     };
 }
-/// Narrow config view for resilience helpers and tests (no auth-only fields).
 pub fn configView(config: Config) ResilienceConfigView {
     return .{
         .connect_timeout_ms = config.connect_timeout_ms,
@@ -477,14 +416,12 @@ pub fn configView(config: Config) ResilienceConfigView {
         .rate_limit_enabled = config.rate_limit_enabled,
     };
 }
-/// Case-insensitive header lookup for parser entry points.
 pub fn findHeaderValue(headers: []const HttpHeader, name: []const u8) ?[]const u8 {
     for (headers) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
     }
     return null;
 }
-/// Map HTTP status to reactive retry bucket (`429` vs gateway/timeout vs none).
 pub fn classifyHttpStatus(status: std.http.Status) RetryKind {
     return switch (status) {
         .too_many_requests => .rate_limit,
@@ -492,15 +429,10 @@ pub fn classifyHttpStatus(status: std.http.Status) RetryKind {
         else => .none,
     };
 }
-/// True when `classifyHttpStatus` would schedule a reactive transport retry.
 pub fn isRetryableHttpStatus(status: std.http.Status) bool {
     return classifyHttpStatus(status) != .none;
 }
-/// Classify transient transport failures that may succeed on idempotent retry.
-///
-/// Hard auth, parse, and digest failures stay outside this helper. Opaque wrapper
-/// errors such as `error.TransportFailed` map to `.none` so policy does not retry
-/// faults the exchanger collapsed.
+/// Opaque `TransportFailed` / collapsed wrapper errors map to `.none` (not retried).
 pub fn classifyNetworkTransportError(err: anyerror) RetryKind {
     return switch (err) {
         error.ConnectionResetByPeer,
@@ -512,12 +444,10 @@ pub fn classifyNetworkTransportError(err: anyerror) RetryKind {
         else => .none,
     };
 }
-/// Errors while reading a bounded HTTP response body into an owned buffer.
 pub const HttpBodyReadError = error{
     OutOfMemory,
     BodyTooLarge,
 } || std.Io.Reader.ShortError;
-/// Read up to `max_bytes` from the response body stream into caller-owned storage.
 pub fn readHttpResponseBodyAlloc(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -529,7 +459,6 @@ pub fn readHttpResponseBodyAlloc(
         else => |e| return e,
     };
 }
-/// Malformed rate-limit or retry-after header values from registry responses.
 pub const ResilienceParseError = error{
     InvalidRateLimitHeader,
     InvalidRetryAfterHeader,
@@ -537,10 +466,7 @@ pub const ResilienceParseError = error{
 };
 // --- Resilience header parsers ---
 
-/// Parse registry pull rate-limit headers (`RateLimit-*`).
-///
-/// Empty `.source` when no registry headers are present. Partial registry sets are
-/// kept for logging but rejected by pre-emptive throttling trust checks.
+/// Partial registry sets are kept for logging but fail pre-emptive trust checks.
 pub fn parseRegistryRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!RateLimitInfo {
     const limit_raw = findHeaderValue(headers, "RateLimit-Limit");
     const remaining_raw = findHeaderValue(headers, "RateLimit-Remaining");
@@ -570,10 +496,7 @@ pub fn parseRegistryRateLimitHeaders(headers: []const HttpHeader) ResiliencePars
 
     return info;
 }
-/// Parse API rate-limit headers (`X-RateLimit-*`).
-///
-/// Empty `.source` when no API headers are present. Pre-emptive throttling ignores
-/// API-only snapshots because token-bucket metadata is not pull-bucket trustworthy.
+/// Pre-emptive throttling ignores API-only snapshots (not pull-bucket trustworthy).
 pub fn parseApiRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!RateLimitInfo {
     const limit_raw = findHeaderValue(headers, "X-RateLimit-Limit");
     const remaining_raw = findHeaderValue(headers, "X-RateLimit-Remaining");
@@ -591,30 +514,20 @@ pub fn parseApiRateLimitHeaders(headers: []const HttpHeader) ResilienceParseErro
 
     return info;
 }
-/// Parse rate-limit headers, preferring registry `RateLimit-*` over API
-/// `X-RateLimit-*` when both families are present.
-///
-/// Live on manifest transport via `ManifestThrottle` when pre-emptive
-/// throttling is enabled. Reactive transport retry uses `retryAfterFromHeaders`.
+/// Prefers registry `RateLimit-*` over API `X-RateLimit-*` when both are present.
 pub fn parseRateLimitHeaders(headers: []const HttpHeader) ResilienceParseError!RateLimitInfo {
     const registry = try parseRegistryRateLimitHeaders(headers);
     if (registry.isSet()) return registry;
     return parseApiRateLimitHeaders(headers);
 }
-/// True when registry pull `RateLimit-*` headers form a complete Docker Hub-style snapshot.
-///
-/// Requires registry source plus `limit`, `remaining`, and `RateLimit-Reset`. Partial
-/// sets and API-only headers are rejected so unreliable metadata does not slow pulls.
+/// Requires registry source plus `limit`, `remaining`, and `RateLimit-Reset`.
 pub fn isTrustworthyPreemptiveRateLimit(info: RateLimitInfo) bool {
     if (info.source != .registry_rate_limit) return false;
     if (info.limit == null or info.remaining == null) return false;
     if (info.reset_unix_seconds == null) return false;
     return true;
 }
-/// Milliseconds to sleep before the next manifest request when the pull bucket is exhausted.
-///
-/// `null` when pre-emption is disabled, headers fail the trust check, remaining is above
-/// `remaining_threshold`, or the reset time has already passed.
+/// `null` when disabled, untrusted, remaining above threshold, or reset already passed.
 pub fn preemptiveRateLimitDelayMs(
     rate_limit_enabled: bool,
     info: RateLimitInfo,
@@ -630,8 +543,7 @@ pub fn preemptiveRateLimitDelayMs(
     if (delay == 0) return null;
     return delay;
 }
-/// Carries the last trustworthy registry rate-limit snapshot across manifest HTTP
-/// calls within one resolve/validate/get operation via `ResolverParams.manifest_throttle`.
+/// Last trustworthy registry snapshot across HEAD/GET in one operation (`ResolverParams.manifest_throttle`).
 pub const ManifestThrottle = struct {
     prior: ?RateLimitInfo = null,
 
@@ -665,11 +577,7 @@ pub const ManifestThrottle = struct {
         sleepForTransportRetry(client, hooks, delay);
     }
 };
-/// Parse `Retry-After` or `X-Retry-After` when either header is present.
-///
-/// `null` when neither header exists. Integer-second delays anchor to
-/// `response_date_unix_seconds` or a captured `Date` header per RFC 7231. Malformed
-/// values surface as `ResilienceParseError`; transport wrappers fall back to backoff.
+/// `null` if neither header exists; malformed values are `ResilienceParseError` (wrappers fall back to backoff).
 pub fn parseRetryAfterFromHeaders(
     headers: []const HttpHeader,
     response_date_unix_seconds: ?i64,
@@ -687,7 +595,7 @@ pub fn parseRetryAfterFromHeaders(
     }
     return null;
 }
-/// Parse a single raw `Retry-After` value without response `Date` anchoring.
+/// No response `Date` anchoring.
 pub fn parseRetryAfterValue(raw: []const u8) ResilienceParseError!RetryAfter {
     return parseRetryAfterValueWithContext(raw, null);
 }

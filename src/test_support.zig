@@ -9,10 +9,6 @@ const std = @import("std");
 const json = @import("json.zig");
 const Descriptor = @import("Descriptor.zig");
 
-/// Read a fixture into a temporary buffer, parse it into a self-contained
-/// std.json.Parsed(T), then free the raw bytes before returning.
-///
-/// The caller owns the returned Parsed(T) arena and must call .deinit().
 pub fn parseFixture(comptime T: type, path: []const u8, comptime max_bytes: usize) !std.json.Parsed(T) {
     return parseFixtureWithAllocator(T, std.testing.allocator, path, max_bytes);
 }

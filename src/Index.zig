@@ -19,18 +19,14 @@ const test_support = @import("test_support.zig");
 
 // --- Index types ---
 
-/// OCI Image Index (application/vnd.oci.image.index.v1+json).
 pub const OciImageIndex = struct {
-    /// OCI spec field: schemaVersion. Always 2.
+    /// Always `2`.
     schema_version: u8,
-    /// OCI spec field: mediaType.
     media_type: MediaType,
-    /// OCI spec field: manifests. One entry per platform.
     manifests: []const Descriptor,
-    /// OCI spec field: annotations. Value is std.json.Value.object when present.
+    /// `std.json.Value.object` when present.
     annotations: ?std.json.Value = null,
 
-    /// Parse a JSON OCI image index object.
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !OciImageIndex {
         if (.object_begin != try source.next()) return error.UnexpectedToken;
         var result = OciImageIndex{
@@ -74,7 +70,6 @@ pub const OciImageIndex = struct {
         return result;
     }
 
-    /// Stringify to a JSON OCI image index with camelCase field names.
     pub fn jsonStringify(self: OciImageIndex, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("schemaVersion");
@@ -91,16 +86,12 @@ pub const OciImageIndex = struct {
     }
 };
 
-/// Docker Manifest List (application/vnd.docker.distribution.manifest.list.v2+json).
 pub const DockerManifestList = struct {
-    /// Docker schema 2 field: schemaVersion. Always 2.
+    /// Always `2`.
     schema_version: u8,
-    /// Docker schema 2 field: mediaType.
     media_type: MediaType,
-    /// Docker spec field: manifests. One entry per platform.
     manifests: []const Descriptor,
 
-    /// Parse a JSON Docker manifest list object.
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !DockerManifestList {
         if (.object_begin != try source.next()) return error.UnexpectedToken;
         var result = DockerManifestList{
@@ -142,7 +133,6 @@ pub const DockerManifestList = struct {
         return result;
     }
 
-    /// Stringify to a JSON Docker manifest list with camelCase field names.
     pub fn jsonStringify(self: DockerManifestList, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("schemaVersion");
@@ -155,13 +145,11 @@ pub const DockerManifestList = struct {
     }
 };
 
-/// Tagged union over OciImageIndex and DockerManifestList.
-/// Use this type in resolvers. Do not branch on the spec variant outside this file.
+/// Prefer this over branching on OCI vs Docker outside this file.
 pub const MultiArchManifest = union(enum) {
     oci: OciImageIndex,
     docker: DockerManifestList,
 
-    /// Returns the descriptor list regardless of which spec variant is underneath.
     pub fn descriptors(self: MultiArchManifest) []const Descriptor {
         return switch (self) {
             .oci => |idx| idx.manifests,
@@ -169,8 +157,6 @@ pub const MultiArchManifest = union(enum) {
         };
     }
 
-    /// Returns the first Descriptor whose platform satisfies Platform.match(candidate, filter).
-    /// Returns null if no descriptor matches or if a descriptor has no platform field.
     pub fn filterByPlatform(self: MultiArchManifest, filter: Platform) ?Descriptor {
         for (self.descriptors()) |desc| {
             const plat = desc.platform orelse continue;
@@ -179,8 +165,7 @@ pub const MultiArchManifest = union(enum) {
         return null;
     }
 
-    /// Returns the first platform-matching descriptor that points to another
-    /// manifest document the resolver can fetch.
+    /// Like `filterByPlatform`, but only media types the resolver can fetch as children.
     pub fn selectChildDescriptorByPlatform(self: MultiArchManifest, filter: Platform) ?Descriptor {
         for (self.descriptors()) |desc| {
             const plat = desc.platform orelse continue;
@@ -213,7 +198,6 @@ const TestDescriptor = struct {
     }
 };
 
-// makeDescriptor builds a test Descriptor with all hex bytes set to hex_char.
 // hex_char must be a valid ASCII hex digit (0-9, a-f).
 fn makeDescriptor(hex_char: u8, os: []const u8, arch: []const u8) !TestDescriptor {
     const digest_hex = try std.testing.allocator.alloc(u8, 64);

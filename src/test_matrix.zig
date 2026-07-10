@@ -64,7 +64,6 @@ pub const get_manifest_failure_scenarios = [_]Scenario{
     .platform_required,
 };
 
-/// Phase 4 public-boundary matrix (C4): documents which tests own each API surface.
 pub const PublicApi = enum { resolve, validate, get_manifest };
 
 pub const C4Surface = enum {

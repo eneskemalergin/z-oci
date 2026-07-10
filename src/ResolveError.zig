@@ -21,132 +21,91 @@
 
 const std = @import("std");
 
-/// Authentication failed. The registry rejected the request.
 pub const AuthFailed = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// The requested manifest or blob was not found.
 pub const NotFound = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// The resolution attempt hit a rate limit imposed by the registry.
 pub const RateLimited = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
-    /// True when reactive transport retries were consumed before this `429`.
+    /// Reactive transport retries were consumed before this `429`.
     transport_retries_exhausted: bool = false,
 };
 
-/// The pulled content digest does not match the requested digest.
 pub const DigestMismatch = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// No manifest in the index matched the requested platform.
 pub const PlatformNotFound = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// The manifest is multi-arch and the caller must provide a platform.
 pub const PlatformRequired = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// The manifest JSON could not be parsed or failed schema validation.
 pub const ManifestParseError = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// A network-level error: DNS failure, TCP timeout, TLS error, etc.
 pub const NetworkError = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
-    /// True when reactive transport retries were consumed before this failure.
+    /// Reactive transport retries were consumed before this failure.
     transport_retries_exhausted: bool = false,
 };
 
-/// The digest algorithm in the response is not supported by the resolver.
 pub const UnsupportedAlgorithm = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// The server returned a Content-Type that does not match what was requested.
 pub const ContentTypeMismatch = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// The operation exceeded the configured timeout.
 pub const Timeout = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
-    /// True when reactive transport retries were consumed before this timeout.
+    /// Reactive transport retries were consumed before this timeout.
     transport_retries_exhausted: bool = false,
 };
 
-/// Manifest index nesting exceeded the maximum allowed depth.
-/// Prevents unbounded recursion when indices point to other indices.
+/// Caps index nesting so indices pointing at indices cannot recurse unboundedly.
 pub const DepthLimitExceeded = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// The server response exceeded configured size limits.
 pub const ResponseTooLarge = struct {
-    /// Registry hostname; borrows from the caller's reference.
     registry: []const u8,
-    /// Canonical reference string; caller-owned on public API outcomes.
     reference: []const u8,
     http_status: ?u16 = null,
 };
 
-/// Tagged union over all possible OCI resolve failure modes.
-/// Public resolver failures own their `reference` string through the caller allocator.
 pub const ResolveError = union(enum) {
     auth_failed: AuthFailed,
     not_found: NotFound,
@@ -162,8 +121,6 @@ pub const ResolveError = union(enum) {
     depth_limit_exceeded: DepthLimitExceeded,
     response_too_large: ResponseTooLarge,
 
-    /// Write a human-readable error description.
-    /// Format: "summary: registry <reg> for <ref> [status <N>]"
     pub fn format(self: ResolveError, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const ctx = self.context();
         try w.print("{s}: registry {s} for {s}", .{ self.summary(), ctx.registry, ctx.reference });
@@ -184,20 +141,15 @@ pub const ResolveError = union(enum) {
         };
     }
 
-    /// Release the owned `reference` string carried by **single-resolve** public
-    /// failures (`resolve` / `validate` / `getManifest`).
-    ///
-    /// Does **not** free `registry` (borrowed from the input `Reference` on those
-    /// APIs). Do not use this on `resolveMany` item failures: those own `registry`
-    /// as well; use `ResolveManyItem.deinit` / `ResolveManyResult.deinit` instead.
+    /// Single-resolve only: frees `reference`, not borrowed `registry`. Do not use on
+    /// batch item failures (those own `registry`; use `ResolveManyItem.deinit`).
     pub fn deinitOwned(self: ResolveError, allocator: std.mem.Allocator) void {
         switch (self) {
             inline else => |value| allocator.free(value.reference),
         }
     }
 
-    /// Free the owned `reference` and clear it in place so the error value cannot
-    /// retain a dangling pointer (for storage still live after release).
+    /// Frees `reference` and clears it so a live error value cannot keep a dangling pointer.
     pub fn releaseOwnedReference(self: *ResolveError, allocator: std.mem.Allocator) void {
         switch (self.*) {
             inline else => |*value| {
@@ -209,7 +161,6 @@ pub const ResolveError = union(enum) {
         }
     }
 
-    /// Rebuild the error with a caller-owned `reference` string.
     pub fn withOwnedReference(self: ResolveError, owned_reference: []const u8) ResolveError {
         return switch (self) {
             .auth_failed => |value| .{ .auth_failed = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },

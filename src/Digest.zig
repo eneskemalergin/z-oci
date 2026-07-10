@@ -6,11 +6,9 @@
 
 const std = @import("std");
 
-/// The hash algorithm. Only sha256 in v1.
 pub const Algorithm = enum {
     sha256,
 
-    /// Expected hex string length for this algorithm.
     pub fn hexLen(self: Algorithm) usize {
         return switch (self) {
             .sha256 => 64,
@@ -18,7 +16,6 @@ pub const Algorithm = enum {
     }
 };
 
-/// Errors from [`parse`].
 pub const ParseError = error{
     MissingColon,
     UnsupportedAlgorithm,
@@ -27,12 +24,12 @@ pub const ParseError = error{
 };
 
 algorithm: Algorithm,
-/// Borrowed slice into the original input. No copy made.
+/// Borrows from the parse input (or arena after `jsonParse`).
 hex: []const u8,
 
 const Digest = @This();
 
-/// Parse "algorithm:hex" into a Digest. Returns a borrowed view into `input`.
+/// Returns a borrowed view into `input` (no allocation).
 pub fn parse(input: []const u8) ParseError!Digest {
     const colon = std.mem.indexOfScalar(u8, input, ':') orelse return error.MissingColon;
     const alg_str = input[0..colon];
@@ -55,19 +52,15 @@ pub fn parse(input: []const u8) ParseError!Digest {
     return .{ .algorithm = alg, .hex = hex };
 }
 
-/// Case-sensitive equality. Both algorithm and hex must match.
 pub fn eql(a: Digest, b: Digest) bool {
     return a.algorithm == b.algorithm and std.mem.eql(u8, a.hex, b.hex);
 }
 
-/// Formats as "sha256:<hex>". Use "{f}" in format strings.
 pub fn format(self: Digest, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{s}:{s}", .{ @tagName(self.algorithm), self.hex });
 }
 
-/// Parse a JSON string value as "algorithm:hex".
-/// The hex slice is copied into the arena allocator so the returned Digest
-/// does not borrow from the scanner buffer.
+/// Dupes hex into the arena so the result does not borrow the scanner buffer.
 pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Digest {
     const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
     defer switch (tok) {
@@ -79,15 +72,12 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
         else => return error.UnexpectedToken,
     };
     const d = Digest.parse(s) catch return error.UnexpectedToken;
-    // Dupe hex into the arena so the Digest does not borrow from the
-    // scanner input buffer. Callers can free the input after parse().
     const hex_owned = try allocator.dupe(u8, d.hex);
     return Digest{ .algorithm = d.algorithm, .hex = hex_owned };
 }
 
-/// Stringify as a JSON string "algorithm:hex".
 pub fn jsonStringify(self: Digest, jw: anytype) !void {
-    // Stack buffer: "sha256:" (7) + 64 hex = 71; extra headroom for future algorithms.
+    // "sha256:" (7) + 64 hex = 71; headroom for future algorithms.
     var buf: [128]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{s}:{s}", .{ @tagName(self.algorithm), self.hex }) catch unreachable;
     try jw.write(s);

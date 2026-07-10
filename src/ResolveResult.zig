@@ -18,22 +18,13 @@ const MediaType = @import("MediaType.zig").MediaType;
 const Platform = @import("Platform.zig");
 const Reference = @import("Reference.zig");
 
-/// The pinned digest of the resolved manifest.
 digest: Digest,
-/// The manifest media type (OCI or Docker).
 media_type: MediaType,
-/// The platform if resolution targeted a specific platform. Null for
-/// single-arch manifests or when platform was not requested.
 platform: ?Platform,
-/// The parsed image reference.
 reference: Reference,
 
 const ResolveResult = @This();
 
-/// clone produces an independent deep copy of all slice fields.
-///
-/// Use case: move a ResolveResult into a different allocator or keep it after
-/// a source arena teardown.
 pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
     const registry = try allocator.dupe(u8, self.reference.registry);
     errdefer allocator.free(registry);
@@ -127,10 +118,6 @@ pub fn clone(self: ResolveResult, allocator: std.mem.Allocator) !ResolveResult {
     };
 }
 
-/// deinit frees all slices owned by this ResolveResult.
-///
-/// This is valid for values returned from the public `resolve` API and for
-/// values produced by `clone()`.
 pub fn deinit(self: *ResolveResult, allocator: std.mem.Allocator) void {
     allocator.free(self.reference.registry);
     allocator.free(self.reference.repository);

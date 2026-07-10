@@ -11,27 +11,19 @@
 
 const std = @import("std");
 
-/// Operating system. Borrows from the parse arena, caller input, or a clone.
 os: []const u8,
-/// CPU architecture. Borrows from the parse arena, caller input, or a clone.
 architecture: []const u8,
-/// Optional CPU variant. Borrows from the parse arena, caller input, or a clone.
 variant: ?[]const u8 = null,
-/// Optional OS version string. Borrows from the parse arena, caller input, or a clone.
 os_version: ?[]const u8 = null,
-/// Optional OS feature list. Outer and inner slices borrow from the parse arena or a clone.
 os_features: ?[]const []const u8 = null,
 
 const Platform = @This();
 
-/// match returns true if candidate satisfies all constraints in filter.
-///
-/// Rules:
+/// Partial match rules (not obvious from the name):
 ///   - os and architecture: case-insensitive exact match (required).
-///   - variant: if filter specifies one, candidate must match. Omitting accepts any.
-///   - os_version: dot-segment prefix match. filter "10.0" matches candidate "10.0.17763.1234"
-///     but not "10.01".
-///   - os_features: not checked by match. Use eql for strict comparison.
+///   - variant: if filter specifies one, candidate must match; omitting accepts any.
+///   - os_version: dot-segment prefix (filter "10.0" matches "10.0.17763.1234", not "10.01").
+///   - os_features: not checked here; use `eql` for strict comparison.
 pub fn match(candidate: Platform, filter: Platform) bool {
     if (!std.ascii.eqlIgnoreCase(candidate.os, filter.os)) return false;
     if (!std.ascii.eqlIgnoreCase(candidate.architecture, filter.architecture)) return false;
@@ -54,7 +46,6 @@ fn osVersionMatches(candidate: []const u8, filter: []const u8) bool {
     return candidate.len == filter.len or candidate[filter.len] == '.';
 }
 
-/// eql returns true only when every non-null field matches exactly (case-sensitive).
 pub fn eql(a: Platform, b: Platform) bool {
     if (!std.mem.eql(u8, a.os, b.os)) return false;
     if (!std.mem.eql(u8, a.architecture, b.architecture)) return false;
@@ -64,9 +55,7 @@ pub fn eql(a: Platform, b: Platform) bool {
     return true;
 }
 
-/// Parse a JSON platform object.
-/// OCI spec uses dot-named fields ("os.version", "os.features"); these map to
-/// the underscore Zig fields (os_version, os_features).
+/// OCI uses "os.version" / "os.features"; Zig fields are `os_version` / `os_features`.
 pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Platform {
     if (.object_begin != try source.next()) return error.UnexpectedToken;
     var result = Platform{ .os = "", .architecture = "" };
@@ -104,7 +93,6 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
     return result;
 }
 
-/// Stringify to a JSON platform object using OCI spec field names.
 pub fn jsonStringify(self: Platform, jw: anytype) !void {
     try jw.beginObject();
     try jw.objectField("os");

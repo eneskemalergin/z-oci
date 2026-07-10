@@ -9,7 +9,6 @@
 
 const std = @import("std");
 
-/// Stable stderr text for the CLI scaffold entrypoint.
 pub const usage_message =
     \\z-oci: CLI scaffold (not implemented yet).
     \\
@@ -21,7 +20,6 @@ pub const usage_message =
     \\
 ;
 
-/// Print usage and point callers at the packaged examples.
 pub fn main(init: std.process.Init) !void {
     var stderr_buffer: [512]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);

@@ -1,21 +1,9 @@
 //! Resolve a live image reference to a pinned manifest digest.
 //!
-//! Uses a bare `Config{}` for anonymous public-registry access. Defaults apply for
-//! retry budgets, body-size limits, and TLS trust via the caller-owned
-//! `std.http.Client` (OS trust roots on first HTTPS when `ca_bundle_path` is unset).
-//! Set `ca_bundle_path`, `credential_provider`, or `rate_limit_enabled` on `Config`
-//! when enterprise TLS, auth, or pre-emptive throttling is required.
-//!
-//! Ownership notes:
-//! - CLI args live in `init.arena` (short-lived process).
-//! - The input `Reference` is parsed with `init.gpa`. On success, `resolve` moves
-//!   `registry` / `repository` / `tag` into the result; do not `ref.deinit` after
-//!   success. On failure, `registry` on the error still borrows the input
-//!   `Reference`: format/log the failure first, then `deinitOwned` and
-//!   `reference.deinit`.
-//! - The returned `ResolveResult` (including moved reference fields and digest
-//!   buffers) is owned by `init.gpa` and must be `deinit`ed with that allocator.
-//! - `std.http.Client` owns connection-pool state and must be deinitialized.
+//! Bare `Config{}` for anonymous access. On success, `resolve` moves reference
+//! fields into the result (do not `ref.deinit`). On failure, `registry` still
+//! borrows the input: format first, then `deinitOwned` and `reference.deinit`.
+//! Result and client use `init.gpa`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -30,7 +18,6 @@ const USAGE_TEXT =
     \\
 ;
 
-/// Live resolve example; see file header for `Config` and ownership.
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
@@ -64,11 +51,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.deinit();
 
-    // Anonymous defaults: OS TLS trust, retry budgets, and body-size limits from Config{}.
     const outcome = try z_oci.resolve(gpa, &client, z_oci.Config{}, reference, platform);
     switch (outcome) {
         .success => |result| {
-            // Success moves reference fields into the result.
             var owned_result = result;
             defer owned_result.deinit(gpa);
 
@@ -93,8 +78,7 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
         },
         .failure => |failure| {
-            // Single-resolve failures borrow `registry` from the input Reference.
-            // Format (or copy) before freeing that reference.
+            // `registry` borrows the input Reference; format before freeing it.
             try stderr.print("resolve failed: {f}\n", .{failure});
             failure.deinitOwned(gpa);
             reference.deinit(gpa);
