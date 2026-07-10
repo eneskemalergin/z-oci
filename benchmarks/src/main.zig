@@ -14,23 +14,23 @@ const USAGE =
     \\usage: z-oci-bench <operation> [options]
     \\
     \\Operations:
-    \\  reference-parse   Reference.parse throughput
-    \\  digest-parse      Digest.parse throughput
-    \\  manifest-parse    json.parse(Manifest) throughput
-    \\  challenge-parse   parseAuthenticateHeader throughput
-    \\  platform-match    Platform.match throughput
-    \\  authenticate-miss AuthEngine.authenticate (cache miss per iteration)
-    \\  authenticate-hit  AuthEngine.authenticate (cached token, second call)
+    \\  reference-parse         Reference.parse throughput
+    \\  digest-parse            Digest.parse throughput
+    \\  manifest-parse          json.parse(Manifest) throughput
+    \\  challenge-parse         parseAuthenticateHeader throughput
+    \\  platform-match          Platform.match throughput
+    \\  authenticate-miss       AuthEngine.authenticate (cache miss per iteration)
+    \\  authenticate-hit        AuthEngine.authenticate (cached token, second call)
     \\  authenticate-rate-limit AuthEngine.authenticate (429 then success per call)
-    \\  resolve-single    public resolve() single-arch path via injected transports
-    \\  resolve-session   resolve() reusing one AuthEngine across iterations
-    \\  resolve-many      public resolveMany() duplicate-heavy batch via injected transports
-    \\  resolve-many-unique public resolveMany() unique-reference batch via injected transports
-    \\  resolve-single-retry public resolve() with one transient 503 retry per call
-    \\  resolve-multi     public resolve() multi-arch child-selection path via injected transports
-    \\  validate-single   public validate() single-arch path via injected transports
-    \\  get-manifest      public getManifest() single-arch path via injected transports
-    \\  all               run every operation sequentially
+    \\  resolve-single          public resolve() single-arch path via injected transports
+    \\  resolve-session         resolve() reusing one AuthEngine across iterations
+    \\  resolve-many            public resolveMany() duplicate-heavy batch via injected transports
+    \\  resolve-many-unique     public resolveMany() unique-reference batch via injected transports
+    \\  resolve-single-retry    public resolve() with one transient 503 retry per call
+    \\  resolve-multi           public resolve() multi-arch child-selection path via injected transports
+    \\  validate-single         public validate() single-arch path via injected transports
+    \\  get-manifest            public getManifest() single-arch path via injected transports
+    \\  all                     run every operation sequentially
     \\
     \\Options:
     \\  --iterations <n>   iterations per run (default: 10000)
@@ -376,7 +376,7 @@ fn benchAuthenticateMiss(io: Io, iterations: usize, counting: bool) !void {
     var ca = CountingAllocator{ .inner = std.heap.page_allocator };
     const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
 
-    const ExchangeState = struct {
+    const TokenMock = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
             defer request.deinit(allocator);
             return .{ .status = .ok, .body =
@@ -388,7 +388,7 @@ fn benchAuthenticateMiss(io: Io, iterations: usize, counting: bool) !void {
         }
     };
 
-    var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{}, ExchangeState.exchange);
+    var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{}, TokenMock.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
 
@@ -424,7 +424,7 @@ fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
     var ca = CountingAllocator{ .inner = std.heap.page_allocator };
     const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
 
-    const ExchangeState = struct {
+    const TokenMock = struct {
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
             defer request.deinit(allocator);
             return .{ .status = .ok, .body =
@@ -436,7 +436,7 @@ fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
         }
     };
 
-    var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{}, ExchangeState.exchange);
+    var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{}, TokenMock.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
 
@@ -466,7 +466,7 @@ fn benchAuthenticateRateLimit(io: Io, iterations: usize, counting: bool) !void {
     var ca = CountingAllocator{ .inner = std.heap.page_allocator };
     const alloc = if (counting) ca.allocator() else std.heap.page_allocator;
 
-    const ExchangeState = struct {
+    const TokenMock = struct {
         var calls: usize = 0;
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
@@ -490,10 +490,10 @@ fn benchAuthenticateRateLimit(io: Io, iterations: usize, counting: bool) !void {
         }
     };
 
-    ExchangeState.calls = 0;
+    TokenMock.calls = 0;
     var engine = z_oci.AuthEngine.initWithTokenHttpExchanger(alloc, .{
         .max_rate_limit_retries = 1,
-    }, ExchangeState.exchange);
+    }, TokenMock.exchange);
     defer engine.deinit();
     var client: std.http.Client = undefined;
 

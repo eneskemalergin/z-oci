@@ -498,7 +498,7 @@ pub const AuthEngine = struct {
     }
 
     fn cachedTokenResponseForRequest(self: *AuthEngine, client: *std.http.Client, request: AuthenticateRequest) AuthError!?TokenResponse {
-        const entry = self.token_cache.getPtrAdapted(request, TokenCacheRequestContext{}) orelse return null;
+        const entry = self.token_cache.getPtrAdapted(request, TokenCacheRequestHash{}) orelse return null;
         if (self.cachedTokenIsExpired(client, entry.*)) {
             _ = self.removeCachedTokenForRequest(request);
             return null;
@@ -611,7 +611,7 @@ pub const AuthEngine = struct {
         token_response: *TokenResponse,
     ) AuthError!TokenResponse {
         const limit = self.config.max_token_cache_entries;
-        const is_new_entry = self.token_cache.getAdapted(request, TokenCacheRequestContext{}) == null;
+        const is_new_entry = self.token_cache.getAdapted(request, TokenCacheRequestHash{}) == null;
         if (limit > 0 and is_new_entry) {
             while (self.token_cache.count() >= limit) {
                 self.evictLruTokenCacheEntry();
@@ -658,7 +658,7 @@ pub const AuthEngine = struct {
     }
 
     fn removeCachedTokenForRequest(self: *AuthEngine, request: AuthenticateRequest) bool {
-        const removed = self.token_cache.fetchRemoveAdapted(request, TokenCacheRequestContext{}) orelse return false;
+        const removed = self.token_cache.fetchRemoveAdapted(request, TokenCacheRequestHash{}) orelse return false;
         var key = removed.key;
         key.deinit(self.allocator);
         var cached_token = removed.value;
@@ -899,6 +899,10 @@ pub fn liveTokenHttpExchanger(
     }
 
     const owned_body = resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return mapLiveTokenTransportError(err);
+    errdefer {
+        std.crypto.secureZero(u8, owned_body);
+        allocator.free(owned_body);
+    }
 
     const owned_headers = try resilience_headers.toOwnedSlice(allocator);
     return .{
@@ -1210,8 +1214,8 @@ const ParsedTokenBody = struct {
     expires_in: ?u64 = null,
     refresh_token: ?[]const u8 = null,
 };
-const TokenCacheMap = std.HashMapUnmanaged(TokenCacheKey, CachedToken, TokenCacheKeyContext, 80);
-const TokenCacheKeyContext = struct {
+const TokenCacheMap = std.HashMapUnmanaged(TokenCacheKey, CachedToken, TokenCacheKeyHash, 80);
+const TokenCacheKeyHash = struct {
     pub fn hash(_: @This(), key: TokenCacheKey) u64 {
         return hashTokenCacheFields(key.realm, key.service, key.scope);
     }
@@ -1220,7 +1224,7 @@ const TokenCacheKeyContext = struct {
         return tokenCacheKeysEqual(a, b);
     }
 };
-const TokenCacheRequestContext = struct {
+const TokenCacheRequestHash = struct {
     pub fn hash(_: @This(), request: AuthenticateRequest) u64 {
         return hashTokenCacheFields(request.challenge.realm, request.service(), request.scope());
     }
@@ -1560,7 +1564,11 @@ fn dockerCredentialHelperCommandAlloc(
     helper_suffix: []const u8,
 ) AuthError![]u8 {
     if (!isValidDockerHelperSuffix(helper_suffix)) return error.InvalidDockerConfig;
-    return std.fmt.allocPrint(allocator, "docker-credential-{s}", .{helper_suffix});
+    const prefix = "docker-credential-";
+    const command = try allocator.alloc(u8, prefix.len + helper_suffix.len);
+    @memcpy(command[0..prefix.len], prefix);
+    @memcpy(command[prefix.len..], helper_suffix);
+    return command;
 }
 fn isValidDockerHelperSuffix(helper_suffix: []const u8) bool {
     if (helper_suffix.len == 0) return false;
@@ -2904,7 +2912,7 @@ test "AuthEngine.dockerCredentialForRegistry: helper and inline auth matrix" {
 // --- AuthEngine.authenticate: credential helper integration ---
 
 test "AuthEngine.authenticate: helper credential integration matrix" {
-    const HelperState = struct {
+    const HelperMock = struct {
         fn runner(allocator: std.mem.Allocator, _: std.Io, helper_suffix: []const u8, server_url: []const u8, _: std.Io.Timeout) AuthError!CredentialHandle {
             if (!std.mem.eql(u8, helper_suffix, "secretservice")) return error.HelperFailed;
             if (!std.mem.eql(u8, server_url, "ghcr.io")) return error.HelperFailed;
@@ -2912,7 +2920,7 @@ test "AuthEngine.authenticate: helper credential integration matrix" {
         }
     };
 
-    const ExchangeState = struct {
+    const TokenMock = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
             defer request.deinit(std.testing.allocator);
             if (request.authorization == null or !std.mem.eql(u8, request.authorization.?, "Basic aGVscGVyLXVzZXI6aGVscGVyLXNlY3JldA==")) {
@@ -2934,8 +2942,8 @@ test "AuthEngine.authenticate: helper credential integration matrix" {
         \\}
     );
     defer engine.deinit();
-    engine.docker_helper_config = .{ .io = std.testing.io, .runner = HelperState.runner };
-    engine.token_http_exchanger = ExchangeState.exchange;
+    engine.docker_helper_config = .{ .io = std.testing.io, .runner = HelperMock.runner };
+    engine.token_http_exchanger = TokenMock.exchange;
 
     var client: std.http.Client = undefined;
     const request = try AuthenticateRequest.init(
@@ -2993,7 +3001,7 @@ test "AuthEngine.authenticate: helper credential integration matrix" {
     }
 }
 test "AuthEngine.authenticate: generic self-hosted bearer registry path uses docker config auth" {
-    const ExchangeState = struct {
+    const TokenMock = struct {
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
             defer request.deinit(std.testing.allocator);
 
@@ -3027,7 +3035,7 @@ test "AuthEngine.authenticate: generic self-hosted bearer registry path uses doc
         \\}
     );
     defer engine.deinit();
-    engine.token_http_exchanger = ExchangeState.exchange;
+    engine.token_http_exchanger = TokenMock.exchange;
 
     const probe = ProbeHttpResponse{
         .status = .unauthorized,
@@ -3641,7 +3649,7 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
     // Miss path must borrow the just-stored cache entry (no post-store re-lookup copy).
     try std.testing.expect(!first.owns_access_token);
     try std.testing.expectEqual(
-        engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value.ptr,
+        engine.token_cache.getAdapted(request, TokenCacheRequestHash{}).?.token.value.ptr,
         first.access_token.value.ptr,
     );
     MockHarness.fake_now = 1_002;
@@ -3652,7 +3660,7 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
     try std.testing.expectEqualStrings("cached-token", second.access_token.value);
     try std.testing.expect(!second.owns_access_token);
     try std.testing.expectEqual(
-        engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value.ptr,
+        engine.token_cache.getAdapted(request, TokenCacheRequestHash{}).?.token.value.ptr,
         second.access_token.value.ptr,
     );
 
@@ -3780,9 +3788,9 @@ test "AuthEngine.authenticate: max_token_cache_entries evicts LRU entry" {
     var first_c = (try engine.authenticate(&client, request_c)).?;
     defer first_c.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), engine.token_cache.count());
-    try std.testing.expect(engine.token_cache.getAdapted(request_a, TokenCacheRequestContext{}) == null);
-    try std.testing.expectEqualStrings("token-b", engine.token_cache.getAdapted(request_b, TokenCacheRequestContext{}).?.token.value);
-    try std.testing.expectEqualStrings("token-c", engine.token_cache.getAdapted(request_c, TokenCacheRequestContext{}).?.token.value);
+    try std.testing.expect(engine.token_cache.getAdapted(request_a, TokenCacheRequestHash{}) == null);
+    try std.testing.expectEqualStrings("token-b", engine.token_cache.getAdapted(request_b, TokenCacheRequestHash{}).?.token.value);
+    try std.testing.expectEqualStrings("token-c", engine.token_cache.getAdapted(request_c, TokenCacheRequestHash{}).?.token.value);
 
     MockHarness.fake_now += 1;
     var hit_b = (try engine.authenticate(&client, request_b)).?;
@@ -3887,7 +3895,7 @@ test "AuthEngine.authenticate: expired cached token triggers fresh exchange" {
 
     try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
-    try std.testing.expectEqualStrings("second-token", engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value);
+    try std.testing.expectEqualStrings("second-token", engine.token_cache.getAdapted(request, TokenCacheRequestHash{}).?.token.value);
     try std.testing.expectEqualStrings("first-token", first_token_value);
     try std.testing.expectEqualStrings("second-token", second.access_token.value);
 }
@@ -4164,7 +4172,7 @@ test "AuthEngine.authenticate: optional basic auth credential matrix" {
     };
 
     for (cases) |case| {
-        const ProviderState = struct {
+        const ProviderMock = struct {
             var released = false;
 
             fn release(_: std.mem.Allocator, _: ConfigModule.Credential) void {
@@ -4180,7 +4188,7 @@ test "AuthEngine.authenticate: optional basic auth credential matrix" {
             }
         };
 
-        const ExchangeState = struct {
+        const TokenMock = struct {
             var expected_auth: ?[]const u8 = null;
             var expected_url: ?[]const u8 = null;
             var expected_token: []const u8 = undefined;
@@ -4212,10 +4220,10 @@ test "AuthEngine.authenticate: optional basic auth credential matrix" {
             }
         };
 
-        ProviderState.released = false;
-        ExchangeState.expected_auth = case.expected_auth;
-        ExchangeState.expected_url = case.expected_url;
-        ExchangeState.expected_token = case.expected_token;
+        ProviderMock.released = false;
+        TokenMock.expected_auth = case.expected_auth;
+        TokenMock.expected_url = case.expected_url;
+        TokenMock.expected_token = case.expected_token;
 
         var environ_map = std.process.Environ.Map.init(std.testing.allocator);
         defer environ_map.deinit();
@@ -4231,11 +4239,11 @@ test "AuthEngine.authenticate: optional basic auth credential matrix" {
             }
         }
 
-        const provider = CredentialProvider{ .getCredentialFn = ProviderState.get };
+        const provider = CredentialProvider{ .getCredentialFn = ProviderMock.get };
         var engine = AuthEngine.initWithTokenHttpExchanger(
             std.testing.allocator,
             if (case.use_provider) .{ .credential_provider = &provider } else .{},
-            ExchangeState.exchange,
+            TokenMock.exchange,
         );
         defer engine.deinit();
         if (case.use_environ) engine.environ_map = &environ_map;
@@ -4247,7 +4255,7 @@ test "AuthEngine.authenticate: optional basic auth credential matrix" {
         defer response.deinit(std.testing.allocator);
 
         try std.testing.expectEqualStrings(case.expected_token, response.access_token.value);
-        if (case.use_provider) try std.testing.expect(ProviderState.released);
+        if (case.use_provider) try std.testing.expect(ProviderMock.released);
     }
 }
 test "AuthEngine.authenticate: repeated success and failure runs stay leak-free" {

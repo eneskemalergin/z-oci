@@ -588,16 +588,16 @@ pub fn parseRetryAfterFromHeaders(
         try responseDateUnixSecondsFromHeaders(headers);
 
     if (findHeaderValue(headers, "Retry-After")) |raw| {
-        return try parseRetryAfterValueWithContext(raw, response_date);
+        return try parseRetryAfterHeaderValue(raw, response_date);
     }
     if (findHeaderValue(headers, "X-Retry-After")) |raw| {
-        return try parseRetryAfterValueWithContext(raw, response_date);
+        return try parseRetryAfterHeaderValue(raw, response_date);
     }
     return null;
 }
 /// No response `Date` anchoring.
 pub fn parseRetryAfterValue(raw: []const u8) ResilienceParseError!RetryAfter {
-    return parseRetryAfterValueWithContext(raw, null);
+    return parseRetryAfterHeaderValue(raw, null);
 }
 
 // --- Private helpers ---
@@ -652,7 +652,7 @@ fn exponentialBackoffDelayMs(
 // Numeric `Retry-After` values at or above this are treated as Unix epoch seconds.
 const RETRY_AFTER_UNIX_EPOCH_THRESHOLD: u64 = 1_000_000_000;
 const epoch = std.time.epoch;
-fn parseRetryAfterValueWithContext(
+fn parseRetryAfterHeaderValue(
     raw: []const u8,
     response_date_unix_seconds: ?i64,
 ) ResilienceParseError!RetryAfter {

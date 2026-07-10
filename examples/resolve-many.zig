@@ -1,5 +1,7 @@
 //! Offline Zencelot-style pin flow through injected exchangers.
 //!
+//! Run: `zig build example-resolve-many`
+//!
 //! Offline demo only: uses `testing.resolveManyWithExchangers` (not public
 //! `resolveMany`); `Client` is unused. Live callers need a real client.
 //!
@@ -11,6 +13,14 @@
 const std = @import("std");
 const Io = std.Io;
 const z_oci = @import("z_oci");
+
+const USAGE_TEXT =
+    \\usage: resolve-many
+    \\
+    \\Examples:
+    \\  zig build example-resolve-many
+    \\
+;
 
 const MANIFEST_PATH = "fixtures/manifests/busybox-amd64-live-oci-manifest.json";
 const MANIFEST_DIGEST = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65";
@@ -70,6 +80,16 @@ const ProgressPrinter = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len > 1) {
+        var stderr_buffer: [1024]u8 = undefined;
+        var stderr_writer = Io.File.stderr().writer(init.io, &stderr_buffer);
+        defer stderr_writer.end() catch {};
+        try stderr_writer.interface.writeAll(USAGE_TEXT);
+        return error.InvalidArguments;
+    }
+
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = Io.File.stdout().writer(init.io, &stdout_buffer);
     defer stdout_writer.end() catch {};

@@ -75,16 +75,16 @@ Docker Hub, Quay, and GHCR are the main named targets in the current code and te
 
 Representative Debug `--counting` snapshot for v0.4.0 (see `benchmarks/baselines/v0.4.0.json`):
 
-| Operation             | Mean per iteration | Allocs per call |
-| --------------------- | ------------------ | --------------- |
-| `resolve-single`      | 78 μs              | 6               |
-| `resolve-multi`       | 664 μs             | 10              |
-| `validate-single`     | 28 μs              | 3               |
-| `get-manifest`        | 125 μs             | 6               |
-| `authenticate` (miss) | 109 μs             | 10              |
-| `authenticate` (hit)  | 3 μs               | 0               |
+| Operation               | Mean per iteration | Allocs per call |
+| ----------------------- | ------------------ | --------------- |
+| `resolve-single`        | 78 μs              | 6               |
+| `resolve-multi`         | 664 μs             | 10              |
+| `validate-single`       | 28 μs              | 3               |
+| `get-manifest`          | 125 μs             | 6               |
+| `authenticate-miss`     | 109 μs             | 10              |
+| `authenticate-hit`      | 3 μs               | 0               |
 
-Full zebrac baselines, parser microbenchmarks, and wall-time summaries live in `benchmarks/baselines/`. Release notes live in [CHANGELOG.md](CHANGELOG.md).
+Full zebrac baselines, parser microbenchmarks, and wall-time summaries live in `benchmarks/baselines/`. Operation names match `z-oci-bench <operation>` (see `./zig-out/bin/z-oci-bench` with no args). Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Getting started
 
@@ -245,14 +245,15 @@ Offline examples:
 - `zig build example-normalize-reference -- ubuntu:22.04`
 - `zig build example-inspect-manifest`
 - `zig build example-select-platform`
+- `zig build example-resolve-many`
 
 See [examples](examples) for the source of the packaged examples.
 
 ## Next
 
-- v0.4.0 release cut (merge `phase4-resilience`, tag, CHANGELOG)
 - CLI for resolve, validate, and inspect
-- Batch resolve and registry compatibility testing
+- Registry compatibility testing beyond the current Docker Hub / GHCR / Quay coverage
+- Formal `v0.5.0` benchmark baseline (includes `resolve-many` / `resolve-many-unique`)
 
 ## References
 

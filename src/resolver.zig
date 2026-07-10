@@ -108,11 +108,18 @@ pub const ManifestRequest = struct {
     allow_cached_auth_retry: bool = true,
 
     pub fn uriAlloc(self: ManifestRequest, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(
-            allocator,
-            "https://{s}/v2/{s}/manifests/{s}",
-            .{ self.reference.registry, self.reference.repository_path, self.reference.ref_string },
-        );
+        const registry = self.reference.registry;
+        const repository_path = self.reference.repository_path;
+        const ref_string = self.reference.ref_string;
+        const len = "https://".len + registry.len + "/v2/".len + repository_path.len + "/manifests/".len + ref_string.len;
+        const uri = try allocator.alloc(u8, len);
+        const written = std.fmt.bufPrint(uri, "https://{s}/v2/{s}/manifests/{s}", .{
+            registry,
+            repository_path,
+            ref_string,
+        }) catch unreachable;
+        std.debug.assert(written.len == len);
+        return uri;
     }
 };
 pub const ManifestHttpRequest = struct {
@@ -255,16 +262,21 @@ pub const ManifestResponseMetadata = struct {
     }
 
     pub fn cloneAllocHeadSuccess(self: ManifestResponseMetadata, allocator: std.mem.Allocator) !ManifestResponseMetadata {
+        const content_type = if (self.content_type) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (content_type) |value| allocator.free(value);
+
+        const docker_content_digest = if (self.docker_content_digest) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+
         return .{
             .status = self.status,
-            .content_type = if (self.content_type) |content_type|
-                try allocator.dupe(u8, content_type)
-            else
-                null,
-            .docker_content_digest = if (self.docker_content_digest) |digest|
-                try allocator.dupe(u8, digest)
-            else
-                null,
+            .content_type = content_type,
+            .docker_content_digest = docker_content_digest,
         };
     }
 
@@ -308,21 +320,35 @@ pub const OwnedManifestResponseMetadata = struct {
     resilience_headers: []resilience.HttpHeader = &.{},
 
     pub fn initAlloc(allocator: std.mem.Allocator, metadata: ManifestResponseMetadata) !OwnedManifestResponseMetadata {
+        const content_type = if (metadata.content_type) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (content_type) |value| allocator.free(value);
+
+        const docker_content_digest = if (metadata.docker_content_digest) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (docker_content_digest) |value| allocator.free(value);
+
+        const location = if (metadata.location) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (location) |value| allocator.free(value);
+
+        const www_authenticate_headers = try duplicateHeaderSlicesAlloc(allocator, metadata.www_authenticate_headers);
+        errdefer freeHeaderSlices(allocator, www_authenticate_headers);
+
+        const resilience_headers = try resilience.duplicateHttpHeadersAlloc(allocator, metadata.resilience_headers);
+
         return .{
-            .content_type = if (metadata.content_type) |content_type|
-                try allocator.dupe(u8, content_type)
-            else
-                null,
-            .docker_content_digest = if (metadata.docker_content_digest) |digest|
-                try allocator.dupe(u8, digest)
-            else
-                null,
-            .location = if (metadata.location) |location|
-                try allocator.dupe(u8, location)
-            else
-                null,
-            .www_authenticate_headers = try duplicateHeaderSlicesAlloc(allocator, metadata.www_authenticate_headers),
-            .resilience_headers = try resilience.duplicateHttpHeadersAlloc(allocator, metadata.resilience_headers),
+            .content_type = content_type,
+            .docker_content_digest = docker_content_digest,
+            .location = location,
+            .www_authenticate_headers = www_authenticate_headers,
+            .resilience_headers = resilience_headers,
         };
     }
 
@@ -506,11 +532,16 @@ pub fn ownedResolveErrorAlloc(
 }
 pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.AuthReferenceView) ![]u8 {
     const separator: []const u8 = if (Digest.parse(reference.ref_string)) |_| "@" else |_| ":";
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}{s}{s}",
-        .{ reference.registry, reference.repository_path, separator, reference.ref_string },
-    );
+    const len = reference.registry.len + 1 + reference.repository_path.len + separator.len + reference.ref_string.len;
+    const canonical = try allocator.alloc(u8, len);
+    const written = std.fmt.bufPrint(canonical, "{s}/{s}{s}{s}", .{
+        reference.registry,
+        reference.repository_path,
+        separator,
+        reference.ref_string,
+    }) catch unreachable;
+    std.debug.assert(written.len == len);
+    return canonical;
 }
 pub fn buildManifestHttpRequestAlloc(
     allocator: std.mem.Allocator,
@@ -819,7 +850,9 @@ fn ownedManifestResponseMetadataFromHead(
             if (www_authenticate_headers.items.len >= MAX_WWW_AUTHENTICATE_HEADERS) {
                 return error.ResponseHeadersTooLarge;
             }
-            try www_authenticate_headers.append(allocator, try dupeManifestHeaderValueAlloc(allocator, header.value));
+            const value = try dupeManifestHeaderValueAlloc(allocator, header.value);
+            errdefer allocator.free(value);
+            try www_authenticate_headers.append(allocator, value);
             if (wwwAuthenticateHeadersSufficient(www_authenticate_headers.items)) {
                 www_authenticate_complete = true;
             }
@@ -832,19 +865,24 @@ fn ownedManifestResponseMetadataFromHead(
             if (resilience_headers.items.len >= MAX_RESILIENCE_HEADERS) {
                 return error.ResponseHeadersTooLarge;
             }
-            try resilience_headers.append(allocator, .{
-                .name = allocator.dupe(u8, header.name) catch return error.OutOfMemory,
-                .value = try dupeManifestHeaderValueAlloc(allocator, header.value),
-            });
+            const name = try allocator.dupe(u8, header.name);
+            errdefer allocator.free(name);
+            const value = try dupeManifestHeaderValueAlloc(allocator, header.value);
+            errdefer allocator.free(value);
+            try resilience_headers.append(allocator, .{ .name = name, .value = value });
         }
     }
+
+    const owned_www_authenticate_headers = try www_authenticate_headers.toOwnedSlice(allocator);
+    errdefer freeHeaderSlices(allocator, owned_www_authenticate_headers);
+    const owned_resilience_headers = try resilience_headers.toOwnedSlice(allocator);
 
     return .{
         .content_type = content_type,
         .docker_content_digest = docker_content_digest,
         .location = location,
-        .www_authenticate_headers = try www_authenticate_headers.toOwnedSlice(allocator),
-        .resilience_headers = try resilience_headers.toOwnedSlice(allocator),
+        .www_authenticate_headers = owned_www_authenticate_headers,
+        .resilience_headers = owned_resilience_headers,
     };
 }
 fn resolveErrorFromAuthError(
@@ -2433,7 +2471,7 @@ test "performManifestHead: outcome and validation matrix" {
     const digest = "sha256:b8d1827e38a1d49cd17217efd7b07d689e4ea1744e39c7dcbb95533d175bea65";
     const pinned_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    const HeadState = struct {
+    const HeadMock = struct {
         var case: Case = undefined;
         var attempts: usize = 0;
 
@@ -2496,8 +2534,8 @@ test "performManifestHead: outcome and validation matrix" {
     };
 
     for (cases) |c| {
-        HeadState.case = c.case;
-        HeadState.attempts = 0;
+        HeadMock.case = c.case;
+        HeadMock.attempts = 0;
 
         var client: std.http.Client = undefined;
         var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, c.config, ResolverTestHarness.refuseTokenExchange);
@@ -2512,7 +2550,7 @@ test "performManifestHead: outcome and validation matrix" {
             c.operation,
         );
 
-        var outcome = try performManifestHead(ctx, &engine, HeadState.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        var outcome = try performManifestHead(ctx, &engine, HeadMock.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
         defer outcome.deinit(std.testing.allocator);
 
         if (std.mem.eql(u8, c.expected_tag, "validate_manifest_ok")) {
@@ -2537,14 +2575,14 @@ test "performManifestHead: outcome and validation matrix" {
         }
 
         if (c.check_attempts) |expected| {
-            try std.testing.expectEqual(expected, HeadState.attempts);
+            try std.testing.expectEqual(expected, HeadMock.attempts);
         }
     }
 }
 test "performManifestGet: fixture document parsing matrix" {
     const DocumentKind = enum { oci_manifest, docker_manifest, oci_index, docker_list };
 
-    const FixtureState = struct {
+    const FixtureMock = struct {
         var fixture_path: []const u8 = undefined;
         var content_type: []const u8 = undefined;
         var normalize_whitespace: bool = false;
@@ -2622,9 +2660,9 @@ test "performManifestGet: fixture document parsing matrix" {
     };
 
     for (cases) |c| {
-        FixtureState.fixture_path = c.fixture_path;
-        FixtureState.content_type = c.content_type;
-        FixtureState.normalize_whitespace = c.normalize_whitespace;
+        FixtureMock.fixture_path = c.fixture_path;
+        FixtureMock.content_type = c.content_type;
+        FixtureMock.normalize_whitespace = c.normalize_whitespace;
 
         var client: std.http.Client = undefined;
         var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, ResolverTestHarness.refuseTokenExchange);
@@ -2638,7 +2676,7 @@ test "performManifestGet: fixture document parsing matrix" {
             c.operation,
         );
 
-        var outcome = try performManifestGet(ctx, &engine, FixtureState.exchange, c.accept);
+        var outcome = try performManifestGet(ctx, &engine, FixtureMock.exchange, c.accept);
         defer outcome.deinit(std.testing.allocator);
 
         switch (outcome) {
@@ -2680,7 +2718,7 @@ test "performManifestGet: body and content-type failure matrix" {
         body_media_type_disagrees,
     };
 
-    const FailureState = struct {
+    const FailureMock = struct {
         var case: FailureCase = undefined;
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2731,7 +2769,7 @@ test "performManifestGet: body and content-type failure matrix" {
     };
 
     for (cases) |c| {
-        FailureState.case = c.failure;
+        FailureMock.case = c.failure;
 
         var client: std.http.Client = undefined;
         var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, ResolverTestHarness.refuseTokenExchange);
@@ -2745,7 +2783,7 @@ test "performManifestGet: body and content-type failure matrix" {
             .resolve,
         );
 
-        var outcome = try performManifestGet(ctx, &engine, FailureState.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        var outcome = try performManifestGet(ctx, &engine, FailureMock.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
         defer outcome.deinit(std.testing.allocator);
 
         switch (outcome) {
@@ -2770,7 +2808,7 @@ test "performManifestGet: digest verification matrix" {
     const matching_digest = try sha256DigestStringAlloc(std.testing.allocator, fixture_body);
     defer std.testing.allocator.free(matching_digest);
 
-    const DigestState = struct {
+    const DigestMock = struct {
         var case: DigestCase = undefined;
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2810,7 +2848,7 @@ test "performManifestGet: digest verification matrix" {
     };
 
     for (cases) |c| {
-        DigestState.case = c.case;
+        DigestMock.case = c.case;
 
         var client: std.http.Client = undefined;
         var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, ResolverTestHarness.refuseTokenExchange);
@@ -2824,7 +2862,7 @@ test "performManifestGet: digest verification matrix" {
             .resolve,
         );
 
-        var outcome = try performManifestGet(ctx, &engine, DigestState.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        var outcome = try performManifestGet(ctx, &engine, DigestMock.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
         defer outcome.deinit(std.testing.allocator);
 
         if (std.mem.eql(u8, c.expected_tag, "success")) {
@@ -2843,7 +2881,7 @@ test "performManifestGet: digest verification matrix" {
 test "performManifestGet: oversize transport maps to response_too_large" {
     const OversizeCase = enum { body, headers };
 
-    const OversizeState = struct {
+    const OversizeMock = struct {
         var case: OversizeCase = undefined;
 
         fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: ManifestHttpRequest) ManifestExchangeError!ManifestHttpResponse {
@@ -2856,7 +2894,7 @@ test "performManifestGet: oversize transport maps to response_too_large" {
     };
 
     for ([_]OversizeCase{ .body, .headers }) |c| {
-        OversizeState.case = c;
+        OversizeMock.case = c;
 
         var client: std.http.Client = undefined;
         var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, ResolverTestHarness.refuseTokenExchange);
@@ -2870,7 +2908,7 @@ test "performManifestGet: oversize transport maps to response_too_large" {
             .resolve,
         );
 
-        const outcome = try performManifestGet(ctx, &engine, OversizeState.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
+        const outcome = try performManifestGet(ctx, &engine, OversizeMock.exchange, &.{"application/vnd.oci.image.manifest.v1+json"});
         switch (outcome) {
             .failure => |failure| {
                 defer failure.deinitOwned(std.testing.allocator);
@@ -3140,7 +3178,7 @@ test "performManifestHead/Get: shared transport and classification matrix" {
 
     for (scenario_defs) |def| {
         for ([_]ManifestRequestMethod{ .head, .get }) |method| {
-            const MatrixState = struct {
+            const MatrixMock = struct {
                 var scenario: Scenario = undefined;
                 var attempts: usize = 0;
                 var manifest_call_count: usize = 0;
@@ -3276,13 +3314,13 @@ test "performManifestHead/Get: shared transport and classification matrix" {
                 }
             };
 
-            MatrixState.scenario = def.scenario;
-            MatrixState.attempts = 0;
-            MatrixState.manifest_call_count = 0;
-            MatrixState.token_call_count = 0;
+            MatrixMock.scenario = def.scenario;
+            MatrixMock.attempts = 0;
+            MatrixMock.manifest_call_count = 0;
+            MatrixMock.token_call_count = 0;
 
             var client: std.http.Client = undefined;
-            var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, def.config, MatrixState.tokenExchange);
+            var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, def.config, MatrixMock.tokenExchange);
             defer engine.deinit();
             const ctx = ResolverParams.init(
                 std.testing.allocator,
@@ -3295,7 +3333,7 @@ test "performManifestHead/Get: shared transport and classification matrix" {
 
             const accept = &.{"application/vnd.oci.image.manifest.v1+json"};
             if (method == .head) {
-                var outcome = try performManifestHead(ctx, &engine, MatrixState.exchange, accept);
+                var outcome = try performManifestHead(ctx, &engine, MatrixMock.exchange, accept);
                 defer outcome.deinit(std.testing.allocator);
                 switch (outcome) {
                     .success => try std.testing.expectEqualStrings("success", def.expected_tag),
@@ -3307,7 +3345,7 @@ test "performManifestHead/Get: shared transport and classification matrix" {
                     else => return error.TestUnexpectedResult,
                 }
             } else {
-                var outcome = try performManifestGet(ctx, &engine, MatrixState.exchange, accept);
+                var outcome = try performManifestGet(ctx, &engine, MatrixMock.exchange, accept);
                 defer outcome.deinit(std.testing.allocator);
                 switch (outcome) {
                     .success => try std.testing.expectEqualStrings("success", def.expected_tag),
@@ -3320,9 +3358,9 @@ test "performManifestHead/Get: shared transport and classification matrix" {
                 }
             }
 
-            try std.testing.expectEqual(def.expected_attempts, MatrixState.attempts);
+            try std.testing.expectEqual(def.expected_attempts, MatrixMock.attempts);
             if (def.expect_token_calls) |expected_token_calls| {
-                try std.testing.expectEqual(expected_token_calls, MatrixState.token_call_count);
+                try std.testing.expectEqual(expected_token_calls, MatrixMock.token_call_count);
             }
         }
     }
