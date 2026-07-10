@@ -3,10 +3,18 @@
 //! Each variant carries context: the registry hostname and the full reference
 //! string. http_status is set when the server returned an HTTP response code.
 //!
-//! Values returned from the public resolver APIs own their `reference` string
-//! through the caller-provided allocator. Call `deinitOwned()` on those public
-//! failures when using a non-arena allocator. If the surrounding allocator is
-//! an arena, tearing the arena down is also sufficient.
+//! Ownership (single-resolve / `validate` / `getManifest` failures):
+//! - `reference` is owned by the caller allocator. Free it with `deinitOwned()`
+//!   (or `z_oci.deinitResolveFailure`).
+//! - `registry` **borrows** the input `Reference.registry`. Keep that input
+//!   `Reference` alive until after you finish reading or formatting the error.
+//!   Do not `Reference.deinit` the input before logging the failure.
+//!
+//! Ownership (batch / `resolveMany` item failures):
+//! - Both `registry` and `reference` are owned. Free them only through
+//!   `ResolveManyItem.deinit` or `ResolveManyResult.deinit`.
+//! - Do **not** call `deinitOwned` / `z_oci.deinitResolveFailure` on a batch
+//!   failure: that frees `reference` only and leaks the owned `registry`.
 //!
 //! Callers switch on variants for structured error handling. The format method
 //! produces a human-readable string for logging or display.
@@ -176,11 +184,12 @@ pub const ResolveError = union(enum) {
         };
     }
 
-    /// Release the owned `reference` string carried by public resolver failures.
+    /// Release the owned `reference` string carried by **single-resolve** public
+    /// failures (`resolve` / `validate` / `getManifest`).
     ///
-    /// Call this only for errors returned from the public resolver APIs, or for
-    /// other ResolveError values whose `reference` string was allocated from the
-    /// same allocator.
+    /// Does **not** free `registry` (borrowed from the input `Reference` on those
+    /// APIs). Do not use this on `resolveMany` item failures: those own `registry`
+    /// as well; use `ResolveManyItem.deinit` / `ResolveManyResult.deinit` instead.
     pub fn deinitOwned(self: ResolveError, allocator: std.mem.Allocator) void {
         switch (self) {
             inline else => |value| allocator.free(value.reference),

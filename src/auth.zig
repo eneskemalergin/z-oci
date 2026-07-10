@@ -594,7 +594,7 @@ pub const AuthEngine = struct {
 
         const credential = if (credential_handle) |handle| handle.credential else null;
         var token_response = try self.exchangeTokenResponse(client, request, credential);
-        self.storeTokenResponseForRequest(client, request, &token_response) catch |err| {
+        const cached_response = self.storeTokenResponseForRequest(client, request, &token_response) catch |err| {
             token_response.deinit(self.allocator);
             return err;
         };
@@ -603,7 +603,7 @@ pub const AuthEngine = struct {
             self.allocator.free(refresh_token);
             token_response.refresh_token = null;
         }
-        return self.borrowedCachedTokenResponseForRequest(request) orelse error.TokenExchangeFailed;
+        return cached_response;
     }
 
     /// Retry auth once after the registry rejects a cached bearer token.
@@ -632,11 +632,6 @@ pub const AuthEngine = struct {
         }
 
         entry.last_used_unix_seconds = self.now_unix_seconds_fn(client);
-        return borrowedCachedTokenResponse(entry.*);
-    }
-
-    fn borrowedCachedTokenResponseForRequest(self: *AuthEngine, request: AuthenticateRequest) ?TokenResponse {
-        const entry = self.token_cache.getPtrAdapted(request, TokenCacheRequestContext{}) orelse return null;
         return borrowedCachedTokenResponse(entry.*);
     }
 
@@ -706,12 +701,6 @@ pub const AuthEngine = struct {
             .method = method,
             .credential = credential,
         };
-        defer {
-            const allocator = self.allocator;
-            if (loop_ctx.cached_url) |url| allocator.free(url);
-            if (loop_ctx.cached_authorization) |authorization| freeOwnedOptionalSecretSlice(allocator, authorization);
-            if (loop_ctx.cached_body) |body| freeOwnedOptionalSecretSlice(allocator, body);
-        }
 
         const loop_outcome = resilience.runHttpRetryLoop(
             client,
@@ -747,7 +736,7 @@ pub const AuthEngine = struct {
         client: *std.http.Client,
         request: AuthenticateRequest,
         token_response: *TokenResponse,
-    ) AuthError!void {
+    ) AuthError!TokenResponse {
         const limit = self.config.max_token_cache_entries;
         const is_new_entry = self.token_cache.getAdapted(request, TokenCacheRequestContext{}) == null;
         if (limit > 0 and is_new_entry) {
@@ -768,6 +757,7 @@ pub const AuthEngine = struct {
 
         const now = self.now_unix_seconds_fn(client);
         gop.value_ptr.* = cachedTokenFromResponse(token_response, now, DEFAULT_TOKEN_CACHE_TTL_SECONDS);
+        return borrowedCachedTokenResponse(gop.value_ptr.*);
     }
 
     fn evictLruTokenCacheEntry(self: *AuthEngine) void {
@@ -922,8 +912,14 @@ pub fn buildTokenHttpRequest(
     const url = switch (method) {
         .get => if (query.len == 0)
             try allocator.dupe(u8, request.challenge.realm)
-        else
-            try std.fmt.allocPrint(allocator, "{s}?{s}", .{ request.challenge.realm, query }),
+        else blk: {
+            const url_len = request.challenge.realm.len + 1 + query.len;
+            const owned = try allocator.alloc(u8, url_len);
+            @memcpy(owned[0..request.challenge.realm.len], request.challenge.realm);
+            owned[request.challenge.realm.len] = '?';
+            @memcpy(owned[request.challenge.realm.len + 1 ..], query);
+            break :blk owned;
+        },
         .post => try allocator.dupe(u8, request.challenge.realm),
     };
     errdefer allocator.free(url);
@@ -968,11 +964,15 @@ pub fn buildTokenQueryAlloc(allocator: std.mem.Allocator, request: AuthenticateR
 }
 /// Allocates a `Basic` Authorization header value from username and secret.
 pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: ConfigModule.Credential) ![]u8 {
-    const joined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ credential.username, credential.secret });
+    const joined_len = credential.username.len + 1 + credential.secret.len;
+    const joined = try allocator.alloc(u8, joined_len);
     defer {
         std.crypto.secureZero(u8, joined);
         allocator.free(joined);
     }
+    @memcpy(joined[0..credential.username.len], credential.username);
+    joined[credential.username.len] = ':';
+    @memcpy(joined[credential.username.len + 1 ..], credential.secret);
 
     const encoder = std.base64.standard.Encoder;
     const encoded_len = encoder.calcSize(joined.len);
@@ -1982,60 +1982,18 @@ const TokenExchangeLoop = struct {
     request: AuthenticateRequest,
     method: TokenRequestMethod,
     credential: ?ConfigModule.Credential,
-    cached_url: ?[]u8 = null,
-    cached_authorization: ?[]u8 = null,
-    cached_content_type: ?[]const u8 = null,
-    cached_body: ?[]u8 = null,
     exchange_attempt: usize = 0,
 };
-fn cacheTokenExchangeBuiltRequest(loop_ctx: *TokenExchangeLoop, built: *const TokenHttpRequest) !void {
-    if (loop_ctx.cached_url != null) return;
-    const allocator = loop_ctx.engine.allocator;
-    loop_ctx.cached_url = try allocator.dupe(u8, built.url);
-    loop_ctx.cached_authorization = if (built.authorization) |authorization|
-        try allocator.dupe(u8, authorization)
-    else
-        null;
-    loop_ctx.cached_content_type = built.content_type;
-    if (built.body) |body| {
-        loop_ctx.cached_body = try allocator.dupe(u8, body);
-    }
-}
 fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse {
     const loop_ctx: *TokenExchangeLoop = @ptrCast(@alignCast(ctx_ptr));
     const allocator = loop_ctx.engine.allocator;
     const exchanger = loop_ctx.engine.token_http_exchanger orelse return error.NotYetImplemented;
     loop_ctx.exchange_attempt += 1;
 
-    if (loop_ctx.cached_url) |cached_url| {
-        var handed_to_exchanger = false;
-        const url = try allocator.dupe(u8, cached_url);
-        errdefer if (!handed_to_exchanger) allocator.free(url);
-
-        const authorization = if (loop_ctx.cached_authorization) |authorization| blk: {
-            const owned = try allocator.dupe(u8, authorization);
-            errdefer if (!handed_to_exchanger) freeOwnedOptionalSecretSlice(allocator, owned);
-            break :blk owned;
-        } else null;
-
-        const body = if (loop_ctx.cached_body) |body| blk: {
-            const owned = try allocator.dupe(u8, body);
-            errdefer if (!handed_to_exchanger) freeOwnedOptionalSecretSlice(allocator, owned);
-            break :blk owned;
-        } else null;
-
-        const http_request = TokenHttpRequest{
-            .method = loop_ctx.method,
-            .url = url,
-            .authorization = authorization,
-            .content_type = loop_ctx.cached_content_type,
-            .body = body,
-            .max_response_body_bytes = loop_ctx.engine.config.max_token_response_bytes,
-        };
-        handed_to_exchanger = true;
-        return exchanger(allocator, loop_ctx.client, http_request);
-    }
-
+    // Build a fresh owned request per attempt. The exchanger always takes ownership
+    // and frees the request, so a retained cache would require re-duping on every
+    // retry (and a second copy on the first attempt). Rebuilding keeps a single
+    // ownership path with no silent aliasing.
     var built = try buildTokenHttpRequest(
         allocator,
         loop_ctx.request,
@@ -2043,8 +2001,6 @@ fn tokenExchangeOnceOpaque(ctx_ptr: *anyopaque) AuthError!TokenExchangeResponse 
         loop_ctx.credential,
     );
     built.max_response_body_bytes = loop_ctx.engine.config.max_token_response_bytes;
-    try cacheTokenExchangeBuiltRequest(loop_ctx, &built);
-
     return exchanger(allocator, loop_ctx.client, built);
 }
 fn tokenExchangeResponseStatus(response: TokenExchangeResponse) std.http.Status {
@@ -3834,13 +3790,18 @@ test "AuthEngine.authenticate: cache hit reuses valid token response" {
 
     var first = (try engine.authenticate(&client, request)).?;
     defer first.deinit(std.testing.allocator);
+    // Miss path must borrow the just-stored cache entry (no post-store re-lookup copy).
+    try std.testing.expect(!first.owns_access_token);
+    try std.testing.expectEqual(
+        engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value.ptr,
+        first.access_token.value.ptr,
+    );
     MockHarness.fake_now = 1_002;
     var second = (try engine.authenticate(&client, request)).?;
     try std.testing.expectEqual(@as(usize, 1), MockHarness.calls);
     try std.testing.expectEqual(@as(usize, 1), engine.token_cache.count());
     try std.testing.expectEqualStrings("cached-token", first.access_token.value);
     try std.testing.expectEqualStrings("cached-token", second.access_token.value);
-    try std.testing.expect(!first.owns_access_token);
     try std.testing.expect(!second.owns_access_token);
     try std.testing.expectEqual(
         engine.token_cache.getAdapted(request, TokenCacheRequestContext{}).?.token.value.ptr,
@@ -4833,7 +4794,7 @@ test "auth: allocation failures do not leak across core paths" {
             defer cache_engine.deinit();
             cache_engine.now_unix_seconds_fn = now;
             var client: std.http.Client = undefined;
-            try cache_engine.storeTokenResponseForRequest(&client, request, &token_response);
+            _ = try cache_engine.storeTokenResponseForRequest(&client, request, &token_response);
         }
     };
 

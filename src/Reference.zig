@@ -16,9 +16,12 @@
 //! Ownership:
 //! - `registry`, `repository`, `tag`, and `digest_raw` are owned allocations.
 //! - `digest.hex` is not separately owned; it points inside `digest_raw`.
+//! - Manual struct literals must obey the same alias rule; `deinit` asserts it
+//!   in Debug builds.
 //! - Call `deinit()` exactly once for parsed values you keep outside an arena.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Digest = @import("Digest.zig");
 
 const DOCKER_HUB_LIBRARY_PREFIX = "library/";
@@ -150,12 +153,30 @@ fn duplicateLibraryRepositoryPath(allocator: std.mem.Allocator, repository: []co
 }
 
 /// Free all owned fields. Safe to call exactly once per parsed value.
+///
+/// Manual construction must keep `digest.hex` pointing into `digest_raw` when
+/// both are set (same contract as `Reference.parse`). Debug builds assert that.
 pub fn deinit(self: *Reference, allocator: std.mem.Allocator) void {
+    if (builtin.mode == .Debug) {
+        if (self.digest) |d| {
+            if (self.digest_raw) |raw| {
+                std.debug.assert(slicePointsInto(d.hex, raw));
+            } else {
+                std.debug.assert(false);
+            }
+        }
+    }
     allocator.free(self.registry);
     allocator.free(self.repository);
     if (self.tag) |t| allocator.free(t);
     if (self.digest_raw) |dr| allocator.free(dr);
     // digest.hex points inside digest_raw, so freeing digest_raw is enough.
+}
+
+fn slicePointsInto(inner: []const u8, outer: []const u8) bool {
+    const inner_start = @intFromPtr(inner.ptr);
+    const outer_start = @intFromPtr(outer.ptr);
+    return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
 }
 
 /// Repository path for /v2/{name}/manifests/{ref} URL construction.
@@ -398,6 +419,15 @@ test "Reference.parse: digest borrows owned digest_raw after caller input is fre
     try std.testing.expect(ref.digest != null);
     try std.testing.expectEqualSlices(u8, "d" ** 64, ref.digest.?.hex);
     try std.testing.expectEqualSlices(u8, ref.digest_raw.?, ref.refString());
+    try std.testing.expect(slicePointsInto(ref.digest.?.hex, ref.digest_raw.?));
+}
+
+test "Reference.deinit: Debug asserts digest.hex aliases digest_raw" {
+    if (builtin.mode != .Debug) return;
+    const alloc = std.testing.allocator;
+    var ref = try parse(alloc, "ghcr.io/owner/repo@sha256:" ++ "a" ** 64);
+    defer ref.deinit(alloc);
+    try std.testing.expect(slicePointsInto(ref.digest.?.hex, ref.digest_raw.?));
 }
 
 test "Reference.parse: allocation failures do not leak partially constructed references" {

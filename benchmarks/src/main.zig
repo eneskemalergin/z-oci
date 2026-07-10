@@ -136,6 +136,19 @@ fn nanoTime() i128 {
 }
 
 fn printReport(name: []const u8, detail: []const u8, io: Io, iterations: usize, wall_ns: i128, alloc_count: usize, alloc_bytes: usize) void {
+    printReportWithExchanges(name, detail, io, iterations, wall_ns, alloc_count, alloc_bytes, null);
+}
+
+fn printReportWithExchanges(
+    name: []const u8,
+    detail: []const u8,
+    io: Io,
+    iterations: usize,
+    wall_ns: i128,
+    alloc_count: usize,
+    alloc_bytes: usize,
+    manifest_exchanges: ?usize,
+) void {
     var buf: [4096]u8 = undefined;
     var w = Io.File.stdout().writer(io, &buf);
     defer w.end() catch {};
@@ -148,6 +161,10 @@ fn printReport(name: []const u8, detail: []const u8, io: Io, iterations: usize, 
     if (alloc_count > 0) {
         out.print("  allocs      {d}\n", .{alloc_count}) catch {};
         out.print("  alloc_bytes {d}\n", .{alloc_bytes}) catch {};
+    }
+    if (manifest_exchanges) |exchanges| {
+        out.print("  manifest_exchanges {d}\n", .{exchanges}) catch {};
+        out.print("  exchanges_per_iter {d}\n", .{exchanges / iterations}) catch {};
     }
 }
 
@@ -548,6 +565,7 @@ const ResolverBenchFixture = struct {
 
 const SingleManifestBenchFixture = struct {
     var body: []const u8 = undefined;
+    var manifest_calls: usize = 0;
 
     fn tokenExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
         request.deinit(allocator);
@@ -560,6 +578,7 @@ const SingleManifestBenchFixture = struct {
         request: z_oci.testing.ManifestHttpRequest,
     ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
         defer request.deinit(allocator);
+        manifest_calls += 1;
         return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
             .status = .ok,
             .content_type = OCI_MANIFEST_MEDIA_TYPE,
@@ -698,6 +717,7 @@ fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
     ), alloc);
 
     ca.reset();
+    SingleManifestBenchFixture.manifest_calls = 0;
     const start = nanoTime();
     for (0..iterations) |_| {
         try deinitResolveSuccess(try z_oci.testing.resolveWithExchangers(
@@ -713,7 +733,17 @@ fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("resolve-single", "single-arch resolve via injected manifest fixture", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    if (SingleManifestBenchFixture.manifest_calls != iterations) return error.UnexpectedBenchmarkFailure;
+    printReportWithExchanges(
+        "resolve-single",
+        "single-arch resolve via injected manifest fixture",
+        io,
+        iterations,
+        elapsed,
+        ca.allocation_count,
+        ca.bytes_allocated,
+        SingleManifestBenchFixture.manifest_calls,
+    );
 }
 
 fn benchResolveSession(io: Io, iterations: usize, counting: bool) !void {
@@ -833,7 +863,18 @@ fn benchResolveMany(io: Io, iterations: usize, counting: bool) !void {
     const elapsed = nanoTime() - start;
 
     if (BatchManifestBenchFixture.manifest_calls != iterations) return error.UnexpectedBenchmarkFailure;
-    printReport("resolve-many", "4-item duplicate-heavy batch with one manifest fetch", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    // Four duplicate inputs resolved independently would cost 4 exchanges per batch.
+    if (!(BatchManifestBenchFixture.manifest_calls < iterations * refs.len)) return error.UnexpectedBenchmarkFailure;
+    printReportWithExchanges(
+        "resolve-many",
+        "4-item duplicate-heavy batch with one manifest fetch",
+        io,
+        iterations,
+        elapsed,
+        ca.allocation_count,
+        ca.bytes_allocated,
+        BatchManifestBenchFixture.manifest_calls,
+    );
 }
 
 fn benchResolveManyUnique(io: Io, iterations: usize, counting: bool) !void {
@@ -908,7 +949,16 @@ fn benchResolveManyUnique(io: Io, iterations: usize, counting: bool) !void {
     const elapsed = nanoTime() - start;
 
     if (BatchManifestBenchFixture.manifest_calls != iterations * refs.len) return error.UnexpectedBenchmarkFailure;
-    printReport("resolve-many-unique", "4-item unique-reference batch with four manifest fetches", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    printReportWithExchanges(
+        "resolve-many-unique",
+        "4-item unique-reference batch with four manifest fetches",
+        io,
+        iterations,
+        elapsed,
+        ca.allocation_count,
+        ca.bytes_allocated,
+        BatchManifestBenchFixture.manifest_calls,
+    );
 }
 
 fn benchResolveSingleRetry(io: Io, iterations: usize, counting: bool) !void {

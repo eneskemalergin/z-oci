@@ -7,11 +7,15 @@
 //! when enterprise TLS, auth, or pre-emptive throttling is required.
 //!
 //! Ownership notes:
-//! - CLI args and the parsed input Reference live in `init.arena`, which is
-//!   sufficient for this short-lived example.
-//! - The returned ResolveResult is allocated through `init.gpa` and is
-//!   explicitly deinitialized before exit.
-//! - std.http.Client owns connection-pool state and must be deinitialized.
+//! - CLI args live in `init.arena` (short-lived process).
+//! - The input `Reference` is parsed with `init.gpa`. On success, `resolve` moves
+//!   `registry` / `repository` / `tag` into the result; do not `ref.deinit` after
+//!   success. On failure, `registry` on the error still borrows the input
+//!   `Reference`: format/log the failure first, then `deinitOwned` and
+//!   `reference.deinit`.
+//! - The returned `ResolveResult` (including moved reference fields and digest
+//!   buffers) is owned by `init.gpa` and must be `deinit`ed with that allocator.
+//! - `std.http.Client` owns connection-pool state and must be deinitialized.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,6 +33,7 @@ const USAGE_TEXT =
 /// Live resolve example; see file header for `Config` and ownership.
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
+    const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(arena);
 
     var stdout_buffer: [2048]u8 = undefined;
@@ -51,20 +56,21 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
-    const reference = try z_oci.Reference.parse(arena, args[1]);
+    var reference = try z_oci.Reference.parse(gpa, args[1]);
 
     var client = std.http.Client{
-        .allocator = init.gpa,
+        .allocator = gpa,
         .io = init.io,
     };
     defer client.deinit();
 
     // Anonymous defaults: OS TLS trust, retry budgets, and body-size limits from Config{}.
-    const outcome = try z_oci.resolve(init.gpa, &client, z_oci.Config{}, reference, platform);
+    const outcome = try z_oci.resolve(gpa, &client, z_oci.Config{}, reference, platform);
     switch (outcome) {
         .success => |result| {
+            // Success moves reference fields into the result.
             var owned_result = result;
-            defer owned_result.deinit(init.gpa);
+            defer owned_result.deinit(gpa);
 
             try stdout.print("input: {s}\n", .{args[1]});
             if (platform) |selected| {
@@ -87,8 +93,11 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
         },
         .failure => |failure| {
-            defer failure.deinitOwned(init.gpa);
+            // Single-resolve failures borrow `registry` from the input Reference.
+            // Format (or copy) before freeing that reference.
             try stderr.print("resolve failed: {f}\n", .{failure});
+            failure.deinitOwned(gpa);
+            reference.deinit(gpa);
             return error.ResolveFailed;
         },
     }

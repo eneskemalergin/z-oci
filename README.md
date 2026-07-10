@@ -143,6 +143,31 @@ switch (manifest_outcome) {
 
 `resolve`, `validate`, and `getManifest` all use a caller-owned `std.http.Client` and the same auth-backed resolver flow.
 
+On single-resolve `.failure`, keep the input `Reference` alive until after you finish reading or formatting the error: `registry` borrows that input. Then call `deinitResolveFailure` (or `ResolveError.deinitOwned`) and `Reference.deinit`.
+
+### Batch resolve (`resolveMany`)
+
+```zig
+var result = try z_oci.resolveMany(allocator, &client, config, refs[0..], .{
+    .platform = .{ .os = "linux", .architecture = "amd64" },
+});
+defer result.deinit(allocator); // tears down every item; do not use deinitResolveFailure here
+
+for (result.items) |item| {
+    switch (item) {
+        .success => |resolved| {
+            // use resolved.digest / resolved.reference
+        },
+        .failure => |failure| {
+            // batch failures own both registry and reference; result.deinit frees them
+            _ = failure;
+        },
+    }
+}
+```
+
+Progress callbacks (optional via `ResolveManyOptions.progress_fn`) receive borrowed reference views valid only for the callback duration. Copy any strings you need to keep. Never call `deinitResolveFailure` on `ResolveManyItem.failure` values; that helper is single-resolve only and would leak the batch-owned `registry`.
+
 ### Normalize an image reference
 
 ```zig

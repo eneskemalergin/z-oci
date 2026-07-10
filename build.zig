@@ -10,7 +10,8 @@
 //!   `example-resolve-many`, and `example-resolve-reference`: run one example with forwarded CLI args.
 //! - `examples-smoke`: run offline examples with fixed fixture inputs.
 //! - `bench`: build and install the benchmark CLI to `zig-out/bin/z-oci-bench`.
-//! - `security-check`: reject private-key PEM blocks in tracked repo material.
+//! - `security-check`: reject private-key PEM blocks and high-confidence credential
+//!   material in tracked repo paths.
 
 const std = @import("std");
 
@@ -84,7 +85,7 @@ pub fn build(b: *std.Build) void {
     }) });
     const run_security_check_tests = b.addRunArtifact(security_check_tests);
 
-    const security_check_step = b.step("security-check", "Reject private keys in tracked PEM material");
+    const security_check_step = b.step("security-check", "Reject private keys and credential material in tracked paths");
     security_check_step.dependOn(&run_security_check.step);
     test_step.dependOn(security_check_step);
     test_step.dependOn(&run_security_check_tests.step);

@@ -338,14 +338,17 @@ pub const ManifestOutcome = union(enum) {
 /// Per-image outcome stored in a batch resolve result.
 ///
 /// Values produced by `resolveMany()` are owned by the enclosing `ResolveManyResult`.
+/// Prefer `ResolveManyResult.deinit` for the whole batch. If tearing down a single
+/// item, call `ResolveManyItem.deinit` — never `deinitResolveFailure`, which is
+/// for single-resolve failures and would leak batch-owned `registry` storage.
 pub const ResolveManyItem = union(enum) {
     /// Owned successful resolve payload.
     success: ResolveResult,
     /// Owned structured failure context. Batch failures own both `registry` and
-    /// `reference`, unlike ordinary public `ResolveError` values.
+    /// `reference`, unlike ordinary public `ResolveError` values from `resolve`.
     failure: ResolveError,
 
-    /// Release owned storage in this item.
+    /// Release owned storage in this item (batch ownership rules).
     pub fn deinit(self: *ResolveManyItem, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .success => |*result| result.deinit(allocator),
@@ -375,7 +378,11 @@ pub const ResolveManyReferenceView = struct {
     /// Tag, digest string, or `"latest"` according to `Reference.refString()`.
     ref_string: []const u8,
 };
-/// Synchronous progress event for future batch resolution.
+/// Synchronous progress event for batch resolution.
+///
+/// `reference` fields borrow the corresponding input `Reference` slices for the
+/// duration of the progress callback only. Do not store those pointers past
+/// return from the callback. The callback cannot fail the batch (`void`).
 pub const ResolveManyProgress = struct {
     /// Event kind.
     event: Event,
@@ -403,7 +410,15 @@ pub const ResolveManyOptions = struct {
     /// User pointer passed through to `progress_fn`.
     progress_user_data: ?*anyopaque = null,
 };
-/// Release caller-owned storage inside a `ResolveError` from a public outcome `.failure` arm.
+/// Release caller-owned storage inside a `ResolveError` from a **single-resolve**
+/// public outcome (`.failure` from `resolve` / `validate` / `getManifest`).
+///
+/// Frees the owned canonical `reference` string only. `registry` still borrows
+/// the input `Reference` on those APIs.
+///
+/// Do **not** call this on `ResolveManyItem.failure` values: batch failures own
+/// both `registry` and `reference`. Use `ResolveManyResult.deinit` or
+/// `ResolveManyItem.deinit` instead, or you will leak `registry`.
 pub fn deinitResolveFailure(failure: ResolveError, allocator: std.mem.Allocator) void {
     failure.deinitOwned(allocator);
 }
@@ -649,6 +664,9 @@ const ResolvedManifestOutcome = union(enum) {
     failure: ResolveError,
 };
 const ResolveManySessionCache = struct {
+    /// Stack buffer for hit-path key formatting. Oversized keys fall back to heap.
+    const cache_key_stack_max = 1024;
+
     map: std.StringHashMapUnmanaged(ResolveResult) = .empty,
 
     fn deinit(self: *ResolveManySessionCache, allocator: std.mem.Allocator) void {
@@ -665,8 +683,19 @@ const ResolveManySessionCache = struct {
         allocator: std.mem.Allocator,
         ref: Reference,
     ) error{OutOfMemory}!?ResolveResult {
-        const key = try cacheKeyAlloc(allocator, ref) orelse return null;
-        defer allocator.free(key);
+        const key_len = cacheKeyByteLen(ref) orelse return null;
+
+        var stack: [cache_key_stack_max]u8 = undefined;
+        var heap_key: ?[]u8 = null;
+        defer if (heap_key) |owned| allocator.free(owned);
+
+        const key: []const u8 = if (key_len <= stack.len) blk: {
+            break :blk formatCacheKey(stack[0..key_len], ref);
+        } else blk: {
+            const owned = try allocator.alloc(u8, key_len);
+            heap_key = owned;
+            break :blk formatCacheKey(owned, ref);
+        };
 
         const cached = self.map.get(key) orelse return null;
         return try cached.clone(allocator);
@@ -689,16 +718,31 @@ const ResolveManySessionCache = struct {
         try self.map.put(allocator, key, cached);
     }
 
+    fn cacheKeyByteLen(ref: Reference) ?usize {
+        if (ref.digest != null) return null;
+        return ref.registry.len + 1 + ref.repository.len + 1 + ref.refString().len;
+    }
+
+    fn formatCacheKey(buf: []u8, ref: Reference) []u8 {
+        const tag = ref.refString();
+        std.debug.assert(buf.len == ref.registry.len + 1 + ref.repository.len + 1 + tag.len);
+        @memcpy(buf[0..ref.registry.len], ref.registry);
+        buf[ref.registry.len] = '/';
+        const repo_start = ref.registry.len + 1;
+        @memcpy(buf[repo_start..][0..ref.repository.len], ref.repository);
+        buf[repo_start + ref.repository.len] = ':';
+        @memcpy(buf[repo_start + ref.repository.len + 1 ..][0..tag.len], tag);
+        return buf;
+    }
+
+    /// Owns a single exact-size key allocation. Digest-addressed refs return null.
     fn cacheKeyAlloc(
         allocator: std.mem.Allocator,
         ref: Reference,
     ) error{OutOfMemory}!?[]u8 {
-        if (ref.digest != null) return null;
-        return try std.fmt.allocPrint(
-            allocator,
-            "{s}/{s}:{s}",
-            .{ ref.registry, ref.repository, ref.refString() },
-        );
+        const key_len = cacheKeyByteLen(ref) orelse return null;
+        const key = try allocator.alloc(u8, key_len);
+        return formatCacheKey(key, ref);
     }
 };
 const ResolveManySession = struct {
@@ -802,6 +846,10 @@ fn resolveManyWithSession(
     if (refs.len == 0) return .{ .items = &.{} };
 
     const allocator = session.allocator;
+    // Upper bound on unique tag-cache entries (digest refs bypass; duplicates share).
+    const cache_cap: u32 = @intCast(@min(refs.len, std.math.maxInt(u32)));
+    try session.cache.map.ensureTotalCapacity(allocator, cache_cap);
+
     var items = try allocator.alloc(ResolveManyItem, refs.len);
     var initialized_items: usize = 0;
     errdefer {
@@ -1753,6 +1801,19 @@ test "ResolveManyResult.deinit: empty result is safe" {
     try std.testing.expectEqual(@as(usize, 0), result.items.len);
 }
 
+test "ResolveManyResult.deinit: second call is a no-op" {
+    const allocator = std.testing.allocator;
+    var items = try allocator.alloc(ResolveManyItem, 1);
+    items[0] = .{ .success = try testingResolveResultAlloc(allocator, "v1", 'a') };
+
+    var result = ResolveManyResult{ .items = items };
+    result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+
+    result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.items.len);
+}
+
 test "ResolveManyResult.deinit: releases single success item" {
     const allocator = std.testing.allocator;
     var items = try allocator.alloc(ResolveManyItem, 1);
@@ -2069,6 +2130,56 @@ test "resolveManyWithExchangers: unique tags resolve independently without cache
     try std.testing.expectEqual(.success, std.meta.activeTag(result.items[1]));
     try std.testing.expectEqualStrings("first", result.items[0].success.reference.tag.?);
     try std.testing.expectEqualStrings("second", result.items[1].success.reference.tag.?);
+}
+
+test "resolveManyWithExchangers: 50 unique tags stay leak-free with pre-sized cache" {
+    const MockHarness = struct {
+        var manifest_attempts: usize = 0;
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            client: *std.http.Client,
+            request: resolver.ManifestHttpRequest,
+        ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            manifest_attempts += 1;
+            return busyboxManifestExchange(allocator, client, request);
+        }
+    };
+    defer MockHarness.manifest_attempts = 0;
+
+    const allocator = std.testing.allocator;
+    const unique_count: usize = 50;
+    var refs: [unique_count]Reference = undefined;
+    var initialized: usize = 0;
+    errdefer for (refs[0..initialized]) |*ref| ref.deinit(allocator);
+    for (&refs, 0..) |*ref, i| {
+        var tag_buf: [16]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "u{d}", .{i});
+        var image_buf: [64]u8 = undefined;
+        const image = try std.fmt.bufPrint(&image_buf, "registry.example.test/owner/repo:{s}", .{tag});
+        ref.* = try Reference.parse(allocator, image);
+        initialized += 1;
+    }
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{},
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(unique_count, result.items.len);
+    try std.testing.expectEqual(unique_count, MockHarness.manifest_attempts);
+    for (result.items) |item| {
+        try std.testing.expectEqual(.success, std.meta.activeTag(item));
+    }
 }
 
 test "resolveManyWithExchangers: duplicate tag uses session cache and clones independent results" {
@@ -2480,12 +2591,14 @@ test "resolveManyWithExchangers: targeted allocation failures clean up batch set
     const refs = [_]Reference{busybox_literal_ref};
 
     const Case = enum {
+        session_cache_ensure,
         result_array,
         input_reference_clone,
         cache_key,
         cache_result_clone,
     };
     const cases = [_]Case{
+        .session_cache_ensure,
         .result_array,
         .input_reference_clone,
         .cache_key,
@@ -2495,14 +2608,19 @@ test "resolveManyWithExchangers: targeted allocation failures clean up batch set
     for (cases) |case| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
             .fail_index = switch (case) {
-                .result_array, .cache_key => 0,
-                .input_reference_clone, .cache_result_clone => 1,
+                // resolveManyWithSession: ensureTotalCapacity, then items array, then cloneReference.
+                .session_cache_ensure => 0,
+                .result_array => 1,
+                .input_reference_clone => 2,
+                // Isolated helpers (not the batch loop):
+                .cache_key => 0,
+                .cache_result_clone => 1,
             },
         });
         const allocator = failing.allocator();
 
         switch (case) {
-            .result_array, .input_reference_clone => {
+            .session_cache_ensure, .result_array, .input_reference_clone => {
                 var client: std.http.Client = undefined;
                 const result = testing.resolveManyWithExchangers(
                     allocator,
@@ -2561,6 +2679,183 @@ test "ResolveManySessionCache: allocation failures clean up store and hit paths"
             try std.testing.expect(source.reference.tag.?.ptr != hit.reference.tag.?.ptr);
         }
     }.run, .{});
+}
+
+test "ResolveManySessionCache: allocation shape for key, clone, store, hit, and map growth" {
+    const Counting = struct {
+        parent: std.mem.Allocator,
+        allocations: usize = 0,
+        bytes: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = alloc,
+                    .resize = resize,
+                    .remap = remap,
+                    .free = free,
+                },
+            };
+        }
+
+        fn reset(self: *@This()) void {
+            self.allocations = 0;
+            self.bytes = 0;
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const ptr = self.parent.rawAlloc(len, alignment, ret_addr) orelse return null;
+            self.allocations += 1;
+            self.bytes += len;
+            return ptr;
+        }
+
+        fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.parent.rawResize(buf, alignment, new_len, ret_addr)) return false;
+            if (new_len > buf.len) self.bytes += new_len - buf.len;
+            return true;
+        }
+
+        fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.parent.rawRemap(buf, alignment, new_len, ret_addr);
+        }
+
+        fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.parent.rawFree(buf, alignment, ret_addr);
+        }
+    };
+
+    var counting: Counting = .{ .parent = std.testing.allocator };
+    const alloc = counting.allocator();
+
+    var source = try testingResolveResultAlloc(std.testing.allocator, "latest", 'e');
+    defer source.deinit(std.testing.allocator);
+
+    // cacheKeyAlloc: one exact-size allocation (no allocPrint growth).
+    counting.reset();
+    const key = try ResolveManySessionCache.cacheKeyAlloc(alloc, busybox_literal_ref) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(key);
+    const key_allocs = counting.allocations;
+    const key_bytes = counting.bytes;
+    try std.testing.expectEqualStrings("registry-1.docker.io/library/busybox:latest", key);
+    try std.testing.expectEqual(@as(usize, 1), key_allocs);
+    try std.testing.expectEqual(key.len, key_bytes);
+
+    // ResolveResult.clone for tag-only / null-platform: 4 dupes.
+    counting.reset();
+    var cloned = try source.clone(alloc);
+    defer cloned.deinit(alloc);
+    const clone_allocs = counting.allocations;
+    try std.testing.expectEqual(@as(usize, 4), clone_allocs);
+
+    // storeSuccess on empty map: key + clone + at least one map growth.
+    var cache: ResolveManySessionCache = .{};
+    defer cache.deinit(alloc);
+    counting.reset();
+    try cache.storeSuccess(alloc, busybox_literal_ref, source);
+    const store_allocs = counting.allocations;
+    try std.testing.expectEqual(key_allocs + clone_allocs + 1, store_allocs);
+    try std.testing.expectEqual(@as(usize, 1), cache.map.count());
+
+    // cloneHit: stack key for typical refs, so only the result clone allocates.
+    counting.reset();
+    var hit = try cache.cloneHit(alloc, busybox_literal_ref) orelse
+        return error.TestUnexpectedResult;
+    defer hit.deinit(alloc);
+    const hit_allocs = counting.allocations;
+    try std.testing.expectEqual(clone_allocs, hit_allocs);
+
+    // Oversized key still hits correctly via heap fallback on lookup.
+    {
+        const long_repo = "r" ** (ResolveManySessionCache.cache_key_stack_max);
+        const long_ref = Reference{
+            .registry = "r.io",
+            .repository = long_repo,
+            .tag = "t",
+            .digest = null,
+            .digest_raw = null,
+        };
+        try cache.storeSuccess(alloc, long_ref, source);
+        counting.reset();
+        var long_hit = try cache.cloneHit(alloc, long_ref) orelse
+            return error.TestUnexpectedResult;
+        defer long_hit.deinit(alloc);
+        // Heap key for lookup + clone.
+        try std.testing.expectEqual(key_allocs + clone_allocs, counting.allocations);
+        try std.testing.expectEqualStrings(source.digest.hex, long_hit.digest.hex);
+    }
+
+    // Result array is one contiguous allocation of ResolveManyItem.
+    counting.reset();
+    const items = try alloc.alloc(ResolveManyItem, 4);
+    defer alloc.free(items);
+    try std.testing.expectEqual(@as(usize, 1), counting.allocations);
+    try std.testing.expectEqual(@sizeOf(ResolveManyItem) * 4, counting.bytes);
+
+    // Map growth without pre-size vs ensureTotalCapacity for a 50-key Zencelot-sized pin.
+    const unique_count: usize = 50;
+    var growth_cache: ResolveManySessionCache = .{};
+    defer growth_cache.deinit(alloc);
+    counting.reset();
+    for (0..unique_count) |i| {
+        var tag_buf: [16]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "t{d}", .{i});
+        const ref = Reference{
+            .registry = "registry.example.test",
+            .repository = "owner/repo",
+            .tag = tag,
+            .digest = null,
+            .digest_raw = null,
+        };
+        try growth_cache.storeSuccess(alloc, ref, source);
+    }
+    const growth_without = counting.allocations;
+
+    var sized_cache: ResolveManySessionCache = .{};
+    defer sized_cache.deinit(alloc);
+    counting.reset();
+    try sized_cache.map.ensureTotalCapacity(alloc, unique_count);
+    const ensure_allocs = counting.allocations;
+    counting.reset();
+    for (0..unique_count) |i| {
+        var tag_buf: [16]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "t{d}", .{i});
+        const ref = Reference{
+            .registry = "registry.example.test",
+            .repository = "owner/repo",
+            .tag = tag,
+            .digest = null,
+            .digest_raw = null,
+        };
+        try sized_cache.storeSuccess(alloc, ref, source);
+    }
+    const growth_with_inserts = counting.allocations;
+
+    // Pre-sizing removes insert-loop map reallocs. Key+clone still dominate.
+    try std.testing.expect(ensure_allocs >= 1);
+    try std.testing.expect(growth_with_inserts < growth_without);
+    // Claimed STYLE win: about 4 map growth allocs saved on a 50-key pin.
+    const map_growth_saved = growth_without - growth_with_inserts;
+    try std.testing.expect(map_growth_saved >= 4);
+    try std.testing.expectEqual(unique_count, growth_cache.map.count());
+    try std.testing.expectEqual(unique_count, sized_cache.map.count());
+    // Lock the measured delta so regressions in HashMap growth are visible.
+    try std.testing.expectEqual(@as(usize, 4), map_growth_saved);
+    try std.testing.expectEqual(@as(usize, 1), ensure_allocs);
+
+    // Structural locks after exact-size key formatting (no allocPrint growth).
+    try std.testing.expectEqual(@as(usize, 1), key_allocs);
+    try std.testing.expectEqual(key.len, key_bytes);
+    try std.testing.expectEqual(@as(usize, 6), store_allocs);
+    try std.testing.expectEqual(@as(usize, 4), hit_allocs);
+    try std.testing.expect(ensure_allocs >= 1);
+    try std.testing.expect(growth_without - growth_with_inserts >= 1);
 }
 
 test "resolveManyWithExchangers: all-failure batch stores every failure" {
@@ -2755,6 +3050,7 @@ test "resolveManyWithExchangers: progress callback preserves ordered events and 
                 .event = event.event,
                 .index = event.index,
                 .total = event.total,
+                // Borrowed for this callback only; compared before input refs are freed.
                 .ref_string = event.reference.ref_string,
             };
             recorder.event_count += 1;
@@ -2817,6 +3113,151 @@ test "resolveManyWithExchangers: progress callback preserves ordered events and 
         try std.testing.expectEqual(want.total, got.total);
         try std.testing.expectEqualStrings(want.ref_string, got.ref_string);
     }
+}
+
+test "resolveManyWithExchangers: progress views must be copied to outlive the callback" {
+    const MockHarness = struct {
+        const CopiedEvent = struct {
+            event: ResolveManyProgress.Event = .item_started,
+            registry: [64]u8 = undefined,
+            registry_len: usize = 0,
+            repository: [64]u8 = undefined,
+            repository_len: usize = 0,
+            ref_string: [32]u8 = undefined,
+            ref_string_len: usize = 0,
+        };
+
+        const Recorder = struct {
+            events: [2]CopiedEvent = .{ .{}, .{} },
+            event_count: usize = 0,
+        };
+
+        fn copyInto(dest: []u8, src: []const u8) usize {
+            std.debug.assert(src.len <= dest.len);
+            @memcpy(dest[0..src.len], src);
+            return src.len;
+        }
+
+        fn progress(event: ResolveManyProgress, user_data: ?*anyopaque) void {
+            const recorder: *Recorder = @ptrCast(@alignCast(user_data.?));
+            std.debug.assert(recorder.event_count < recorder.events.len);
+            var slot = &recorder.events[recorder.event_count];
+            slot.event = event.event;
+            slot.registry_len = copyInto(&slot.registry, event.reference.registry);
+            slot.repository_len = copyInto(&slot.repository, event.reference.repository);
+            slot.ref_string_len = copyInto(&slot.ref_string, event.reference.ref_string);
+            recorder.event_count += 1;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:ok"),
+    };
+
+    var recorder: MockHarness.Recorder = .{};
+    var client: std.http.Client = undefined;
+    var result = try testing.resolveManyWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        refs[0..],
+        .{
+            .progress_fn = MockHarness.progress,
+            .progress_user_data = @ptrCast(&recorder),
+        },
+        refuseToken,
+        busyboxManifestExchange,
+        .{},
+    );
+    result.deinit(allocator);
+    for (&refs) |*ref| ref.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), recorder.event_count);
+    try std.testing.expectEqual(.item_started, recorder.events[0].event);
+    try std.testing.expectEqual(.item_succeeded, recorder.events[1].event);
+    for (recorder.events[0..2]) |event| {
+        try std.testing.expectEqualStrings(
+            "registry.example.test",
+            event.registry[0..event.registry_len],
+        );
+        try std.testing.expectEqualStrings(
+            "owner/repo",
+            event.repository[0..event.repository_len],
+        );
+        try std.testing.expectEqualStrings("ok", event.ref_string[0..event.ref_string_len]);
+    }
+}
+
+test "ResolveManySessionCache: storeSuccess OOM after prior success leaves cache intact" {
+    const allocator = std.testing.allocator;
+    var first = try testingResolveResultAlloc(allocator, "first", 'e');
+    defer first.deinit(allocator);
+    var second = try testingResolveResultAlloc(allocator, "second", 'f');
+    defer second.deinit(allocator);
+
+    var cache: ResolveManySessionCache = .{};
+    defer cache.deinit(allocator);
+
+    var first_ref = try Reference.parse(allocator, "registry.example.test/owner/repo:first");
+    defer first_ref.deinit(allocator);
+    var second_ref = try Reference.parse(allocator, "registry.example.test/owner/repo:second");
+    defer second_ref.deinit(allocator);
+
+    try cache.storeSuccess(allocator, first_ref, first);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        cache.storeSuccess(failing.allocator(), second_ref, second),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+
+    var hit = try cache.cloneHit(allocator, first_ref) orelse return error.TestUnexpectedResult;
+    defer hit.deinit(allocator);
+    try std.testing.expectEqualStrings(first.digest.hex, hit.digest.hex);
+    try std.testing.expect((try cache.cloneHit(allocator, second_ref)) == null);
+}
+
+test "resolveManyWithExchangers: mid-batch storeSuccess OOM after prior success does not leak" {
+    const allocator = std.testing.allocator;
+    var refs = [_]Reference{
+        try Reference.parse(allocator, "registry.example.test/owner/repo:first"),
+        try Reference.parse(allocator, "registry.example.test/owner/repo:second"),
+    };
+    defer for (&refs) |*ref| ref.deinit(allocator);
+
+    var saw_oom = false;
+    var fail_index: usize = 0;
+    while (fail_index < 128) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var client: std.http.Client = undefined;
+        const outcome = testing.resolveManyWithExchangers(
+            failing.allocator(),
+            &client,
+            Config{},
+            refs[0..],
+            .{},
+            refuseToken,
+            busyboxManifestExchange,
+            .{},
+        );
+
+        if (outcome) |result| {
+            var owned = result;
+            owned.deinit(failing.allocator());
+            try std.testing.expect(failing.allocated_bytes == failing.freed_bytes);
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            saw_oom = true;
+        }
+    }
+
+    try std.testing.expect(saw_oom);
 }
 
 test "resolveManyWithExchangers: shared AuthEngine reuses cached token across items" {

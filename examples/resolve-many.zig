@@ -16,7 +16,11 @@
 //! Ownership notes:
 //! - Parsed input references use `init.gpa` and are deinitialized explicitly.
 //! - The returned `ResolveManyResult` is owned; this example calls
-//!   `result.deinit(init.gpa)` once after printing every item.
+//!   `result.deinit(init.gpa)` once after printing every item. Do not call
+//!   `z_oci.deinitResolveFailure` on batch item failures (that helper is
+//!   single-resolve only and would leak owned batch `registry` strings).
+//! - Progress `event.reference` fields borrow the input `Reference` for the
+//!   callback duration only; do not retain those pointers after return.
 //! - Platform is batch-wide. Callers that need per-item platforms must issue
 //!   separate `resolveMany` calls.
 //! - The manifest body comes from a checked-in fixture, so the example does not

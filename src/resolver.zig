@@ -1469,15 +1469,10 @@ fn classifyUsableGetResponse(
     const response_body = owned_body orelse return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
     if (response_body.len == 0) return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError);
 
-    var body_arena = std.heap.ArenaAllocator.init(ctx.allocator);
-    var body_arena_alive = true;
-    defer if (body_arena_alive) body_arena.deinit();
-
-    const transient_body = try body_arena.allocator().dupe(u8, response_body);
-    ctx.allocator.free(response_body);
-    owned_body = null;
-
-    const resolved_digest = verifyManifestBodyIntegrityAlloc(ctx, metadata, transient_body) catch |err| switch (err) {
+    // Hash and parse the owned response body in place. `json.parse` uses
+    // alloc_always; shallow resolve probes return only a MediaType enum. Neither
+    // retains pointers into `response_body`, so the nested arena copy is unnecessary.
+    const resolved_digest = verifyManifestBodyIntegrityAlloc(ctx, metadata, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DigestMismatch => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), digestMismatchError),
         error.UnsupportedAlgorithm => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), unsupportedAlgorithmError),
@@ -1485,7 +1480,7 @@ fn classifyUsableGetResponse(
     var resolved_digest_raw: ?[]u8 = resolved_digest.raw;
     defer if (resolved_digest_raw) |raw| ctx.allocator.free(raw);
 
-    var document = parseManifestDocument(ctx.allocator, ctx.operation, media_type, transient_body) catch |err| switch (err) {
+    var document = parseManifestDocument(ctx.allocator, ctx.operation, media_type, response_body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), manifestParseError),
     };
@@ -1496,8 +1491,8 @@ fn classifyUsableGetResponse(
         return mappedFailureOutcome(GetRequestOutcome, ctx, metadata.httpStatus(), contentTypeMismatchError);
     }
 
-    body_arena.deinit();
-    body_arena_alive = false;
+    ctx.allocator.free(response_body);
+    owned_body = null;
 
     keep_document = true;
     const owned_digest_raw = resolved_digest_raw.?;
@@ -1586,13 +1581,16 @@ fn verifyManifestBodyIntegrityAlloc(
         if (!digestMatchesSha256Hex(header_digest, digest_hex[0..])) return error.DigestMismatch;
     }
 
-    const body_digest_raw = try std.fmt.allocPrint(ctx.allocator, "sha256:{s}", .{digest_hex[0..]});
+    const digest_prefix = "sha256:";
+    const body_digest_raw = try ctx.allocator.alloc(u8, digest_prefix.len + digest_hex.len);
     errdefer ctx.allocator.free(body_digest_raw);
+    @memcpy(body_digest_raw[0..digest_prefix.len], digest_prefix);
+    @memcpy(body_digest_raw[digest_prefix.len..], digest_hex[0..]);
 
     return .{
         .digest = .{
             .algorithm = .sha256,
-            .hex = body_digest_raw["sha256:".len..],
+            .hex = body_digest_raw[digest_prefix.len..],
         },
         .raw = body_digest_raw,
     };
