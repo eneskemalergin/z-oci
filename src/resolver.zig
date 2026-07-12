@@ -615,8 +615,14 @@ pub fn liveManifestHttpExchanger(
         if (isRedirectStatus(response.head.status) and response.head.location != null and redirect_hops_remaining > 0) {
             redirect_hops_remaining -= 1;
 
-            const next_url = try resolveRedirectUrlAlloc(allocator, current_url, uri, response.head.location.?);
+            var next_url = try resolveRedirectUrlAlloc(allocator, current_url, uri, response.head.location.?);
             errdefer allocator.free(next_url);
+
+            // Rewrite before keep-auth so loopback https Locations match the cleartext request scheme.
+            if (testing_loopback.cleartextLoopbackUrlAlloc(allocator, next_url) catch return error.OutOfMemory) |rewritten| {
+                allocator.free(next_url);
+                next_url = rewritten;
+            }
 
             const keep_authorization = shouldKeepAuthorizationOnRedirect(uri, next_url) catch false;
             if (owned_redirect_url) |url| allocator.free(url);

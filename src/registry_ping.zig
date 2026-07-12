@@ -5,6 +5,12 @@
 //!
 //! Failures use `RegistryPingFailure` (no image reference). CA preflight stays
 //! on the public `PublicApiError` surface in `root.zig`.
+//!
+//! Classification locks (status-only probe; Distribution API header not required):
+//! - `200` maps to `reachable_anonymous`
+//! - `401` maps to `reachable_auth_required`
+//! - `403` and other statuses map to `unexpected_status` (not auth-required)
+//! - Redirects are unhandled by the live ping exchanger
 
 const std = @import("std");
 const resilience = @import("resilience.zig");

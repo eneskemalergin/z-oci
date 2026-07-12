@@ -2108,13 +2108,728 @@ test "mock registry core: anonymous single-arch resolve over loopback http" {
     switch (outcome) {
         .success => |result| {
             try std.testing.expectEqualStrings(
-                mock.digest_header["sha256:".len..],
+                mock.digest_header.?["sha256:".len..],
                 result.digest.hex,
             );
             try std.testing.expect(std.mem.startsWith(u8, result.reference.registry, "127.0.0.1:"));
             try std.testing.expectEqualStrings("library/alpine", result.reference.repository);
         },
         .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "mock registry hard: bearer challenge then token then resolve" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    defer allocator.free(digest);
+
+    const MockHarness = struct {
+        repository: []const u8 = "library/alpine",
+        tag: []const u8 = "latest",
+        body: []const u8 = undefined,
+        digest: []const u8 = undefined,
+        content_type: []const u8 = MediaType.oci_manifest_v1.toString(),
+        token_body: []const u8 = "{\"token\":\"mock-token\",\"expires_in\":60}",
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+            const method = request.head.method;
+
+            if (std.mem.startsWith(u8, target, "/token")) {
+                try request.respond(self.token_body, .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "application/json" },
+                    },
+                });
+                return;
+            }
+
+            var manifest_path_buf: [128]u8 = undefined;
+            const manifest_path = try std.fmt.bufPrint(&manifest_path_buf, "/v2/{s}/manifests/{s}", .{
+                self.repository,
+                self.tag,
+            });
+            if (!std.mem.eql(u8, target, manifest_path)) {
+                try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+                return;
+            }
+
+            const authorization = mock_registry.requestAuthorization(request);
+            if (authorization == null or !std.mem.eql(u8, authorization.?, "Bearer mock-token")) {
+                var www_buf: [256]u8 = undefined;
+                const www = try std.fmt.bufPrint(
+                    &www_buf,
+                    "Bearer realm=\"https://{s}/token\",service=\"mock\",scope=\"repository:{s}:pull\"",
+                    .{ reg.registry_host, self.repository },
+                );
+                try request.respond("{}", .{
+                    .status = .unauthorized,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "Www-Authenticate", .value = www },
+                    },
+                });
+                return;
+            }
+
+            const headers = [_]std.http.Header{
+                .{ .name = "Content-Type", .value = self.content_type },
+                .{ .name = "Docker-Content-Digest", .value = self.digest },
+            };
+            switch (method) {
+                .HEAD => try request.respond("", .{ .status = .ok, .keep_alive = false, .extra_headers = &headers }),
+                .GET => try request.respond(self.body, .{ .status = .ok, .keep_alive = false, .extra_headers = &headers }),
+                else => try request.respond("no", .{ .status = .method_not_allowed, .keep_alive = false }),
+            }
+        }
+    };
+
+    var harness: MockHarness = .{ .body = body, .digest = digest };
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var ref_buf: [128]u8 = undefined;
+    const ref_str = try std.fmt.bufPrint(&ref_buf, "{s}/{s}:{s}", .{
+        mock.registry_host,
+        harness.repository,
+        harness.tag,
+    });
+    var ref = try Reference.parse(allocator, ref_str);
+    var outcome = try resolve(allocator, &client, Config{}, ref, null);
+    defer switch (outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |err| {
+            ref.deinit(allocator);
+            deinitResolveFailure(err, allocator);
+        },
+    };
+    try std.testing.expectEqual(.success, std.meta.activeTag(outcome));
+}
+
+test "mock registry hard: same-origin redirect keeps bearer" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    defer allocator.free(digest);
+
+    const MockHarness = struct {
+        body: []const u8,
+        digest: []const u8,
+        saw_auth_on_final: bool = false,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+            const authorization = mock_registry.requestAuthorization(request);
+
+            if (std.mem.eql(u8, target, "/v2/library/alpine/manifests/latest")) {
+                if (authorization == null) {
+                    var www_buf: [256]u8 = undefined;
+                    const www = try std.fmt.bufPrint(
+                        &www_buf,
+                        "Bearer realm=\"https://{s}/token\",service=\"mock\",scope=\"repository:library/alpine:pull\"",
+                        .{reg.registry_host},
+                    );
+                    try request.respond("{}", .{
+                        .status = .unauthorized,
+                        .keep_alive = false,
+                        .extra_headers = &.{.{ .name = "Www-Authenticate", .value = www }},
+                    });
+                    return;
+                }
+                var loc_buf: [128]u8 = undefined;
+                const location = try std.fmt.bufPrint(
+                    &loc_buf,
+                    "https://{s}/v2/library/alpine/manifests/final",
+                    .{reg.registry_host},
+                );
+                try request.respond("", .{
+                    .status = .temporary_redirect,
+                    .keep_alive = false,
+                    .extra_headers = &.{.{ .name = "Location", .value = location }},
+                });
+                return;
+            }
+
+            if (std.mem.startsWith(u8, target, "/token")) {
+                try request.respond("{\"token\":\"mock-token\",\"expires_in\":60}", .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+                });
+                return;
+            }
+
+            if (std.mem.eql(u8, target, "/v2/library/alpine/manifests/final")) {
+                self.saw_auth_on_final = authorization != null and std.mem.eql(u8, authorization.?, "Bearer mock-token");
+                const headers = [_]std.http.Header{
+                    .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
+                    .{ .name = "Docker-Content-Digest", .value = self.digest },
+                };
+                try request.respond(self.body, .{ .status = .ok, .keep_alive = false, .extra_headers = &headers });
+                return;
+            }
+
+            try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+        }
+    };
+
+    var harness: MockHarness = .{ .body = body, .digest = digest };
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 6, MockHarness.handle, &harness);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var ref_buf: [128]u8 = undefined;
+    const ref_str = try std.fmt.bufPrint(&ref_buf, "{s}/library/alpine:latest", .{mock.registry_host});
+    var ref = try Reference.parse(allocator, ref_str);
+    var outcome = try resolve(allocator, &client, Config{}, ref, null);
+    defer switch (outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |err| {
+            ref.deinit(allocator);
+            deinitResolveFailure(err, allocator);
+        },
+    };
+    try std.testing.expect(outcome == .success);
+    try std.testing.expect(harness.saw_auth_on_final);
+}
+
+test "mock registry hard: cross-port redirect strips bearer" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    defer allocator.free(digest);
+
+    const FinalMockHarness = struct {
+        body: []const u8,
+        digest: []const u8,
+        saw_authorization: bool = false,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            self.saw_authorization = mock_registry.requestAuthorization(request) != null;
+            const headers = [_]std.http.Header{
+                .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
+                .{ .name = "Docker-Content-Digest", .value = self.digest },
+            };
+            try request.respond(self.body, .{ .status = .ok, .keep_alive = false, .extra_headers = &headers });
+        }
+    };
+
+    var final_harness: FinalMockHarness = .{ .body = body, .digest = digest };
+    const final_mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 2, FinalMockHarness.handle, &final_harness);
+    defer final_mock.deinit();
+
+    const FirstMockHarness = struct {
+        final_host: []const u8,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+            const authorization = mock_registry.requestAuthorization(request);
+
+            if (std.mem.startsWith(u8, target, "/token")) {
+                try request.respond("{\"token\":\"mock-token\",\"expires_in\":60}", .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+                });
+                return;
+            }
+
+            if (authorization == null) {
+                var www_buf: [256]u8 = undefined;
+                const www = try std.fmt.bufPrint(
+                    &www_buf,
+                    "Bearer realm=\"https://{s}/token\",service=\"mock\",scope=\"repository:library/alpine:pull\"",
+                    .{reg.registry_host},
+                );
+                try request.respond("{}", .{
+                    .status = .unauthorized,
+                    .keep_alive = false,
+                    .extra_headers = &.{.{ .name = "Www-Authenticate", .value = www }},
+                });
+                return;
+            }
+
+            var loc_buf: [128]u8 = undefined;
+            const location = try std.fmt.bufPrint(
+                &loc_buf,
+                "https://{s}/v2/library/alpine/manifests/latest",
+                .{self.final_host},
+            );
+            try request.respond("", .{
+                .status = .temporary_redirect,
+                .keep_alive = false,
+                .extra_headers = &.{.{ .name = "Location", .value = location }},
+            });
+        }
+    };
+
+    var first_harness: FirstMockHarness = .{ .final_host = final_mock.registry_host };
+    const first_mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, FirstMockHarness.handle, &first_harness);
+    defer first_mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var ref_buf: [128]u8 = undefined;
+    const ref_str = try std.fmt.bufPrint(&ref_buf, "{s}/library/alpine:latest", .{first_mock.registry_host});
+    var ref = try Reference.parse(allocator, ref_str);
+    var outcome = try resolve(allocator, &client, Config{}, ref, null);
+    defer switch (outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |err| {
+            ref.deinit(allocator);
+            deinitResolveFailure(err, allocator);
+        },
+    };
+    try std.testing.expect(outcome == .success);
+    try std.testing.expect(!final_harness.saw_authorization);
+}
+
+test "mock registry hard: wrong content-type and digest mismatch and oversized body" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+
+    const Case = enum { wrong_type, digest_mismatch, oversized };
+    const cases = [_]Case{ .wrong_type, .digest_mismatch, .oversized };
+
+    for (cases) |case| {
+        const MockHarness = struct {
+            case: Case,
+            body: []const u8,
+
+            fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+                _ = request.head.method;
+                switch (self.case) {
+                    .wrong_type => try request.respond(self.body, .{
+                        .status = .ok,
+                        .keep_alive = false,
+                        .extra_headers = &.{
+                            .{ .name = "Content-Type", .value = "application/json" },
+                            .{ .name = "Docker-Content-Digest", .value = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+                        },
+                    }),
+                    .digest_mismatch => try request.respond(self.body, .{
+                        .status = .ok,
+                        .keep_alive = false,
+                        .extra_headers = &.{
+                            .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
+                            .{ .name = "Docker-Content-Digest", .value = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+                        },
+                    }),
+                    .oversized => {
+                        const big = try reg.allocator.alloc(u8, 64);
+                        defer reg.allocator.free(big);
+                        @memset(big, 'x');
+                        try request.respond(big, .{
+                            .status = .ok,
+                            .keep_alive = false,
+                            .extra_headers = &.{
+                                .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
+                                .{ .name = "Docker-Content-Digest", .value = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+                            },
+                        });
+                    },
+                }
+            }
+        };
+
+        var harness: MockHarness = .{ .case = case, .body = body };
+        const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 2, MockHarness.handle, &harness);
+        defer mock.deinit();
+
+        var client = std.http.Client{ .allocator = allocator, .io = io };
+        defer client.deinit();
+
+        var ref_buf: [128]u8 = undefined;
+        const ref_str = try std.fmt.bufPrint(&ref_buf, "{s}/library/alpine:latest", .{mock.registry_host});
+        var ref = try Reference.parse(allocator, ref_str);
+        const config: Config = if (case == .oversized) .{ .max_manifest_bytes = 16 } else .{};
+        var outcome = try resolve(allocator, &client, config, ref, null);
+        defer switch (outcome) {
+            .success => |*result| result.deinit(allocator),
+            .failure => |err| {
+                ref.deinit(allocator);
+                deinitResolveFailure(err, allocator);
+            },
+        };
+
+        switch (case) {
+            .wrong_type => try std.testing.expectEqualStrings("content_type_mismatch", @tagName(outcome.failure)),
+            .digest_mismatch => try std.testing.expectEqualStrings("digest_mismatch", @tagName(outcome.failure)),
+            .oversized => try std.testing.expectEqualStrings("response_too_large", @tagName(outcome.failure)),
+        }
+    }
+}
+
+test "mock registry hard: multi-arch platform select over loopback" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const child_body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(child_body);
+    const child_digest = try mock_registry.sha256DigestHeaderAlloc(allocator, child_body);
+    defer allocator.free(child_digest);
+
+    var index_buf: [512]u8 = undefined;
+    const index_body = try std.fmt.bufPrint(&index_buf,
+        \\{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":{d},"digest":"{s}","platform":{{"architecture":"amd64","os":"linux"}}}}]}}
+    , .{ child_body.len, child_digest });
+    const index_digest = try mock_registry.sha256DigestHeaderAlloc(allocator, index_body);
+    defer allocator.free(index_digest);
+
+    const MockHarness = struct {
+        index_body: []const u8,
+        index_digest: []const u8,
+        child_body: []const u8,
+        child_digest: []const u8,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+            if (std.mem.eql(u8, target, "/v2/library/alpine/manifests/latest")) {
+                try request.respond(self.index_body, .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = MediaType.oci_index_v1.toString() },
+                        .{ .name = "Docker-Content-Digest", .value = self.index_digest },
+                    },
+                });
+                return;
+            }
+            var child_path_buf: [128]u8 = undefined;
+            const child_path = try std.fmt.bufPrint(&child_path_buf, "/v2/library/alpine/manifests/{s}", .{self.child_digest});
+            if (std.mem.eql(u8, target, child_path)) {
+                try request.respond(self.child_body, .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
+                        .{ .name = "Docker-Content-Digest", .value = self.child_digest },
+                    },
+                });
+                return;
+            }
+            try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+        }
+    };
+
+    var harness: MockHarness = .{
+        .index_body = index_body,
+        .index_digest = index_digest,
+        .child_body = child_body,
+        .child_digest = child_digest,
+    };
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var ref_buf: [128]u8 = undefined;
+    const ref_str = try std.fmt.bufPrint(&ref_buf, "{s}/library/alpine:latest", .{mock.registry_host});
+    var ref = try Reference.parse(allocator, ref_str);
+    const platform = Platform{ .os = "linux", .architecture = "amd64" };
+    var outcome = try resolve(allocator, &client, Config{}, ref, platform);
+    defer switch (outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |err| {
+            ref.deinit(allocator);
+            deinitResolveFailure(err, allocator);
+        },
+    };
+    try std.testing.expect(outcome == .success);
+    try std.testing.expectEqualStrings(child_digest["sha256:".len..], outcome.success.digest.hex);
+}
+
+test "mock registry hard: nested index depth limit" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Failure domain: nested indexes past MAX_CHILD_MANIFEST_DEPTH.
+    const digests = try allocator.alloc([]u8, 6);
+    defer {
+        for (digests) |d| allocator.free(d);
+        allocator.free(digests);
+    }
+    const bodies = try allocator.alloc([]u8, 6);
+    defer {
+        for (bodies) |b| allocator.free(b);
+        allocator.free(bodies);
+    }
+
+    const leaf = try std.fmt.allocPrint(allocator,
+        \\{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}}
+    , .{});
+    bodies[5] = leaf;
+    digests[5] = try mock_registry.sha256DigestHeaderAlloc(allocator, leaf);
+
+    var i: isize = 4;
+    while (i >= 0) : (i -= 1) {
+        const idx: usize = @intCast(i);
+        const child = digests[idx + 1];
+        bodies[idx] = try std.fmt.allocPrint(allocator,
+            \\{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.index.v1+json","size":{d},"digest":"{s}","platform":{{"architecture":"amd64","os":"linux"}}}}]}}
+        , .{ bodies[idx + 1].len, child });
+        digests[idx] = try mock_registry.sha256DigestHeaderAlloc(allocator, bodies[idx]);
+    }
+
+    const MockHarness = struct {
+        bodies: []const []u8,
+        digests: []const []u8,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+            if (std.mem.eql(u8, target, "/v2/library/alpine/manifests/latest")) {
+                try request.respond(self.bodies[0], .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = MediaType.oci_index_v1.toString() },
+                        .{ .name = "Docker-Content-Digest", .value = self.digests[0] },
+                    },
+                });
+                return;
+            }
+            for (self.digests, 0..) |digest, index| {
+                var path_buf: [160]u8 = undefined;
+                const path = try std.fmt.bufPrint(&path_buf, "/v2/library/alpine/manifests/{s}", .{digest});
+                if (std.mem.eql(u8, target, path)) {
+                    try request.respond(self.bodies[index], .{
+                        .status = .ok,
+                        .keep_alive = false,
+                        .extra_headers = &.{
+                            .{ .name = "Content-Type", .value = MediaType.oci_index_v1.toString() },
+                            .{ .name = "Docker-Content-Digest", .value = digest },
+                        },
+                    });
+                    return;
+                }
+            }
+            try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+        }
+    };
+
+    var harness: MockHarness = .{ .bodies = bodies, .digests = digests };
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 16, MockHarness.handle, &harness);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var ref_buf: [128]u8 = undefined;
+    const ref_str = try std.fmt.bufPrint(&ref_buf, "{s}/library/alpine:latest", .{mock.registry_host});
+    var ref = try Reference.parse(allocator, ref_str);
+    const platform = Platform{ .os = "linux", .architecture = "amd64" };
+    var outcome = try resolve(allocator, &client, Config{}, ref, platform);
+    defer switch (outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |err| {
+            ref.deinit(allocator);
+            deinitResolveFailure(err, allocator);
+        },
+    };
+    try std.testing.expectEqualStrings("depth_limit_exceeded", @tagName(outcome.failure));
+}
+
+test "mock registry hard: 429 then success through live resilience" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    defer allocator.free(digest);
+
+    const MockHarness = struct {
+        body: []const u8,
+        digest: []const u8,
+        attempts: usize = 0,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            self.attempts += 1;
+            if (self.attempts == 1) {
+                try request.respond("{}", .{
+                    .status = .too_many_requests,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "Retry-After", .value = "0" },
+                    },
+                });
+                return;
+            }
+            try request.respond(self.body, .{
+                .status = .ok,
+                .keep_alive = false,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
+                    .{ .name = "Docker-Content-Digest", .value = self.digest },
+                },
+            });
+        }
+    };
+
+    var harness: MockHarness = .{ .body = body, .digest = digest };
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var ref_buf: [128]u8 = undefined;
+    const ref_str = try std.fmt.bufPrint(&ref_buf, "{s}/library/alpine:latest", .{mock.registry_host});
+    var ref = try Reference.parse(allocator, ref_str);
+    var outcome = try resolve(allocator, &client, .{ .max_rate_limit_retries = 1 }, ref, null);
+    defer switch (outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |err| {
+            ref.deinit(allocator);
+            deinitResolveFailure(err, allocator);
+        },
+    };
+    try std.testing.expectEqual(.success, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(@as(usize, 2), harness.attempts);
+}
+
+test "mock registry hard: 503 then success through live resilience" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    defer allocator.free(digest);
+
+    const MockHarness = struct {
+        body: []const u8,
+        digest: []const u8,
+        attempts: usize = 0,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            self.attempts += 1;
+            if (self.attempts == 1) {
+                try request.respond("{}", .{
+                    .status = .service_unavailable,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "Retry-After", .value = "0" },
+                    },
+                });
+                return;
+            }
+            try request.respond(self.body, .{
+                .status = .ok,
+                .keep_alive = false,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
+                    .{ .name = "Docker-Content-Digest", .value = self.digest },
+                },
+            });
+        }
+    };
+
+    var harness: MockHarness = .{ .body = body, .digest = digest };
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var ref_buf: [128]u8 = undefined;
+    const ref_str = try std.fmt.bufPrint(&ref_buf, "{s}/library/alpine:latest", .{mock.registry_host});
+    var ref = try Reference.parse(allocator, ref_str);
+    var outcome = try resolve(allocator, &client, .{ .max_network_retries = 1 }, ref, null);
+    defer switch (outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |err| {
+            ref.deinit(allocator);
+            deinitResolveFailure(err, allocator);
+        },
+    };
+    try std.testing.expectEqual(.success, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(@as(usize, 2), harness.attempts);
+}
+
+test "mock registry hard: ping status classification matrix" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Case = enum { ok, ok_no_api, unauthorized, forbidden, redirect };
+    for ([_]Case{ .ok, .ok_no_api, .unauthorized, .forbidden, .redirect }) |case| {
+        const MockHarness = struct {
+            case: Case,
+            fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+                switch (self.case) {
+                    .ok => try request.respond("{}", .{
+                        .status = .ok,
+                        .keep_alive = false,
+                        .extra_headers = &.{
+                            .{ .name = "Docker-Distribution-Api-Version", .value = "registry/2.0" },
+                        },
+                    }),
+                    .ok_no_api => try request.respond("{}", .{ .status = .ok, .keep_alive = false }),
+                    .unauthorized => try request.respond("{}", .{ .status = .unauthorized, .keep_alive = false }),
+                    .forbidden => try request.respond("{}", .{ .status = .forbidden, .keep_alive = false }),
+                    .redirect => try request.respond("", .{
+                        .status = .temporary_redirect,
+                        .keep_alive = false,
+                        .extra_headers = &.{.{ .name = "Location", .value = "https://example.test/v2/" }},
+                    }),
+                }
+            }
+        };
+
+        var harness: MockHarness = .{ .case = case };
+        const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 2, MockHarness.handle, &harness);
+        defer mock.deinit();
+
+        var client = std.http.Client{ .allocator = allocator, .io = io };
+        defer client.deinit();
+
+        const result = try pingRegistry(allocator, &client, Config{}, mock.registry_host);
+        switch (case) {
+            .ok, .ok_no_api => try std.testing.expectEqual(RegistryPingStatus.reachable_anonymous, result.ok),
+            .unauthorized => try std.testing.expectEqual(RegistryPingStatus.reachable_auth_required, result.ok),
+            .forbidden, .redirect => try std.testing.expectEqual(RegistryPingFailureKind.unexpected_status, result.failure.kind),
+        }
     }
 }
 

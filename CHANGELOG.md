@@ -18,10 +18,13 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 - Credential-helper hang timeout keyed from `Config.read_timeout_ms`; helper failure stays terminal when `credHelpers` is set; `max_retries` does not gate token rate-limit retries.
 - `pingRegistry` probes `https://{registry}/v2/` for anonymous reachability or auth-required; independent of resolve.
 - In-process mock registry peer (`mock_registry.zig`) plus loopback cleartext rewrite for real-client offline validate/resolve tests (test infrastructure, not a public product API).
+- Mock hard-case coverage against a real `std.http.Client`: bearer auth, redirect keep/strip, content-type/digest/size errors, multi-arch, depth limit, 429/503 retry, and ping status classification.
 
 ### Changed
 
 ### Fixed
+
+- Live manifest redirect follow rewrites loopback `https://` Locations to cleartext before the keep-authorization origin compare, so same-origin bearer auth is not stripped on local mock peers.
 
 ### Verified
 

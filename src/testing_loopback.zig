@@ -7,6 +7,7 @@
 
 const std = @import("std");
 
+/// True only for `localhost`, `127.0.0.1`, and `::1` (not `*.localhost` or other loopback ranges).
 pub fn isLoopbackHost(host: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
     if (std.mem.eql(u8, host, "127.0.0.1")) return true;
