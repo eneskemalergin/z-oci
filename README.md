@@ -28,6 +28,7 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 - Parse and normalize Docker and OCI image references, including tags, digests, Docker Hub defaults, and host-plus-port registries.
 - Resolve a tag to a pinned digest with `resolve`.
 - Resolve many references in one call with `resolveMany` (sequential, partial success, in-call tag cache).
+- Check whether a registry answers `/v2/` with `pingRegistry` (anonymous OK or auth required). Independent of resolve: resolve never calls ping.
 - Check whether a manifest exists with `validate`.
 - Fetch and parse a manifest with `getManifest`.
 - Follow OCI indexes and Docker manifest lists when you provide a target platform.
@@ -57,7 +58,7 @@ Reactive transport retries are live on manifest `HEAD`/`GET` and token HTTP path
 - `Config.max_rate_limit_retries` retries `429` responses using `Retry-After` / `X-Retry-After` (and response `Date` when present).
 - `Config.max_retries` stays auth-only: cached-token invalidation after a manifest `401`.
 - `Config.rate_limit_enabled` (default `false`) opts into pre-emptive manifest throttling when trustworthy registry `RateLimit-*` headers show `remaining == 0`.
-- `Config.ca_bundle_path` loads a PEM CA trust bundle at the public API boundary (`resolve`, `validate`, `getManifest`, `resolveMany`).
+- `Config.ca_bundle_path` loads a PEM CA trust bundle at the public API boundary (`resolve`, `validate`, `getManifest`, `resolveMany`, `pingRegistry`).
 - `ResolveError.rate_limited`, `network_error`, and `timeout` carry `transport_retries_exhausted` so callers can distinguish immediate hard failures from post-retry exhaustion.
 
 See [CHANGELOG.md](CHANGELOG.md) and `src/resilience.zig` for registry header assumptions (Docker Hub epoch `Retry-After`, `X-RateLimit-Reset`, and related parser behavior).

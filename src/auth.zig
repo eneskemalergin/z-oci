@@ -2746,6 +2746,18 @@ test "parseDockerCredentialHelperResponse: valid and malformed payload matrix" {
     ));
     try std.testing.expectError(error.HelperFailed, parseDockerCredentialHelperResponse(std.testing.allocator, "not-json"));
 }
+test "dockerCredentialHelperTimeout: maps Config.read_timeout_ms" {
+    try std.testing.expectEqual(std.Io.Timeout.none, dockerCredentialHelperTimeout(.{ .read_timeout_ms = 0 }));
+
+    switch (dockerCredentialHelperTimeout(.{ .read_timeout_ms = 10 })) {
+        .duration => |duration| {
+            try std.testing.expectEqual(std.Io.Clock.awake, duration.clock);
+            try std.testing.expectEqual(@as(i64, 10), duration.raw.toMilliseconds());
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "runDockerCredentialHelperCommand: subprocess matrix" {
     if (builtin.os.tag == .windows) return;
 
@@ -2803,7 +2815,7 @@ test "runDockerCredentialHelperCommand: subprocess matrix" {
             "get",
         },
         "ghcr.io",
-        .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(10), .clock = .awake } },
+        dockerCredentialHelperTimeout(.{ .read_timeout_ms = 10 }),
     ));
 
     // Failure and timeout must not poison the next helper invocation.
@@ -2835,7 +2847,7 @@ test "AuthEngine.dockerCredentialForRegistry: helper and inline auth matrix" {
             switch (timeout) {
                 .duration => |duration| {
                     if (duration.clock != .awake) return error.HelperFailed;
-                    if (duration.raw.toMilliseconds() != 30_000) return error.HelperFailed;
+                    if (duration.raw.toMilliseconds() != 15) return error.HelperFailed;
                 },
                 else => return error.HelperFailed,
             }
@@ -2843,7 +2855,7 @@ test "AuthEngine.dockerCredentialForRegistry: helper and inline auth matrix" {
         }
     };
 
-    var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
+    var engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, .{ .read_timeout_ms = 15 },
         \\{
         \\  "auths": {
         \\    "ghcr.io": {
@@ -2911,7 +2923,7 @@ test "AuthEngine.dockerCredentialForRegistry: helper and inline auth matrix" {
 
 // --- AuthEngine.authenticate: credential helper integration ---
 
-test "AuthEngine.authenticate: helper credential integration matrix" {
+test "AuthEngine.authenticate: helper failure is terminal when credHelpers is set" {
     const HelperMock = struct {
         fn runner(allocator: std.mem.Allocator, _: std.Io, helper_suffix: []const u8, server_url: []const u8, _: std.Io.Timeout) AuthError!CredentialHandle {
             if (!std.mem.eql(u8, helper_suffix, "secretservice")) return error.HelperFailed;
@@ -2965,12 +2977,20 @@ test "AuthEngine.authenticate: helper credential integration matrix" {
     for (terminal_cases) |case| {
         const FailingHelper = struct {
             var helper_err: AuthError = undefined;
+            var exchange_calls: usize = 0;
 
             fn runner(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8, _: std.Io.Timeout) AuthError!CredentialHandle {
                 return helper_err;
             }
+
+            fn exchange(_: std.mem.Allocator, _: *std.http.Client, http_request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+                defer http_request.deinit(std.testing.allocator);
+                exchange_calls += 1;
+                return error.TokenExchangeFailed;
+            }
         };
         FailingHelper.helper_err = case.helper_err;
+        FailingHelper.exchange_calls = 0;
 
         var terminal_engine = try AuthEngine.initWithDockerConfigBytes(std.testing.allocator, Config{},
             \\{
@@ -2986,18 +3006,14 @@ test "AuthEngine.authenticate: helper credential integration matrix" {
         );
         defer terminal_engine.deinit();
         terminal_engine.docker_helper_config = .{ .io = std.testing.io, .runner = FailingHelper.runner };
-        terminal_engine.token_http_exchanger = struct {
-            fn exchange(_: std.mem.Allocator, _: *std.http.Client, http_request: TokenHttpRequest) AuthError!TokenExchangeResponse {
-                defer http_request.deinit(std.testing.allocator);
-                return error.TokenExchangeFailed;
-            }
-        }.exchange;
+        terminal_engine.token_http_exchanger = FailingHelper.exchange;
 
         const terminal_request = try AuthenticateRequest.init(
             "ghcr.io",
             .{ .realm = "https://auth.example.test/token" },
         );
         try std.testing.expectError(case.helper_err, terminal_engine.authenticate(&client, terminal_request));
+        try std.testing.expectEqual(@as(usize, 0), FailingHelper.exchange_calls);
     }
 }
 test "AuthEngine.authenticate: generic self-hosted bearer registry path uses docker config auth" {
@@ -3536,6 +3552,44 @@ test "AuthEngine.authenticate: exhausts repeated 429 on token exchange" {
 
     try std.testing.expectError(error.RateLimited, engine.authenticate(&client, request));
     try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
+}
+
+test "AuthEngine.authenticate: max_retries zero still allows rate-limit retries" {
+    const MockHarness = struct {
+        var calls: usize = 0;
+
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: TokenHttpRequest) AuthError!TokenExchangeResponse {
+            defer request.deinit(std.testing.allocator);
+            calls += 1;
+            return .{
+                .status = .too_many_requests,
+                .body = "",
+                .resilience_headers = &.{
+                    .{ .name = "Retry-After", .value = "1" },
+                },
+            };
+        }
+    };
+
+    defer MockHarness.calls = 0;
+    var engine = AuthEngine.initWithTokenHttpExchangerAndHooks(std.testing.allocator, .{
+        .max_retries = 0,
+        .max_rate_limit_retries = 1,
+    }, MockHarness.exchange, .{ .sleeper = resilience.noopTransportSleeper });
+    defer engine.deinit();
+    var client: std.http.Client = undefined;
+    const request = try AuthenticateRequest.init(
+        "registry.example.test",
+        .{
+            .realm = "https://auth.example.test/token",
+            .service = "registry.example.test",
+            .scope = "repository:owner/image:pull",
+        },
+    );
+
+    try std.testing.expectError(error.RateLimited, engine.authenticate(&client, request));
+    // GET (initial + one rate-limit retry) then POST (initial + one retry).
+    try std.testing.expectEqual(@as(usize, 4), MockHarness.calls);
 }
 test "AuthEngine.authenticate: GET 429 then POST auth failure stays TokenExchangeFailed" {
     const MockHarness = struct {

@@ -251,6 +251,43 @@ test "workflow smoke: z_oci.testing resolveWithExchangers propagates network_err
     }
 }
 
+test "workflow smoke: z_oci.testing pingRegistryWithExchanger maps probe outcomes" {
+    const MockHarness = struct {
+        var status: std.http.Status = .ok;
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.testing.PingHttpRequest) z_oci.testing.PingExchangeError!z_oci.testing.PingHttpResponse {
+            defer request.deinit(allocator);
+            return .{ .status = status };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+
+    MockHarness.status = .ok;
+    try std.testing.expectEqual(
+        z_oci.RegistryPingStatus.reachable_anonymous,
+        (try z_oci.testing.pingRegistryWithExchanger(
+            std.testing.allocator,
+            &client,
+            .{},
+            "registry.example.test",
+            MockHarness.exchange,
+        )).ok,
+    );
+
+    MockHarness.status = .unauthorized;
+    try std.testing.expectEqual(
+        z_oci.RegistryPingStatus.reachable_auth_required,
+        (try z_oci.testing.pingRegistryWithExchanger(
+            std.testing.allocator,
+            &client,
+            .{},
+            "registry.example.test",
+            MockHarness.exchange,
+        )).ok,
+    );
+}
+
 test "workflow smoke: z_oci.testing validateWithExchangers propagates scenario failures" {
     defer tm.Fixtures.reset(std.testing.allocator);
 

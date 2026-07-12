@@ -15,6 +15,8 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 
 - Offline parser coverage: Manifest empty/truncated exact-error cases and fixed-seed fuzz; Index empty-list and empty/truncated exact-error cases plus Docker manifest-list fuzz; resilience conflicting `Retry-After` fixture wired; auth empty/trailing-junk authenticate-header cases.
 - Public-path `ResolveError` matrix: `getManifest` covers all 13 variants; `validate` covers 11/13 with documented skips plus a digest-pinned `digest_mismatch` proof.
+- Credential-helper hang timeout keyed from `Config.read_timeout_ms`; helper failure stays terminal when `credHelpers` is set; `max_retries` does not gate token rate-limit retries.
+- `pingRegistry` probes `https://{registry}/v2/` for anonymous reachability or auth-required; independent of resolve.
 
 ### Changed
 

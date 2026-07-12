@@ -5,6 +5,7 @@
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
 //! - auth engine: manifest HEAD/GET challenge handling, token exchange, credential providers
 //! - public manifest resolution for single-arch and supported multi-arch flows
+//! - registry `/v2/` ping (`pingRegistry`); not used by resolve
 //!
 //! Ownership conventions:
 //! - Functions taking an allocator produce owned storage that the caller must
@@ -58,10 +59,12 @@
 //! - `Reference.ParseError` / `Digest.ParseError`: caller parses before invoking resolve APIs.
 //! - `ResolveError`: registry operation failures inside `ResolveOutcome.failure`,
 //!   `ValidateOutcome.failure`, or `ManifestOutcome.failure`.
+//! - `RegistryPingResult`: `/v2/` probe outcomes. Independent of resolve; resolve never calls ping.
 //!
 const std = @import("std");
 const resolver = @import("resolver.zig");
 const resilience = @import("resilience.zig");
+const registry_ping = @import("registry_ping.zig");
 pub const test_matrix = @import("test_matrix.zig");
 
 pub const Digest = @import("Digest.zig");
@@ -93,6 +96,10 @@ pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
 pub const CredentialHandle = @import("Config.zig").CredentialHandle;
 pub const PublicApiError = Config.ApplyError;
+pub const RegistryPingStatus = registry_ping.RegistryPingStatus;
+pub const RegistryPingFailure = registry_ping.RegistryPingFailure;
+pub const RegistryPingFailureKind = registry_ping.RegistryPingFailureKind;
+pub const RegistryPingResult = registry_ping.RegistryPingResult;
 pub const testing = struct {
     pub const FailureScenario = test_matrix.Scenario;
     pub const refuseTokenExchange = test_matrix.refuseTokenExchange;
@@ -101,6 +108,20 @@ pub const testing = struct {
     pub const ManifestHttpRequest = resolver.ManifestHttpRequest;
     pub const ManifestHttpResponse = resolver.ManifestHttpResponse;
     pub const ManifestExchangeError = resolver.ManifestExchangeError;
+    pub const PingHttpExchanger = registry_ping.PingHttpExchanger;
+    pub const PingHttpRequest = registry_ping.PingHttpRequest;
+    pub const PingHttpResponse = registry_ping.PingHttpResponse;
+    pub const PingExchangeError = registry_ping.PingExchangeError;
+
+    pub fn pingRegistryWithExchanger(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        config: Config,
+        registry: []const u8,
+        exchanger: PingHttpExchanger,
+    ) PublicApiError!RegistryPingResult {
+        return root.pingRegistryWithExchanger(allocator, client, config, registry, exchanger);
+    }
 
     pub fn resolveWithExchangers(
         allocator: std.mem.Allocator,
@@ -425,6 +446,22 @@ pub fn getManifest(
     );
 }
 
+/// Probe `https://{registry}/v2/`. Does not fetch manifests and is not used by resolve.
+pub fn pingRegistry(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    registry: []const u8,
+) PublicApiError!RegistryPingResult {
+    return pingRegistryWithExchanger(
+        allocator,
+        client,
+        config,
+        registry,
+        registry_ping.livePingHttpExchanger,
+    );
+}
+
 // --- Private helpers ---
 
 const root = @This();
@@ -665,6 +702,16 @@ const ResolveManySession = struct {
 };
 fn ensureClientConfigured(config: Config, client: *std.http.Client) PublicApiError!void {
     return config.applyToClient(client);
+}
+fn pingRegistryWithExchanger(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    registry: []const u8,
+    exchanger: registry_ping.PingHttpExchanger,
+) PublicApiError!RegistryPingResult {
+    try ensureClientConfigured(config, client);
+    return registry_ping.pingRegistryWithExchanger(allocator, client, registry, exchanger);
 }
 fn resolveWithExchangers(
     allocator: std.mem.Allocator,
@@ -1885,6 +1932,109 @@ test "resolveManyWithExchangers: empty batch applies config before returning" {
     try std.testing.expectError(error.CaBundleFileNotFound, result);
     try std.testing.expectEqual(@as(usize, 0), MockHarness.token_calls);
     try std.testing.expectEqual(@as(usize, 0), MockHarness.manifest_calls);
+}
+
+test "pingRegistryWithExchanger: anonymous and auth-required outcomes" {
+    const MockHarness = struct {
+        var status: std.http.Status = .ok;
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
+            defer request.deinit(allocator);
+            if (!std.mem.eql(u8, request.url, "https://registry.example.test/v2/")) return error.TransportFailed;
+            return .{ .status = status };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+
+    MockHarness.status = .ok;
+    try std.testing.expectEqual(
+        RegistryPingStatus.reachable_anonymous,
+        (try testing.pingRegistryWithExchanger(
+            std.testing.allocator,
+            &client,
+            Config{},
+            "registry.example.test",
+            MockHarness.exchange,
+        )).ok,
+    );
+
+    MockHarness.status = .unauthorized;
+    try std.testing.expectEqual(
+        RegistryPingStatus.reachable_auth_required,
+        (try testing.pingRegistryWithExchanger(
+            std.testing.allocator,
+            &client,
+            Config{},
+            "registry.example.test",
+            MockHarness.exchange,
+        )).ok,
+    );
+}
+
+test "pingRegistryWithExchanger: unexpected status and network failure" {
+    const MockHarness = struct {
+        var mode: enum { unexpected, network } = .unexpected;
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
+            defer request.deinit(allocator);
+            return switch (mode) {
+                .unexpected => .{ .status = .internal_server_error },
+                .network => error.ConnectionRefused,
+            };
+        }
+    };
+
+    var client: std.http.Client = undefined;
+
+    MockHarness.mode = .unexpected;
+    const unexpected = try testing.pingRegistryWithExchanger(
+        std.testing.allocator,
+        &client,
+        Config{},
+        "registry.example.test",
+        MockHarness.exchange,
+    );
+    try std.testing.expectEqual(RegistryPingFailureKind.unexpected_status, unexpected.failure.kind);
+    try std.testing.expectEqual(@as(?u16, 500), unexpected.failure.http_status);
+
+    MockHarness.mode = .network;
+    try std.testing.expectEqual(
+        RegistryPingFailureKind.network,
+        (try testing.pingRegistryWithExchanger(
+            std.testing.allocator,
+            &client,
+            Config{},
+            "registry.example.test",
+            MockHarness.exchange,
+        )).failure.kind,
+    );
+}
+
+test "pingRegistryWithExchanger: missing ca bundle maps to PublicApiError" {
+    const MockHarness = struct {
+        var calls: usize = 0;
+
+        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
+            defer request.deinit(allocator);
+            calls += 1;
+            return .{ .status = .ok };
+        }
+    };
+    defer MockHarness.calls = 0;
+
+    var client = std.http.Client{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    const result = testing.pingRegistryWithExchanger(
+        std.testing.allocator,
+        &client,
+        .{ .ca_bundle_path = "/nonexistent/z-oci-ca-bundle.pem" },
+        "registry.example.test",
+        MockHarness.exchange,
+    );
+    try std.testing.expectError(error.CaBundleFileNotFound, result);
+    try std.testing.expectEqual(@as(usize, 0), MockHarness.calls);
 }
 
 test "resolveManyWithExchangers: single-item success owns output and preserves input" {
