@@ -14,6 +14,7 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 ### Added
 
 - Offline parser coverage: Manifest empty/truncated exact-error cases and fixed-seed fuzz; Index empty-list and empty/truncated exact-error cases plus Docker manifest-list fuzz; resilience conflicting `Retry-After` fixture wired; auth empty/trailing-junk authenticate-header cases.
+- Public-path `ResolveError` matrix: `getManifest` covers all 13 variants; `validate` covers 11/13 with documented skips plus a digest-pinned `digest_mismatch` proof.
 
 ### Changed
 

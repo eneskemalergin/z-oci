@@ -52,16 +52,39 @@ pub const resolve_failure_scenarios = [_]Scenario{
 };
 
 pub const validate_failure_scenarios = [_]Scenario{
-    .not_found,
-    .network_error,
+    .auth_failed,
+    .content_type_mismatch,
     .manifest_parse_error,
+    .network_error,
+    .not_found,
+    .platform_not_found,
     .platform_required,
+    .rate_limited,
+    .response_too_large,
+    .timeout,
+    .unsupported_algorithm,
+};
+
+/// Paired with `validate_failure_scenarios`; shared tag-ref plans cannot produce these tags.
+pub const validate_failure_scenario_skips = [_]Scenario{
+    .digest_mismatch,
+    .depth_limit_exceeded,
 };
 
 pub const get_manifest_failure_scenarios = [_]Scenario{
-    .not_found,
+    .auth_failed,
+    .content_type_mismatch,
+    .depth_limit_exceeded,
+    .digest_mismatch,
+    .manifest_parse_error,
     .network_error,
+    .not_found,
+    .platform_not_found,
     .platform_required,
+    .rate_limited,
+    .response_too_large,
+    .timeout,
+    .unsupported_algorithm,
 };
 
 pub const PublicApi = enum { resolve, validate, get_manifest };
@@ -545,6 +568,21 @@ test "test_matrix: failure scenario tables align with ResolveError tags and C4 b
         }
         try std.testing.expect(listed);
     }
+
+    try std.testing.expectEqual(
+        resolve_failure_scenarios.len,
+        validate_failure_scenarios.len + validate_failure_scenario_skips.len,
+    );
+    for (validate_failure_scenario_skips) |skipped| {
+        try std.testing.expect(!scenarioInList(skipped, &validate_failure_scenarios));
+        try std.testing.expect(scenarioInList(skipped, &resolve_failure_scenarios));
+    }
+    for (resolve_failure_scenarios) |scenario| {
+        const in_validate = scenarioInList(scenario, &validate_failure_scenarios);
+        const in_skips = scenarioInList(scenario, &validate_failure_scenario_skips);
+        try std.testing.expect(in_validate != in_skips);
+    }
+    try std.testing.expectEqual(resolve_failure_scenarios.len, get_manifest_failure_scenarios.len);
 }
 
 test "test_matrix: scenario metadata helpers match expected HTTP status, reference, platform, and config" {

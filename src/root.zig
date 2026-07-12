@@ -3819,10 +3819,59 @@ test "validateWithExchangers: failure scenarios map to outcome or ResolveError w
                     "registry-1.docker.io",
                     test_matrix.expectedReference(scenario),
                     test_matrix.expectedHttpStatus(scenario),
-                    null,
+                    switch (scenario) {
+                        .rate_limited => false,
+                        .timeout => true,
+                        else => null,
+                    },
                 ),
             },
         }
+    }
+}
+
+test "validateWithExchangers: digest_mismatch when digest-pinned HEAD disagrees with Docker-Content-Digest" {
+    const MockHarness = struct {
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            return test_matrix.manifestExchange(.digest_mismatch, allocator, request);
+        }
+    };
+
+    const digest_raw = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const pinned = Reference{
+        .registry = "registry-1.docker.io",
+        .repository = "library/busybox",
+        .tag = null,
+        .digest = try Digest.parse(digest_raw),
+        .digest_raw = digest_raw,
+    };
+
+    var client: std.http.Client = undefined;
+    const outcome = try validateWithExchangers(
+        std.testing.allocator,
+        &client,
+        Config{},
+        pinned,
+        null,
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .failure => |failure| deinitOwnedResolveError(failure, std.testing.allocator),
+        else => {},
+    };
+
+    switch (outcome) {
+        .valid, .not_found => return error.TestUnexpectedResult,
+        .failure => |failure| try expectResolveFailure(
+            failure,
+            "digest_mismatch",
+            "registry-1.docker.io",
+            "registry-1.docker.io/library/busybox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            200,
+            null,
+        ),
     }
 }
 
@@ -4083,7 +4132,11 @@ test "getManifestWithExchangers: failure scenarios map to ResolveError with full
                 "registry-1.docker.io",
                 test_matrix.expectedReference(scenario),
                 test_matrix.expectedHttpStatus(scenario),
-                null,
+                switch (scenario) {
+                    .rate_limited => false,
+                    .timeout => true,
+                    else => null,
+                },
             ),
         }
     }

@@ -59,7 +59,11 @@ fn expectWorkflowValidateFailure(outcome: z_oci.ValidateOutcome, scenario: tm.Sc
                 "registry-1.docker.io",
                 tm.expectedReference(scenario),
                 tm.expectedHttpStatus(scenario),
-                null,
+                switch (scenario) {
+                    .rate_limited => false,
+                    .timeout => true,
+                    else => null,
+                },
             ),
         },
     }
@@ -74,7 +78,11 @@ fn expectWorkflowGetManifestFailure(outcome: z_oci.ManifestOutcome, scenario: tm
             "registry-1.docker.io",
             tm.expectedReference(scenario),
             tm.expectedHttpStatus(scenario),
-            null,
+            switch (scenario) {
+                .rate_limited => false,
+                .timeout => true,
+                else => null,
+            },
         ),
     }
 }
