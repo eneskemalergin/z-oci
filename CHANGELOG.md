@@ -19,6 +19,8 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 - `pingRegistry` probes `https://{registry}/v2/` for anonymous reachability or auth-required; independent of resolve.
 - In-process mock registry peer (`mock_registry.zig`) plus loopback cleartext rewrite for real-client offline validate/resolve tests (test infrastructure, not a public product API).
 - Mock hard-case coverage against a real `std.http.Client`: bearer auth, redirect keep/strip, content-type/digest/size errors, multi-arch, depth limit, 429/503 retry, and ping status classification.
+- Opt-in local `registry:2` harness (`zig build integration-registry`): resolve by tag and digest, validate missing → `not_found`. Clear-fails when Docker is absent; never part of `zig build test`.
+- `security-check` scans `integration/` and flags non-placeholder Docker `auths` embedded in `.zig` sources.
 
 ### Changed
 

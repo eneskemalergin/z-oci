@@ -261,7 +261,15 @@ This repository vendors Zig 0.16 under `./zig-0.16.0/`. Prefer the bundled compi
 
 Fixtures under `fixtures/` include checked-in live registry snapshots plus synthetic malformed payloads for deterministic negative-path tests. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
 
-Offline tests can also drive a real `std.http.Client` against an in-process mock peer (`src/mock_registry.zig`) on loopback HTTP. That mock is test infrastructure only—not part of the public library API.
+Offline tests can also drive a real `std.http.Client` against an in-process mock peer (`src/mock_registry.zig`) on loopback HTTP. That mock is test infrastructure only, not part of the public library API.
+
+For Distribution `registry:2` interoperability, use the opt-in step (requires a Docker daemon; clear-fails if absent):
+
+```sh
+./zig-0.16.0/zig build integration-registry --zig-lib-dir ./zig-0.16.0/lib
+```
+
+See `integration/registry2/README.md`. This step is never part of `zig build test`.
 
 The Zig package contents in this repository bundle `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
 

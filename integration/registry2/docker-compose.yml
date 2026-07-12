@@ -1,0 +1,11 @@
+# Local Distribution registry for opt-in interoperability checks.
+# Loopback bind only, anonymous auth, delete enabled, HTTP cleartext, throwaway test peer.
+# Do not expose on 0.0.0.0 or reuse for production images.
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "127.0.0.1:5000:5000"
+    environment:
+      # Allows manifest deletes during local experiments; irrelevant to z-oci harness proofs.
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"

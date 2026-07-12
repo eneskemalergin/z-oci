@@ -23,6 +23,18 @@
 //!   token POST bodies). No automated test proves zero at `free` time.
 //! - Docker config inline auth borrows from the engine `auth_cache` until `deinit()`;
 //!   `release()` is a no-op for those hits.
+//!
+//! Runtime credential sources (caller environment; never written to the repo):
+//! - `Config` `CredentialProvider` (caller-owned slices for the call).
+//! - `Z_OCI_REGISTRY_HOST` / `Z_OCI_REGISTRY_USER` / `Z_OCI_REGISTRY_TOKEN`.
+//! - `DOCKER_CONFIG` / `HOME` / `USERPROFILE` → `~/.docker/config.json` (`auths`,
+//!   `credHelpers`, `credsStore`) and `docker-credential-*` helper subprocesses.
+//! Tokens and passwords exist in memory for the auth/resolve session. Owned bearer
+//! bytes, helper stdout secrets, and POST bodies are zeroed before free.
+//! `ResolveError` payloads carry registry, reference, and HTTP status only; do not
+//! log them expecting embedded secrets.
+//! Token cache entries are bounded by `Config.max_token_cache_entries` and cleared on
+//! `AuthEngine.deinit()`.
 const std = @import("std");
 const builtin = @import("builtin");
 const ConfigModule = @import("Config.zig");

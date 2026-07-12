@@ -20,7 +20,9 @@
 //! Loopback cleartext (testing / local registry):
 //! - URL builders still emit `https://`. Live manifest/token/ping exchangers rewrite
 //!   to `http://` only when the registry host is `127.0.0.1`, `localhost`, or `::1`.
-//! - No public Config switch. Public hostnames are never rewritten.
+//! - No public Config switch. Public hostnames, RFC1918, and link-local hosts are
+//!   never rewritten. See `testing_loopback.isLoopbackHost` for the exact allowlist.
+//! - Runtime credential sources and zeroing policy: `auth.zig` file header.
 //!
 //! TLS trust (`ca_bundle_path`):
 //! - When unset, the caller-owned `std.http.Client` loads OS trust roots on the first

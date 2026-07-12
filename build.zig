@@ -12,6 +12,8 @@
 //! - `bench`: build and install the benchmark CLI to `zig-out/bin/z-oci-bench`.
 //! - `security-check`: reject private-key PEM blocks and high-confidence credential
 //!   material in tracked repo paths.
+//! - `integration-registry`: opt-in local `registry:2` checks (requires Docker;
+//!   clear-fails if absent; never part of `test`).
 
 const std = @import("std");
 
@@ -228,4 +230,28 @@ pub fn build(b: *std.Build) void {
     smoke_examples_step.dependOn(&smoke_resolve_many.step);
 
     test_step.dependOn(smoke_examples_step);
+
+    // --- Opt-in local registry:2 interoperability (never part of `test`) ---
+
+    const registry2_harness = b.addExecutable(.{
+        .name = "registry2-harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("integration/registry2/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "z_oci", .module = mod },
+            },
+        }),
+    });
+
+    const run_registry2 = b.addSystemCommand(&.{"bash"});
+    run_registry2.addFileArg(b.path("integration/registry2/run.sh"));
+    run_registry2.addArtifactArg(registry2_harness);
+
+    const integration_registry_step = b.step(
+        "integration-registry",
+        "Opt-in registry:2 interoperability (requires Docker; clear-fails if absent)",
+    );
+    integration_registry_step.dependOn(&run_registry2.step);
 }

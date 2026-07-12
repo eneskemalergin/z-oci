@@ -12,9 +12,10 @@
 //!   docker `auths` blobs with embedded `"auth"` values, and non-placeholder
 //!   secret assignments.
 //! - Non-source text under scan roots (`.md`, `.toml`, `.json`, `.yml`, `.yaml`,
-//!   `.txt`, `.sh`): reject private-key PEM markers. `.zig` is intentionally not
-//!   PEM-scanned so detector string literals and synthetic test PEMs do not
-//!   false-positive; real key files must use key-like extensions.
+//!   `.txt`, `.sh`): reject private-key PEM markers.
+//! - `.zig` sources: reject non-placeholder Docker `auths` `"auth"` values only.
+//!   PEM markers and `.env`-style assignments are not scanned in `.zig` (field names
+//!   like `max_token_cache_entries` and test literals false-positive otherwise).
 //!
 //! Files larger than `MAX_SCAN_BYTES` (10 MiB) are rejected. Empty files are allowed.
 const std = @import("std");
@@ -33,6 +34,7 @@ const SCAN_ROOTS = [_][]const u8{
     "examples",
     "benchmarks",
     "tools",
+    "integration",
 };
 
 const KEY_EXTENSIONS = [_][]const u8{
@@ -67,10 +69,13 @@ const MAX_MARKER_LEN = blk: {
 
 const MARKER_OVERLAP = MAX_MARKER_LEN - 1;
 
+const BASE64_DECODER = std.base64.standard.decoderWithIgnore(" \t\r\n");
+
 const ScanClass = enum {
     key_material,
     credential_file,
     text_pem_only,
+    zig_source,
 };
 
 const Finding = enum {
@@ -118,6 +123,7 @@ fn classifyPath(path: []const u8, basename: []const u8) ?ScanClass {
     if (isCredentialBasename(basename) or isDockerConfigPath(path, basename)) {
         return .credential_file;
     }
+    if (std.mem.endsWith(u8, basename, ".zig")) return .zig_source;
     for (KEY_EXTENSIONS) |ext| {
         if (std.mem.endsWith(u8, basename, ext)) return .key_material;
     }
@@ -175,6 +181,105 @@ fn containsDockerAuths(body: []const u8) bool {
         while (i < body.len and body[i] != '"') : (i += 1) {}
         if (i > value_start) return true;
         search_from = i;
+    }
+    return false;
+}
+
+fn containsNonPlaceholderDockerAuths(body: []const u8) bool {
+    // Same `"auth"` JSON shape as containsDockerAuths; decodes base64 and rejects live credentials.
+    if (std.mem.indexOf(u8, body, "\"auths\"") == null) return false;
+    if (std.mem.indexOf(u8, body, "\"auth\"") == null) return false;
+
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, body, search_from, "\"auth\"")) |idx| {
+        const after_key = idx + "\"auth\"".len;
+        var i = after_key;
+        while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) : (i += 1) {}
+        if (i >= body.len or body[i] != ':') {
+            search_from = after_key;
+            continue;
+        }
+        i += 1;
+        while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) : (i += 1) {}
+        if (i >= body.len or body[i] != '"') {
+            search_from = after_key;
+            continue;
+        }
+        i += 1;
+        const value_start = i;
+        while (i < body.len and body[i] != '"') : (i += 1) {}
+        if (i > value_start) {
+            const value = body[value_start..i];
+            if (!isPlaceholderDockerAuthBase64(value)) return true;
+        }
+        search_from = i;
+    }
+    return false;
+}
+
+fn isPlaceholderDockerAuthBase64(b64: []const u8) bool {
+    if (b64.len == 0) return true;
+
+    var decoded_buf: [256]u8 = undefined;
+    const decoded_len = BASE64_DECODER.decode(decoded_buf[0..], b64) catch return false;
+    return isPlaceholderCredentialLiteral(decoded_buf[0..decoded_len]);
+}
+
+fn isPlaceholderCredentialLiteral(decoded: []const u8) bool {
+    if (decoded.len == 0) return true;
+
+    const exact = [_][]const u8{
+        "octocat:ghp_example",
+        "dockeruser:secret",
+        "internal-user:token",
+        "user:secret",
+        "user:pass",
+        "no_colon",
+        "octocat:first",
+        "octocat:second",
+        "home-user:home-token",
+        "docker-user:docker-token",
+    };
+    for (exact) |known| {
+        if (std.mem.eql(u8, decoded, known)) return true;
+    }
+
+    if (isPlaceholderSecretValue(decoded)) return true;
+
+    const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse return false;
+    const user = decoded[0..colon];
+    const secret = decoded[colon + 1 ..];
+
+    const test_users = [_][]const u8{
+        "octocat",
+        "dockeruser",
+        "internal-user",
+        "user",
+        "home-user",
+        "docker-user",
+    };
+    const test_secrets = [_][]const u8{
+        "ghp_example",
+        "secret",
+        "token",
+        "pass",
+        "first",
+        "second",
+        "home-token",
+        "docker-token",
+    };
+
+    var user_ok = false;
+    for (test_users) |u| {
+        if (std.mem.eql(u8, user, u)) {
+            user_ok = true;
+            break;
+        }
+    }
+    if (!user_ok) return false;
+
+    for (test_secrets) |s| {
+        if (std.mem.eql(u8, secret, s)) return true;
     }
     return false;
 }
@@ -249,13 +354,22 @@ fn containsEnvSecretAssignment(body: []const u8) bool {
 }
 
 fn findingForBody(body: []const u8, class: ScanClass) ?Finding {
-    if (containsPrivateKeyMarker(body)) return .private_key_pem;
     switch (class) {
-        .key_material, .text_pem_only => return null,
-        .credential_file => {
-            if (containsDockerAuths(body)) return .docker_auths;
-            if (containsEnvSecretAssignment(body)) return .env_secret;
+        .zig_source => {
+            if (containsNonPlaceholderDockerAuths(body)) return .docker_auths;
             return null;
+        },
+        else => {
+            if (containsPrivateKeyMarker(body)) return .private_key_pem;
+            switch (class) {
+                .key_material, .text_pem_only => return null,
+                .credential_file => {
+                    if (containsDockerAuths(body)) return .docker_auths;
+                    if (containsEnvSecretAssignment(body)) return .env_secret;
+                    return null;
+                },
+                .zig_source => unreachable,
+            }
         },
     }
 }
@@ -358,8 +472,15 @@ test "classifyPath covers key, credential, and text classes" {
         ScanClass.text_pem_only,
         classifyPath("fixtures/manifests/busybox.json", "busybox.json").?,
     );
-    try std.testing.expect(classifyPath("src/root.zig", "root.zig") == null);
-    try std.testing.expect(classifyPath("src/Config.zig", "Config.zig") == null);
+    try std.testing.expectEqual(ScanClass.zig_source, classifyPath("src/root.zig", "root.zig").?);
+    try std.testing.expectEqual(
+        ScanClass.zig_source,
+        classifyPath("integration/registry2/main.zig", "main.zig").?,
+    );
+    try std.testing.expectEqual(
+        ScanClass.text_pem_only,
+        classifyPath("integration/registry2/README.md", "README.md").?,
+    );
     try std.testing.expect(classifyPath("fixtures/blob.bin", "blob.bin") == null);
 }
 
@@ -391,7 +512,33 @@ test "findingForBody keeps zig-style bearer fixtures out of credential class" {
     ;
     try std.testing.expect(findingForBody(zig_with_bearer, .text_pem_only) == null);
     try std.testing.expect(findingForBody("-----BEGIN PRIVATE KEY-----\n", .text_pem_only) == .private_key_pem);
+    try std.testing.expect(findingForBody("-----BEGIN PRIVATE KEY-----\n", .zig_source) == null);
     try std.testing.expect(findingForBody(zig_with_bearer, .credential_file) == null);
+    try std.testing.expect(findingForBody(zig_with_bearer, .zig_source) == null);
+}
+
+test "isPlaceholderDockerAuthBase64 accepts test fixture auths only" {
+    try std.testing.expect(isPlaceholderDockerAuthBase64("b2N0b2NhdDpnaHBfZXhhbXBsZQ=="));
+    try std.testing.expect(isPlaceholderDockerAuthBase64("ZG9ja2VydXNlcjpzZWNyZXQ="));
+    try std.testing.expect(isPlaceholderDockerAuthBase64("dXNlcjpwYXNz"));
+    try std.testing.expect(!isPlaceholderDockerAuthBase64("c3VwZXItc2VjcmV0LXRva2Vu"));
+}
+
+test "findingForBody zig_source flags live docker auths" {
+    const fixture_auth =
+        \\{"auths":{"registry.example.test":{"auth":"b2N0b2NhdDpnaHBfZXhhbXBsZQ=="}}}
+    ;
+    const live_auth_prefix = "{\"auths\":{\"registry.example.test\":{\"auth\":\"";
+    const live_auth_suffix = "\"}}}";
+    const live_auth_b64 = "c3VwZXItc2VjcmV0LXRva2Vu";
+    var live_auth_buf: [256]u8 = undefined;
+    const live_auth = try std.fmt.bufPrint(
+        &live_auth_buf,
+        "{s}{s}{s}",
+        .{ live_auth_prefix, live_auth_b64, live_auth_suffix },
+    );
+    try std.testing.expect(findingForBody(fixture_auth, .zig_source) == null);
+    try std.testing.expectEqual(Finding.docker_auths, findingForBody(live_auth, .zig_source).?);
 }
 
 test "streaming overlap window catches split marker" {
