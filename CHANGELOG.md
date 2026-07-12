@@ -5,7 +5,21 @@ All notable changes to z-oci are documented here. The format follows [Keep a Cha
 
 Versions listed here may be prepared ahead of the matching git tag. Tags follow once the release is cut.
 
-## [Unreleased]
+## [0.6.0] - [Unreleased]
+
+Integration and compatibility verification on top of the v0.5.0 client: deeper offline coverage, a local mock registry peer for the real HTTP client path, optional `registry:2`, enabled CI, and an evidence-tagged registry compatibility matrix. Resolve and auth stay on the shipped seams unless a Phase 6 test finds a defect.
+
+Nothing under this version is released yet. Add, change, fix, and verified notes land here only after the matching work is on the branch and gated. Internal milestone labels stay in `plan/phase6-plan.md`, not in this file.
+
+### Added
+
+- Offline parser coverage: Manifest empty/truncated exact-error cases and fixed-seed fuzz; Index empty-list and empty/truncated exact-error cases plus Docker manifest-list fuzz; resilience conflicting `Retry-After` fixture wired; auth empty/trailing-junk authenticate-header cases.
+
+### Changed
+
+### Fixed
+
+### Verified
 
 ## [0.5.0] - 2026-07-10 - [Tagged]
 

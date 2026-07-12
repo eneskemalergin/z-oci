@@ -591,6 +591,54 @@ test "MultiArchManifest.filterByPlatform: spec fixtures and live busybox/quay se
     try std.testing.expectEqualSlices(u8, "35e7e430350711653810b2b3cc889fec2a6e0175c078e4114964c7252c411209", quay_amd64.?.digest.hex);
 }
 
+test "OciImageIndex.jsonParse: empty manifests list is valid" {
+    const bytes =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}
+    ;
+    const parsed = try json.parse(OciImageIndex, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value.media_type);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.manifests.len);
+}
+
+test "DockerManifestList.jsonParse: empty manifests list is valid" {
+    const bytes =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}
+    ;
+    const parsed = try json.parse(DockerManifestList, std.testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try std.testing.expectEqual(MediaType.docker_manifest_list_v2, parsed.value.media_type);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.manifests.len);
+}
+
+test "OciImageIndex.jsonParse: empty and truncated bodies return exact errors" {
+    const cases = [_]struct { []const u8, anyerror }{
+        .{ "", error.UnexpectedEndOfInput },
+        .{ "{", error.UnexpectedEndOfInput },
+        .{
+            "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[",
+            error.UnexpectedEndOfInput,
+        },
+    };
+    for (cases) |case| try expectJsonParseError(OciImageIndex, case[0], case[1]);
+}
+
+test "DockerManifestList.jsonParse: empty and truncated bodies return exact errors" {
+    const cases = [_]struct { []const u8, anyerror }{
+        .{ "", error.UnexpectedEndOfInput },
+        .{ "{", error.UnexpectedEndOfInput },
+        .{
+            "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.docker.distribution.manifest.list.v2+json\",\"manifests\":[",
+            error.UnexpectedEndOfInput,
+        },
+    };
+    for (cases) |case| try expectJsonParseError(DockerManifestList, case[0], case[1]);
+}
+
 test "OciImageIndex.jsonParse: allocation failures do not leak" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
@@ -628,6 +676,28 @@ test "OciImageIndex.jsonParse: pseudo-random inputs never panic" {
             defer parsed.deinit();
             try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
             try std.testing.expectEqual(MediaType.oci_index_v1, parsed.value.media_type);
+        } else |_| {}
+    }
+}
+
+test "DockerManifestList.jsonParse: pseudo-random inputs never panic" {
+    // Fixed seed and iteration count for CI. Mirrors the OciImageIndex fuzz above.
+    var seed: u64 = 0x11a7_d0c;
+    var buf: [256]u8 = undefined;
+
+    for (0..512) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const result = json.parse(DockerManifestList, std.testing.allocator, buf[0..len]);
+        if (result) |parsed| {
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+            try std.testing.expectEqual(MediaType.docker_manifest_list_v2, parsed.value.media_type);
         } else |_| {}
     }
 }

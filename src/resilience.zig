@@ -839,6 +839,13 @@ const ResilienceHeaderFixture = struct {
         value: []const u8,
     },
 };
+const ConflictingRetryAfterFixture = struct {
+    headers: []const struct {
+        name: []const u8,
+        value: []const u8,
+    },
+    expected_delay_seconds: u32,
+};
 const MalformedResilienceHeaderFixture = struct {
     cases: []const struct {
         headers: []const struct {
@@ -1109,6 +1116,28 @@ test "parseRetryAfterFromHeaders: prefers Retry-After over X-Retry-After and anc
     }, null) == null);
 }
 
+test "parseRetryAfterFromHeaders: conflicting fixture prefers Retry-After" {
+    var fixture_buffer: [2 * 1024]u8 = undefined;
+    const fixture = try loadResilienceFixture(
+        ConflictingRetryAfterFixture,
+        "fixtures/resilience/conflicting-retry-after.json",
+        &fixture_buffer,
+    );
+    defer fixture.deinit();
+
+    var header_storage: [4]HttpHeader = undefined;
+    const header_slice = copyFixtureHeaders(fixture.value.headers, &header_storage);
+    // Fixture includes Date, so integer Retry-After is anchored to a unix instant.
+    // expected_delay_seconds is 30 (Retry-After), not 99 (X-Retry-After).
+    const retry_after = (try parseRetryAfterFromHeaders(header_slice, null)).?;
+    const response_date = (try responseDateUnixSecondsFromHeaders(header_slice)).?;
+    try std.testing.expectEqual(
+        response_date + fixture.value.expected_delay_seconds,
+        retry_after.retry_at_unix_seconds,
+    );
+    try std.testing.expect(retry_after.retry_at_unix_seconds != response_date + 99);
+}
+
 test "retryAfterFromHeaders: reads Retry-After when rate-limit headers present" {
     const retry_headers = [_]HttpHeader{
         .{ .name = "Retry-After", .value = "30" },
@@ -1121,6 +1150,36 @@ test "retryAfterFromHeaders: reads Retry-After when rate-limit headers present" 
 test "parseRetryAfterValue: rejects empty and malformed HTTP-date strings" {
     try std.testing.expectError(error.InvalidRetryAfterHeader, parseRetryAfterValue(""));
     try std.testing.expectError(error.InvalidHttpDate, parseRetryAfterValue("Thu, 99 Foo 2025 99:99:99 GMT"));
+}
+
+test "resilience header parsers: pseudo-random inputs never panic" {
+    // Fixed seed and iteration count for CI.
+    var seed: u64 = 0x2e51_11e1;
+    var buf: [128]u8 = undefined;
+    var name_buf: [32]u8 = undefined;
+
+    for (0..256) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const value_len: usize = @intCast(seed % (buf.len + 1));
+        for (buf[0..value_len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+        _ = parseRetryAfterValue(buf[0..value_len]) catch {};
+
+        seed = seed *% 6364136223846793005 +% 1;
+        const name_len: usize = @intCast((seed % name_buf.len) + 1);
+        for (name_buf[0..name_len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+        const headers = [_]HttpHeader{.{
+            .name = name_buf[0..name_len],
+            .value = buf[0..value_len],
+        }};
+        _ = parseRateLimitHeaders(&headers) catch {};
+        _ = parseRetryAfterFromHeaders(&headers, null) catch {};
+    }
 }
 
 test "resilience: malformed header fixture maps to exact parser errors" {

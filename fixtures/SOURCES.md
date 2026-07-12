@@ -95,7 +95,7 @@ Checked-in header snapshots for rate-limit and `Retry-After` parser tests. See `
 - `fixtures/resilience/conflicting-retry-after.json`
     - Source: repository-authored synthetic fixture
     - Created: 2026-06-25
-    - Purpose: assert `Retry-After` wins over `X-Retry-After` when both are present
+    - Purpose: assert `Retry-After` wins over `X-Retry-After` when both are present. When `Date` is also present, the integer delay is anchored to a unix instant (see `parseRetryAfterFromHeaders` in `src/resilience.zig`).
 
 ## TLS test fixtures
 

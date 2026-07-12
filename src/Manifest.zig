@@ -235,6 +235,17 @@ test "Manifest jsonParse: malformed nested values return specific errors" {
     }
 }
 
+test "Manifest jsonParse: empty and truncated bodies return exact errors" {
+    const cases = [_]struct { []const u8, anyerror }{
+        .{ "", error.UnexpectedEndOfInput },
+        .{ "{", error.UnexpectedEndOfInput },
+        .{ "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[", error.UnexpectedEndOfInput },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case[1], json.parse(Manifest, std.testing.allocator, case[0]));
+    }
+}
+
 test "Manifest jsonParse: parses checked-in manifest fixtures" {
     const cases = [_]struct {
         path: []const u8,
@@ -353,4 +364,26 @@ test "Manifest jsonStringify: round-trip preserves all fields" {
         "stable",
         reparsed.value.annotations.?.object.get("org.opencontainers.image.ref.name").?.string,
     );
+}
+
+test "Manifest jsonParse: pseudo-random inputs never panic" {
+    // Fixed seed and iteration count for CI. Same pattern as Index.zig.
+    var seed: u64 = 0x0a1f_e57;
+    var buf: [256]u8 = undefined;
+
+    for (0..512) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const result = json.parse(Manifest, std.testing.allocator, buf[0..len]);
+        if (result) |parsed| {
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
+            try std.testing.expect(parsed.value.media_type == .oci_manifest_v1 or parsed.value.media_type == .docker_manifest_v2);
+        } else |_| {}
+    }
 }

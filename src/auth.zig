@@ -4480,6 +4480,11 @@ test "parseAuthenticateHeader: bearer parsing and error matrix" {
         .{ .raw = "Basic realm=\"example\"", .err = error.UnsupportedAuthenticateScheme },
         .{ .raw = "realm=\"https://example.test/token\"", .err = error.UnsupportedAuthenticateScheme },
         .{ .raw = "Bearer realm=\"https://\"", .err = error.InsecureRealmUrl },
+        .{ .raw = "", .err = error.MissingAuthenticateHeader },
+        .{
+            .raw = "Bearer realm=\"https://auth.example.test/token\" trailing-junk",
+            .err = error.InvalidAuthenticateHeader,
+        },
     };
 
     for (error_cases) |case| {
