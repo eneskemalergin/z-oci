@@ -17,6 +17,7 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 - Public-path `ResolveError` matrix: `getManifest` covers all 13 variants; `validate` covers 11/13 with documented skips plus a digest-pinned `digest_mismatch` proof.
 - Credential-helper hang timeout keyed from `Config.read_timeout_ms`; helper failure stays terminal when `credHelpers` is set; `max_retries` does not gate token rate-limit retries.
 - `pingRegistry` probes `https://{registry}/v2/` for anonymous reachability or auth-required; independent of resolve.
+- In-process mock registry peer (`mock_registry.zig`) plus loopback cleartext rewrite for real-client offline validate/resolve tests (test infrastructure, not a public product API).
 
 ### Changed
 

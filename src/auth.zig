@@ -32,6 +32,7 @@ const CredentialProvider = ConfigModule.CredentialProvider;
 const Reference = @import("Reference.zig");
 const json = @import("json.zig");
 const resilience = @import("resilience.zig");
+const testing_loopback = @import("testing_loopback.zig");
 
 /// Mapped to `ResolveError` at the manifest boundary (most → `auth_failed`).
 pub const AuthError = error{
@@ -845,7 +846,11 @@ pub fn liveTokenHttpExchanger(
 ) AuthError!TokenExchangeResponse {
     defer request.deinit(allocator);
 
-    const uri = std.Uri.parse(request.url) catch return error.TokenExchangeFailed;
+    const loopback_url = testing_loopback.cleartextLoopbackUrlAlloc(allocator, request.url) catch return error.OutOfMemory;
+    defer if (loopback_url) |url| allocator.free(url);
+    const request_url = loopback_url orelse request.url;
+
+    const uri = std.Uri.parse(request_url) catch return error.TokenExchangeFailed;
 
     var http_request = client.request(
         switch (request.method) {

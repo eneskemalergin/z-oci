@@ -48,6 +48,7 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 - Multi-arch public calls without an explicit platform fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
 - Per-request HTTP read/connect timeouts are not wired through `std.http.Client.request` on Zig 0.16 yet (`connect_timeout_ms` is exposed for caller-owned `connectTcpOptions` recipes; see `Config` docs and zig#31305).
 - Windows is not a supported host for live HTTPS registry traffic. Offline parsing works cross-platform; TLS to registries is validated on Linux and macOS only.
+- Live exchangers rewrite `https://` to cleartext `http://` only for loopback registry hosts (`127.0.0.1`, `localhost`, `::1`) so offline mock / local `registry:2` tests can use a real `std.http.Client`. Public hostnames stay HTTPS. There is no public Config switch for cleartext.
 - User-facing CLI commands built on top of the live resolver surface are still future work.
 
 ### Resilience
@@ -259,6 +260,8 @@ This repository vendors Zig 0.16 under `./zig-0.16.0/`. Prefer the bundled compi
 - `zig build bench`: build the benchmark CLI (`z-oci-bench`)
 
 Fixtures under `fixtures/` include checked-in live registry snapshots plus synthetic malformed payloads for deterministic negative-path tests. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
+
+Offline tests can also drive a real `std.http.Client` against an in-process mock peer (`src/mock_registry.zig`) on loopback HTTP. That mock is test infrastructure only—not part of the public library API.
 
 The Zig package contents in this repository bundle `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
 

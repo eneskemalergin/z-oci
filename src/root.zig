@@ -6,6 +6,7 @@
 //! - auth engine: manifest HEAD/GET challenge handling, token exchange, credential providers
 //! - public manifest resolution for single-arch and supported multi-arch flows
 //! - registry `/v2/` ping (`pingRegistry`); not used by resolve
+//! - offline in-process mock peer (`mock_registry.zig`) is test infrastructure only
 //!
 //! Ownership conventions:
 //! - Functions taking an allocator produce owned storage that the caller must
@@ -112,6 +113,11 @@ pub const testing = struct {
     pub const PingHttpRequest = registry_ping.PingHttpRequest;
     pub const PingHttpResponse = registry_ping.PingHttpResponse;
     pub const PingExchangeError = registry_ping.PingExchangeError;
+
+    /// Loopback cleartext helpers. Live exchangers rewrite automatically; these
+    /// exports exist so tests can assert host policy without importing the module.
+    pub const isLoopbackHost = @import("testing_loopback.zig").isLoopbackHost;
+    pub const cleartextLoopbackUrlAlloc = @import("testing_loopback.zig").cleartextLoopbackUrlAlloc;
 
     pub fn pingRegistryWithExchanger(
         allocator: std.mem.Allocator,
@@ -1664,6 +1670,9 @@ test {
     _ = @import("Config.zig");
     _ = @import("resolver.zig");
     _ = @import("resilience.zig");
+    _ = @import("registry_ping.zig");
+    _ = @import("testing_loopback.zig");
+    _ = @import("mock_registry.zig");
     _ = @import("test_support.zig");
     _ = @import("test_matrix.zig");
 }
@@ -2035,6 +2044,78 @@ test "pingRegistryWithExchanger: missing ca bundle maps to PublicApiError" {
     );
     try std.testing.expectError(error.CaBundleFileNotFound, result);
     try std.testing.expectEqual(@as(usize, 0), MockHarness.calls);
+}
+
+test "mock registry core: anonymous single-arch validate over loopback http" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+
+    const mock = try mock_registry.MockRegistry.start(allocator, io, .{
+        .repository = "library/alpine",
+        .tag = "latest",
+        .body = body,
+        .content_type = MediaType.oci_manifest_v1.toString(),
+    }, 1);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const ref_str = try mock.imageReferenceAlloc(allocator);
+    defer allocator.free(ref_str);
+    var ref = try Reference.parse(allocator, ref_str);
+    defer ref.deinit(allocator);
+
+    const outcome = try validate(allocator, &client, Config{}, ref, null);
+    try std.testing.expectEqual(ValidateOutcome.valid, outcome);
+}
+
+test "mock registry core: anonymous single-arch resolve over loopback http" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+
+    const mock = try mock_registry.MockRegistry.start(allocator, io, .{
+        .repository = "library/alpine",
+        .tag = "latest",
+        .body = body,
+        .content_type = MediaType.oci_manifest_v1.toString(),
+    }, 1);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const ref_str = try mock.imageReferenceAlloc(allocator);
+    defer allocator.free(ref_str);
+    var ref = try Reference.parse(allocator, ref_str);
+    var outcome = try resolve(allocator, &client, Config{}, ref, null);
+    defer switch (outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |err| {
+            ref.deinit(allocator);
+            deinitResolveFailure(err, allocator);
+        },
+    };
+
+    switch (outcome) {
+        .success => |result| {
+            try std.testing.expectEqualStrings(
+                mock.digest_header["sha256:".len..],
+                result.digest.hex,
+            );
+            try std.testing.expect(std.mem.startsWith(u8, result.reference.registry, "127.0.0.1:"));
+            try std.testing.expectEqualStrings("library/alpine", result.reference.repository);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
 }
 
 test "resolveManyWithExchangers: single-item success owns output and preserves input" {

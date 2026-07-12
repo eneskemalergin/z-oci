@@ -11,6 +11,7 @@ const auth = @import("auth.zig");
 const config_module = @import("Config.zig");
 const Config = config_module.Config;
 const resilience = @import("resilience.zig");
+const testing_loopback = @import("testing_loopback.zig");
 const Digest = @import("Digest.zig");
 const DockerManifestList = @import("Index.zig").DockerManifestList;
 const MediaType = @import("MediaType.zig").MediaType;
@@ -582,7 +583,10 @@ pub fn liveManifestHttpExchanger(
 
     var redirect_hops_remaining: u8 = redirect_hop_limit;
     while (true) {
-        const uri = std.Uri.parse(current_url) catch return error.TransportFailed;
+        const loopback_url = testing_loopback.cleartextLoopbackUrlAlloc(allocator, current_url) catch return error.OutOfMemory;
+        defer if (loopback_url) |url| allocator.free(url);
+        const request_url = loopback_url orelse current_url;
+        const uri = std.Uri.parse(request_url) catch return error.TransportFailed;
 
         var http_request = client.request(
             switch (request.method) {

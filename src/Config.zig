@@ -17,6 +17,11 @@
 //!   does not honor it until Zig passes `ConnectTcpOptions.timeout` through
 //!   (zig#31305). Manifest/token HTTP read timeouts are not configurable per request.
 //!
+//! Loopback cleartext (testing / local registry):
+//! - URL builders still emit `https://`. Live manifest/token/ping exchangers rewrite
+//!   to `http://` only when the registry host is `127.0.0.1`, `localhost`, or `::1`.
+//! - No public Config switch. Public hostnames are never rewritten.
+//!
 //! TLS trust (`ca_bundle_path`):
 //! - When unset, the caller-owned `std.http.Client` loads OS trust roots on the first
 //!   HTTPS request (Linux: `/etc/ssl/certs/...` and distro-specific paths; macOS:

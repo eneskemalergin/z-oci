@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const resilience = @import("resilience.zig");
+const testing_loopback = @import("testing_loopback.zig");
 
 pub const RegistryPingStatus = enum {
     reachable_anonymous,
@@ -116,7 +117,11 @@ pub fn livePingHttpExchanger(
 ) PingExchangeError!PingHttpResponse {
     defer request.deinit(allocator);
 
-    const uri = std.Uri.parse(request.url) catch return error.TransportFailed;
+    const loopback_url = testing_loopback.cleartextLoopbackUrlAlloc(allocator, request.url) catch return error.OutOfMemory;
+    defer if (loopback_url) |url| allocator.free(url);
+    const request_url = loopback_url orelse request.url;
+
+    const uri = std.Uri.parse(request_url) catch return error.TransportFailed;
     var http_request = client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
     }) catch |err| return mapLivePingTransportError(err);
