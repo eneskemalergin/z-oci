@@ -30,6 +30,7 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 - The `testing` namespace re-exports the in-process mock peer for callers writing integration tests.
 - Ping URL ownership is centralized in `pingRegistryWithExchanger`; exchangers borrow the probe URL only.
 - README and CONTRIBUTING list the same build steps as the repository gate (`security-check`, `integration-registry`, bundled toolchain, `fmt --check`).
+- v0.6.0 documentation now points at `benchmarks/baselines/v0.6.0.json` and `benchmarks/baselines/v0.6.0-debug-counting.txt` as current comparison snapshots.
 
 ### Fixed
 
@@ -41,9 +42,9 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 ### Verified
 
 - `./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes (350/350 tests, examples-smoke, workflow-smoke, security-check).
-- `./zig-0.16.0/zig fmt --check` passes on `src/`, `examples/`, `benchmarks/`, `build.zig`, `tools/`, `integration/`.
+- `./zig-0.16.0/zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/` passes on `src/`, `examples/`, `benchmarks/`, `build.zig`, `tools/`, `integration/`.
 - `./zig-0.16.0/zig build security-check` passes on tracked roots including `integration/`.
-- Debug `--counting` for core resolve bench ops matches `benchmarks/baselines/v0.5.0-debug-counting.txt` allocation counts (5 / 5 / 27 / 50 per call); no hot-path optimization required. Official ReleaseFast baseline remains `benchmarks/baselines/v0.5.0.json` until the v0.6.0 tag.
+- Debug `--counting` for core resolve bench ops matches `benchmarks/baselines/v0.6.0-debug-counting.txt` allocation counts (`resolve-single` 500, `resolve-session` 500, `resolve-many` 2700, `resolve-many-unique` 5000). ReleaseFast baseline is `benchmarks/baselines/v0.6.0.json`.
 
 ## [0.5.0] - 2026-07-10 - [Tagged]
 

@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.5.0-8B5CF6?style=flat-square" alt="v0.5.0">
-    <img src="https://img.shields.io/badge/status-batch%20resolve-2D7D46?style=flat-square" alt="Status: batch resolve">
+    <img src="https://img.shields.io/badge/version-v0.6.0%20unreleased-8B5CF6?style=flat-square" alt="v0.6.0">
+    <img src="https://img.shields.io/badge/status-documentation%20run-2D7D46?style=flat-square" alt="Status: documentation run">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -48,6 +48,8 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 - Multi-arch public calls without an explicit platform fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
 - Per-request HTTP read/connect timeouts are not wired through `std.http.Client.request` on Zig 0.16 yet (`connect_timeout_ms` is exposed for caller-owned `connectTcpOptions` recipes; see `Config` docs and zig#31305).
 - Windows is not a supported host for live HTTPS registry traffic. Offline parsing works cross-platform; TLS to registries is validated on Linux and macOS only.
+- `pingRegistry` is a status probe. `200` reports anonymous reachability, `401` reports auth required, and everything else maps to `unexpected_status`. Redirects are not followed.
+- `resolve` does not call ping, and ping does not call resolve.
 - Live exchangers rewrite `https://` to cleartext `http://` only for loopback registry hosts (`127.0.0.1`, `localhost`, `::1`) so offline mock / local `registry:2` tests can use a real `std.http.Client`. Public hostnames stay HTTPS. There is no public Config switch for cleartext.
 - User-facing CLI commands built on top of the live resolver surface are still future work.
 
@@ -79,18 +81,28 @@ Checked-in fixtures and in-process mocks cover most paths in `zig build test`. L
 
 ### Performance
 
-Representative Debug `--counting` snapshot for single-image ops from v0.4.0 (see `benchmarks/baselines/v0.4.0.json`):
+ReleaseFast baseline for this version is `benchmarks/baselines/v0.6.0.json`:
 
-| Operation               | Mean per iteration | Allocs per call |
-| ----------------------- | ------------------ | --------------- |
-| `resolve-single`        | 78 μs              | 6               |
-| `resolve-multi`         | 664 μs             | 10              |
-| `validate-single`       | 28 μs              | 3               |
-| `get-manifest`          | 125 μs             | 6               |
-| `authenticate-miss`     | 109 μs             | 10              |
-| `authenticate-hit`      | 3 μs               | 0               |
+| Operation                 | Mean per iteration | Mean RSS | Samples |
+| ------------------------- | ------------------ | -------- | ------- |
+| `reference-parse`         | 306847.4 us        | 1.05 MB  | 14      |
+| `digest-parse`            | 1331.9 us          | 1.05 MB  | 2985    |
+| `manifest-parse`          | 262327.0 us        | 1.07 MB  | 16      |
+| `challenge-parse`         | 5318.3 us          | 1.10 MB  | 751     |
+| `platform-match`          | 1319.3 us          | 1.29 MB  | 3013    |
+| `authenticate-miss`       | 69191.6 us         | 3.05 MB  | 58      |
+| `authenticate-hit`        | 1589.2 us          | 1.70 MB  | 2505    |
+| `authenticate-rate-limit` | 83847.2 us         | 3.05 MB  | 48      |
+| `resolve-single`          | 42199.9 us         | 1.97 MB  | 95      |
+| `resolve-single-retry`    | 42154.7 us         | 1.99 MB  | 95      |
+| `resolve-session`         | 43309.9 us         | 2.01 MB  | 93      |
+| `resolve-many`            | 199525.9 us        | 2.02 MB  | 21      |
+| `resolve-many-unique`     | 385818.8 us        | 2.03 MB  | 11      |
+| `resolve-multi`           | 175768.9 us        | 2.03 MB  | 23      |
+| `validate-single`         | 25160.7 us         | 2.04 MB  | 159     |
+| `get-manifest`            | 54015.5 us         | 2.07 MB  | 75      |
 
-v0.5.0 batch Debug `--counting` (100 iterations; see `benchmarks/baselines/v0.5.0-debug-counting.txt`): `resolve-single` 5 allocs/call, `resolve-many` 27 allocs/batch, `resolve-many-unique` 50 allocs/batch. Full ReleaseFast zebrac numbers live in `benchmarks/baselines/v0.5.0.json`. Operation names match `z-oci-bench <operation>`. Release notes live in [CHANGELOG.md](CHANGELOG.md).
+v0.6.0 Debug `--counting` snapshot for core resolve ops (100 iterations; see `benchmarks/baselines/v0.6.0-debug-counting.txt`): `resolve-single` 500 allocs/call, `resolve-session` 500 allocs/call, `resolve-many` 2700 allocs/batch, `resolve-many-unique` 5000 allocs/batch.
 
 ## Getting started
 

@@ -42,6 +42,44 @@ Current operations (run `./zig-out/bin/z-oci-bench` with no args for the same li
 - `v0.4.0.json` is the Phase 4 pre-release baseline: reactive transport retries (wave 1) plus v0.3.9 performance hot-path work (wave 2). Includes `resolve-single-retry`, `authenticate-rate-limit`, and `resolve-session`. Regenerated with zebrac 0.6.0 after the token-cache LRU pre-insert eviction fix.
 - `v0.5.0.json` is the Phase 5 batch-resolve baseline. Adds `resolve-many` and `resolve-many-unique` to the full operation set. Captured 2026-07-10 with zebrac 0.6.0.
 - `v0.5.0-debug-counting.txt` is the Debug `--counting` snapshot for `resolve-single`, `resolve-session`, `resolve-many`, and `resolve-many-unique` (100 iterations each).
+- `v0.6.0.json` is the current release-baseline snapshot for v0.6.0. It includes all 16 operations and was captured with zebrac 0.6.0.
+- `v0.6.0-debug-counting.txt` is the current release-debug snapshot for core resolve batch behavior: `resolve-single`, `resolve-session`, `resolve-many`, and `resolve-many-unique` (100 iterations each).
+
+### `v0.6.0-debug-counting.txt`: Debug `--counting` (per call / per batch)
+
+Captured with `zig build -Doptimize=Debug install`, 100 iterations each.
+
+| Operation | Mean per iteration | Allocs per call |
+| --- | --- | --- |
+| `resolve-single` | 70 us | 500 |
+| `resolve-session` | 66 us | 500 |
+| `resolve-many` | 242 us | 2700 |
+| `resolve-many-unique` | 514 us | 5000 |
+
+`resolve-many` is a 4-item duplicate-heavy batch (1 manifest exchange per batch). `resolve-many-unique` is a 4-item unique-reference batch (4 exchanges per batch).
+
+### `v0.6.0.json`: ReleaseFast zebrac (per iteration)
+
+Captured with `zig build -Doptimize=ReleaseFast install`, `./tools/zebrac -d 4000 -w 1`.
+
+| Operation | Mean per iteration | Mean RSS | Samples |
+| --- | --- | --- | --- |
+| `reference-parse` | 306847.4 us | 1.05 MB | 14 |
+| `digest-parse` | 1331.9 us | 1.05 MB | 2985 |
+| `manifest-parse` | 262327.0 us | 1.07 MB | 16 |
+| `challenge-parse` | 5318.3 us | 1.10 MB | 751 |
+| `platform-match` | 1319.3 us | 1.29 MB | 3013 |
+| `authenticate-miss` | 69191.6 us | 3.05 MB | 58 |
+| `authenticate-hit` | 1589.2 us | 1.70 MB | 2505 |
+| `authenticate-rate-limit` | 83847.2 us | 3.05 MB | 48 |
+| `resolve-single` | 42199.9 us | 1.97 MB | 95 |
+| `resolve-single-retry` | 42154.7 us | 1.99 MB | 95 |
+| `resolve-session` | 43309.9 us | 2.01 MB | 93 |
+| `resolve-many` | 199525.9 us | 2.02 MB | 21 |
+| `resolve-many-unique` | 385818.8 us | 2.03 MB | 11 |
+| `resolve-multi` | 175768.9 us | 2.03 MB | 23 |
+| `validate-single` | 25160.7 us | 2.04 MB | 159 |
+| `get-manifest` | 54015.5 us | 2.07 MB | 75 |
 
 ### `v0.5.0.json`: ReleaseFast zebrac (per iteration)
 
@@ -127,7 +165,7 @@ Run ReleaseFast install to completion before starting zebrac. Do not run `instal
 
 ```sh
 zig build -Doptimize=ReleaseFast install
-./tools/zebrac -d 4000 -w 1 --json benchmarks/baselines/v0.5.0.json \
+./tools/zebrac -d 4000 -w 1 --json benchmarks/baselines/v0.6.0.json \
   './zig-out/bin/z-oci-bench reference-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench digest-parse --iterations 10000' \
   './zig-out/bin/z-oci-bench manifest-parse --iterations 10000' \
