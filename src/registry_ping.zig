@@ -6,6 +6,10 @@
 //! Failures use `RegistryPingFailure` (no image reference). CA preflight stays
 //! on the public `PublicApiError` surface in `root.zig`.
 //!
+//! `PingHttpExchanger` receives a borrowed `PingHttpRequest.url`; the caller
+//! (`pingRegistryWithExchanger`) owns that buffer for the duration of the call.
+//! Exchangers must not free `request.url`.
+//!
 //! Classification locks (status-only probe; Distribution API header not required):
 //! - `200` maps to `reachable_anonymous`
 //! - `401` maps to `reachable_auth_required`
@@ -15,6 +19,7 @@
 const std = @import("std");
 const resilience = @import("resilience.zig");
 const testing_loopback = @import("testing_loopback.zig");
+const mock_registry = @import("mock_registry.zig");
 
 pub const RegistryPingStatus = enum {
     reachable_anonymous,
@@ -68,11 +73,11 @@ pub const PingHttpExchanger = *const fn (
     request: PingHttpRequest,
 ) PingExchangeError!PingHttpResponse;
 
-pub fn pingRegistryUriAlloc(allocator: std.mem.Allocator, registry: []const u8) error{OutOfMemory}![]u8 {
+fn pingRegistryUriAlloc(allocator: std.mem.Allocator, registry: []const u8) error{OutOfMemory}![]u8 {
     return std.fmt.allocPrint(allocator, "https://{s}/v2/", .{registry});
 }
 
-pub fn classifyPingHttpStatus(status: std.http.Status) RegistryPingResult {
+fn classifyPingHttpStatus(status: std.http.Status) RegistryPingResult {
     return switch (status) {
         .ok => .{ .ok = .reachable_anonymous },
         .unauthorized => .{ .ok = .reachable_auth_required },
@@ -83,7 +88,7 @@ pub fn classifyPingHttpStatus(status: std.http.Status) RegistryPingResult {
     };
 }
 
-pub fn mapPingExchangeError(err: PingExchangeError) RegistryPingFailure {
+fn mapPingExchangeError(err: PingExchangeError) RegistryPingFailure {
     return switch (err) {
         error.OutOfMemory => .{ .kind = .other },
         error.Timeout => .{ .kind = .timeout },
@@ -120,6 +125,8 @@ pub fn pingRegistryWithExchanger(
     return classifyPingHttpStatus(response.status);
 }
 
+/// Live GET exchanger for `https://{registry}/v2/`. Rewrites loopback hosts to
+/// cleartext HTTP. Borrows `request.url`; does not free it.
 pub fn livePingHttpExchanger(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -258,7 +265,6 @@ test "mapPingExchangeError: timeout network tls and other kinds" {
 }
 
 test "livePingHttpExchanger: loopback mock peer uses cleartext rewrite" {
-    const mock_registry = @import("mock_registry.zig");
     const io = std.testing.io;
     const mock = try mock_registry.MockRegistry.startWithHandler(
         std.testing.allocator,
@@ -333,7 +339,6 @@ test "pingRegistryWithExchanger: exchange error without exchanger deinit does no
 }
 
 test "livePingHttpExchanger: allocation failures do not leak request URL" {
-    const mock_registry = @import("mock_registry.zig");
     const io = std.testing.io;
     const mock = try mock_registry.MockRegistry.startWithHandler(
         std.testing.allocator,

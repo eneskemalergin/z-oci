@@ -65,4 +65,4 @@ What the harness does (`integration/registry2/run.sh`):
 4. Run `registry2-harness` with the loaded tag ref and a missing tag ref.
 5. `compose down -v` on exit.
 
-`pingRegistry` is intentionally out of scope here: resolve and validate use the live client path; ping is a separate caller API (see `root.zig` mock integration ping-then-resolve test).
+`pingRegistry` is intentionally out of scope here: resolve and validate use the live client path; ping is a separate public API.

@@ -17,20 +17,24 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 - Public-path `ResolveError` matrix: `getManifest` covers all 13 variants; `validate` covers 11/13 with documented skips plus a digest-pinned `digest_mismatch` proof.
 - Credential-helper hang timeout keyed from `Config.read_timeout_ms`; helper failure stays terminal when `credHelpers` is set; `max_retries` does not gate token rate-limit retries.
 - `pingRegistry` probes `https://{registry}/v2/` for anonymous reachability or auth-required; independent of resolve.
-- In-process mock registry peer (`mock_registry.zig`) plus loopback cleartext rewrite for real-client offline validate/resolve tests (test infrastructure, not a public product API).
+- In-process loopback mock registry peer for offline tests that drive a real `std.http.Client` (not a public product API).
 - Mock hard-case coverage against a real `std.http.Client`: bearer auth, redirect keep/strip, content-type/digest/size errors, multi-arch, depth limit, 429/503 retry, and ping status classification.
-- Opt-in local `registry:2` harness (`zig build integration-registry`): resolve by tag and digest, validate missing → `not_found`. Clear-fails when Docker is absent; never part of `zig build test`.
+- Opt-in local `registry:2` harness (`zig build integration-registry`): resolve by tag and digest, validate missing -> `not_found`. Clear-fails when Docker is absent; never part of `zig build test`.
 - `security-check` scans `integration/` and flags non-placeholder Docker `auths` embedded in `.zig` sources.
 - Registry compatibility coverage in README (Hub, GHCR, Quay, generic bearer, loopback `registry:2`; fixtures, mocks, opt-in harness, and live commands).
-- Testing run: mock/ping/loopback edge and invariant coverage; workflow smoke trimmed duplicate ping status test; `deinitResolveOutcome` ownership fix; mock `NoManifestScript` error and request-budget test.
-- Real integration checks: public `resolveMany` pin-list, ping-then-resolve, and batch failure ownership on in-process mock peer (`root.zig`); recorded `registry:2` recipe; manual live ping `--bad-host` / `--missing-ca` recipes (`temp/live_ping_smoke.zig`).
+- Offline test coverage for mock/ping/loopback edge cases and ownership invariants.
+- Integration-style offline checks: public `resolveMany` pin-list, ping-then-resolve caller flow, and batch failure ownership on a loopback mock peer; recorded `registry:2` recipe in `integration/registry2/README.md`.
 
 ### Changed
+
+- The `testing` namespace re-exports the in-process mock peer for callers writing integration tests.
+- Ping URL ownership is centralized in `pingRegistryWithExchanger`; exchangers borrow the probe URL only.
+- README and CONTRIBUTING list the same build steps as the repository gate (`security-check`, `integration-registry`, bundled toolchain, `fmt --check`).
 
 ### Fixed
 
 - Live manifest redirect follow rewrites loopback `https://` Locations to cleartext before the keep-authorization origin compare, so same-origin bearer auth is not stripped on local mock peers.
-- Workflow smoke `deinitResolveOutcome` tears down success and failure paths; arena-backed preemptive rate-limit smoke skips double-free on success.
+- Cross-module workflow tests: `deinitResolveOutcome` tears down success and failure paths; arena-backed preemptive rate-limit smoke skips double-free on success.
 - `pingRegistryWithExchanger` owns the probe URL buffer; ping exchangers borrow only (prevents double-free when mock exchangers also freed the URL).
 - Docker credential-helper timeout path relies on `defer child.kill` for reap (removed redundant kill on timeout).
 

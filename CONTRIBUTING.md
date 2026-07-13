@@ -12,13 +12,24 @@ The current release gate covers the codebase from a few complementary angles:
 
 ## Running tests
 
+Prefer the bundled toolchain and lib dir so builds match the documented offline gate:
+
 ```sh
-zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/
-zig build test            # Run all unit tests (includes security-check, workflow-smoke, examples-smoke)
-zig build examples-smoke  # Smoke pass over offline example programs
-zig build workflow-smoke  # Offline workflow smoke-test matrix
+./zig-0.16.0/zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/
+./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib
+./zig-0.16.0/zig build security-check --zig-lib-dir ./zig-0.16.0/lib
+./zig-0.16.0/zig build examples-smoke --zig-lib-dir ./zig-0.16.0/lib
+./zig-0.16.0/zig build workflow-smoke --zig-lib-dir ./zig-0.16.0/lib
+```
+
+`zig build test` already runs `security-check`, `workflow-smoke`, and `examples-smoke`. The standalone steps above are for narrower iteration.
+
+Opt-in interoperability (requires Docker; never part of `zig build test`):
+
+```sh
+./zig-0.16.0/zig build integration-registry --zig-lib-dir ./zig-0.16.0/lib
 ```
 
 ## Requirements
 
-Zig **0.16.0** or later.
+Zig **0.16.0** (bundled under `./zig-0.16.0/` in this repository).

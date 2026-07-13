@@ -6,7 +6,7 @@
 //! - auth engine: manifest HEAD/GET challenge handling, token exchange, credential providers
 //! - public manifest resolution for single-arch and supported multi-arch flows
 //! - registry `/v2/` ping (`pingRegistry`); not used by resolve
-//! - offline in-process mock peer (`mock_registry.zig`) is test infrastructure only
+//! - offline in-process mock peer for integration tests (not a public product API)
 //!
 //! Ownership conventions:
 //! - Functions taking an allocator produce owned storage that the caller must
@@ -66,6 +66,8 @@ const std = @import("std");
 const resolver = @import("resolver.zig");
 const resilience = @import("resilience.zig");
 const registry_ping = @import("registry_ping.zig");
+const testing_loopback = @import("testing_loopback.zig");
+const mock_registry_peer = @import("mock_registry.zig");
 pub const test_matrix = @import("test_matrix.zig");
 
 pub const Digest = @import("Digest.zig");
@@ -114,10 +116,12 @@ pub const testing = struct {
     pub const PingHttpResponse = registry_ping.PingHttpResponse;
     pub const PingExchangeError = registry_ping.PingExchangeError;
 
-    /// Loopback cleartext helpers. Live exchangers rewrite automatically; these
-    /// exports exist so tests can assert host policy without importing the module.
-    pub const isLoopbackHost = @import("testing_loopback.zig").isLoopbackHost;
-    pub const cleartextLoopbackUrlAlloc = @import("testing_loopback.zig").cleartextLoopbackUrlAlloc;
+    /// In-process mock Distribution peer. Test infrastructure only.
+    pub const mock_registry = mock_registry_peer;
+
+    /// Loopback cleartext policy helpers (`src/testing_loopback.zig`). Production URLs stay `https://`.
+    pub const isLoopbackHost = testing_loopback.isLoopbackHost;
+    pub const cleartextLoopbackUrlAlloc = testing_loopback.cleartextLoopbackUrlAlloc;
 
     pub fn pingRegistryWithExchanger(
         allocator: std.mem.Allocator,
@@ -1670,9 +1674,6 @@ test {
     _ = @import("Config.zig");
     _ = @import("resolver.zig");
     _ = @import("resilience.zig");
-    _ = @import("registry_ping.zig");
-    _ = @import("testing_loopback.zig");
-    _ = @import("mock_registry.zig");
     _ = @import("test_support.zig");
     _ = @import("test_matrix.zig");
 }
@@ -2044,14 +2045,13 @@ test "pingRegistryWithExchanger: missing ca bundle maps to PublicApiError" {
 }
 
 test "mock registry core: anonymous single-arch validate over loopback http" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(body);
 
-    const mock = try mock_registry.MockRegistry.start(allocator, io, .{
+    const mock = try mock_registry_peer.MockRegistry.start(allocator, io, .{
         .repository = "library/alpine",
         .tag = "latest",
         .body = body,
@@ -2072,14 +2072,13 @@ test "mock registry core: anonymous single-arch validate over loopback http" {
 }
 
 test "mock registry core: anonymous single-arch resolve over loopback http" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(body);
 
-    const mock = try mock_registry.MockRegistry.start(allocator, io, .{
+    const mock = try mock_registry_peer.MockRegistry.start(allocator, io, .{
         .repository = "library/alpine",
         .tag = "latest",
         .body = body,
@@ -2116,13 +2115,12 @@ test "mock registry core: anonymous single-arch resolve over loopback http" {
 }
 
 test "mock registry hard: bearer challenge then token then resolve" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(body);
-    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    const digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, body);
     defer allocator.free(digest);
 
     const MockHarness = struct {
@@ -2133,7 +2131,7 @@ test "mock registry hard: bearer challenge then token then resolve" {
         content_type: []const u8 = MediaType.oci_manifest_v1.toString(),
         token_body: []const u8 = "{\"token\":\"mock-token\",\"expires_in\":60}",
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             const target = request.head.target;
             const method = request.head.method;
@@ -2159,7 +2157,7 @@ test "mock registry hard: bearer challenge then token then resolve" {
                 return;
             }
 
-            const authorization = mock_registry.requestAuthorization(request);
+            const authorization = mock_registry_peer.requestAuthorization(request);
             if (authorization == null or !std.mem.eql(u8, authorization.?, "Bearer mock-token")) {
                 var www_buf: [256]u8 = undefined;
                 const www = try std.fmt.bufPrint(
@@ -2190,7 +2188,7 @@ test "mock registry hard: bearer challenge then token then resolve" {
     };
 
     var harness: MockHarness = .{ .body = body, .digest = digest };
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
     defer mock.deinit();
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2215,13 +2213,12 @@ test "mock registry hard: bearer challenge then token then resolve" {
 }
 
 test "mock registry hard: same-origin redirect keeps bearer" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(body);
-    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    const digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, body);
     defer allocator.free(digest);
 
     const MockHarness = struct {
@@ -2229,10 +2226,10 @@ test "mock registry hard: same-origin redirect keeps bearer" {
         digest: []const u8,
         saw_auth_on_final: bool = false,
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             const target = request.head.target;
-            const authorization = mock_registry.requestAuthorization(request);
+            const authorization = mock_registry_peer.requestAuthorization(request);
 
             if (std.mem.eql(u8, target, "/v2/library/alpine/manifests/latest")) {
                 if (authorization == null) {
@@ -2287,7 +2284,7 @@ test "mock registry hard: same-origin redirect keeps bearer" {
     };
 
     var harness: MockHarness = .{ .body = body, .digest = digest };
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 6, MockHarness.handle, &harness);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 6, MockHarness.handle, &harness);
     defer mock.deinit();
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2309,13 +2306,12 @@ test "mock registry hard: same-origin redirect keeps bearer" {
 }
 
 test "mock registry hard: cross-port redirect strips bearer" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(body);
-    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    const digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, body);
     defer allocator.free(digest);
 
     const FinalMockHarness = struct {
@@ -2323,9 +2319,9 @@ test "mock registry hard: cross-port redirect strips bearer" {
         digest: []const u8,
         saw_authorization: bool = false,
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
-            self.saw_authorization = mock_registry.requestAuthorization(request) != null;
+            self.saw_authorization = mock_registry_peer.requestAuthorization(request) != null;
             const headers = [_]std.http.Header{
                 .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
                 .{ .name = "Docker-Content-Digest", .value = self.digest },
@@ -2335,16 +2331,16 @@ test "mock registry hard: cross-port redirect strips bearer" {
     };
 
     var final_harness: FinalMockHarness = .{ .body = body, .digest = digest };
-    const final_mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 2, FinalMockHarness.handle, &final_harness);
+    const final_mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 2, FinalMockHarness.handle, &final_harness);
     defer final_mock.deinit();
 
     const FirstMockHarness = struct {
         final_host: []const u8,
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             const target = request.head.target;
-            const authorization = mock_registry.requestAuthorization(request);
+            const authorization = mock_registry_peer.requestAuthorization(request);
 
             if (std.mem.startsWith(u8, target, "/token")) {
                 try request.respond("{\"token\":\"mock-token\",\"expires_in\":60}", .{
@@ -2385,7 +2381,7 @@ test "mock registry hard: cross-port redirect strips bearer" {
     };
 
     var first_harness: FirstMockHarness = .{ .final_host = final_mock.registry_host };
-    const first_mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, FirstMockHarness.handle, &first_harness);
+    const first_mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 4, FirstMockHarness.handle, &first_harness);
     defer first_mock.deinit();
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2407,7 +2403,6 @@ test "mock registry hard: cross-port redirect strips bearer" {
 }
 
 test "mock registry hard: wrong content-type and digest mismatch and oversized body" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2422,7 +2417,7 @@ test "mock registry hard: wrong content-type and digest mismatch and oversized b
             case: Case,
             body: []const u8,
 
-            fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
                 const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
                 _ = request.head.method;
                 switch (self.case) {
@@ -2460,7 +2455,7 @@ test "mock registry hard: wrong content-type and digest mismatch and oversized b
         };
 
         var harness: MockHarness = .{ .case = case, .body = body };
-        const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 2, MockHarness.handle, &harness);
+        const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 2, MockHarness.handle, &harness);
         defer mock.deinit();
 
         var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2488,20 +2483,19 @@ test "mock registry hard: wrong content-type and digest mismatch and oversized b
 }
 
 test "mock registry hard: multi-arch platform select over loopback" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const child_body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(child_body);
-    const child_digest = try mock_registry.sha256DigestHeaderAlloc(allocator, child_body);
+    const child_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, child_body);
     defer allocator.free(child_digest);
 
     var index_buf: [512]u8 = undefined;
     const index_body = try std.fmt.bufPrint(&index_buf,
         \\{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":{d},"digest":"{s}","platform":{{"architecture":"amd64","os":"linux"}}}}]}}
     , .{ child_body.len, child_digest });
-    const index_digest = try mock_registry.sha256DigestHeaderAlloc(allocator, index_body);
+    const index_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, index_body);
     defer allocator.free(index_digest);
 
     const MockHarness = struct {
@@ -2510,7 +2504,7 @@ test "mock registry hard: multi-arch platform select over loopback" {
         child_body: []const u8,
         child_digest: []const u8,
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             const target = request.head.target;
             if (std.mem.eql(u8, target, "/v2/library/alpine/manifests/latest")) {
@@ -2547,7 +2541,7 @@ test "mock registry hard: multi-arch platform select over loopback" {
         .child_body = child_body,
         .child_digest = child_digest,
     };
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
     defer mock.deinit();
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2570,7 +2564,6 @@ test "mock registry hard: multi-arch platform select over loopback" {
 }
 
 test "mock registry hard: nested index depth limit" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2590,7 +2583,7 @@ test "mock registry hard: nested index depth limit" {
         \\{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}}
     , .{});
     bodies[5] = leaf;
-    digests[5] = try mock_registry.sha256DigestHeaderAlloc(allocator, leaf);
+    digests[5] = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, leaf);
 
     var i: isize = 4;
     while (i >= 0) : (i -= 1) {
@@ -2599,14 +2592,14 @@ test "mock registry hard: nested index depth limit" {
         bodies[idx] = try std.fmt.allocPrint(allocator,
             \\{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.index.v1+json","size":{d},"digest":"{s}","platform":{{"architecture":"amd64","os":"linux"}}}}]}}
         , .{ bodies[idx + 1].len, child });
-        digests[idx] = try mock_registry.sha256DigestHeaderAlloc(allocator, bodies[idx]);
+        digests[idx] = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, bodies[idx]);
     }
 
     const MockHarness = struct {
         bodies: []const []u8,
         digests: []const []u8,
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             const target = request.head.target;
             if (std.mem.eql(u8, target, "/v2/library/alpine/manifests/latest")) {
@@ -2640,7 +2633,7 @@ test "mock registry hard: nested index depth limit" {
     };
 
     var harness: MockHarness = .{ .bodies = bodies, .digests = digests };
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 16, MockHarness.handle, &harness);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 16, MockHarness.handle, &harness);
     defer mock.deinit();
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2662,13 +2655,12 @@ test "mock registry hard: nested index depth limit" {
 }
 
 test "mock registry hard: 429 then success through live resilience" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(body);
-    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    const digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, body);
     defer allocator.free(digest);
 
     const MockHarness = struct {
@@ -2676,7 +2668,7 @@ test "mock registry hard: 429 then success through live resilience" {
         digest: []const u8,
         attempts: usize = 0,
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             self.attempts += 1;
             if (self.attempts == 1) {
@@ -2701,7 +2693,7 @@ test "mock registry hard: 429 then success through live resilience" {
     };
 
     var harness: MockHarness = .{ .body = body, .digest = digest };
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
     defer mock.deinit();
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2723,13 +2715,12 @@ test "mock registry hard: 429 then success through live resilience" {
 }
 
 test "mock registry hard: 503 then success through live resilience" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(body);
-    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, body);
+    const digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, body);
     defer allocator.free(digest);
 
     const MockHarness = struct {
@@ -2737,7 +2728,7 @@ test "mock registry hard: 503 then success through live resilience" {
         digest: []const u8,
         attempts: usize = 0,
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             self.attempts += 1;
             if (self.attempts == 1) {
@@ -2762,7 +2753,7 @@ test "mock registry hard: 503 then success through live resilience" {
     };
 
     var harness: MockHarness = .{ .body = body, .digest = digest };
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 4, MockHarness.handle, &harness);
     defer mock.deinit();
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2784,7 +2775,6 @@ test "mock registry hard: 503 then success through live resilience" {
 }
 
 test "mock registry hard: ping status classification matrix" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2792,7 +2782,7 @@ test "mock registry hard: ping status classification matrix" {
     for ([_]Case{ .ok, .ok_no_api, .unauthorized, .forbidden, .redirect }) |case| {
         const MockHarness = struct {
             case: Case,
-            fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
                 const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
                 switch (self.case) {
                     .ok => try request.respond("{}", .{
@@ -2815,7 +2805,7 @@ test "mock registry hard: ping status classification matrix" {
         };
 
         var harness: MockHarness = .{ .case = case };
-        const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 2, MockHarness.handle, &harness);
+        const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 2, MockHarness.handle, &harness);
         defer mock.deinit();
 
         var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -2833,7 +2823,6 @@ test "mock registry hard: ping status classification matrix" {
 test "mock registry integration: resolveMany pin-list over peer" {
     defer test_matrix.Fixtures.reset(std.testing.allocator);
 
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const manifest_fixture = "fixtures/manifests/busybox-amd64-live-oci-manifest.json";
@@ -2850,7 +2839,7 @@ test "mock registry integration: resolveMany pin-list over peer" {
             if (event.event == .cache_hit) self.cache_hits += 1;
         }
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) !void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) !void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             const target = request.head.target;
             if (std.mem.eql(u8, target, "/v2/") or std.mem.eql(u8, target, "/v2")) {
@@ -2885,7 +2874,7 @@ test "mock registry integration: resolveMany pin-list over peer" {
 
     const manifest_body = try readFixtureAlloc(allocator, manifest_fixture, 32 * 1024);
     defer allocator.free(manifest_body);
-    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, manifest_body);
+    const digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, manifest_body);
     defer allocator.free(digest);
 
     var harness: PinHarness = .{
@@ -2896,7 +2885,7 @@ test "mock registry integration: resolveMany pin-list over peer" {
     defer harness.manifest_calls = 0;
     defer harness.cache_hits = 0;
 
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 16, PinHarness.handle, &harness);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 16, PinHarness.handle, &harness);
     defer mock.deinit();
 
     const image_strings = blk: {
@@ -2970,7 +2959,6 @@ test "mock registry integration: resolveMany pin-list over peer" {
 }
 
 test "mock registry integration: ping then resolve are independent caller steps" {
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2982,7 +2970,7 @@ test "mock registry integration: ping then resolve are independent caller steps"
         v2_requests: usize = 0,
         manifest_requests: usize = 0,
 
-        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) !void {
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) !void {
             const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
             const target = request.head.target;
             if (std.mem.eql(u8, target, "/v2/") or std.mem.eql(u8, target, "/v2")) {
@@ -3009,7 +2997,7 @@ test "mock registry integration: ping then resolve are independent caller steps"
 
     const manifest_body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
     defer allocator.free(manifest_body);
-    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, manifest_body);
+    const digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, manifest_body);
     defer allocator.free(digest);
 
     var harness: Harness = .{
@@ -3023,7 +3011,7 @@ test "mock registry integration: ping then resolve are independent caller steps"
         harness.manifest_requests = 0;
     }
 
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 8, Harness.handle, &harness);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 8, Harness.handle, &harness);
     defer mock.deinit();
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -3079,12 +3067,11 @@ test "mock registry integration: ping then resolve are independent caller steps"
 test "mock registry integration: batch failure registry outlives input deinit on peer" {
     defer test_matrix.Fixtures.reset(std.testing.allocator);
 
-    const mock_registry = @import("mock_registry.zig");
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     const Harness = struct {
-        fn handle(_: *mock_registry.MockRegistry, request: *std.http.Server.Request) !void {
+        fn handle(_: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) !void {
             const target = request.head.target;
             if (std.mem.indexOf(u8, target, "/manifests/") != null) {
                 try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
@@ -3094,7 +3081,7 @@ test "mock registry integration: batch failure registry outlives input deinit on
         }
     };
 
-    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 2, Harness.handle, null);
+    const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 2, Harness.handle, null);
     defer mock.deinit();
 
     const ref_str = try std.fmt.allocPrint(allocator, "{s}/library/busybox:missing", .{mock.registry_host});

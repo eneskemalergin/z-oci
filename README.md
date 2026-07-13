@@ -257,14 +257,16 @@ This repository vendors Zig 0.16 under `./zig-0.16.0/`. Prefer the bundled compi
 
 - `zig build`: build and install the current `z-oci` CLI scaffold and `z-oci-bench` executable
 - `zig build test`: run all unit tests, smoke checks, and the `security-check` PEM scan (`tools/check_repo_security.zig`)
+- `zig build security-check`: standalone credential and private-key scan (same tool as inside `test`)
 - `zig build examples`: build all packaged example programs
 - `zig build examples-smoke`: run a small smoke pass over the offline example programs
 - `zig build workflow-smoke`: run the offline workflow smoke-test matrix
 - `zig build bench`: build the benchmark CLI (`z-oci-bench`)
+- `zig build integration-registry`: opt-in local `registry:2` checks (requires Docker; clear-fails if absent)
 
 Fixtures under `fixtures/` include checked-in live registry snapshots plus synthetic malformed payloads for deterministic negative-path tests. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
 
-Offline tests can also drive a real `std.http.Client` against an in-process mock peer (`src/mock_registry.zig`) on loopback HTTP. That mock is test infrastructure only, not part of the public library API.
+Offline tests can drive a real `std.http.Client` against an in-process loopback mock peer. That peer is test infrastructure only, not part of the public library API.
 
 For Distribution `registry:2` interoperability, use the opt-in step (requires a Docker daemon; clear-fails if absent):
 

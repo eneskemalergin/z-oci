@@ -568,6 +568,7 @@ test "MockRegistry: deinit while client awaits response does not hang" {
         struct {
             fn handle(_: *MockRegistry, _: *http.Server.Request) !void {
                 State.handler_entered.store(true, .release);
+                // Never respond: client blocks until peer teardown closes the connection.
             }
         }.handle,
         null,
