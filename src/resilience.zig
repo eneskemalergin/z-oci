@@ -103,17 +103,17 @@ pub const RetryBudgetConfig = struct {
 /// snapshot. Only `max_network_retries` and `max_rate_limit_retries` feed
 /// `RetryPolicy` today via `retryBudgetConfig`.
 pub const ResilienceConfigView = struct {
-    /// Projected only; does not feed `RetryPolicy`. `0` = unset.
+    // Projected only; does not feed `RetryPolicy`. `0` = unset.
     connect_timeout_ms: u32,
-    /// Projected only; helper I/O reads `Config.read_timeout_ms` in auth instead.
+    // Projected only; helper I/O reads `Config.read_timeout_ms` in auth instead.
     read_timeout_ms: u32,
-    /// Live: reactive budget for transient `5xx` / socket errors.
+    // Live: reactive budget for transient `5xx` / socket errors.
     max_network_retries: u8,
-    /// Live: reactive budget for `429`.
+    // Live: reactive budget for `429`.
     max_rate_limit_retries: u8,
-    /// Not applied by live transport wrappers today.
+    // Not applied by live transport wrappers today.
     ca_bundle_path: ?[]const u8,
-    /// Opt-in pre-emptive pause on trusted `RateLimit-*` remaining=0; reactive `429` ignores this.
+    // Opt-in pre-emptive pause on trusted `RateLimit-*` remaining=0; reactive `429` ignores this.
     rate_limit_enabled: bool,
 };
 pub const RetryBudget = struct {
@@ -245,7 +245,7 @@ pub const TransportHooks = struct {
     sleeper: TransportSleeper = noopTransportSleeper,
     random_u64: RetryRandomSource = systemRetryRandomU64,
     clock: RetryClock = SYSTEM_RETRY_CLOCK,
-    /// When true, resolver/auth sleep through `std.http.Client.io` instead of `sleeper`.
+    // When true, resolver/auth sleep through `std.http.Client.io` instead of `sleeper`.
     use_live_sleep: bool = false,
 };
 pub fn noopTransportSleeper(_: u32) void {}

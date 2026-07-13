@@ -27,7 +27,7 @@
 //! Runtime credential sources (caller environment; never written to the repo):
 //! - `Config` `CredentialProvider` (caller-owned slices for the call).
 //! - `Z_OCI_REGISTRY_HOST` / `Z_OCI_REGISTRY_USER` / `Z_OCI_REGISTRY_TOKEN`.
-//! - `DOCKER_CONFIG` / `HOME` / `USERPROFILE` → `~/.docker/config.json` (`auths`,
+//! - `DOCKER_CONFIG` / `HOME` / `USERPROFILE` to `~/.docker/config.json` (`auths`,
 //!   `credHelpers`, `credsStore`) and `docker-credential-*` helper subprocesses.
 //! Tokens and passwords exist in memory for the auth/resolve session. Owned bearer
 //! bytes, helper stdout secrets, and POST bodies are zeroed before free.
@@ -46,7 +46,7 @@ const json = @import("json.zig");
 const resilience = @import("resilience.zig");
 const testing_loopback = @import("testing_loopback.zig");
 
-/// Mapped to `ResolveError` at the manifest boundary (most → `auth_failed`).
+/// Mapped to `ResolveError` at the manifest boundary (most to `auth_failed`).
 pub const AuthError = error{
     NotYetImplemented,
     OutOfMemory,
@@ -154,10 +154,10 @@ pub const TOKEN_REFRESH_WINDOW_SECONDS: u64 = 5;
 pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: u64 = 60;
 pub const TokenResponse = struct {
     access_token: Token,
-    /// Present but unused for refresh today; `deinit` releases owned bytes.
+    // Present but unused for refresh today; `deinit` releases owned bytes.
     refresh_token: ?[]const u8 = null,
-    /// When false, `access_token` borrows the engine cache until `AuthEngine.deinit`
-    /// or a same-scope `authenticate` replaces the entry. `deinit` does not free it.
+    // When false, `access_token` borrows the engine cache until `AuthEngine.deinit`
+    // or a same-scope `authenticate` replaces the entry. `deinit` does not free it.
     owns_access_token: bool = true,
 
     /// Zeroes and frees owned access/refresh bytes only.
@@ -316,7 +316,7 @@ pub const AuthEngine = struct {
     docker_config: ?DockerConfig = null,
     token_cache: TokenCacheMap = .empty,
     preferred_token_method_by_realm: std.StringHashMapUnmanaged(TokenRequestMethod) = .empty,
-    /// Consumed by resolver → `ResolveError.transport_retries_exhausted`.
+    // Consumed by resolver for `ResolveError.transport_retries_exhausted`.
     token_transport_retries_exhausted: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
@@ -499,7 +499,7 @@ pub const AuthEngine = struct {
         return cached_response;
     }
 
-    /// Invalidates one cache slot; `max_retries == 0` → `TokenExchangeFailed`. Ownership matches `authenticate`.
+    /// Invalidates one cache slot; `max_retries == 0` maps to `TokenExchangeFailed`. Ownership matches `authenticate`.
     pub fn retryAuthenticateAfterCachedUnauthorized(
         self: *AuthEngine,
         client: *std.http.Client,
@@ -1091,7 +1091,7 @@ const DockerConfig = struct {
         if (self.creds_store) |creds_store| allocator.free(creds_store);
     }
 
-    /// Malformed docker auth entries yield `null` (anonymous fallback), not hard fail.
+    // Malformed docker auth entries yield `null` (anonymous fallback), not hard fail.
     fn credentialForRegistry(self: *DockerConfig, allocator: std.mem.Allocator, registry: []const u8) AuthError!?CredentialHandle {
         const credential = self.authCredentialForRegistry(allocator, registry) catch |err| switch (err) {
             error.InvalidDockerConfig => return null,

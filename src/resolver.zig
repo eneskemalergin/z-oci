@@ -40,7 +40,7 @@ pub const ResolverParams = struct {
     platform: ?Platform,
     operation: ResolverOperation,
     transport_hooks: resilience.TransportHooks = .{},
-    /// Shared across HEAD/GET in one resolve session when pre-emptive throttling is on.
+    // Shared across HEAD/GET in one resolve session when pre-emptive throttling is on.
     manifest_throttle: ?*resilience.ManifestThrottle = null,
 
     pub fn init(
@@ -413,7 +413,7 @@ pub const ManifestGetSuccess = struct {
     resolved_digest: Digest,
     resolved_digest_raw: []u8,
     document: ParsedManifestDocument,
-    /// When set, JSON strings in `document` may borrow from this buffer.
+    // When set, JSON strings in `document` may borrow from this buffer.
     backing_body: ?[]u8 = null,
 
     pub fn deinit(self: *ManifestGetSuccess, allocator: std.mem.Allocator) void {

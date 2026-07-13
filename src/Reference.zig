@@ -30,11 +30,11 @@ const DOCKER_HUB_ALIASES = [_][]const u8{ "docker.io", "index.docker.io", DOCKER
 
 registry: []const u8,
 repository: []const u8,
-/// Informational when digest is also present; `refString()` returns the digest then.
+// Informational when digest is also present; `refString()` returns the digest then.
 tag: ?[]const u8,
-/// `.hex` points into `digest_raw` when set.
+// `.hex` points into `digest_raw` when set.
 digest: ?Digest,
-/// `"sha256:hex"` for `refString()`; freed by `deinit`.
+// `"sha256:hex"` for `refString()`; freed by `deinit`.
 digest_raw: ?[]const u8,
 
 const Reference = @This();

@@ -24,7 +24,7 @@ pub const ParseError = error{
 };
 
 algorithm: Algorithm,
-/// Borrows from the parse input (or arena after `jsonParse`).
+// Borrows from the parse input (or arena after `jsonParse`).
 hex: []const u8,
 
 const Digest = @This();

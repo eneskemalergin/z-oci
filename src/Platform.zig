@@ -3,7 +3,7 @@
 //! Slice fields borrow from their source unless copied with `clonePlatformAlloc`
 //! in `root.zig`. Values produced by `jsonParse` borrow from the parse arena.
 //! Caller literals and stack buffers remain valid for the caller's lifetime.
-//! match() does partial matching. The filter only needs to specify what it cares about.
+//! match() does partial matching. The filter only needs to include constrained fields.
 //! Omitting variant accepts any variant (e.g. arm64 matches arm64/v8).
 //! os_version uses dot-segment prefix matching for Windows builds.
 //!
@@ -249,7 +249,7 @@ test "Platform.match: partial matching matrix" {
             .expected = true,
         },
         .{
-            .candidate = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0.βeta" },
+            .candidate = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0.beta" },
             .filter = .{ .os = "windows", .architecture = "amd64", .os_version = "10.0" },
             .expected = true,
         },

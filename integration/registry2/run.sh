@@ -15,6 +15,15 @@ LOCAL_REF="${REGISTRY_HOST}/${IMAGE_REPO}:${IMAGE_TAG}"
 MISSING_REF="${REGISTRY_HOST}/${IMAGE_REPO}:does-not-exist-zoci"
 
 HARNESS="${1:?usage: run.sh <harness-binary>}"
+if [[ ! -x "${HARNESS}" ]]; then
+  echo "integration-registry: harness must be executable: ${HARNESS}" >&2
+  exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "integration-registry: curl not found. Install curl and retry." >&2
+  exit 1
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "integration-registry: Docker CLI not found. Install Docker or skip this opt-in step." >&2
@@ -26,14 +35,23 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE_CMD=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE_CMD=(docker-compose)
+else
+  echo "integration-registry: docker compose plugin not available and docker-compose not found." >&2
+  exit 1
+fi
+
 compose() {
-  docker compose -f "${COMPOSE_FILE}" -p "${PROJECT}" "$@"
+  "${COMPOSE_CMD[@]}" -f "${COMPOSE_FILE}" -p "${PROJECT}" "$@"
 }
 
 cleanup() {
   compose down -v --remove-orphans >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 echo "integration-registry: starting registry:2 on ${REGISTRY_HOST}"
 compose up -d
@@ -41,7 +59,7 @@ compose up -d
 echo "integration-registry: waiting for GET /v2/"
 ready=0
 for _ in $(seq 1 60); do
-  if curl -sf "http://${REGISTRY_HOST}/v2/" >/dev/null; then
+  if curl --max-time 2 -sf "http://${REGISTRY_HOST}/v2/" >/dev/null; then
     ready=1
     break
   fi

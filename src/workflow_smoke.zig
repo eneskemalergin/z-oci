@@ -106,7 +106,7 @@ const ScenarioHarness = struct {
 
 const ResolveOutcomeTeardown = struct {
     owned_input: ?*z_oci.Reference = null,
-    /// Success payload lives in an arena; skip `ResolveResult.deinit` (arena teardown owns it).
+    // Success payload lives in an arena; skip `ResolveResult.deinit` (arena teardown owns it).
     success_owned_by_arena: bool = false,
 };
 

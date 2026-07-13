@@ -62,9 +62,9 @@ pub const Credential = struct {
 
 pub const CredentialHandle = struct {
     credential: Credential,
-    /// When set, `release_allocator` must be the allocator that owns `credential` slices.
-    /// `release_fn` must free through that allocator. Env/helper paths in `auth.zig`
-    /// zero secrets via `freeOwnedOptionalSecretSlice` before `free`.
+    // When set, `release_allocator` must be the allocator that owns `credential` slices.
+    // `release_fn` must free through that allocator. Env/helper paths in `auth.zig`
+    // zero secrets via `freeOwnedOptionalSecretSlice` before `free`.
     release_fn: ?*const fn (allocator: std.mem.Allocator, credential: Credential) void = null,
     release_allocator: std.mem.Allocator = undefined,
 
@@ -74,7 +74,7 @@ pub const CredentialHandle = struct {
 };
 
 pub const CredentialProvider = struct {
-    /// Null = anonymous. Slices must outlive the resolve call.
+    // Null = anonymous. Slices must outlive the resolve call.
     getCredentialFn: *const fn (registry: []const u8) ?CredentialHandle,
 
     pub fn getCredential(self: CredentialProvider, registry: []const u8) ?CredentialHandle {
@@ -95,27 +95,27 @@ pub const Config = struct {
 
     credential_provider: ?*const CredentialProvider = null,
 
-    /// Caller-owned TCP only; live exchangers ignore this (zig#31305). `0` = unset.
+    // Caller-owned TCP only; live exchangers ignore this (zig#31305). `0` = unset.
     connect_timeout_ms: u32 = 0,
 
-    /// Docker credential helper subprocess I/O only (not manifest/token HTTP).
+    // Docker credential helper subprocess I/O only (not manifest/token HTTP).
     read_timeout_ms: u32 = 30_000,
 
-    /// Cached-401 auth invalidation only; transport uses the budgets below.
+    // Cached-401 auth invalidation only; transport uses the budgets below.
     max_retries: u8 = 1,
 
     max_network_retries: u8 = 1,
     max_rate_limit_retries: u8 = 1,
 
-    /// Public CA PEM only; see file header. Null = OS trust scan.
+    // Public CA PEM only; see file header. Null = OS trust scan.
     ca_bundle_path: ?[]const u8 = null,
 
-    /// Opt-in pre-emptive pause on `RateLimit-*` remaining=0. Reactive 429 stays on.
+    // Opt-in pre-emptive pause on `RateLimit-*` remaining=0. Reactive 429 stays on.
     rate_limit_enabled: bool = false,
 
     max_manifest_bytes: usize = DEFAULT_MAX_MANIFEST_BYTES,
     max_token_response_bytes: usize = DEFAULT_MAX_TOKEN_RESPONSE_BYTES,
-    /// `0` means unbounded.
+    // `0` means unbounded.
     max_token_cache_entries: u32 = DEFAULT_MAX_TOKEN_CACHE_ENTRIES,
 
     /// For caller-owned `connectTcpOptions` only (not live exchangers yet).

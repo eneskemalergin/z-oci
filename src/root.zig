@@ -10,7 +10,7 @@
 //!
 //! Ownership conventions:
 //! - Functions taking an allocator produce owned storage that the caller must
-//!   free (pattern B): `Reference.parse(gpa, "img")` → caller calls `ref.deinit(gpa)`.
+//!   free (pattern B): `Reference.parse(gpa, "img")`, then caller calls `ref.deinit(gpa)`.
 //! - Functions returning `std.json.Parsed(T)` own an arena (pattern A): the caller
 //!   calls `parsed.deinit()` to free everything.
 //! - `AuthEngine` wraps persistent cache storage with its own `deinit()`.
@@ -314,7 +314,7 @@ pub const ManifestOutcome = union(enum) {
 /// One batch outcome. Failures own both `registry` and `reference`; never use `deinitResolveFailure`.
 pub const ResolveManyItem = union(enum) {
     success: ResolveResult,
-    /// Unlike single-resolve failures, owns `registry` as well as `reference`.
+    // Unlike single-resolve failures, owns `registry` as well as `reference`.
     failure: ResolveError,
 
     pub fn deinit(self: *ResolveManyItem, allocator: std.mem.Allocator) void {
@@ -350,16 +350,16 @@ pub const ResolveManyProgress = struct {
 
     pub const Event = enum {
         item_started,
-        /// In-call tag / implicit `latest` session cache hit; digest refs never hit.
+        // In-call tag / implicit `latest` session cache hit; digest refs never hit.
         cache_hit,
         item_succeeded,
         item_failed,
     };
 };
 pub const ResolveManyOptions = struct {
-    /// Batch-wide; per-item platforms need separate batches.
+    // Batch-wide; per-item platforms need separate batches.
     platform: ?Platform = null,
-    /// Optional observer; must not retain `event.reference` past return.
+    // Optional observer; must not retain `event.reference` past return.
     progress_fn: ?*const fn (event: ResolveManyProgress, user_data: ?*anyopaque) void = null,
     progress_user_data: ?*anyopaque = null,
 };
@@ -417,7 +417,7 @@ pub fn resolveMany(
 }
 /// Ownership: no success payload. HEAD uses the caller allocator; GET fallback uses a
 /// transient arena and promotes `ResolveError.reference` on failure. `.not_found` is terminal;
-/// multi-arch without `platform` → `platform_required`.
+/// multi-arch without `platform` maps to `platform_required`.
 pub fn validate(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -436,7 +436,8 @@ pub fn validate(
         resilience.liveTransportHooks(),
     );
 }
-/// Ownership: `.success` is a JSON arena (`parsed.deinit()`). Multi-arch without `platform` → `platform_required`.
+/// Ownership: `.success` is a JSON arena (`parsed.deinit()`). Multi-arch without
+/// `platform` maps to `platform_required`.
 pub fn getManifest(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -588,7 +589,7 @@ const ResolvedManifestOutcome = union(enum) {
     failure: ResolveError,
 };
 const ResolveManySessionCache = struct {
-    /// Stack buffer for hit-path key formatting. Oversized keys fall back to heap.
+    // Stack buffer for hit-path key formatting. Oversized keys fall back to heap.
     const cache_key_stack_max = 1024;
 
     map: std.StringHashMapUnmanaged(ResolveResult) = .empty,
@@ -659,7 +660,7 @@ const ResolveManySessionCache = struct {
         return buf;
     }
 
-    /// Owns a single exact-size key allocation. Digest-addressed refs return null.
+    // Owns a single exact-size key allocation. Digest-addressed refs return null.
     fn cacheKeyAlloc(
         allocator: std.mem.Allocator,
         ref: Reference,

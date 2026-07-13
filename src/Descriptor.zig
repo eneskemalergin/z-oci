@@ -14,7 +14,7 @@ const test_support = @import("test_support.zig");
 media_type: MediaType,
 digest: Digest,
 size: u64,
-/// Index / manifest-list entries only.
+// Index / manifest-list entries only.
 platform: ?Platform = null,
 urls: ?[]const []const u8 = null,
 annotations: ?std.json.Value = null,

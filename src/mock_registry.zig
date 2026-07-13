@@ -30,11 +30,11 @@ pub const MockRegistry = struct {
     io: Io,
     tcp: net.Server,
     port: u16,
-    /// Owned `127.0.0.1:{port}` for `Reference.parse`.
+    // Owned `127.0.0.1:{port}` for `Reference.parse`.
     registry_host: []u8,
     script: ?ManifestScript,
     digest_header: ?[]u8,
-    /// Remaining accepts; caps the serve loop so teardown need not rely on cancel alone.
+    // Remaining accepts; caps the serve loop so teardown need not rely on cancel alone.
     request_budget: std.atomic.Value(usize),
     serve_future: Io.Future(anyerror!void),
     handler: ServeHandler,

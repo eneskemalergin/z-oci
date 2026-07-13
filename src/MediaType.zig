@@ -21,7 +21,7 @@ pub const MediaType = enum {
     docker_container_image_v1,
     docker_layer_gzip,
     docker_layer_foreign_gzip,
-    /// Recognized so the resolver can reject it cleanly.
+    // Recognized so the resolver can reject it cleanly.
     docker_manifest_v1_signed,
 
     const mime_table = [_]struct { []const u8, MediaType }{

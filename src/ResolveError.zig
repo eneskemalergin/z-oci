@@ -37,7 +37,7 @@ pub const RateLimited = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
-    /// Reactive transport retries were consumed before this `429`.
+    // Reactive transport retries were consumed before this `429`.
     transport_retries_exhausted: bool = false,
 };
 
@@ -69,7 +69,7 @@ pub const NetworkError = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
-    /// Reactive transport retries were consumed before this failure.
+    // Reactive transport retries were consumed before this failure.
     transport_retries_exhausted: bool = false,
 };
 
@@ -89,7 +89,7 @@ pub const Timeout = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
-    /// Reactive transport retries were consumed before this timeout.
+    // Reactive transport retries were consumed before this timeout.
     transport_retries_exhausted: bool = false,
 };
 
