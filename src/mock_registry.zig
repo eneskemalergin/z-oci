@@ -522,6 +522,91 @@ test "MockRegistry: failed serve does not consume request budget" {
     try std.testing.expectEqual(@as(usize, 2), State.calls);
 }
 
+test "MockRegistry: start allocation failures release listening socket" {
+    const noop = struct {
+        fn handle(_: *MockRegistry, request: *http.Server.Request) !void {
+            try request.respond("{}", .{ .status = .ok, .keep_alive = false });
+        }
+    }.handle;
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const mock = try MockRegistry.startWithHandler(allocator, std.testing.io, 1, noop, null);
+            defer mock.deinit();
+        }
+    }.run, .{});
+}
+
+test "MockRegistry: anonymous start allocation failures release digest and listener" {
+    const body = "{\"schemaVersion\":2}\n";
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const mock = try MockRegistry.start(allocator, std.testing.io, .{
+                .repository = "library/alpine",
+                .tag = "latest",
+                .body = body,
+                .content_type = "application/vnd.oci.image.manifest.v1+json",
+            }, 1);
+            defer mock.deinit();
+        }
+    }.run, .{});
+}
+
+test "MockRegistry: deinit while client awaits response does not hang" {
+    const State = struct {
+        var handler_entered: std.atomic.Value(bool) = .init(false);
+    };
+    defer State.handler_entered.store(false, .monotonic);
+
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const mock = try MockRegistry.startWithHandler(
+        allocator,
+        io,
+        2,
+        struct {
+            fn handle(_: *MockRegistry, _: *http.Server.Request) !void {
+                State.handler_entered.store(true, .release);
+            }
+        }.handle,
+        null,
+    );
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://{s}/v2/", .{mock.registry_host});
+
+    const ClientCtx = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        url: []const u8,
+
+        fn run(ctx: *@This()) !void {
+            var client = std.http.Client{ .allocator = ctx.allocator, .io = ctx.io };
+            defer client.deinit();
+            const uri = std.Uri.parse(ctx.url) catch return;
+            var http_request = client.request(.GET, uri, .{}) catch return;
+            defer http_request.deinit();
+            http_request.sendBodiless() catch return;
+            var redirect_buffer: [4 * 1024]u8 = undefined;
+            _ = http_request.receiveHead(&redirect_buffer) catch {};
+        }
+    };
+
+    var ctx = ClientCtx{ .allocator = allocator, .io = io, .url = url };
+    var client_future = try io.concurrent(ClientCtx.run, .{&ctx});
+
+    var spins: usize = 0;
+    while (!State.handler_entered.load(.acquire)) {
+        spins += 1;
+        if (spins > 1_000_000) return error.TestTimeout;
+    }
+
+    mock.deinit();
+    _ = client_future.cancel(io) catch {};
+    _ = client_future.await(io) catch {};
+}
+
 test "MockRegistry: deinit without accepts does not hang" {
     const mock = try MockRegistry.startWithHandler(
         std.testing.allocator,

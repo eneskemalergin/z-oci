@@ -98,6 +98,9 @@ pub fn mapPingExchangeError(err: PingExchangeError) RegistryPingFailure {
 }
 
 /// Probe `https://{registry}/v2/` through `exchanger`. Caller owns CA setup.
+///
+/// The probe URL buffer is owned by this function; exchangers must not free
+/// `request.url` (borrow only for the duration of the call).
 pub fn pingRegistryWithExchanger(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
@@ -109,6 +112,7 @@ pub fn pingRegistryWithExchanger(
     }
 
     const url = try pingRegistryUriAlloc(allocator, registry);
+    defer allocator.free(url);
     const response = exchanger(allocator, client, .{ .url = url }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = mapPingExchangeError(err) };
@@ -121,8 +125,6 @@ pub fn livePingHttpExchanger(
     client: *std.http.Client,
     request: PingHttpRequest,
 ) PingExchangeError!PingHttpResponse {
-    defer request.deinit(allocator);
-
     const loopback_url = testing_loopback.cleartextLoopbackUrlAlloc(allocator, request.url) catch return error.OutOfMemory;
     defer if (loopback_url) |url| allocator.free(url);
     const request_url = loopback_url orelse request.url;
@@ -192,8 +194,7 @@ test "pingRegistryWithExchanger: empty registry maps to other failure" {
         &client,
         "",
         struct {
-            fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: PingHttpRequest) PingExchangeError!PingHttpResponse {
-                request.deinit(allocator);
+            fn exchange(_: std.mem.Allocator, _: *std.http.Client, _: PingHttpRequest) PingExchangeError!PingHttpResponse {
                 return error.TransportFailed;
             }
         }.exchange,
@@ -205,8 +206,7 @@ test "pingRegistryWithExchanger: status and transport matrix" {
     const MockHarness = struct {
         var mode: enum { ok, unauthorized, not_found, timeout, network } = .ok;
 
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: PingHttpRequest) PingExchangeError!PingHttpResponse {
-            defer request.deinit(allocator);
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: PingHttpRequest) PingExchangeError!PingHttpResponse {
             if (!std.mem.eql(u8, request.url, "https://ghcr.io/v2/")) return error.TransportFailed;
             return switch (mode) {
                 .ok => .{ .status = .ok },
@@ -281,14 +281,92 @@ test "livePingHttpExchanger: loopback mock peer uses cleartext rewrite" {
     defer client.deinit();
 
     const url = try pingRegistryUriAlloc(std.testing.allocator, mock.registry_host);
+    defer std.testing.allocator.free(url);
 
     const response = try livePingHttpExchanger(std.testing.allocator, &client, .{ .url = url });
     try std.testing.expectEqual(std.http.Status.unauthorized, response.status);
 }
 
+test "pingRegistryWithExchanger: allocation failures do not leak ping URL" {
+    const MockHarness = struct {
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, _: PingHttpRequest) PingExchangeError!PingHttpResponse {
+            return .{ .status = .ok };
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var client: std.http.Client = undefined;
+            _ = try pingRegistryWithExchanger(allocator, &client, "ghcr.io", MockHarness.exchange);
+        }
+    }.run, .{});
+}
+
+test "pingRegistryWithExchanger: propagates exchanger OutOfMemory" {
+    const OomHarness = struct {
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, _: PingHttpRequest) PingExchangeError!PingHttpResponse {
+            return error.OutOfMemory;
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pingRegistryWithExchanger(std.testing.allocator, &client, "ghcr.io", OomHarness.exchange),
+    );
+}
+
+test "pingRegistryWithExchanger: exchange error without exchanger deinit does not leak URL" {
+    const LeakProbe = struct {
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, _: PingHttpRequest) PingExchangeError!PingHttpResponse {
+            return error.TransportFailed;
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var client: std.http.Client = undefined;
+            const result = try pingRegistryWithExchanger(allocator, &client, "ghcr.io", LeakProbe.exchange);
+            try std.testing.expectEqual(RegistryPingFailureKind.network, result.failure.kind);
+        }
+    }.run, .{});
+}
+
+test "livePingHttpExchanger: allocation failures do not leak request URL" {
+    const mock_registry = @import("mock_registry.zig");
+    const io = std.testing.io;
+    const mock = try mock_registry.MockRegistry.startWithHandler(
+        std.testing.allocator,
+        io,
+        4,
+        struct {
+            fn handle(_: *mock_registry.MockRegistry, request: *std.http.Server.Request) !void {
+                try request.respond("{}", .{ .status = .ok, .keep_alive = false });
+            }
+        }.handle,
+        null,
+    );
+    defer mock.deinit();
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+
+    const url = try pingRegistryUriAlloc(std.testing.allocator, mock.registry_host);
+    defer std.testing.allocator.free(url);
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, ping_url: []const u8, http_client: *std.http.Client) !void {
+            const owned = try allocator.dupe(u8, ping_url);
+            defer allocator.free(owned);
+            _ = try livePingHttpExchanger(allocator, http_client, .{ .url = owned });
+        }
+    }.run, .{ url, &client });
+}
+
 test "livePingHttpExchanger: invalid URL maps to TransportFailed" {
     var client: std.http.Client = undefined;
     const url = try std.testing.allocator.dupe(u8, "not a url");
+    defer std.testing.allocator.free(url);
     try std.testing.expectError(
         error.TransportFailed,
         livePingHttpExchanger(std.testing.allocator, &client, .{ .url = url }),

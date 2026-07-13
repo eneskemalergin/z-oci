@@ -5,6 +5,10 @@
 //! Offline demo only: uses `testing.resolveManyWithExchangers` (not public
 //! `resolveMany`); `Client` is unused. Live callers need a real client.
 //!
+//! For the same pin-list shape against an in-process mock registry peer with a
+//! real `std.http.Client` and public `resolveMany`, see `root.zig`
+//! ("mock registry integration: resolveMany pin-list over peer").
+//!
 //! Ownership: input refs and `result` use `init.gpa`; never `deinitResolveFailure`
 //! on batch items (use `result.deinit`). Progress views borrow for the callback
 //! only. Platform is batch-wide. In-call tag/`latest` session cache applies;

@@ -23,6 +23,7 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 - `security-check` scans `integration/` and flags non-placeholder Docker `auths` embedded in `.zig` sources.
 - Registry compatibility coverage in README (Hub, GHCR, Quay, generic bearer, loopback `registry:2`; fixtures, mocks, opt-in harness, and live commands).
 - Testing run: mock/ping/loopback edge and invariant coverage; workflow smoke trimmed duplicate ping status test; `deinitResolveOutcome` ownership fix; mock `NoManifestScript` error and request-budget test.
+- Real integration checks: public `resolveMany` pin-list, ping-then-resolve, and batch failure ownership on in-process mock peer (`root.zig`); recorded `registry:2` recipe; manual live ping `--bad-host` / `--missing-ca` recipes (`temp/live_ping_smoke.zig`).
 
 ### Changed
 
@@ -30,11 +31,15 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 
 - Live manifest redirect follow rewrites loopback `https://` Locations to cleartext before the keep-authorization origin compare, so same-origin bearer auth is not stripped on local mock peers.
 - Workflow smoke `deinitResolveOutcome` tears down success and failure paths; arena-backed preemptive rate-limit smoke skips double-free on success.
+- `pingRegistryWithExchanger` owns the probe URL buffer; ping exchangers borrow only (prevents double-free when mock exchangers also freed the URL).
+- Docker credential-helper timeout path relies on `defer child.kill` for reap (removed redundant kill on timeout).
 
 ### Verified
 
-- `./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes (339/339 tests, examples-smoke, workflow-smoke, security-check).
+- `./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes (350/350 tests, examples-smoke, workflow-smoke, security-check).
 - `./zig-0.16.0/zig fmt --check` passes on `src/`, `examples/`, `benchmarks/`, `build.zig`, `tools/`, `integration/`.
+- `./zig-0.16.0/zig build security-check` passes on tracked roots including `integration/`.
+- Debug `--counting` for core resolve bench ops matches `benchmarks/baselines/v0.5.0-debug-counting.txt` allocation counts (5 / 5 / 27 / 50 per call); no hot-path optimization required. Official ReleaseFast baseline remains `benchmarks/baselines/v0.5.0.json` until the v0.6.0 tag.
 
 ## [0.5.0] - 2026-07-10 - [Tagged]
 

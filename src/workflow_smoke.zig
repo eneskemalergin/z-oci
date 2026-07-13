@@ -2,7 +2,8 @@
 //!
 //! These tests sit above the owning unit tests and below any future integration
 //! layer. They exercise the public resolver surface through `z_oci.testing` with
-//! injected transports.
+//! injected transports, and app-shaped public API flows against the in-process mock
+//! peer are covered in `root.zig` mock integration tests.
 
 const std = @import("std");
 const z_oci = @import("z_oci");
@@ -318,8 +319,7 @@ test "workflow smoke: pingRegistryWithExchanger requests only /v2/ root" {
         var saw_manifest_path: bool = false;
         var saw_v2_root: bool = false;
 
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.testing.PingHttpRequest) z_oci.testing.PingExchangeError!z_oci.testing.PingHttpResponse {
-            defer request.deinit(allocator);
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: z_oci.testing.PingHttpRequest) z_oci.testing.PingExchangeError!z_oci.testing.PingHttpResponse {
             if (std.mem.indexOf(u8, request.url, "/manifests/") != null) saw_manifest_path = true;
             if (std.mem.endsWith(u8, request.url, "/v2/")) saw_v2_root = true;
             return .{ .status = .unauthorized };

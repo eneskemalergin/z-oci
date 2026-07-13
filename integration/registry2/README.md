@@ -39,3 +39,30 @@ Do not reuse this compose file for real images, credentials, or internet-facing 
 - Live URL builders emit `https://`; loopback exchangers rewrite to `http://` for `127.0.0.1` only (`testing_loopback.zig`).
 - The default peer is anonymous. This harness does not exercise ping.
 - Named registry coverage and proof levels are summarized in the root README Registry coverage section.
+
+## Recorded recipe (manual, opt-in)
+
+Evidence tag: `registry:2`. Run only when Docker is available. This is not part of `zig build test`.
+
+```sh
+# One-shot (compose up, pull/tag/push busybox, harness, teardown):
+./zig-0.16.0/zig build integration-registry --zig-lib-dir ./zig-0.16.0/lib
+```
+
+Expected stdout (digest hex will match the pushed busybox manifest):
+
+```text
+resolve(tag): ok digest=sha256:... mediaType=application/vnd.oci.image.manifest.v1+json
+resolve(digest): ok digest=sha256:...
+validate(missing): ok not_found
+```
+
+What the harness does (`integration/registry2/run.sh`):
+
+1. `docker compose up -d` on `127.0.0.1:5000` (anonymous HTTP).
+2. Wait for `GET http://127.0.0.1:5000/v2/`.
+3. `docker pull busybox:1.36.1`, retag to `127.0.0.1:5000/zoci/smoke:1.36.1`, push.
+4. Run `registry2-harness` with the loaded tag ref and a missing tag ref.
+5. `compose down -v` on exit.
+
+`pingRegistry` is intentionally out of scope here: resolve and validate use the live client path; ping is a separate caller API (see `root.zig` mock integration ping-then-resolve test).

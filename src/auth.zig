@@ -1625,6 +1625,7 @@ fn runDockerCredentialHelperCommand(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.HelperFailed,
     };
+    // `kill` blocks until the subprocess exits (reap). Required on timeout and early-failure paths.
     defer child.kill(io);
 
     {
@@ -1652,10 +1653,7 @@ fn runDockerCredentialHelperCommand(
         if (multi_reader.reader(1).buffered().len > DOCKER_HELPER_STDERR_LIMIT) return error.HelperFailed;
     } else |err| switch (err) {
         error.EndOfStream => {},
-        error.Timeout => {
-            child.kill(io);
-            return error.HelperTimedOut;
-        },
+        error.Timeout => return error.HelperTimedOut,
         else => return error.HelperFailed,
     }
 
@@ -2772,6 +2770,29 @@ test "dockerCredentialHelperTimeout: maps Config.read_timeout_ms" {
             try std.testing.expectEqual(@as(i64, 10), duration.raw.toMilliseconds());
         },
         else => return error.TestUnexpectedResult,
+    }
+}
+
+test "runDockerCredentialHelperCommand: repeated timeouts reap each subprocess" {
+    if (builtin.os.tag == .windows) return;
+
+    const hang_argv = [_][]const u8{
+        "/bin/sh",
+        "-c",
+        "IFS= read -r _ || exit 7\nsleep 1\nprintf '{\"Username\":\"late\",\"Secret\":\"late\"}'\n",
+        "docker-credential-secretservice",
+        "get",
+    };
+    const timeout = dockerCredentialHelperTimeout(.{ .read_timeout_ms = 10 });
+
+    for (0..3) |_| {
+        try std.testing.expectError(error.HelperTimedOut, runDockerCredentialHelperCommand(
+            std.testing.allocator,
+            std.testing.io,
+            &hang_argv,
+            "ghcr.io",
+            timeout,
+        ));
     }
 }
 

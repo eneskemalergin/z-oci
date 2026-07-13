@@ -1947,8 +1947,7 @@ test "pingRegistryWithExchanger: anonymous and auth-required outcomes" {
     const MockHarness = struct {
         var status: std.http.Status = .ok;
 
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
-            defer request.deinit(allocator);
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, request: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
             if (!std.mem.eql(u8, request.url, "https://registry.example.test/v2/")) return error.TransportFailed;
             return .{ .status = status };
         }
@@ -1985,8 +1984,7 @@ test "pingRegistryWithExchanger: unexpected status and network failure" {
     const MockHarness = struct {
         var mode: enum { unexpected, network } = .unexpected;
 
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
-            defer request.deinit(allocator);
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, _: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
             return switch (mode) {
                 .unexpected => .{ .status = .internal_server_error },
                 .network => error.ConnectionRefused,
@@ -2024,8 +2022,7 @@ test "pingRegistryWithExchanger: missing ca bundle maps to PublicApiError" {
     const MockHarness = struct {
         var calls: usize = 0;
 
-        fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
-            defer request.deinit(allocator);
+        fn exchange(_: std.mem.Allocator, _: *std.http.Client, _: registry_ping.PingHttpRequest) registry_ping.PingExchangeError!registry_ping.PingHttpResponse {
             calls += 1;
             return .{ .status = .ok };
         }
@@ -2831,6 +2828,302 @@ test "mock registry hard: ping status classification matrix" {
             .forbidden, .redirect => try std.testing.expectEqual(RegistryPingFailureKind.unexpected_status, result.failure.kind),
         }
     }
+}
+
+test "mock registry integration: resolveMany pin-list over peer" {
+    defer test_matrix.Fixtures.reset(std.testing.allocator);
+
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const manifest_fixture = "fixtures/manifests/busybox-amd64-live-oci-manifest.json";
+
+    const PinHarness = struct {
+        manifest_body: []const u8,
+        digest: []const u8,
+        content_type: []const u8,
+        manifest_calls: usize = 0,
+        cache_hits: usize = 0,
+
+        fn progress(event: ResolveManyProgress, user_data: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            if (event.event == .cache_hit) self.cache_hits += 1;
+        }
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+            if (std.mem.eql(u8, target, "/v2/") or std.mem.eql(u8, target, "/v2")) {
+                try request.respond("{}", .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "Docker-Distribution-Api-Version", .value = "registry/2.0" },
+                    },
+                });
+                return;
+            }
+            if (std.mem.indexOf(u8, target, "/manifests/") == null) {
+                try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+                return;
+            }
+            self.manifest_calls += 1;
+            if (std.mem.endsWith(u8, target, "/manifests/missing")) {
+                try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+                return;
+            }
+            try request.respond(self.manifest_body, .{
+                .status = .ok,
+                .keep_alive = false,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = self.content_type },
+                    .{ .name = "Docker-Content-Digest", .value = self.digest },
+                },
+            });
+        }
+    };
+
+    const manifest_body = try readFixtureAlloc(allocator, manifest_fixture, 32 * 1024);
+    defer allocator.free(manifest_body);
+    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, manifest_body);
+    defer allocator.free(digest);
+
+    var harness: PinHarness = .{
+        .manifest_body = manifest_body,
+        .digest = digest,
+        .content_type = MediaType.oci_manifest_v1.toString(),
+    };
+    defer harness.manifest_calls = 0;
+    defer harness.cache_hits = 0;
+
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 16, PinHarness.handle, &harness);
+    defer mock.deinit();
+
+    const image_strings = blk: {
+        var list: [5][]u8 = undefined;
+        list[0] = try std.fmt.allocPrint(allocator, "{s}/library/busybox", .{mock.registry_host});
+        list[1] = try std.fmt.allocPrint(allocator, "{s}/library/busybox:latest", .{mock.registry_host});
+        list[2] = try std.fmt.allocPrint(allocator, "{s}/library/busybox@{s}", .{ mock.registry_host, digest });
+        list[3] = try std.fmt.allocPrint(allocator, "{s}/owner/busybox:stable", .{mock.registry_host});
+        list[4] = try std.fmt.allocPrint(allocator, "{s}/library/busybox:missing", .{mock.registry_host});
+        break :blk list;
+    };
+    defer for (image_strings) |image| allocator.free(image);
+
+    var refs: [image_strings.len]Reference = undefined;
+    var parsed_count: usize = 0;
+    defer for (refs[0..parsed_count]) |*ref| ref.deinit(allocator);
+    for (image_strings) |image| {
+        refs[parsed_count] = try Reference.parse(allocator, image);
+        parsed_count += 1;
+    }
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var result = try resolveMany(allocator, &client, .{}, refs[0..], .{
+        .platform = .{ .os = "linux", .architecture = "amd64" },
+        .progress_fn = PinHarness.progress,
+        .progress_user_data = @ptrCast(&harness),
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), result.items.len);
+    try std.testing.expectEqual(@as(usize, 4), harness.manifest_calls);
+    try std.testing.expectEqual(@as(usize, 1), harness.cache_hits);
+
+    var pinned_count: usize = 0;
+    var failed_count: usize = 0;
+    for (result.items, 0..) |item, index| {
+        switch (item) {
+            .success => |resolved| {
+                pinned_count += 1;
+                try std.testing.expectEqual(MediaType.oci_manifest_v1, resolved.media_type);
+                try std.testing.expectEqualStrings(digest["sha256:".len..], resolved.digest.hex);
+                try std.testing.expect(std.mem.startsWith(u8, resolved.reference.registry, "127.0.0.1:"));
+                if (index == 1) {
+                    try std.testing.expect(result.items[0].success.digest.hex.ptr != resolved.digest.hex.ptr);
+                }
+            },
+            .failure => |failure| {
+                failed_count += 1;
+                var message_buf: [256]u8 = undefined;
+                var message_writer = std.Io.Writer.fixed(&message_buf);
+                try failure.format(&message_writer);
+                const message = message_writer.buffered();
+                try std.testing.expect(std.mem.indexOf(u8, message, "busybox:missing") != null);
+                try test_matrix.expectResolveFailure(
+                    failure,
+                    "not_found",
+                    refs[index].registry,
+                    image_strings[index],
+                    null,
+                    null,
+                );
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), pinned_count);
+    try std.testing.expectEqual(@as(usize, 1), failed_count);
+    try std.testing.expectEqualStrings("library/busybox", refs[0].repository);
+    try std.testing.expectEqualStrings("missing", refs[4].tag.?);
+}
+
+test "mock registry integration: ping then resolve are independent caller steps" {
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Harness = struct {
+        manifest_body: []const u8,
+        digest: []const u8,
+        content_type: []const u8,
+        v2_status: std.http.Status,
+        v2_requests: usize = 0,
+        manifest_requests: usize = 0,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+            if (std.mem.eql(u8, target, "/v2/") or std.mem.eql(u8, target, "/v2")) {
+                self.v2_requests += 1;
+                try request.respond("{}", .{ .status = self.v2_status, .keep_alive = false });
+                return;
+            }
+            const manifest_path = "/v2/library/alpine/manifests/latest";
+            if (!std.mem.eql(u8, target, manifest_path)) {
+                try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+                return;
+            }
+            self.manifest_requests += 1;
+            try request.respond(self.manifest_body, .{
+                .status = .ok,
+                .keep_alive = false,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = self.content_type },
+                    .{ .name = "Docker-Content-Digest", .value = self.digest },
+                },
+            });
+        }
+    };
+
+    const manifest_body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(manifest_body);
+    const digest = try mock_registry.sha256DigestHeaderAlloc(allocator, manifest_body);
+    defer allocator.free(digest);
+
+    var harness: Harness = .{
+        .manifest_body = manifest_body,
+        .digest = digest,
+        .content_type = MediaType.oci_manifest_v1.toString(),
+        .v2_status = .unauthorized,
+    };
+    defer {
+        harness.v2_requests = 0;
+        harness.manifest_requests = 0;
+    }
+
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 8, Harness.handle, &harness);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const ping_result = try pingRegistry(allocator, &client, .{}, mock.registry_host);
+    try std.testing.expectEqual(RegistryPingStatus.reachable_auth_required, ping_result.ok);
+    try std.testing.expectEqual(@as(usize, 1), harness.v2_requests);
+    try std.testing.expectEqual(@as(usize, 0), harness.manifest_requests);
+
+    const ref_str = try std.fmt.allocPrint(allocator, "{s}/library/alpine:latest", .{mock.registry_host});
+    defer allocator.free(ref_str);
+    var ref = try Reference.parse(allocator, ref_str);
+    var resolve_outcome = try resolve(allocator, &client, .{}, ref, null);
+    defer switch (resolve_outcome) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |failure| {
+            ref.deinit(allocator);
+            deinitResolveFailure(failure, allocator);
+        },
+    };
+
+    switch (resolve_outcome) {
+        .success => |result| {
+            try std.testing.expectEqualStrings(digest["sha256:".len..], result.digest.hex);
+            try std.testing.expect(std.mem.startsWith(u8, result.reference.registry, "127.0.0.1:"));
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), harness.v2_requests);
+    try std.testing.expectEqual(@as(usize, 1), harness.manifest_requests);
+
+    harness.v2_status = .forbidden;
+    const ping_forbidden = try pingRegistry(allocator, &client, .{}, mock.registry_host);
+    try std.testing.expectEqual(RegistryPingFailureKind.unexpected_status, ping_forbidden.failure.kind);
+    try std.testing.expectEqual(@as(usize, 2), harness.v2_requests);
+    try std.testing.expectEqual(@as(usize, 1), harness.manifest_requests);
+
+    var ref_again = try Reference.parse(allocator, ref_str);
+    var resolve_again = try resolve(allocator, &client, .{}, ref_again, null);
+    defer switch (resolve_again) {
+        .success => |*result| result.deinit(allocator),
+        .failure => |failure| {
+            ref_again.deinit(allocator);
+            deinitResolveFailure(failure, allocator);
+        },
+    };
+    try std.testing.expectEqual(.success, std.meta.activeTag(resolve_again));
+    try std.testing.expectEqual(@as(usize, 2), harness.v2_requests);
+    try std.testing.expectEqual(@as(usize, 2), harness.manifest_requests);
+}
+
+test "mock registry integration: batch failure registry outlives input deinit on peer" {
+    defer test_matrix.Fixtures.reset(std.testing.allocator);
+
+    const mock_registry = @import("mock_registry.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Harness = struct {
+        fn handle(_: *mock_registry.MockRegistry, request: *std.http.Server.Request) !void {
+            const target = request.head.target;
+            if (std.mem.indexOf(u8, target, "/manifests/") != null) {
+                try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+                return;
+            }
+            try request.respond("{}", .{ .status = .ok, .keep_alive = false });
+        }
+    };
+
+    const mock = try mock_registry.MockRegistry.startWithHandler(allocator, io, 2, Harness.handle, null);
+    defer mock.deinit();
+
+    const ref_str = try std.fmt.allocPrint(allocator, "{s}/library/busybox:missing", .{mock.registry_host});
+    defer allocator.free(ref_str);
+
+    var ref = try Reference.parse(allocator, ref_str);
+    const input_registry_ptr = ref.registry.ptr;
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var result = try resolveMany(allocator, &client, .{}, &.{ref}, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.items.len);
+    try std.testing.expectEqual(.failure, std.meta.activeTag(result.items[0]));
+    const failure_registry = switch (result.items[0].failure) {
+        inline else => |value| value.registry,
+    };
+    try std.testing.expect(failure_registry.ptr != input_registry_ptr);
+
+    ref.deinit(allocator);
+
+    var message_buf: [256]u8 = undefined;
+    var message_writer = std.Io.Writer.fixed(&message_buf);
+    try result.items[0].failure.format(&message_writer);
+    const message = message_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, message, mock.registry_host) != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "busybox:missing") != null);
 }
 
 test "resolveManyWithExchangers: single-item success owns output and preserves input" {
