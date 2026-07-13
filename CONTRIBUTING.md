@@ -13,8 +13,8 @@ The current release gate covers the codebase from a few complementary angles:
 ## Running tests
 
 ```sh
-zig fmt --check src/ examples/ benchmarks/ build.zig
-zig build test            # Run all unit tests
+zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/
+zig build test            # Run all unit tests (includes security-check, workflow-smoke, examples-smoke)
 zig build examples-smoke  # Smoke pass over offline example programs
 zig build workflow-smoke  # Offline workflow smoke-test matrix
 ```

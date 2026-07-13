@@ -174,9 +174,12 @@ test "pingRegistryUriAlloc: builds https /v2/ URL" {
     try std.testing.expectEqualStrings("https://registry-1.docker.io/v2/", url);
 }
 
-test "classifyPingHttpStatus: anonymous, auth required, and unexpected" {
+test "classifyPingHttpStatus: anonymous, auth required, forbidden, and unexpected" {
     try std.testing.expectEqual(RegistryPingStatus.reachable_anonymous, classifyPingHttpStatus(.ok).ok);
     try std.testing.expectEqual(RegistryPingStatus.reachable_auth_required, classifyPingHttpStatus(.unauthorized).ok);
+    const forbidden = classifyPingHttpStatus(.forbidden);
+    try std.testing.expectEqual(RegistryPingFailureKind.unexpected_status, forbidden.failure.kind);
+    try std.testing.expectEqual(@as(?u16, 403), forbidden.failure.http_status);
     const unexpected = classifyPingHttpStatus(.not_found);
     try std.testing.expectEqual(RegistryPingFailureKind.unexpected_status, unexpected.failure.kind);
     try std.testing.expectEqual(@as(?u16, 404), unexpected.failure.http_status);
@@ -247,10 +250,40 @@ test "pingRegistryWithExchanger: status and transport matrix" {
     );
 }
 
-test "mapPingExchangeError: timeout network and tls kinds" {
+test "mapPingExchangeError: timeout network tls and other kinds" {
     try std.testing.expectEqual(RegistryPingFailureKind.timeout, mapPingExchangeError(error.Timeout).kind);
     try std.testing.expectEqual(RegistryPingFailureKind.network, mapPingExchangeError(error.ConnectionRefused).kind);
     try std.testing.expectEqual(RegistryPingFailureKind.tls, mapPingExchangeError(error.TlsFailure).kind);
+    try std.testing.expectEqual(RegistryPingFailureKind.other, mapPingExchangeError(error.OutOfMemory).kind);
+}
+
+test "livePingHttpExchanger: loopback mock peer uses cleartext rewrite" {
+    const mock_registry = @import("mock_registry.zig");
+    const io = std.testing.io;
+    const mock = try mock_registry.MockRegistry.startWithHandler(
+        std.testing.allocator,
+        io,
+        2,
+        struct {
+            fn handle(_: *mock_registry.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+                if (!std.mem.eql(u8, request.head.target, "/v2/") and !std.mem.eql(u8, request.head.target, "/v2")) {
+                    try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+                    return;
+                }
+                try request.respond("{}", .{ .status = .unauthorized, .keep_alive = false });
+            }
+        }.handle,
+        null,
+    );
+    defer mock.deinit();
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+
+    const url = try pingRegistryUriAlloc(std.testing.allocator, mock.registry_host);
+
+    const response = try livePingHttpExchanger(std.testing.allocator, &client, .{ .url = url });
+    try std.testing.expectEqual(std.http.Status.unauthorized, response.status);
 }
 
 test "livePingHttpExchanger: invalid URL maps to TransportFailed" {

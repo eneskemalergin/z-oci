@@ -103,10 +103,25 @@ const ScenarioHarness = struct {
     }
 };
 
-fn deinitResolveOutcome(outcome: z_oci.ResolveOutcome, allocator: std.mem.Allocator) void {
-    switch (outcome) {
-        .failure => |failure| z_oci.testing.deinitResolveError(failure, allocator),
-        else => {},
+const ResolveOutcomeTeardown = struct {
+    owned_input: ?*z_oci.Reference = null,
+    /// Success payload lives in an arena; skip `ResolveResult.deinit` (arena teardown owns it).
+    success_owned_by_arena: bool = false,
+};
+
+fn deinitResolveOutcome(
+    outcome: *z_oci.ResolveOutcome,
+    allocator: std.mem.Allocator,
+    teardown: ResolveOutcomeTeardown,
+) void {
+    switch (outcome.*) {
+        .success => |*result| {
+            if (!teardown.success_owned_by_arena) result.deinit(allocator);
+        },
+        .failure => |failure| {
+            if (teardown.owned_input) |ref| ref.deinit(allocator);
+            z_oci.testing.deinitResolveError(failure, allocator);
+        },
     }
 }
 
@@ -222,7 +237,7 @@ test "workflow smoke: z_oci.testing resolveWithExchangers propagates network_err
     var client: std.http.Client = undefined;
     const allocator = std.testing.allocator;
 
-    const resolve_outcome = try z_oci.testing.resolveWithExchangers(
+    var resolve_outcome = try z_oci.testing.resolveWithExchangers(
         allocator,
         &client,
         z_oci.Config{},
@@ -236,7 +251,7 @@ test "workflow smoke: z_oci.testing resolveWithExchangers propagates network_err
         }.call,
         .{},
     );
-    defer deinitResolveOutcome(resolve_outcome, allocator);
+    defer deinitResolveOutcome(&resolve_outcome, allocator, .{});
 
     switch (resolve_outcome) {
         .failure => |failure| try tm.expectResolveFailure(
@@ -251,41 +266,83 @@ test "workflow smoke: z_oci.testing resolveWithExchangers propagates network_err
     }
 }
 
-test "workflow smoke: z_oci.testing pingRegistryWithExchanger maps probe outcomes" {
+test "workflow smoke: resolveWithExchangers never probes registry /v2/ root" {
     const MockHarness = struct {
-        var status: std.http.Status = .ok;
+        var saw_v2_root: bool = false;
+
+        fn manifestExchange(
+            allocator: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            if (std.mem.endsWith(u8, request.url, "/v2/") or std.mem.eql(u8, request.url, "https://registry-1.docker.io/v2")) {
+                saw_v2_root = true;
+            }
+            const body = try allocator.dupe(u8, child_manifest_json);
+            errdefer allocator.free(body);
+            const digest = try tm.sha256DigestStringAlloc(allocator, body);
+            errdefer allocator.free(digest);
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = digest,
+            }, body);
+        }
+    };
+    defer MockHarness.saw_v2_root = false;
+
+    var ref = try z_oci.Reference.parse(std.testing.allocator, "registry-1.docker.io/library/busybox:latest");
+
+    var client: std.http.Client = undefined;
+    var owned_outcome = try z_oci.testing.resolveWithExchangers(
+        std.testing.allocator,
+        &client,
+        z_oci.Config{},
+        ref,
+        null,
+        tm.refuseTokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer deinitResolveOutcome(&owned_outcome, std.testing.allocator, .{ .owned_input = &ref });
+
+    switch (owned_outcome) {
+        .success => try std.testing.expect(!MockHarness.saw_v2_root),
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "workflow smoke: pingRegistryWithExchanger requests only /v2/ root" {
+    const MockHarness = struct {
+        var saw_manifest_path: bool = false;
+        var saw_v2_root: bool = false;
 
         fn exchange(allocator: std.mem.Allocator, _: *std.http.Client, request: z_oci.testing.PingHttpRequest) z_oci.testing.PingExchangeError!z_oci.testing.PingHttpResponse {
             defer request.deinit(allocator);
-            return .{ .status = status };
+            if (std.mem.indexOf(u8, request.url, "/manifests/") != null) saw_manifest_path = true;
+            if (std.mem.endsWith(u8, request.url, "/v2/")) saw_v2_root = true;
+            return .{ .status = .unauthorized };
         }
     };
+    defer {
+        MockHarness.saw_manifest_path = false;
+        MockHarness.saw_v2_root = false;
+    }
 
     var client: std.http.Client = undefined;
-
-    MockHarness.status = .ok;
-    try std.testing.expectEqual(
-        z_oci.RegistryPingStatus.reachable_anonymous,
-        (try z_oci.testing.pingRegistryWithExchanger(
-            std.testing.allocator,
-            &client,
-            .{},
-            "registry.example.test",
-            MockHarness.exchange,
-        )).ok,
-    );
-
-    MockHarness.status = .unauthorized;
     try std.testing.expectEqual(
         z_oci.RegistryPingStatus.reachable_auth_required,
         (try z_oci.testing.pingRegistryWithExchanger(
             std.testing.allocator,
             &client,
-            .{},
+            z_oci.Config{},
             "registry.example.test",
             MockHarness.exchange,
         )).ok,
     );
+    try std.testing.expect(!MockHarness.saw_manifest_path);
+    try std.testing.expect(MockHarness.saw_v2_root);
 }
 
 test "workflow smoke: z_oci.testing validateWithExchangers propagates scenario failures" {
@@ -377,7 +434,7 @@ test "workflow smoke: public resolve maps exhausted token 429 to rate_limited" {
     defer RateLimitHarness.manifest_calls = 0;
 
     var client: std.http.Client = undefined;
-    const rate_limited = try z_oci.testing.resolveWithExchangers(
+    var rate_limited = try z_oci.testing.resolveWithExchangers(
         std.testing.allocator,
         &client,
         .{ .max_rate_limit_retries = 0 },
@@ -387,7 +444,7 @@ test "workflow smoke: public resolve maps exhausted token 429 to rate_limited" {
         RateLimitHarness.manifestExchange,
         .{},
     );
-    defer deinitResolveOutcome(rate_limited, std.testing.allocator);
+    defer deinitResolveOutcome(&rate_limited, std.testing.allocator, .{});
 
     switch (rate_limited) {
         .failure => |failure| try tm.expectResolveFailure(
@@ -523,7 +580,7 @@ test "workflow smoke: public resolve preemptively sleeps before child fetch when
     defer arena.deinit();
 
     var client: std.http.Client = undefined;
-    const outcome = try z_oci.testing.resolveWithExchangers(
+    var outcome = try z_oci.testing.resolveWithExchangers(
         arena.allocator(),
         &client,
         .{ .rate_limit_enabled = true },
@@ -536,6 +593,7 @@ test "workflow smoke: public resolve preemptively sleeps before child fetch when
             .clock = .{ .now_unix_seconds = MockHarness.now },
         },
     );
+    defer deinitResolveOutcome(&outcome, arena.allocator(), .{ .success_owned_by_arena = true });
 
     switch (outcome) {
         .success => |result| {
@@ -543,14 +601,13 @@ test "workflow smoke: public resolve preemptively sleeps before child fetch when
             try std.testing.expectEqual(@as(u32, 30_000), MockHarness.preemptive_sleep_ms);
             try std.testing.expectEqual(z_oci.MediaType.oci_manifest_v1, result.media_type);
         },
-        .failure => |failure| {
-            z_oci.testing.deinitResolveError(failure, std.testing.allocator);
-            return error.TestUnexpectedResult;
-        },
+        .failure => return error.TestUnexpectedResult,
     }
 }
 
 test "workflow smoke: resolveMany caches implicit latest and preserves partial failures" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+
     const MockHarness = struct {
         var manifest_calls: usize = 0;
         var child: ChildArtifacts = undefined;
@@ -624,6 +681,8 @@ test "workflow smoke: resolveMany caches implicit latest and preserves partial f
 }
 
 test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed registries" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+
     // Multi-arch, auth isolation, digest verify, cache, lockfile metadata.
     const MockHarness = struct {
         const RecordedEvent = struct {
@@ -997,6 +1056,7 @@ test "workflow smoke: public resolveMany empty batch requires a live Client" {
 }
 
 test "workflow smoke: batch failure registry outlives input Reference deinit" {
+    defer tm.Fixtures.reset(std.testing.allocator);
     // Batch failures own registry; safe to deinit inputs then format failures.
     const MockHarness = struct {
         fn tokenExchange(allocator: std.mem.Allocator, client: *std.http.Client, request: z_oci.auth.TokenHttpRequest) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
@@ -1050,6 +1110,8 @@ test "workflow smoke: batch failure registry outlives input Reference deinit" {
 }
 
 test "workflow smoke: warm token cache still probes without Authorization first" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+
     // Warm token does not skip the unauthenticated probe (still pays 401).
     const MockHarness = struct {
         var unauthorized_probes: usize = 0;
@@ -1134,6 +1196,8 @@ test "workflow smoke: warm token cache still probes without Authorization first"
 }
 
 test "workflow smoke: CredentialProvider supplies Basic auth on per-registry token exchange" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+
     // credential_provider is on the live batch path, not storage-only.
     const MockHarness = struct {
         var docker_basic_seen: bool = false;

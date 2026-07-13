@@ -78,6 +78,11 @@ test "authorityHost: host port and bracketed ipv6" {
     try std.testing.expectEqualStrings("::1", authorityHost("[::1]:5000").?);
 }
 
+test "authorityHost: empty and malformed bracketed ipv6" {
+    try std.testing.expect(authorityHost("") == null);
+    try std.testing.expect(authorityHost("[::1") == null);
+}
+
 test "cleartextLoopbackUrlAlloc: rewrites loopback https only" {
     const alloc = std.testing.allocator;
 
@@ -88,6 +93,10 @@ test "cleartextLoopbackUrlAlloc: rewrites loopback https only" {
     const localhost = try cleartextLoopbackUrlAlloc(alloc, "https://localhost/v2/");
     defer alloc.free(localhost.?);
     try std.testing.expectEqualStrings("http://localhost/v2/", localhost.?);
+
+    const bracketed = try cleartextLoopbackUrlAlloc(alloc, "https://[::1]:5000/v2/");
+    defer alloc.free(bracketed.?);
+    try std.testing.expectEqualStrings("http://[::1]:5000/v2/", bracketed.?);
 
     try std.testing.expect(try cleartextLoopbackUrlAlloc(alloc, "https://ghcr.io/v2/") == null);
     try std.testing.expect(try cleartextLoopbackUrlAlloc(alloc, "https://registry-1.docker.io/v2/") == null);

@@ -7,9 +7,9 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [0.6.0] - [Unreleased]
 
-Integration and compatibility verification on top of the v0.5.0 client: deeper offline coverage, a local mock registry peer for the real HTTP client path, optional `registry:2`, enabled CI, and an evidence-tagged registry compatibility matrix. Resolve and auth stay on the shipped seams unless a Phase 6 test finds a defect.
+Integration and compatibility verification on top of the v0.5.0 client: deeper offline coverage, a local mock registry peer for the real HTTP client path, optional `registry:2`, and documented registry compatibility coverage. Resolve and auth stay on the shipped seams unless compat testing finds a defect.
 
-Nothing under this version is released yet. Add, change, fix, and verified notes land here only after the matching work is on the branch and gated. Internal milestone labels stay in `plan/phase6-plan.md`, not in this file.
+Nothing under this version is released yet. Add, change, fix, and verified notes land here only after the matching work is on the branch and gated.
 
 ### Added
 
@@ -21,14 +21,20 @@ Nothing under this version is released yet. Add, change, fix, and verified notes
 - Mock hard-case coverage against a real `std.http.Client`: bearer auth, redirect keep/strip, content-type/digest/size errors, multi-arch, depth limit, 429/503 retry, and ping status classification.
 - Opt-in local `registry:2` harness (`zig build integration-registry`): resolve by tag and digest, validate missing → `not_found`. Clear-fails when Docker is absent; never part of `zig build test`.
 - `security-check` scans `integration/` and flags non-placeholder Docker `auths` embedded in `.zig` sources.
+- Registry compatibility coverage in README (Hub, GHCR, Quay, generic bearer, loopback `registry:2`; fixtures, mocks, opt-in harness, and live commands).
+- Testing run: mock/ping/loopback edge and invariant coverage; workflow smoke trimmed duplicate ping status test; `deinitResolveOutcome` ownership fix; mock `NoManifestScript` error and request-budget test.
 
 ### Changed
 
 ### Fixed
 
 - Live manifest redirect follow rewrites loopback `https://` Locations to cleartext before the keep-authorization origin compare, so same-origin bearer auth is not stripped on local mock peers.
+- Workflow smoke `deinitResolveOutcome` tears down success and failure paths; arena-backed preemptive rate-limit smoke skips double-free on success.
 
 ### Verified
+
+- `./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes (339/339 tests, examples-smoke, workflow-smoke, security-check).
+- `./zig-0.16.0/zig fmt --check` passes on `src/`, `examples/`, `benchmarks/`, `build.zig`, `tools/`, `integration/`.
 
 ## [0.5.0] - 2026-07-10 - [Tagged]
 

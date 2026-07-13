@@ -72,7 +72,10 @@ Docker Hub, Quay, and GHCR are the main named targets in the current code and te
 - Quay: covered in auth tests and fixture-backed resolver coverage.
 - GHCR: covered in auth and challenge-flow tests.
 - GitLab and Harbor: covered through generic bearer-registry mock tests.
+- Distribution `registry:2` on loopback: opt-in `zig build integration-registry` (see [integration/registry2/README.md](integration/registry2/README.md)).
 - ECR, GCR, and ACR: not first-class targets yet. Use the credential helper chain where it fits your setup.
+
+Checked-in fixtures and in-process mocks cover most paths in `zig build test`. Live registry checks use packaged examples and are not part of the default gate.
 
 ### Performance
 
@@ -246,7 +249,7 @@ pub fn main() !void {
 
 ## Build steps
 
-This repository vendors Zig 0.16 under `./zig-0.16.0/`. Prefer the bundled compiler and pass `--zig-lib-dir ./zig-0.16.0/lib` so builds match CI and sandboxed environments:
+This repository vendors Zig 0.16 under `./zig-0.16.0/`. Prefer the bundled compiler and pass `--zig-lib-dir ./zig-0.16.0/lib` so builds match the documented offline gate:
 
 ```sh
 ./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib
@@ -294,7 +297,6 @@ See [examples](examples) for the source of the packaged examples.
 ## Next
 
 - CLI for resolve, validate, and inspect
-- Registry compatibility testing beyond the current Docker Hub / GHCR / Quay coverage
 
 ## References
 

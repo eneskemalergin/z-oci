@@ -131,14 +131,19 @@ pub const MockRegistry = struct {
     }
 
     /// Owned `{host}/{repository}:{tag}` for anonymous `start` peers only (`script` set).
-    pub fn imageReferenceAlloc(self: *const MockRegistry, allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
-        const script = self.script orelse return error.OutOfMemory;
+    pub fn imageReferenceAlloc(self: *const MockRegistry, allocator: std.mem.Allocator) ImageReferenceAllocError![]u8 {
+        const script = self.script orelse return error.NoManifestScript;
         return std.fmt.allocPrint(allocator, "{s}/{s}:{s}", .{
             self.registry_host,
             script.repository,
             script.tag,
         });
     }
+
+    pub const ImageReferenceAllocError = error{
+        OutOfMemory,
+        NoManifestScript,
+    };
 
     fn serveLoop(self: *MockRegistry) anyerror!void {
         while (self.request_budget.load(.acquire) > 0) {
@@ -316,6 +321,205 @@ test "MockRegistry: GET /v2/ returns distribution api version" {
     });
     try std.testing.expectEqual(http.Status.ok, result.status);
     try std.testing.expectEqualStrings("{}", response_body.written());
+}
+
+test "requestAuthorization: captures Authorization header on mock connection" {
+    const State = struct {
+        var authorization: ?[]const u8 = null;
+    };
+    defer State.authorization = null;
+
+    const io = std.testing.io;
+    const mock = try MockRegistry.startWithHandler(
+        std.testing.allocator,
+        io,
+        1,
+        struct {
+            fn handle(_: *MockRegistry, request: *http.Server.Request) anyerror!void {
+                State.authorization = requestAuthorization(request);
+                try request.respond("{}", .{ .status = .ok, .keep_alive = false });
+            }
+        }.handle,
+        null,
+    );
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://{s}/v2/", .{mock.registry_host});
+
+    var client: http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var http_request = try client.request(.GET, uri, .{
+        .extra_headers = &.{
+            .{ .name = "Authorization", .value = "Bearer secret" },
+        },
+    });
+    defer http_request.deinit();
+    try http_request.sendBodiless();
+
+    var redirect_buffer: [4 * 1024]u8 = undefined;
+    _ = try http_request.receiveHead(&redirect_buffer);
+    try std.testing.expectEqualStrings("Bearer secret", State.authorization.?);
+}
+
+test "requestAuthorization: absent when client sends no Authorization header" {
+    const State = struct {
+        var saw_authorization: bool = false;
+    };
+    defer State.saw_authorization = false;
+
+    const io = std.testing.io;
+    const mock = try MockRegistry.startWithHandler(
+        std.testing.allocator,
+        io,
+        1,
+        struct {
+            fn handle(_: *MockRegistry, request: *http.Server.Request) anyerror!void {
+                State.saw_authorization = requestAuthorization(request) != null;
+                try request.respond("{}", .{ .status = .ok, .keep_alive = false });
+            }
+        }.handle,
+        null,
+    );
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://{s}/v2/", .{mock.registry_host});
+
+    var client: http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var http_request = try client.request(.GET, uri, .{});
+    defer http_request.deinit();
+    try http_request.sendBodiless();
+
+    var redirect_buffer: [4 * 1024]u8 = undefined;
+    _ = try http_request.receiveHead(&redirect_buffer);
+    try std.testing.expect(!State.saw_authorization);
+}
+
+test "MockRegistry: anonymous handler returns not_found for unknown manifest path" {
+    const io = std.testing.io;
+    const mock = try MockRegistry.start(std.testing.allocator, io, .{
+        .repository = "library/alpine",
+        .tag = "latest",
+        .body = "{}",
+        .content_type = "application/json",
+    }, 1);
+    defer mock.deinit();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://{s}/v2/library/alpine/manifests/missing", .{mock.registry_host});
+
+    var client: http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var http_request = try client.request(.GET, uri, .{});
+    defer http_request.deinit();
+    try http_request.sendBodiless();
+
+    var redirect_buffer: [4 * 1024]u8 = undefined;
+    const response = try http_request.receiveHead(&redirect_buffer);
+    try std.testing.expectEqual(http.Status.not_found, response.head.status);
+}
+
+test "MockRegistry: anonymous handler rejects unsupported manifest method" {
+    const io = std.testing.io;
+    const mock = try MockRegistry.start(std.testing.allocator, io, .{
+        .repository = "library/alpine",
+        .tag = "latest",
+        .body = "{}",
+        .content_type = "application/json",
+    }, 1);
+    defer mock.deinit();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://{s}/v2/library/alpine/manifests/latest", .{mock.registry_host});
+
+    var client: http.Client = .{ .allocator = std.testing.allocator, .io = io };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var http_request = try client.request(.DELETE, uri, .{});
+    defer http_request.deinit();
+    try http_request.sendBodiless();
+
+    var redirect_buffer: [4 * 1024]u8 = undefined;
+    const response = try http_request.receiveHead(&redirect_buffer);
+    try std.testing.expectEqual(http.Status.method_not_allowed, response.head.status);
+}
+
+test "MockRegistry: imageReferenceAlloc fails without anonymous script" {
+    const mock = try MockRegistry.startWithHandler(
+        std.testing.allocator,
+        std.testing.io,
+        1,
+        struct {
+            fn handle(_: *MockRegistry, request: *http.Server.Request) anyerror!void {
+                try request.respond("{}", .{ .status = .ok, .keep_alive = false });
+            }
+        }.handle,
+        null,
+    );
+    defer mock.deinit();
+
+    const ref = mock.imageReferenceAlloc(std.testing.allocator);
+    try std.testing.expectError(error.NoManifestScript, ref);
+}
+
+test "MockRegistry: failed serve does not consume request budget" {
+    const State = struct {
+        var calls: usize = 0;
+    };
+    defer State.calls = 0;
+
+    const io = std.testing.io;
+    const mock = try MockRegistry.startWithHandler(
+        std.testing.allocator,
+        io,
+        1,
+        struct {
+            fn handle(_: *MockRegistry, request: *http.Server.Request) anyerror!void {
+                State.calls += 1;
+                if (State.calls == 1) return error.SimulatedServeFailure;
+                try request.respond("{}", .{ .status = .ok, .keep_alive = false });
+            }
+        }.handle,
+        null,
+    );
+    defer mock.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://{s}/v2/", .{mock.registry_host});
+
+    {
+        var client: http.Client = .{ .allocator = std.testing.allocator, .io = io };
+        defer client.deinit();
+        const uri = try std.Uri.parse(url);
+        var http_request = try client.request(.GET, uri, .{});
+        defer http_request.deinit();
+        http_request.sendBodiless() catch {};
+        var redirect_buffer: [4 * 1024]u8 = undefined;
+        _ = http_request.receiveHead(&redirect_buffer) catch {};
+    }
+
+    {
+        var client: http.Client = .{ .allocator = std.testing.allocator, .io = io };
+        defer client.deinit();
+        const uri = try std.Uri.parse(url);
+        var http_request = try client.request(.GET, uri, .{});
+        defer http_request.deinit();
+        try http_request.sendBodiless();
+        var redirect_buffer: [4 * 1024]u8 = undefined;
+        const response = try http_request.receiveHead(&redirect_buffer);
+        try std.testing.expectEqual(http.Status.ok, response.head.status);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), State.calls);
 }
 
 test "MockRegistry: deinit without accepts does not hang" {
