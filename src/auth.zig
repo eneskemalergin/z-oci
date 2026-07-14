@@ -24,11 +24,11 @@
 //! - Docker config inline auth borrows from the engine `auth_cache` until `deinit()`;
 //!   `release()` is a no-op for those hits.
 //!
-//! Runtime credential sources (caller environment; never written to the repo):
-//! - `Config` `CredentialProvider` (caller-owned slices for the call).
-//! - `Z_OCI_REGISTRY_HOST` / `Z_OCI_REGISTRY_USER` / `Z_OCI_REGISTRY_TOKEN`.
-//! - `DOCKER_CONFIG` / `HOME` / `USERPROFILE` to `~/.docker/config.json` (`auths`,
-//!   `credHelpers`, `credsStore`) and `docker-credential-*` helper subprocesses.
+//! Runtime credential sources (caller-injected; never written to the repo):
+//! - `Config.credential_provider`
+//! - `Config.credential_sources` (environ map, Docker config bytes/file load,
+//!   process Io for helpers). Public resolve applies these; no hidden getenv
+//!   or helper spawn. `*WithEngine` leaves wiring to the caller.
 //! Tokens and passwords exist in memory for the auth/resolve session. Owned bearer
 //! bytes, helper stdout secrets, and POST bodies are zeroed before free.
 //! `ResolveError` payloads carry registry, reference, and HTTP status only; do not
@@ -120,13 +120,7 @@ pub const HOME_DIR_VAR = "HOME";
 pub const USERPROFILE_DIR_VAR = "USERPROFILE";
 /// Docker Hub `auths` key in `config.json` (not a hostname).
 pub const DOCKER_HUB_AUTH_KEY = "https://index.docker.io/v1/";
-pub const DockerCredentialHelperRunner = *const fn (
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    helper_suffix: []const u8,
-    server_url: []const u8,
-    timeout: std.Io.Timeout,
-) AuthError!CredentialHandle;
+pub const DockerCredentialHelperRunner = ConfigModule.CredentialHelperRunner;
 /// Borrowed from the authenticate header; duplicate before freeing header bytes.
 pub const BearerChallenge = struct {
     realm: []const u8,
@@ -398,6 +392,36 @@ pub const AuthEngine = struct {
         var engine = init(allocator, config);
         try engine.setDockerConfigBytes(docker_config_json);
         return engine;
+    }
+
+    /// `*WithExchangers` applies this; `*WithEngine` does not.
+    pub fn applyCredentialSources(self: *AuthEngine, sources: ConfigModule.CredentialSources) Config.ApplyError!void {
+        self.environ_map = sources.environ_map;
+
+        if (sources.docker_config_json) |docker_json| {
+            self.setDockerConfigBytes(docker_json) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidDockerConfig => return error.InvalidDockerConfig,
+                else => return error.InvalidDockerConfig,
+            };
+        } else if (sources.load_docker_config_from_environ) {
+            if (sources.environ_map == null or sources.process_io == null) {
+                return error.CredentialSourcesIncomplete;
+            }
+            const loaded = self.loadDockerConfigFromEnvironment(sources.process_io.?) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidDockerConfig => return error.InvalidDockerConfig,
+                else => return error.InvalidDockerConfig,
+            };
+            _ = loaded;
+        }
+
+        if (sources.process_io) |io| {
+            self.docker_helper_config = .{
+                .io = io,
+                .runner = sources.helper_runner orelse runDockerCredentialHelperBySuffix,
+            };
+        }
     }
 
     pub fn deinit(self: *AuthEngine) void {
@@ -718,7 +742,13 @@ pub const AuthEngine = struct {
             if (try docker_config.registrySpecificHelperLookupForRegistry(self.allocator, registry)) |helper_lookup| {
                 const helper_server = try canonicalDockerCredentialHelperServerAlloc(self.allocator, helper_lookup.server_url);
                 defer self.allocator.free(helper_server);
-                return try context.runner(self.allocator, context.io, helper_lookup.helper_suffix, helper_server, helper_timeout);
+                return try mapHelperRunnerResult(context.runner(
+                    self.allocator,
+                    context.io,
+                    helper_lookup.helper_suffix,
+                    helper_server,
+                    helper_timeout,
+                ));
             }
         }
 
@@ -730,7 +760,13 @@ pub const AuthEngine = struct {
             if (try docker_config.globalHelperLookupForRegistry(self.allocator, registry)) |helper_lookup| {
                 const helper_server = try canonicalDockerCredentialHelperServerAlloc(self.allocator, helper_lookup.server_url);
                 defer self.allocator.free(helper_server);
-                return try context.runner(self.allocator, context.io, helper_lookup.helper_suffix, helper_server, helper_timeout);
+                return try mapHelperRunnerResult(context.runner(
+                    self.allocator,
+                    context.io,
+                    helper_lookup.helper_suffix,
+                    helper_server,
+                    helper_timeout,
+                ));
             }
         }
 
@@ -1602,12 +1638,21 @@ fn runDockerCredentialHelperBySuffix(
     helper_suffix: []const u8,
     server_url: []const u8,
     timeout: std.Io.Timeout,
-) AuthError!CredentialHandle {
+) anyerror!CredentialHandle {
     const command = try dockerCredentialHelperCommandAlloc(allocator, helper_suffix);
     defer allocator.free(command);
 
     const argv = [_][]const u8{ command, "get" };
     return runDockerCredentialHelperCommand(allocator, io, &argv, server_url, timeout);
+}
+fn mapHelperRunnerResult(result: anyerror!CredentialHandle) AuthError!CredentialHandle {
+    return result catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.HelperTimedOut => error.HelperTimedOut,
+        error.HelperFailed => error.HelperFailed,
+        error.InvalidDockerConfig => error.InvalidDockerConfig,
+        else => error.HelperFailed,
+    };
 }
 fn runDockerCredentialHelperCommand(
     allocator: std.mem.Allocator,
@@ -2377,6 +2422,96 @@ test "parseDockerConfig: lookup, helpers, and alias matrix" {
     defer case_insensitive.deinit(std.testing.allocator);
     const mixed_case_auth = (try case_insensitive.authCredentialForRegistry(std.testing.allocator, "ghcr.io")).?;
     try std.testing.expectEqualStrings("octocat", mixed_case_auth.username);
+}
+test "AuthEngine.applyCredentialSources: env, docker bytes, incomplete load, and invalid JSON" {
+    const allocator = std.testing.allocator;
+
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+    try AuthTestHarness.populateGhcrEnv(&environ_map);
+
+    {
+        var engine = AuthEngine.init(allocator, Config{});
+        defer engine.deinit();
+        try engine.applyCredentialSources(.{ .environ_map = &environ_map });
+        const handle = (try engine.credentialForRegistry("ghcr.io")).?;
+        defer handle.release();
+        try std.testing.expectEqualStrings("env-user", handle.credential.username);
+    }
+
+    {
+        var engine = AuthEngine.init(allocator, Config{});
+        defer engine.deinit();
+        try engine.applyCredentialSources(.{
+            .docker_config_json = AuthTestHarness.ghcr_docker_config_json,
+            .process_io = std.testing.io,
+        });
+        try std.testing.expect(engine.docker_config != null);
+        try std.testing.expect(engine.docker_helper_config != null);
+        const handle = (try engine.credentialForRegistry("ghcr.io")).?;
+        try std.testing.expectEqualStrings("octocat", handle.credential.username);
+    }
+
+    {
+        var engine = AuthEngine.init(allocator, Config{});
+        defer engine.deinit();
+        try std.testing.expectError(
+            error.CredentialSourcesIncomplete,
+            engine.applyCredentialSources(.{
+                .environ_map = &environ_map,
+                .load_docker_config_from_environ = true,
+            }),
+        );
+    }
+
+    {
+        var engine = AuthEngine.init(allocator, Config{});
+        defer engine.deinit();
+        try std.testing.expectError(
+            error.InvalidDockerConfig,
+            engine.applyCredentialSources(.{ .docker_config_json = "{not-json" }),
+        );
+    }
+}
+test "AuthEngine.applyCredentialSources: allocation failures do not leak" {
+    const docker_json = AuthTestHarness.ghcr_docker_config_json;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var engine = AuthEngine.init(allocator, Config{});
+            defer engine.deinit();
+            engine.applyCredentialSources(.{ .docker_config_json = docker_json }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return,
+            };
+        }
+    }.run, .{});
+}
+test "AuthEngine.applyCredentialSources: load_docker_config_from_environ loads HOME config" {
+    const io = std.testing.io;
+    const ghcr_config_json = AuthTestHarness.ghcr_docker_config_json;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try AuthTestHarness.writeDockerConfigAt(io, &tmp_dir, ".docker", ghcr_config_json);
+    const home_dir = try AuthTestHarness.tmpHomePath(tmp_dir);
+    defer std.testing.allocator.free(home_dir);
+
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+    try environ_map.put(HOME_DIR_VAR, home_dir);
+
+    var engine = AuthEngine.init(std.testing.allocator, Config{});
+    defer engine.deinit();
+    try engine.applyCredentialSources(.{
+        .environ_map = &environ_map,
+        .load_docker_config_from_environ = true,
+        .process_io = io,
+    });
+
+    try std.testing.expect(engine.docker_config != null);
+    try std.testing.expect(engine.docker_helper_config != null);
+    const handle = (try engine.credentialForRegistry("ghcr.io")).?;
+    try std.testing.expectEqualStrings("octocat", handle.credential.username);
 }
 test "AuthEngine.setDockerConfigBytes: replaces parsed config on warm engine" {
     var engine = AuthEngine.init(std.testing.allocator, Config{});

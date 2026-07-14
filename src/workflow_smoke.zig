@@ -1301,3 +1301,701 @@ test "workflow smoke: CredentialProvider supplies Basic auth on per-registry tok
     try std.testing.expect(MockHarness.docker_basic_seen);
     try std.testing.expect(MockHarness.ghcr_basic_seen);
 }
+
+test "workflow smoke: public path ignores env credentials unless credential_sources injects them" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+    const allocator = std.testing.allocator;
+
+    const MockHarness = struct {
+        var saw_basic: bool = false;
+        var child: ChildArtifacts = undefined;
+
+        fn tokenExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(alloc);
+            if (request.authorization) |authorization| {
+                if (std.mem.startsWith(u8, authorization, "Basic ")) saw_basic = true;
+            }
+            return .{ .status = .ok, .body = "{\"access_token\":\"anon-token\",\"expires_in\":3600}" };
+        }
+
+        fn manifestExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(alloc);
+            if (request.authorization == null) {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{
+                        "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/app:pull\"",
+                    },
+                }, null);
+            }
+            if (!std.mem.eql(u8, request.authorization.?, "Bearer anon-token")) return error.TransportFailed;
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = child.digest,
+            }, child.body);
+        }
+    };
+
+    MockHarness.child = try ChildArtifacts.alloc(allocator);
+    defer MockHarness.child.deinit(allocator);
+    defer {
+        MockHarness.saw_basic = false;
+    }
+
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+    try environ_map.put(z_oci.auth.ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(z_oci.auth.ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(z_oci.auth.ENV_REGISTRY_TOKEN, "env-token");
+
+    var client: std.http.Client = undefined;
+
+    var anonymous_ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    var anonymous_outcome = try z_oci.testing.resolveWithExchangers(
+        allocator,
+        &client,
+        .{},
+        anonymous_ref,
+        null,
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer deinitResolveOutcome(&anonymous_outcome, allocator, .{ .owned_input = &anonymous_ref });
+    try std.testing.expectEqual(.success, std.meta.activeTag(anonymous_outcome));
+    try std.testing.expect(!MockHarness.saw_basic);
+
+    MockHarness.saw_basic = false;
+    var injected_ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    var injected_outcome = try z_oci.testing.resolveWithExchangers(
+        allocator,
+        &client,
+        .{
+            .credential_sources = .{ .environ_map = &environ_map },
+        },
+        injected_ref,
+        null,
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer deinitResolveOutcome(&injected_outcome, allocator, .{ .owned_input = &injected_ref });
+    try std.testing.expectEqual(.success, std.meta.activeTag(injected_outcome));
+    try std.testing.expect(MockHarness.saw_basic);
+}
+
+test "workflow smoke: public path uses injected docker_config_json Basic auth" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+    const allocator = std.testing.allocator;
+
+    const docker_config_json =
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const MockHarness = struct {
+        var saw_expected_basic: bool = false;
+        var child: ChildArtifacts = undefined;
+
+        fn tokenExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(alloc);
+            const authorization = request.authorization orelse return error.TokenExchangeFailed;
+            if (std.mem.eql(u8, authorization, "Basic b2N0b2NhdDpnaHBfZXhhbXBsZQ==")) {
+                saw_expected_basic = true;
+            }
+            return .{ .status = .ok, .body = "{\"access_token\":\"docker-token\",\"expires_in\":3600}" };
+        }
+
+        fn manifestExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(alloc);
+            if (request.authorization == null) {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{
+                        "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/app:pull\"",
+                    },
+                }, null);
+            }
+            if (!std.mem.eql(u8, request.authorization.?, "Bearer docker-token")) return error.TransportFailed;
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = child.digest,
+            }, child.body);
+        }
+    };
+
+    MockHarness.child = try ChildArtifacts.alloc(allocator);
+    defer MockHarness.child.deinit(allocator);
+    defer {
+        MockHarness.saw_expected_basic = false;
+    }
+
+    var client: std.http.Client = undefined;
+    var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    var outcome = try z_oci.testing.resolveWithExchangers(
+        allocator,
+        &client,
+        .{
+            .credential_sources = .{ .docker_config_json = docker_config_json },
+        },
+        ref,
+        null,
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer deinitResolveOutcome(&outcome, allocator, .{ .owned_input = &ref });
+    try std.testing.expectEqual(.success, std.meta.activeTag(outcome));
+    try std.testing.expect(MockHarness.saw_expected_basic);
+}
+
+test "workflow smoke: credential_provider wins over injected environ on public path" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+    const allocator = std.testing.allocator;
+
+    const MockHarness = struct {
+        var saw_provider_basic: bool = false;
+        var saw_env_basic: bool = false;
+        var child: ChildArtifacts = undefined;
+
+        fn getCredential(registry: []const u8) ?z_oci.CredentialHandle {
+            if (!std.mem.eql(u8, registry, "ghcr.io")) return null;
+            return .{ .credential = .{ .username = "provider-user", .secret = "provider-secret" } };
+        }
+
+        fn tokenExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(alloc);
+            const authorization = request.authorization orelse return error.TokenExchangeFailed;
+            if (std.mem.eql(u8, authorization, "Basic cHJvdmlkZXItdXNlcjpwcm92aWRlci1zZWNyZXQ=")) {
+                saw_provider_basic = true;
+            }
+            if (std.mem.eql(u8, authorization, "Basic ZW52LXVzZXI6ZW52LXRva2Vu")) {
+                saw_env_basic = true;
+            }
+            return .{ .status = .ok, .body = "{\"access_token\":\"provider-token\",\"expires_in\":3600}" };
+        }
+
+        fn manifestExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(alloc);
+            if (request.authorization == null) {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{
+                        "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/app:pull\"",
+                    },
+                }, null);
+            }
+            if (!std.mem.eql(u8, request.authorization.?, "Bearer provider-token")) return error.TransportFailed;
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = child.digest,
+            }, child.body);
+        }
+    };
+
+    MockHarness.child = try ChildArtifacts.alloc(allocator);
+    defer MockHarness.child.deinit(allocator);
+    defer {
+        MockHarness.saw_provider_basic = false;
+        MockHarness.saw_env_basic = false;
+    }
+
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+    try environ_map.put(z_oci.auth.ENV_REGISTRY_HOST, "ghcr.io");
+    try environ_map.put(z_oci.auth.ENV_REGISTRY_USER, "env-user");
+    try environ_map.put(z_oci.auth.ENV_REGISTRY_TOKEN, "env-token");
+
+    const provider = z_oci.CredentialProvider{ .getCredentialFn = MockHarness.getCredential };
+
+    var client: std.http.Client = undefined;
+    var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    var outcome = try z_oci.testing.resolveWithExchangers(
+        allocator,
+        &client,
+        .{
+            .credential_provider = &provider,
+            .credential_sources = .{ .environ_map = &environ_map },
+        },
+        ref,
+        null,
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer deinitResolveOutcome(&outcome, allocator, .{ .owned_input = &ref });
+    try std.testing.expectEqual(.success, std.meta.activeTag(outcome));
+    try std.testing.expect(MockHarness.saw_provider_basic);
+    try std.testing.expect(!MockHarness.saw_env_basic);
+}
+
+test "workflow smoke: invalid docker_config_json is PublicApiError on public path" {
+    const allocator = std.testing.allocator;
+
+    var client: std.http.Client = undefined;
+    var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    defer ref.deinit(allocator);
+
+    try std.testing.expectError(
+        error.InvalidDockerConfig,
+        z_oci.testing.resolveWithExchangers(
+            allocator,
+            &client,
+            .{
+                .credential_sources = .{ .docker_config_json = "{not-json" },
+            },
+            ref,
+            null,
+            tm.refuseTokenExchange,
+            struct {
+                fn exchange(
+                    alloc: std.mem.Allocator,
+                    _: *std.http.Client,
+                    request: z_oci.testing.ManifestHttpRequest,
+                ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+                    defer request.deinit(alloc);
+                    return error.TransportFailed;
+                }
+            }.exchange,
+            .{},
+        ),
+    );
+}
+
+test "workflow smoke: load_docker_config_from_environ without Io is CredentialSourcesIncomplete" {
+    const allocator = std.testing.allocator;
+
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+    try environ_map.put(z_oci.auth.HOME_DIR_VAR, "/tmp");
+
+    var client: std.http.Client = undefined;
+    var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    defer ref.deinit(allocator);
+
+    try std.testing.expectError(
+        error.CredentialSourcesIncomplete,
+        z_oci.testing.resolveWithExchangers(
+            allocator,
+            &client,
+            .{
+                .credential_sources = .{
+                    .environ_map = &environ_map,
+                    .load_docker_config_from_environ = true,
+                },
+            },
+            ref,
+            null,
+            tm.refuseTokenExchange,
+            struct {
+                fn exchange(
+                    alloc: std.mem.Allocator,
+                    _: *std.http.Client,
+                    request: z_oci.testing.ManifestHttpRequest,
+                ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+                    defer request.deinit(alloc);
+                    return error.TransportFailed;
+                }
+            }.exchange,
+            .{},
+        ),
+    );
+}
+
+test "workflow smoke: public path helper_runner failure stays terminal on resolveWithExchangers" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+    const allocator = std.testing.allocator;
+
+    const docker_config_json =
+        \\{
+        \\  "credHelpers": {
+        \\    "ghcr.io": "mock-helper"
+        \\  }
+        \\}
+    ;
+
+    const MockHarness = struct {
+        fn failingHelper(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: []const u8,
+            _: []const u8,
+            _: std.Io.Timeout,
+        ) anyerror!z_oci.CredentialHandle {
+            return error.HelperFailed;
+        }
+
+        fn tokenExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(alloc);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(alloc);
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                .status = .unauthorized,
+                .www_authenticate_headers = &.{
+                    "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/app:pull\"",
+                },
+            }, null);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    var outcome = try z_oci.testing.resolveWithExchangers(
+        allocator,
+        &client,
+        .{
+            .credential_sources = .{
+                .docker_config_json = docker_config_json,
+                .process_io = std.testing.io,
+                .helper_runner = MockHarness.failingHelper,
+            },
+        },
+        ref,
+        null,
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer deinitResolveOutcome(&outcome, allocator, .{ .owned_input = &ref });
+    try std.testing.expectEqual(.failure, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(.auth_failed, std.meta.activeTag(outcome.failure));
+}
+
+test "workflow smoke: public path helper_runner timeout maps to ResolveError.timeout" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+    const allocator = std.testing.allocator;
+
+    const docker_config_json =
+        \\{
+        \\  "credHelpers": {
+        \\    "ghcr.io": "mock-helper"
+        \\  }
+        \\}
+    ;
+
+    const MockHarness = struct {
+        fn timeoutHelper(
+            _: std.mem.Allocator,
+            _: std.Io,
+            _: []const u8,
+            _: []const u8,
+            _: std.Io.Timeout,
+        ) anyerror!z_oci.CredentialHandle {
+            return error.HelperTimedOut;
+        }
+
+        fn tokenExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(alloc);
+            return error.TokenExchangeFailed;
+        }
+
+        fn manifestExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(alloc);
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                .status = .unauthorized,
+                .www_authenticate_headers = &.{
+                    "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/app:pull\"",
+                },
+            }, null);
+        }
+    };
+
+    var client: std.http.Client = undefined;
+    var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    var outcome = try z_oci.testing.resolveWithExchangers(
+        allocator,
+        &client,
+        .{
+            .credential_sources = .{
+                .docker_config_json = docker_config_json,
+                .process_io = std.testing.io,
+                .helper_runner = MockHarness.timeoutHelper,
+            },
+        },
+        ref,
+        null,
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer deinitResolveOutcome(&outcome, allocator, .{ .owned_input = &ref });
+    try std.testing.expectEqual(.failure, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(.timeout, std.meta.activeTag(outcome.failure));
+}
+
+test "workflow smoke: public path load_docker_config_from_environ supplies Basic auth" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ghcr_config_json =
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    {
+        var config_dir = try tmp_dir.dir.createDirPathOpen(io, ".docker", .{});
+        defer config_dir.close(io);
+        const file = try config_dir.createFile(io, "config.json", .{ .read = true });
+        defer file.close(io);
+        var file_buffer: [512]u8 = undefined;
+        var file_writer = file.writer(io, &file_buffer);
+        try file_writer.interface.writeAll(ghcr_config_json);
+        try file_writer.interface.flush();
+    }
+    const home_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp_dir.sub_path[0..] });
+    defer allocator.free(home_dir);
+
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+    try environ_map.put(z_oci.auth.HOME_DIR_VAR, home_dir);
+
+    const MockHarness = struct {
+        var saw_expected_basic: bool = false;
+        var child: ChildArtifacts = undefined;
+
+        fn tokenExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(alloc);
+            const authorization = request.authorization orelse return error.TokenExchangeFailed;
+            if (std.mem.eql(u8, authorization, "Basic b2N0b2NhdDpnaHBfZXhhbXBsZQ==")) {
+                saw_expected_basic = true;
+            }
+            return .{ .status = .ok, .body = "{\"access_token\":\"docker-token\",\"expires_in\":3600}" };
+        }
+
+        fn manifestExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(alloc);
+            if (request.authorization == null) {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{
+                        "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/app:pull\"",
+                    },
+                }, null);
+            }
+            if (!std.mem.eql(u8, request.authorization.?, "Bearer docker-token")) return error.TransportFailed;
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = child.digest,
+            }, child.body);
+        }
+    };
+
+    MockHarness.child = try ChildArtifacts.alloc(allocator);
+    defer MockHarness.child.deinit(allocator);
+    defer {
+        MockHarness.saw_expected_basic = false;
+    }
+
+    var client: std.http.Client = undefined;
+    var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+    var outcome = try z_oci.testing.resolveWithExchangers(
+        allocator,
+        &client,
+        .{
+            .credential_sources = .{
+                .environ_map = &environ_map,
+                .load_docker_config_from_environ = true,
+                .process_io = io,
+            },
+        },
+        ref,
+        null,
+        MockHarness.tokenExchange,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer deinitResolveOutcome(&outcome, allocator, .{ .owned_input = &ref });
+    try std.testing.expectEqual(.success, std.meta.activeTag(outcome));
+    try std.testing.expect(MockHarness.saw_expected_basic);
+}
+
+test "workflow smoke: credential_sources Basic auth works on validate, getManifest, and resolveMany" {
+    defer tm.Fixtures.reset(std.testing.allocator);
+    const allocator = std.testing.allocator;
+
+    const docker_config_json =
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "b2N0b2NhdDpnaHBfZXhhbXBsZQ=="
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    const MockHarness = struct {
+        var basic_token_calls: usize = 0;
+        var child: ChildArtifacts = undefined;
+
+        fn tokenExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.auth.TokenHttpRequest,
+        ) z_oci.auth.AuthError!z_oci.auth.TokenExchangeResponse {
+            defer request.deinit(alloc);
+            const authorization = request.authorization orelse return error.TokenExchangeFailed;
+            if (!std.mem.eql(u8, authorization, "Basic b2N0b2NhdDpnaHBfZXhhbXBsZQ==")) {
+                return error.TokenExchangeFailed;
+            }
+            basic_token_calls += 1;
+            return .{ .status = .ok, .body = "{\"access_token\":\"docker-token\",\"expires_in\":3600}" };
+        }
+
+        fn manifestExchange(
+            alloc: std.mem.Allocator,
+            _: *std.http.Client,
+            request: z_oci.testing.ManifestHttpRequest,
+        ) z_oci.testing.ManifestExchangeError!z_oci.testing.ManifestHttpResponse {
+            defer request.deinit(alloc);
+            if (request.authorization == null) {
+                return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                    .status = .unauthorized,
+                    .www_authenticate_headers = &.{
+                        "Bearer realm=\"https://auth.ghcr.test/token\",service=\"ghcr.io\",scope=\"repository:owner/app:pull\"",
+                    },
+                }, null);
+            }
+            if (!std.mem.eql(u8, request.authorization.?, "Bearer docker-token")) return error.TransportFailed;
+            return z_oci.testing.ManifestHttpResponse.initOwnedAlloc(alloc, .{
+                .status = .ok,
+                .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+                .docker_content_digest = child.digest,
+            }, child.body);
+        }
+    };
+
+    MockHarness.child = try ChildArtifacts.alloc(allocator);
+    defer MockHarness.child.deinit(allocator);
+    defer {
+        MockHarness.basic_token_calls = 0;
+    }
+
+    const config = z_oci.Config{
+        .credential_sources = .{ .docker_config_json = docker_config_json },
+    };
+    var client: std.http.Client = undefined;
+
+    {
+        var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+        defer ref.deinit(allocator);
+        const validity = try z_oci.testing.validateWithExchangers(
+            allocator,
+            &client,
+            config,
+            ref,
+            null,
+            MockHarness.tokenExchange,
+            MockHarness.manifestExchange,
+            .{},
+        );
+        defer deinitValidateOutcome(validity, allocator);
+        try std.testing.expectEqual(.valid, validity);
+    }
+
+    {
+        var ref = try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest");
+        defer ref.deinit(allocator);
+        const manifest_outcome = try z_oci.testing.getManifestWithExchangers(
+            allocator,
+            &client,
+            config,
+            ref,
+            null,
+            MockHarness.tokenExchange,
+            MockHarness.manifestExchange,
+            .{},
+        );
+        defer deinitManifestOutcome(manifest_outcome, allocator);
+        try std.testing.expectEqual(.success, std.meta.activeTag(manifest_outcome));
+    }
+
+    {
+        var refs = [_]z_oci.Reference{
+            try z_oci.Reference.parse(allocator, "ghcr.io/owner/app:latest"),
+        };
+        defer for (&refs) |*ref| ref.deinit(allocator);
+        var batch = try z_oci.testing.resolveManyWithExchangers(
+            allocator,
+            &client,
+            config,
+            refs[0..],
+            .{},
+            MockHarness.tokenExchange,
+            MockHarness.manifestExchange,
+            .{},
+        );
+        defer batch.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 1), batch.items.len);
+        try std.testing.expectEqual(.success, std.meta.activeTag(batch.items[0]));
+    }
+
+    try std.testing.expect(MockHarness.basic_token_calls >= 3);
+}

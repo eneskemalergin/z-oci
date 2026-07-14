@@ -21,9 +21,9 @@
 //!   Call `TokenResponse.deinit(allocator)` to release any owned refresh token.
 //! - Batch workloads should reuse one `std.http.Client` and one `AuthEngine` across
 //!   multiple manifest operations so per-scope token cache entries stay warm.
-//!   Public `resolve`/`validate`/`getManifest` create a fresh engine per call; use
-//!   `testing.resolveWithEngine` (or the same pattern in application code) when
-//!   measuring or implementing session reuse.
+//!   Public `resolve`/`validate`/`getManifest` create a fresh engine per call and
+//!   apply `Config.credential_sources`. `testing.resolveWithEngine` does not
+//!   re-apply sources onto a caller-owned engine.
 //! - Per-operation transient arena (`resolveWithEngine`, `getManifestWithEngine`, and
 //!   the GET fallback inside `validateWithEngine`): one bump arena wraps the caller
 //!   allocator for manifest fetch work, including multi-arch child fetches where
@@ -55,7 +55,8 @@
 //!   These need no deinit.
 //!
 //! Error surfaces at the public boundary:
-//! - `PublicApiError` (`Config.ApplyError`): pre-flight config/TLS setup only (`applyToClient`).
+//! - `PublicApiError` (`Config.ApplyError`): pre-flight config/TLS setup and
+//!   credential-source apply (`applyToClient`, `AuthEngine.applyCredentialSources`).
 //!   Returned as the API error union, not inside `ResolveOutcome.failure`.
 //! - `Reference.ParseError` / `Digest.ParseError`: caller parses before invoking resolve APIs.
 //! - `ResolveError`: registry operation failures inside `ResolveOutcome.failure`,
@@ -95,6 +96,8 @@ pub const TokenResponse = auth.TokenResponse;
 pub const ResolveError = @import("ResolveError.zig").ResolveError;
 pub const ResolveResult = @import("ResolveResult.zig");
 pub const Config = @import("Config.zig").Config;
+pub const CredentialSources = @import("Config.zig").CredentialSources;
+pub const CredentialHelperRunner = @import("Config.zig").CredentialHelperRunner;
 pub const CredentialProvider = @import("Config.zig").CredentialProvider;
 pub const Credential = @import("Config.zig").Credential;
 pub const CredentialHandle = @import("Config.zig").CredentialHandle;
@@ -694,7 +697,7 @@ const ResolveManySession = struct {
             .allocator = allocator,
             .client = client,
             .config = config,
-            .engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(
+            .engine = try initAuthEngineForPublicResolve(
                 allocator,
                 config,
                 token_exchanger,
@@ -713,6 +716,22 @@ const ResolveManySession = struct {
 };
 fn ensureClientConfigured(config: Config, client: *std.http.Client) PublicApiError!void {
     return config.applyToClient(client);
+}
+fn initAuthEngineForPublicResolve(
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_exchanger: auth.TokenHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+) PublicApiError!auth.AuthEngine {
+    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(
+        allocator,
+        config,
+        token_exchanger,
+        transport_hooks,
+    );
+    errdefer engine.deinit();
+    try engine.applyCredentialSources(config.credential_sources);
+    return engine;
 }
 fn pingRegistryWithExchanger(
     allocator: std.mem.Allocator,
@@ -736,7 +755,7 @@ fn resolveWithExchangers(
 ) PublicApiError!ResolveOutcome {
     try ensureClientConfigured(config, client);
 
-    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
+    var engine = try initAuthEngineForPublicResolve(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
 
     return resolveWithEngine(
@@ -922,7 +941,7 @@ fn validateWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ValidateOutcome {
-    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
+    var engine = try initAuthEngineForPublicResolve(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
     return validateWithEngine(
         allocator,
@@ -1067,7 +1086,7 @@ fn getManifestWithExchangers(
     manifest_exchanger: resolver.ManifestHttpExchanger,
     transport_hooks: resilience.TransportHooks,
 ) PublicApiError!ManifestOutcome {
-    var engine = auth.AuthEngine.initWithTokenHttpExchangerAndHooks(allocator, config, token_exchanger, transport_hooks);
+    var engine = try initAuthEngineForPublicResolve(allocator, config, token_exchanger, transport_hooks);
     defer engine.deinit();
     return getManifestWithEngine(
         allocator,

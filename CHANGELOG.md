@@ -7,6 +7,14 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [Unreleased]
 
+### Added
+
+- Public `Config.credential_sources` for caller-injected environment maps, Docker config JSON (or environ file load), process Io for credential helpers, and optional `helper_runner` override. Wired through `resolve`, `validate`, `getManifest`, and `resolveMany`. Default remains provider-only / anonymous with no hidden process reads.
+
+### Changed
+
+- README and auth docs describe the live public credential contract truthfully: env / Docker / helpers require `credential_sources` injection.
+
 ## [0.6.0] - 2026-07-13 - [Tagged]
 
 Integration and compatibility verification on top of the v0.5.0 client: deeper offline coverage, a local mock registry peer for the real HTTP client path, optional `registry:2`, and documented registry compatibility coverage. Resolve and auth stay on the shipped seams unless compat testing finds a defect.

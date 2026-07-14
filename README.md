@@ -39,7 +39,7 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
 - **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, and `MultiArchManifest`, all with JSON round-trip support.
-- **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Live auth starts from manifest `HEAD`/`GET` challenges (not a separate `/v2/` probe). It parses `WWW-Authenticate` headers, exchanges tokens, resolves credentials from config, environment variables, or Docker config/helpers, and caches tokens per scope with TTL expiry.
+- **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Live auth starts from manifest `HEAD`/`GET` challenges (not a separate `/v2/` probe). It parses `WWW-Authenticate` headers, exchanges tokens, and caches tokens per scope with TTL expiry. Credentials on the public path come from an optional `Config.credential_provider` and optional caller-injected `Config.credential_sources` (environment map, Docker `config.json` bytes or file load, and process Io for credential helpers). Bare `Config{}` is anonymous: the library does not silently read the process environment or spawn helpers.
 - **Public resolver path**: `resolve`, `validate`, `getManifest`, and `resolveMany` perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit. `resolveMany` is sequential over one shared client and auth engine; it does not parallelize registry traffic.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
 
@@ -52,6 +52,7 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 - `resolve` does not call ping, and ping does not call resolve.
 - Live exchangers rewrite `https://` to cleartext `http://` only for loopback registry hosts (`127.0.0.1`, `localhost`, `::1`) so offline mock / local `registry:2` tests can use a real `std.http.Client`. Public hostnames stay HTTPS. There is no public Config switch for cleartext.
 - User-facing CLI commands built on top of the live resolver surface are still future work.
+- Environment variables, Docker `config.json`, and credential helpers are opt-in via `Config.credential_sources`. Without that injection, only `credential_provider` (or anonymous access) is used.
 
 ### Resilience
 
@@ -75,7 +76,7 @@ Docker Hub, Quay, and GHCR are the main named targets in the current code and te
 - GHCR: covered in auth and challenge-flow tests.
 - GitLab and Harbor: covered through generic bearer-registry mock tests.
 - Distribution `registry:2` on loopback: opt-in `zig build integration-registry` (see [integration/registry2/README.md](integration/registry2/README.md)).
-- ECR, GCR, and ACR: not first-class targets yet. Use the credential helper chain where it fits your setup.
+- ECR, GCR, and ACR: not first-class targets yet. Callers can inject Docker config and credential-helper Io through `Config.credential_sources` where that fits the deployment.
 
 Checked-in fixtures and in-process mocks cover most paths in `zig build test`. Live registry checks use packaged examples and are not part of the default gate.
 
@@ -160,6 +161,24 @@ switch (manifest_outcome) {
 ```
 
 `resolve`, `validate`, and `getManifest` all use a caller-owned `std.http.Client` and the same auth-backed resolver flow.
+
+Credential sources are opt-in. A CLI-shaped Zig 0.16 entrypoint injects the process environment and helper Io through `Config.credential_sources` (no silent process reads):
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    // … build std.http.Client with init.io …
+    const config = z_oci.Config{
+        .credential_sources = .{
+            .environ_map = init.environ_map,
+            .load_docker_config_from_environ = true,
+            .process_io = init.io,
+        },
+    };
+    // … resolve / validate / getManifest …
+}
+```
+
+Bare `Config{}` stays anonymous. Prefer `docker_config_json` when you already hold `config.json` bytes. `helper_runner` overrides the default `docker-credential-*` spawn (tests / advanced callers).
 
 On single-resolve `.failure`, keep the input `Reference` alive until after you finish reading or formatting the error: `registry` borrows that input. Then call `deinitResolveFailure` (or `ResolveError.deinitOwned`) and `Reference.deinit`.
 

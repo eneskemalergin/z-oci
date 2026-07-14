@@ -40,13 +40,13 @@
 //! - Custom CA support does not make Windows a supported host. Zig 0.16 TLS on
 //!   Windows remains out of scope for z-oci regardless of bundle configuration.
 //!
-//! CredentialProvider and Credential are defined here because they describe
-//! the interface slot, not the implementation. Concrete providers (env vars,
-//! Docker config, credential helpers) live in `auth.zig`.
+//! CredentialProvider / CredentialSources are interface slots here; lookup
+//! lives in `auth.zig`. Public resolve applies `credential_sources` only when
+//! the caller injects them (no hidden process reads).
 //!
-//! Config fields are copied by value. Slices (ca_bundle_path,
-//! Credential.secret) borrow from the caller. The caller is responsible for
-//! keeping those strings alive for the duration of any resolve call.
+//! Config fields are copied by value. Slices (`ca_bundle_path`,
+//! `Credential.secret`, `CredentialSources.docker_config_json`) and
+//! `CredentialSources.environ_map` / `process_io` borrow for the resolve call.
 
 const std = @import("std");
 
@@ -54,6 +54,31 @@ pub const DEFAULT_MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_TOKEN_RESPONSE_BYTES = 64 * 1024;
 /// `0` means unbounded.
 pub const DEFAULT_MAX_TOKEN_CACHE_ENTRIES: u32 = 128;
+
+/// Opt-in auth sources for the public resolver path. Default `{}` is
+/// provider-only / anonymous. Borrowed views must outlive the resolve call.
+/// Precedence: `credential_provider`, then env, then Docker config/helpers.
+pub const CredentialSources = struct {
+    environ_map: ?*const std.process.Environ.Map = null,
+    /// Wins over `load_docker_config_from_environ`.
+    docker_config_json: ?[]const u8 = null,
+    /// Requires `environ_map` and `process_io`, else `CredentialSourcesIncomplete`.
+    load_docker_config_from_environ: bool = false,
+    /// Enables helper spawn once a Docker config is loaded. Default runner is
+    /// `docker-credential-*`; override with `helper_runner` for tests.
+    process_io: ?std.Io = null,
+    helper_runner: ?CredentialHelperRunner = null,
+};
+
+/// Matches `auth.DockerCredentialHelperRunner`. `anyerror` so Config does not
+/// depend on the auth error set; auth maps unknown errors to `HelperFailed`.
+pub const CredentialHelperRunner = *const fn (
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    helper_suffix: []const u8,
+    server_url: []const u8,
+    timeout: std.Io.Timeout,
+) anyerror!CredentialHandle;
 
 pub const Credential = struct {
     username: []const u8,
@@ -91,9 +116,12 @@ pub const Config = struct {
         CaBundleTlsDisabled,
         CaBundleInsecurePermissions,
         CaBundleContainsPrivateKey,
+        InvalidDockerConfig,
+        CredentialSourcesIncomplete,
     };
 
     credential_provider: ?*const CredentialProvider = null,
+    credential_sources: CredentialSources = .{},
 
     // Caller-owned TCP only; live exchangers ignore this (zig#31305). `0` = unset.
     connect_timeout_ms: u32 = 0,
@@ -338,6 +366,11 @@ test "Config: default field values" {
     const defaults = Config{};
 
     try std.testing.expect(defaults.credential_provider == null);
+    try std.testing.expect(defaults.credential_sources.environ_map == null);
+    try std.testing.expect(defaults.credential_sources.docker_config_json == null);
+    try std.testing.expect(!defaults.credential_sources.load_docker_config_from_environ);
+    try std.testing.expect(defaults.credential_sources.process_io == null);
+    try std.testing.expect(defaults.credential_sources.helper_runner == null);
     try std.testing.expect(!defaults.rate_limit_enabled);
     try std.testing.expect(defaults.ca_bundle_path == null);
     try std.testing.expectEqual(@as(u32, 0), defaults.connect_timeout_ms);
