@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.6.0%20unreleased-8B5CF6?style=flat-square" alt="v0.6.0">
-    <img src="https://img.shields.io/badge/status-documentation%20run-2D7D46?style=flat-square" alt="Status: documentation run">
+    <img src="https://img.shields.io/badge/version-v0.6.0-8B5CF6?style=flat-square" alt="v0.6.0">
+    <img src="https://img.shields.io/badge/status-compat%20testing-2D7D46?style=flat-square" alt="Status: compat testing">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -111,7 +111,7 @@ v0.6.0 Debug `--counting` snapshot for core resolve ops (100 iterations; see `be
 ### Add as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.5.0
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.6.0
 ```
 
 Then in `build.zig`, import the package:

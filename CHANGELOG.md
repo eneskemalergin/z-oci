@@ -5,11 +5,11 @@ All notable changes to z-oci are documented here. The format follows [Keep a Cha
 
 Versions listed here may be prepared ahead of the matching git tag. Tags follow once the release is cut.
 
-## [0.6.0] - [Unreleased]
+## [Unreleased]
+
+## [0.6.0] - 2026-07-13 - [Tagged]
 
 Integration and compatibility verification on top of the v0.5.0 client: deeper offline coverage, a local mock registry peer for the real HTTP client path, optional `registry:2`, and documented registry compatibility coverage. Resolve and auth stay on the shipped seams unless compat testing finds a defect.
-
-Nothing under this version is released yet. Add, change, fix, and verified notes land here only after the matching work is on the branch and gated.
 
 ### Added
 
@@ -588,3 +588,4 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 [0.3.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.3.0
 [0.4.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.4.0
 [0.5.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.5.0
+[0.6.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.6.0
