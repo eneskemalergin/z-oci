@@ -20,6 +20,7 @@ This release collects the public API and executable foundations added after v0.6
 
 - README and auth docs describe the live public credential contract truthfully: env / Docker / helpers require `credential_sources` injection.
 - The executable build now installs the CLI process adapter and runs its parser and output tests as part of the default test step.
+- The process adapter now owns bounded standard-output writers and one caller-owned HTTP client, projects process credential sources explicitly, applies custom CA and helper-timeout settings through `Config`, and maps pre-flight configuration failures to stable CLI output.
 
 ## [0.6.0] - 2026-07-13 - [Tagged]
 
