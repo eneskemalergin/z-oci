@@ -37,7 +37,7 @@ pub const RateLimited = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
-    // Reactive transport retries were consumed before this `429`.
+    /// Reactive transport retries were consumed before this `429`.
     transport_retries_exhausted: bool = false,
 };
 
@@ -69,7 +69,7 @@ pub const NetworkError = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
-    // Reactive transport retries were consumed before this failure.
+    /// Reactive transport retries were consumed before this failure.
     transport_retries_exhausted: bool = false,
 };
 
@@ -89,7 +89,7 @@ pub const Timeout = struct {
     registry: []const u8,
     reference: []const u8,
     http_status: ?u16 = null,
-    // Reactive transport retries were consumed before this timeout.
+    /// Reactive transport retries were consumed before this timeout.
     transport_retries_exhausted: bool = false,
 };
 
@@ -195,8 +195,6 @@ pub const ResolveError = union(enum) {
         };
     }
 
-    // context returns the common context fields regardless of variant.
-    // Using a shared struct avoids repeating the same switch in each method.
     fn context(self: ResolveError) struct {
         registry: []const u8,
         reference: []const u8,
@@ -229,8 +227,6 @@ pub const ResolveError = union(enum) {
         };
     }
 };
-
-// --- Test helpers ---
 
 fn formatBuffered(err: ResolveError, buf: []u8) ![]const u8 {
     var w = std.Io.Writer.fixed(buf);
@@ -334,8 +330,6 @@ const all_tags = [_]std.meta.Tag(ResolveError){
     .depth_limit_exceeded,
     .response_too_large,
 };
-
-// --- Tests ---
 
 test "ResolveError.format: every variant summary, HTTP status, transport suffix, and long context" {
     const summaries = [_]struct { tag: std.meta.Tag(ResolveError), summary: []const u8 }{

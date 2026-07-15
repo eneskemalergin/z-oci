@@ -160,8 +160,6 @@ fn slicePointsInto(inner: []const u8, outer: []const u8) bool {
     return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
 }
 
-// --- Tests ---
-
 const sha256_a = "a" ** 64;
 const sha256_b = "b" ** 64;
 const sha256_f = "f" ** 64;

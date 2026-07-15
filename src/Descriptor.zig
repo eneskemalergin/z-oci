@@ -14,7 +14,7 @@ const test_support = @import("test_support.zig");
 media_type: MediaType,
 digest: Digest,
 size: u64,
-// Index / manifest-list entries only.
+/// Used only for index or manifest-list entries.
 platform: ?Platform = null,
 urls: ?[]const []const u8 = null,
 annotations: ?std.json.Value = null,
@@ -96,16 +96,12 @@ pub fn jsonStringify(self: Descriptor, jw: anytype) !void {
     try jw.endObject();
 }
 
-// --- Tests ---
-
 const hex_a = "a" ** 64;
 const hex_d = "d" ** 64;
 const hex_1 = "1" ** 64;
 const manifest_media_type = "application/vnd.oci.image.manifest.v1+json";
 const minimal_json =
     "{\"mediaType\":\"" ++ manifest_media_type ++ "\",\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1234}";
-
-// jsonParse -------------------------------------------------------------------
 
 test "Descriptor jsonParse: valid payloads parse expected fields" {
     const full_json =
@@ -232,8 +228,6 @@ test "Descriptor jsonParse: repeated parse rounds leave no residual allocations 
         parsed.deinit();
     }
 }
-
-// jsonStringify ----------------------------------------------------------------
 
 test "Descriptor jsonStringify: omits null optional fields" {
     const d = Descriptor{

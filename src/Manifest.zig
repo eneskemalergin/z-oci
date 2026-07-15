@@ -131,8 +131,6 @@ pub fn jsonStringify(self: Manifest, jw: anytype) !void {
     try jw.endObject();
 }
 
-// --- Tests ---
-
 const hex_a = "a" ** 64;
 const hex_b = "b" ** 64;
 const hex_c = "c" ** 64;
@@ -148,8 +146,6 @@ const minimal_manifest_json =
     "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[]}";
 const manifest_with_layer_json =
     "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[" ++ layer_field ++ "]}";
-
-// jsonParse -------------------------------------------------------------------
 
 test "Manifest jsonParse: valid OCI and Docker payloads parse expected fields" {
     const minimal = try json.parse(Manifest, std.testing.allocator, minimal_manifest_json);
@@ -305,8 +301,6 @@ test "Manifest jsonParse: repeated parse rounds leave no residual allocations un
     }
 }
 
-// parseMediaTypeShallow ---------------------------------------------------------
-
 test "Manifest parseMediaTypeShallow: extracts mediaType without full manifest validation" {
     const success_cases = [_]struct { []const u8, MediaType }{
         .{ minimal_manifest_json, .oci_manifest_v1 },
@@ -321,8 +315,6 @@ test "Manifest parseMediaTypeShallow: extracts mediaType without full manifest v
     try std.testing.expectError(error.MissingField, Manifest.parseMediaTypeShallow(std.testing.allocator, "{\"schemaVersion\":2}"));
     try std.testing.expectError(error.UnexpectedToken, Manifest.parseMediaTypeShallow(std.testing.allocator, "null"));
 }
-
-// jsonStringify ----------------------------------------------------------------
 
 test "Manifest jsonStringify: omits null annotations" {
     const config = Descriptor{

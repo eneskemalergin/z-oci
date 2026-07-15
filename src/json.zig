@@ -59,8 +59,6 @@ pub fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
     return aw;
 }
 
-// --- Private helpers ---
-
 fn expectManifestFieldsMatch(expected: Manifest, actual: Manifest) !void {
     try std.testing.expectEqual(expected.schema_version, actual.schema_version);
     try std.testing.expectEqual(expected.media_type, actual.media_type);
@@ -111,8 +109,6 @@ const minimal_manifest_json =
     \\  "layers": []
     \\}
 ;
-
-// --- Tests ---
 
 test "json.parse: arena-owned Manifest survives freeing input buffer" {
     const json_bytes = try std.testing.allocator.dupe(u8,

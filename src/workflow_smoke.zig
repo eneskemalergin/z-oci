@@ -1,7 +1,6 @@
 //! Small workflow smoke matrix.
 //!
-//! These tests sit above the owning unit tests and below any future integration
-//! layer. They exercise the public resolver surface through `z_oci.testing` with
+//! These tests cover cross-module public flows through `z_oci.testing` with
 //! injected transports, and app-shaped public API flows against the in-process mock
 //! peer are covered in `root.zig` mock integration tests.
 
@@ -139,8 +138,6 @@ fn deinitManifestOutcome(outcome: z_oci.ManifestOutcome, allocator: std.mem.Allo
         .success => |parsed| parsed.deinit(),
     }
 }
-
-// --- Tests ---
 
 test "workflow smoke: ResolveResult clone survives arena teardown" {
     var cloned: z_oci.ResolveResult = undefined;
@@ -680,10 +677,9 @@ test "workflow smoke: resolveMany caches implicit latest and preserves partial f
     );
 }
 
-test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed registries" {
+test "workflow smoke: batch pin flow formats pinned refs across mixed registries" {
     defer tm.Fixtures.reset(std.testing.allocator);
 
-    // Multi-arch, auth isolation, digest verify, cache, lockfile metadata.
     const MockHarness = struct {
         const RecordedEvent = struct {
             event: z_oci.ResolveManyProgress.Event,
@@ -862,7 +858,6 @@ test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed r
         .{wrong_digest},
     );
 
-    // Mixed tag/digest/failure list shaped like a pipeline pin set.
     const image_strings = [_][]const u8{
         "registry-1.docker.io/library/busybox",
         "registry-1.docker.io/library/busybox:latest",
@@ -893,7 +888,6 @@ test "workflow smoke: Zencelot-style pin flow formats pinned refs across mixed r
         .{ .max_rate_limit_retries = 1 },
         refs[0..],
         .{
-            // Batch-wide platform only.
             .platform = .{ .os = "linux", .architecture = "amd64" },
             .progress_fn = MockHarness.progress,
             .progress_user_data = @ptrCast(&recorder),
@@ -1198,7 +1192,6 @@ test "workflow smoke: warm token cache still probes without Authorization first"
 test "workflow smoke: CredentialProvider supplies Basic auth on per-registry token exchange" {
     defer tm.Fixtures.reset(std.testing.allocator);
 
-    // credential_provider is on the live batch path, not storage-only.
     const MockHarness = struct {
         var docker_basic_seen: bool = false;
         var ghcr_basic_seen: bool = false;

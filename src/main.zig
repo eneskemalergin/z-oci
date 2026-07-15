@@ -4,8 +4,8 @@
 //! stable executable shape while the library surface matures. A full CLI is not
 //! implemented here yet.
 //!
-//! Today the packaged examples provide the practical command-line entrypoints
-//! for live resolver and offline fixture workflows.
+//! Packaged examples provide the practical command-line entrypoints for live
+//! resolver and offline fixture workflows.
 
 const std = @import("std");
 

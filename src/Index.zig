@@ -17,8 +17,6 @@ const Platform = @import("Platform.zig");
 const json = @import("json.zig");
 const test_support = @import("test_support.zig");
 
-// --- Index types ---
-
 pub const OciImageIndex = struct {
     schema_version: u8,
     media_type: MediaType,
@@ -211,8 +209,6 @@ fn makeDescriptor(hex_char: u8, os: []const u8, arch: []const u8) !TestDescripto
         },
     };
 }
-
-// --- Tests ---
 
 const minimal_oci_index_json =
     \\{

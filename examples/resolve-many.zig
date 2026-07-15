@@ -1,4 +1,4 @@
-//! Offline Zencelot-style pin flow through injected exchangers.
+//! Offline batch pin flow through injected exchangers.
 //!
 //! Run: `zig build example-resolve-many`
 //!
@@ -103,7 +103,6 @@ pub fn main(init: std.process.Init) !void {
     MockRegistry.manifest_body = manifest_body;
     MockRegistry.manifest_calls = 0;
 
-    // Shaped like pipeline.toml [[tasks]] image fields.
     const image_strings = [_][]const u8{
         "registry-1.docker.io/library/busybox",
         "registry-1.docker.io/library/busybox:latest",

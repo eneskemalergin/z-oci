@@ -24,7 +24,7 @@ pub const ParseError = error{
 };
 
 algorithm: Algorithm,
-// Borrows from the parse input (or arena after `jsonParse`).
+/// Borrows from the parse input (or arena after `jsonParse`).
 hex: []const u8,
 
 const Digest = @This();
@@ -82,10 +82,6 @@ pub fn jsonStringify(self: Digest, jw: anytype) !void {
     const s = std.fmt.bufPrint(&buf, "{s}:{s}", .{ @tagName(self.algorithm), self.hex }) catch unreachable;
     try jw.write(s);
 }
-
-// Tests
-//
-// parse
 
 test "Digest.parse: valid inputs borrow hex slice and return expected fields" {
     const hex_lower = "abcdef0123456789" ** 4;
@@ -147,8 +143,6 @@ test "Digest.parse: pseudo-random inputs never panic and only return declared er
     }
 }
 
-// eql
-
 test "Digest.eql: compares algorithm and hex case-sensitively" {
     const hex = "d" ** 64;
     var other_buf: [7 + 64]u8 = undefined;
@@ -169,8 +163,6 @@ test "Digest.eql: compares algorithm and hex case-sensitively" {
         try std.testing.expect(!eql(a, b));
     }
 }
-
-// format / jsonStringify
 
 test "Digest: format and jsonStringify emit canonical algorithm:hex" {
     const d = try parse("sha256:" ++ "b" ** 64);
@@ -204,8 +196,6 @@ test "Digest.jsonParse: round-trip preserves digest and arena-owns hex" {
     const hex_ptr: usize = @intFromPtr(reparsed.value.hex.ptr);
     try std.testing.expect(!(hex_ptr >= json_start and hex_ptr < json_end));
 }
-
-// jsonParse
 
 test "Digest jsonParse: bad tokens return UnexpectedToken" {
     const bad_tokens = [_][]const u8{ "123", "true", "null", "{}", "\"not-a-digest\"", "\"\"" };

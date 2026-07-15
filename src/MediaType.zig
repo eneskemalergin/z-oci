@@ -1,6 +1,6 @@
 //! OCI and Docker media types for manifest negotiation.
 //!
-//! Covers all types the resolver needs to recognize today.
+//! Covers all types the resolver recognizes.
 //! Unknown content-types return null from fromString. The caller decides how to react.
 //! Legacy v1 signed manifests are recognized and flagged for rejection.
 
@@ -21,7 +21,6 @@ pub const MediaType = enum {
     docker_container_image_v1,
     docker_layer_gzip,
     docker_layer_foreign_gzip,
-    // Recognized so the resolver can reject it cleanly.
     docker_manifest_v1_signed,
 
     const mime_table = [_]struct { []const u8, MediaType }{
@@ -49,7 +48,6 @@ pub const MediaType = enum {
         return null;
     }
 
-    /// Shares one table entry with `fromString` (no second string table).
     pub fn toString(self: MediaType) []const u8 {
         for (mime_table) |entry| {
             if (entry[1] == self) return entry[0];
@@ -85,8 +83,6 @@ pub const MediaType = enum {
         try jw.write(self.toString());
     }
 };
-
-// --- Tests ---
 
 const all_media_types = [_]MediaType{
     .oci_manifest_v1,

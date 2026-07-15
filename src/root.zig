@@ -317,7 +317,6 @@ pub const ManifestOutcome = union(enum) {
 /// One batch outcome. Failures own both `registry` and `reference`; never use `deinitResolveFailure`.
 pub const ResolveManyItem = union(enum) {
     success: ResolveResult,
-    // Unlike single-resolve failures, owns `registry` as well as `reference`.
     failure: ResolveError,
 
     pub fn deinit(self: *ResolveManyItem, allocator: std.mem.Allocator) void {
@@ -353,16 +352,16 @@ pub const ResolveManyProgress = struct {
 
     pub const Event = enum {
         item_started,
-        // In-call tag / implicit `latest` session cache hit; digest refs never hit.
+        /// In-call tag or implicit `latest` session cache hit; digest refs never hit.
         cache_hit,
         item_succeeded,
         item_failed,
     };
 };
 pub const ResolveManyOptions = struct {
-    // Batch-wide; per-item platforms need separate batches.
+    /// Applies to the whole batch; per-item platforms need separate batches.
     platform: ?Platform = null,
-    // Optional observer; must not retain `event.reference` past return.
+    /// Optional observer; its reference view is valid only during the callback.
     progress_fn: ?*const fn (event: ResolveManyProgress, user_data: ?*anyopaque) void = null,
     progress_user_data: ?*anyopaque = null,
 };
@@ -3901,7 +3900,7 @@ test "ResolveManySessionCache: allocation shape for key, clone, store, hit, and 
     try std.testing.expectEqual(@as(usize, 1), counting.allocations);
     try std.testing.expectEqual(@sizeOf(ResolveManyItem) * 4, counting.bytes);
 
-    // Map growth without pre-size vs ensureTotalCapacity for a 50-key Zencelot-sized pin.
+    // Compare map growth with and without pre-sizing for a 50-key pin.
     const unique_count: usize = 50;
     var growth_cache: ResolveManySessionCache = .{};
     defer growth_cache.deinit(alloc);
@@ -3943,7 +3942,6 @@ test "ResolveManySessionCache: allocation shape for key, clone, store, hit, and 
     // Pre-sizing removes insert-loop map reallocs. Key+clone still dominate.
     try std.testing.expect(ensure_allocs >= 1);
     try std.testing.expect(growth_with_inserts < growth_without);
-    // Claimed STYLE win: about 4 map growth allocs saved on a 50-key pin.
     const map_growth_saved = growth_without - growth_with_inserts;
     try std.testing.expect(map_growth_saved >= 4);
     try std.testing.expectEqual(unique_count, growth_cache.map.count());

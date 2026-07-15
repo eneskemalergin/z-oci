@@ -20,7 +20,7 @@
 //! - Environment and docker-credential-helper hits dup username/secret onto the engine
 //!   allocator and set `release_fn`; call `release()` when the handle is done.
 //!   Secrets are zeroed via `freeOwnedOptionalSecretSlice` before `free` (same as
-//!   token POST bodies). No automated test proves zero at `free` time.
+//!   token POST bodies).
 //! - Docker config inline auth borrows from the engine `auth_cache` until `deinit()`;
 //!   `release()` is a no-op for those hits.
 //!
@@ -148,10 +148,9 @@ pub const TOKEN_REFRESH_WINDOW_SECONDS: u64 = 5;
 pub const DEFAULT_TOKEN_CACHE_TTL_SECONDS: u64 = 60;
 pub const TokenResponse = struct {
     access_token: Token,
-    // Present but unused for refresh today; `deinit` releases owned bytes.
+    /// Optional refresh token released by `deinit` when present.
     refresh_token: ?[]const u8 = null,
-    // When false, `access_token` borrows the engine cache until `AuthEngine.deinit`
-    // or a same-scope `authenticate` replaces the entry. `deinit` does not free it.
+    /// When false, `access_token` borrows the engine cache and `deinit` does not free it.
     owns_access_token: bool = true,
 
     /// Zeroes and frees owned access/refresh bytes only.
@@ -240,7 +239,7 @@ pub const CachedToken = struct {
         allocator.free(self.token.value);
     }
 };
-/// Auth-facing `Config` projection. See file header / `Config.zig` for field liveness.
+/// Configuration values used by auth.
 pub const AuthConfigView = struct {
     credential_provider: ?*const CredentialProvider,
     connect_timeout_ms: u32,
@@ -256,7 +255,7 @@ pub const AuthReferenceView = struct {
     repository_path: []const u8,
     ref_string: []const u8,
 
-    /// Tests/helpers only; live resolve probes via manifest HEAD/GET.
+    /// Builds the registry probe URI without performing I/O.
     pub fn probeUriAlloc(self: AuthReferenceView, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "https://{s}/v2/", .{self.registry});
     }
@@ -310,7 +309,7 @@ pub const AuthEngine = struct {
     docker_config: ?DockerConfig = null,
     token_cache: TokenCacheMap = .empty,
     preferred_token_method_by_realm: std.StringHashMapUnmanaged(TokenRequestMethod) = .empty,
-    // Consumed by resolver for `ResolveError.transport_retries_exhausted`.
+    /// Read by the resolver when mapping exhausted token transport retries.
     token_transport_retries_exhausted: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) AuthEngine {
@@ -2260,7 +2259,6 @@ test "AuthEngine.credentialForRegistry: precedence matrix" {
         }.get,
     };
 
-    // Config provider beats environment.
     {
         var environ_map = std.process.Environ.Map.init(std.testing.allocator);
         defer environ_map.deinit();
@@ -2278,7 +2276,6 @@ test "AuthEngine.credentialForRegistry: precedence matrix" {
         try std.testing.expectEqualStrings("config-token", handle.credential.secret);
     }
 
-    // Environment supplies owned fallback credentials.
     {
         var environ_map = std.process.Environ.Map.init(std.testing.allocator);
         defer environ_map.deinit();
@@ -2292,7 +2289,6 @@ test "AuthEngine.credentialForRegistry: precedence matrix" {
         try std.testing.expectEqualStrings("env-token", handle.credential.secret);
     }
 
-    // Environment normalizes Docker Hub aliases and matches GHCR case-insensitively.
     {
         var hub_map = std.process.Environ.Map.init(std.testing.allocator);
         defer hub_map.deinit();
@@ -2317,7 +2313,6 @@ test "AuthEngine.credentialForRegistry: precedence matrix" {
         try std.testing.expectEqualStrings("env-user", ghcr_handle.credential.username);
     }
 
-    // Partial or mismatched environment yields no credential.
     {
         var partial_map = std.process.Environ.Map.init(std.testing.allocator);
         defer partial_map.deinit();
@@ -2330,7 +2325,6 @@ test "AuthEngine.credentialForRegistry: precedence matrix" {
         try std.testing.expect((try partial_engine.credentialForRegistry("ghcr.io")) == null);
     }
 
-    // Anonymous fallback when no provider matches.
     {
         var empty_map = std.process.Environ.Map.init(std.testing.allocator);
         defer empty_map.deinit();
@@ -2344,7 +2338,6 @@ test "AuthEngine.credentialForRegistry: precedence matrix" {
         try std.testing.expect((try anon_engine.credentialForRegistry("registry-1.docker.io")) == null);
     }
 
-    // Docker config auth supplies fallback credentials and normalizes Docker Hub keys.
     {
         var ghcr_engine = try AuthEngine.initWithDockerConfigBytes(
             std.testing.allocator,
@@ -2367,7 +2360,6 @@ test "AuthEngine.credentialForRegistry: precedence matrix" {
         try std.testing.expectEqualStrings("secret", hub_handle.credential.secret);
     }
 
-    // Environment remains ahead of docker config.
     {
         var environ_map = std.process.Environ.Map.init(std.testing.allocator);
         defer environ_map.deinit();
@@ -2745,7 +2737,6 @@ test "AuthEngine.loadDockerConfigFromEnvironment: path resolution matrix" {
         \\}
     ;
 
-    // HOME/.docker/config.json
     {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
@@ -2764,7 +2755,6 @@ test "AuthEngine.loadDockerConfigFromEnvironment: path resolution matrix" {
         try std.testing.expectEqualStrings("octocat", handle.credential.username);
     }
 
-    // DOCKER_CONFIG overrides HOME
     {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
@@ -2803,7 +2793,6 @@ test "AuthEngine.loadDockerConfigFromEnvironment: path resolution matrix" {
         try std.testing.expectEqualStrings("docker-user", handle.credential.username);
     }
 
-    // USERPROFILE fallback when HOME is unset
     {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
@@ -2822,7 +2811,6 @@ test "AuthEngine.loadDockerConfigFromEnvironment: path resolution matrix" {
         try std.testing.expectEqualStrings("octocat", handle.credential.username);
     }
 
-    // Missing config file is a clean miss
     {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
@@ -2839,7 +2827,6 @@ test "AuthEngine.loadDockerConfigFromEnvironment: path resolution matrix" {
         try std.testing.expect((try engine.credentialForRegistry("ghcr.io")) == null);
     }
 
-    // Oversize config file is a clean miss
     {
         var tmp_dir = std.testing.tmpDir(.{});
         defer tmp_dir.cleanup();
@@ -3761,7 +3748,6 @@ test "AuthEngine.authenticate: max_retries zero still allows rate-limit retries"
     );
 
     try std.testing.expectError(error.RateLimited, engine.authenticate(&client, request));
-    // GET (initial + one rate-limit retry) then POST (initial + one retry).
     try std.testing.expectEqual(@as(usize, 4), MockHarness.calls);
 }
 test "AuthEngine.authenticate: GET 429 then POST auth failure stays TokenExchangeFailed" {

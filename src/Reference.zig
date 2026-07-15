@@ -30,11 +30,11 @@ const DOCKER_HUB_ALIASES = [_][]const u8{ "docker.io", "index.docker.io", DOCKER
 
 registry: []const u8,
 repository: []const u8,
-// Informational when digest is also present; `refString()` returns the digest then.
+/// If a digest is present, `refString()` returns it instead of this tag.
 tag: ?[]const u8,
-// `.hex` points into `digest_raw` when set.
+/// `.hex` points into `digest_raw` when set.
 digest: ?Digest,
-// `"sha256:hex"` for `refString()`; freed by `deinit`.
+/// `"sha256:hex"` for `refString()`; freed by `deinit`.
 digest_raw: ?[]const u8,
 
 const Reference = @This();
@@ -112,10 +112,6 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     const needs_library_prefix =
         std.ascii.eqlIgnoreCase(registry_str, DOCKER_HUB_REGISTRY) and
         std.mem.indexOfScalar(u8, repo_str, '/') == null;
-
-    if (tag_str == null and digest == null) {
-        // Implicit `latest`: leave `tag` null; `refString()` returns `"latest"`.
-    }
 
     const registry_owned = try allocator.dupe(u8, registry_str);
     errdefer allocator.free(registry_owned);
@@ -232,8 +228,6 @@ const ReferenceCorpusCase = struct {
     repository_path: []const u8,
     ref_string: []const u8,
 };
-
-// --- Tests ---
 
 fn expectParseError(input: []const u8, expected: ParseError) !void {
     try std.testing.expectError(expected, parse(std.testing.allocator, input));

@@ -65,7 +65,7 @@ pub const validate_failure_scenarios = [_]Scenario{
     .unsupported_algorithm,
 };
 
-/// Paired with `validate_failure_scenarios`; shared tag-ref plans cannot produce these tags.
+/// These cases require a digest or nested index and cannot use the shared tag reference.
 pub const validate_failure_scenario_skips = [_]Scenario{
     .digest_mismatch,
     .depth_limit_exceeded,
@@ -493,8 +493,6 @@ pub fn expectResolveFailure(
     }
 }
 
-// --- Test helpers ---
-
 fn allocManifestGet(allocator: std.mem.Allocator, url: []const u8) !resolver.ManifestHttpRequest {
     return .{
         .method = .get,
@@ -516,8 +514,6 @@ fn expectScenarioTagMatchesResolveError(scenario: Scenario) !void {
     }
     return error.TestUnexpectedResult;
 }
-
-// --- Tests ---
 
 test "test_matrix: failure scenario tables align with ResolveError tags and C4 builders" {
     try std.testing.expectEqual(@typeInfo(ResolveError).@"union".fields.len, resolve_failure_scenarios.len);

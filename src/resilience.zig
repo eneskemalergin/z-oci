@@ -5,45 +5,14 @@
 //! in this module alongside the pure policy helpers resolver and auth transport
 //! wrappers share.
 //!
-//! Bundled Zig 0.16.0 HTTP/TLS notes:
-//! - Manifest and token traffic use `std.http.Client.request`; `RequestOptions`
-//!   has no per-request read/connect timeout field today.
-//! - `ConnectTcpOptions.timeout` exists, but `connectTcpOptions` does not pass
-//!   it through to `host.connect` today (zig#31305).
-//! - Custom CA trust lives on `std.http.Client.ca_bundle`. When `Config.ca_bundle_path`
-//!   is set, `Config.applyToClient` loads that PEM file at the public API boundary
-//!   (`resolve`, `validate`, `getManifest`). When unset, Zig lazy-scans OS trust.
+//! Transport wrappers use separate network and rate-limit retry budgets.
+//! Retry decisions are pure apart from injected clock and random sources;
+//! wrappers perform sleeping and response cleanup.
 //!
-//! Config field liveness:
-//! - Live on transport path: `max_network_retries`, `max_rate_limit_retries`.
-//! - Live on helper subprocess only: `read_timeout_ms` (via auth, not this module).
-//! - Caller recipe via `Config.connectIoTimeout`; live manifest/token `client.request`
-//!   paths do not enforce connect timeout (zig#31305).
-//! - Live on public API boundary: `ca_bundle_path` via `Config.applyToClient`.
-//! - Live on manifest transport when `rate_limit_enabled`: `ManifestThrottle`
-//!   and `parseRateLimitHeaders` for opt-in pre-emptive throttling.
-//!
-//! Parser liveness:
-//! - Live on transport path: `retryAfterFromHeaders` / `parseRetryAfterFromHeaders`
-//!   (`Retry-After`, `X-Retry-After`, optional response `Date` anchoring).
-//! - Live on manifest transport when pre-emptive mode is enabled: `parseRateLimitHeaders`.
-//!
-//! Policy liveness:
-//! - Pure policy core: `RetryPolicy`, `decideHttpRetry`, `decideTransportRetry`,
-//!   `RetryBackoffConfig` defaults, injected `RetryClock` / `RetryRandomSource`.
-//! - Live via transport wrappers: `retryPolicyFromConfig` on manifest HEAD/GET and
-//!   token HTTP paths. Wrappers sleep on `RetryDecision.delay_ms` and re-invoke
-//!   the inner exchanger.
-//! - `TransportHooks` sleep wiring is a transport concern, not part of the pure
-//!   policy decision. `retryPolicyFromConfig` only borrows clock/RNG hooks.
-//! - `classifyNetworkTransportError` only retries errors the exchanger surfaces.
-//!   Opaque `TransportFailed` / `TokenExchangeFailed` stay non-retryable at the
-//!   policy layer even when the underlying fault was transient.
-//!
-//! Retry budgets:
-//! - `Config.max_retries` stays auth-only (cached-401 invalidation).
-//! - `Config.max_network_retries` and `Config.max_rate_limit_retries` own
-//!   transport retry budgets separately.
+//! Header parsing accepts the registry `RateLimit-*`, `X-RateLimit-*`,
+//! `Retry-After`, `X-Retry-After`, and `Date` fields needed by those policies.
+//! HTTP/TLS setup remains owned by the caller-provided `std.http.Client` and
+//! the public `Config` boundary.
 const std = @import("std");
 const Config = @import("Config.zig").Config;
 const json = @import("json.zig");
@@ -89,31 +58,18 @@ pub const HttpHeader = struct {
     name: []const u8,
     value: []const u8,
 };
-/// Fields that actually drive `RetryBudget` on the live transport path.
-///
-/// Kept separate from `ResilienceConfigView` so reserved config slots do not
-/// look wired into retry policy before their live paths land.
+/// Separate network and rate-limit retry budgets used by transport wrappers.
 pub const RetryBudgetConfig = struct {
     max_network_retries: u8,
     max_rate_limit_retries: u8,
 };
-/// Narrow view of `Config` fields that are visible to resilience policy.
-///
-/// `configView` projects the full struct for callers that need one
-/// snapshot. Only `max_network_retries` and `max_rate_limit_retries` feed
-/// `RetryPolicy` today via `retryBudgetConfig`.
+/// Config values projected into resilience policy.
 pub const ResilienceConfigView = struct {
-    // Projected only; does not feed `RetryPolicy`. `0` = unset.
     connect_timeout_ms: u32,
-    // Projected only; helper I/O reads `Config.read_timeout_ms` in auth instead.
     read_timeout_ms: u32,
-    // Live: reactive budget for transient `5xx` / socket errors.
     max_network_retries: u8,
-    // Live: reactive budget for `429`.
     max_rate_limit_retries: u8,
-    // Not applied by live transport wrappers today.
     ca_bundle_path: ?[]const u8,
-    // Opt-in pre-emptive pause on trusted `RateLimit-*` remaining=0; reactive `429` ignores this.
     rate_limit_enabled: bool,
 };
 pub const RetryBudget = struct {
@@ -155,7 +111,7 @@ pub const RetryBudget = struct {
         return self.network_attempts_used > 0;
     }
 };
-/// Fixed defaults; `Config` does not tune backoff yet.
+/// Backoff defaults used by `RetryPolicy`.
 pub const RetryBackoffConfig = struct {
     base_delay_ms: u32 = 1_000,
     max_delay_ms: u32 = 30_000,
@@ -174,7 +130,7 @@ pub const RetryDecision = struct {
     kind: RetryKind = .none,
     delay_ms: u32 = 0,
 };
-/// Shared by manifest and token wrappers. Auth cached-401 uses `Config.max_retries` instead.
+/// Retry policy shared by manifest and token transport wrappers.
 pub const RetryPolicy = struct {
     backoff: RetryBackoffConfig = .{},
     budget: RetryBudget,
@@ -232,10 +188,7 @@ pub const RetryPolicy = struct {
         }
     }
 };
-/// Inputs that actually drive `RetryPolicy` today.
-///
-/// `Config` only supplies the budget half via `retryPolicyConfig`. Backoff stays
-/// on fixed defaults until configuration exposes tuning fields.
+/// Inputs used to initialize `RetryPolicy`.
 pub const RetryPolicyConfig = struct {
     budget: RetryBudgetConfig,
     backoff: RetryBackoffConfig = .{},
@@ -245,7 +198,7 @@ pub const TransportHooks = struct {
     sleeper: TransportSleeper = noopTransportSleeper,
     random_u64: RetryRandomSource = systemRetryRandomU64,
     clock: RetryClock = SYSTEM_RETRY_CLOCK,
-    // When true, resolver/auth sleep through `std.http.Client.io` instead of `sleeper`.
+    /// When true, resolver/auth sleep through `std.http.Client.io` instead of `sleeper`.
     use_live_sleep: bool = false,
 };
 pub fn noopTransportSleeper(_: u32) void {}

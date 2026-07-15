@@ -4,13 +4,13 @@
 //! Callers still own `std.http.Client`; a bare `Config{}` works for anonymous
 //! public registry access.
 //!
-//! Retry budget split (live today):
+//! Retry budget split:
 //! - `max_retries`: cached-401 auth invalidation only (`AuthEngine.retryAuthenticateAfterCachedUnauthorized`).
 //! - `max_network_retries` / `max_rate_limit_retries`: reactive transport retries on
 //!   manifest `HEAD`/`GET` and token HTTP (`exchangeManifestRequest`,
 //!   `exchangeTokenHttpRequestWithRetries`).
 //!
-//! Timeout field liveness:
+//! Timeout fields:
 //! - `read_timeout_ms`: Docker credential helper subprocess I/O in `auth.zig`.
 //! - `connect_timeout_ms`: exposed via `connectIoTimeout` for caller-owned
 //!   `connectTcpOptions` recipes; live z-oci exchangers use `client.request`, which
@@ -87,9 +87,8 @@ pub const Credential = struct {
 
 pub const CredentialHandle = struct {
     credential: Credential,
-    // When set, `release_allocator` must be the allocator that owns `credential` slices.
-    // `release_fn` must free through that allocator. Env/helper paths in `auth.zig`
-    // zero secrets via `freeOwnedOptionalSecretSlice` before `free`.
+    /// When set, `release_allocator` must own the credential slices, and
+    /// `release_fn` must free through it.
     release_fn: ?*const fn (allocator: std.mem.Allocator, credential: Credential) void = null,
     release_allocator: std.mem.Allocator = undefined,
 
@@ -99,7 +98,7 @@ pub const CredentialHandle = struct {
 };
 
 pub const CredentialProvider = struct {
-    // Null = anonymous. Slices must outlive the resolve call.
+    /// A null result selects anonymous access. Returned slices must outlive the resolve call.
     getCredentialFn: *const fn (registry: []const u8) ?CredentialHandle,
 
     pub fn getCredential(self: CredentialProvider, registry: []const u8) ?CredentialHandle {
@@ -123,30 +122,24 @@ pub const Config = struct {
     credential_provider: ?*const CredentialProvider = null,
     credential_sources: CredentialSources = .{},
 
-    // Caller-owned TCP only; live exchangers ignore this (zig#31305). `0` = unset.
     connect_timeout_ms: u32 = 0,
 
-    // Docker credential helper subprocess I/O only (not manifest/token HTTP).
     read_timeout_ms: u32 = 30_000,
 
-    // Cached-401 auth invalidation only; transport uses the budgets below.
     max_retries: u8 = 1,
 
     max_network_retries: u8 = 1,
     max_rate_limit_retries: u8 = 1,
 
-    // Public CA PEM only; see file header. Null = OS trust scan.
     ca_bundle_path: ?[]const u8 = null,
 
-    // Opt-in pre-emptive pause on `RateLimit-*` remaining=0. Reactive 429 stays on.
     rate_limit_enabled: bool = false,
 
     max_manifest_bytes: usize = DEFAULT_MAX_MANIFEST_BYTES,
     max_token_response_bytes: usize = DEFAULT_MAX_TOKEN_RESPONSE_BYTES,
-    // `0` means unbounded.
     max_token_cache_entries: u32 = DEFAULT_MAX_TOKEN_CACHE_ENTRIES,
 
-    /// For caller-owned `connectTcpOptions` only (not live exchangers yet).
+    /// Builds a timeout for caller-owned `connectTcpOptions` recipes.
     pub fn connectIoTimeout(self: Config) std.Io.Timeout {
         if (self.connect_timeout_ms == 0) return .none;
         return .{
@@ -274,9 +267,8 @@ const AddCertsFromPemBytesError = std.mem.Allocator.Error ||
     std.base64.Error ||
     error{MissingEndCertificateMarker};
 
-// Parses `BEGIN CERTIFICATE` blocks from an in-memory PEM buffer.
-// Vendored from `std.crypto.Certificate.Bundle.addCertsFromFile` so
-// `loadCaBundleFromOpenFile` can read the file once and scan before parse.
+// Scan the complete buffer before parsing so private-key markers are rejected
+// without reopening the CA bundle.
 fn addCertsFromPemBytes(
     cb: *std.crypto.Certificate.Bundle,
     gpa: std.mem.Allocator,
@@ -359,8 +351,6 @@ fn tmpFileAbsPath(tmp: std.testing.TmpDir, rel_path: []const u8, abs_buf: *[std.
     const abs_len = try tmp.dir.realPathFile(std.testing.io, rel_path, abs_buf);
     return abs_buf[0..abs_len];
 }
-
-// --- Tests ---
 
 test "Config: default field values" {
     const defaults = Config{};

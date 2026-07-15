@@ -131,8 +131,6 @@ fn featuresEql(a: ?[]const []const u8, b: ?[]const []const u8) bool {
     return true;
 }
 
-// --- Tests ---
-
 const minimal_platform_json = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
 
 const full_platform_json =
