@@ -7,7 +7,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [0.7.0] - Unreleased
 
-This release collects the public API and executable work added after v0.6.0. The executable now includes live `resolve` output on top of the public resolver; `validate` and `inspect` command execution remain pending.
+This release collects the public API and executable work added after v0.6.0. The executable now includes live `resolve` and digest-only `validate` commands on top of the public resolver; `inspect` command execution remains pending.
 
 ### Added
 
@@ -16,6 +16,7 @@ This release collects the public API and executable work added after v0.6.0. The
 - Executable command parsing for `resolve`, `validate`, and `inspect`, including global and command options, digest-pinned validation, platform selection syntax, deterministic usage failures, and standalone help and version output.
 - Build-time version wiring from `build.zig.zon` to the executable, keeping the package metadata as the single version source.
 - Resolver-backed `z-oci resolve` execution, including pinned text output, full JSON result output, selected-platform preservation, and shared resolver failure mapping.
+- Resolver-backed `z-oci validate` execution, including digest-only input, exact valid/not-found text and JSON output, and shared resolver failure mapping.
 
 ### Changed
 

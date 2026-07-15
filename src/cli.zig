@@ -985,6 +985,8 @@ test "parse: validates numbers, formats, paths, references, and command argument
     try expectUsage(&.{ "z-oci", "resolve", "--platform", "linux/amd64/one/two", "ubuntu" }, .invalid_platform, .resolve);
     try expectUsage(&.{ "z-oci", "resolve", "not a reference" }, .invalid_reference, .resolve);
     try expectUsage(&.{ "z-oci", "validate", "ubuntu:latest" }, .invalid_reference, .validate);
+    try expectUsage(&.{ "z-oci", "validate", "ubuntu@sha512:" ++ ("a" ** 64) }, .invalid_reference, .validate);
+    try expectUsage(&.{ "z-oci", "validate", "ubuntu@sha256:" ++ ("a" ** 63) }, .invalid_reference, .validate);
     try expectUsage(&.{ "z-oci", "resolve" }, .missing_argument, .resolve);
     try expectUsage(&.{ "z-oci", "resolve", pinned, "extra" }, .extra_argument, .resolve);
 }

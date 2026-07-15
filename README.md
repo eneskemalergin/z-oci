@@ -63,7 +63,7 @@ Inputs such as `Reference` values and the caller-owned HTTP client remain caller
 - `pingRegistry` is a status probe. `200` reports anonymous reachability, `401` reports auth required, and everything else maps to `unexpected_status`. Redirects are not followed.
 - `resolve` does not call ping, and ping does not call resolve.
 - Live exchangers rewrite `https://` to cleartext `http://` only for loopback registry hosts (`127.0.0.1`, `localhost`, `::1`) so offline mock / local `registry:2` tests can use a real `std.http.Client`. Public hostnames stay HTTPS. There is no public Config switch for cleartext.
-- The `resolve` CLI command is available for live digest pinning; `validate` and `inspect` CLI execution remain future work.
+- The `resolve` and `validate` CLI commands are available for live registry checks; `inspect` CLI execution remains future work.
 - Environment variables, Docker `config.json`, and credential helpers are opt-in via `Config.credential_sources`. Without that injection, only `credential_provider` (or anonymous access) is used.
 
 ### Resilience
