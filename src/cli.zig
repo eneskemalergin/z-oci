@@ -64,6 +64,7 @@ pub const CommandOptions = struct {
 
 pub const ParsedCommand = struct {
     command: Command,
+    input: []const u8,
     global: GlobalOptions,
     options: CommandOptions,
     reference: Reference,
@@ -288,6 +289,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!
 
     return .{ .command = .{
         .command = command,
+        .input = args[index],
         .global = global,
         .options = options,
         .reference = reference,
@@ -922,6 +924,7 @@ test "parse: valid commands preserve options and owned references" {
             try std.testing.expectEqual(Command.resolve, command.command);
             try std.testing.expectEqualStrings("ca.pem", command.global.ca_bundle_path.?);
             try std.testing.expectEqual(@as(u32, 0), command.global.helper_timeout_ms.?);
+            try std.testing.expectEqualStrings("ubuntu:22.04", command.input);
             try std.testing.expectEqual(Format.json, command.options.format);
             try std.testing.expect(command.options.verbose);
             try std.testing.expectEqualStrings("linux", command.options.platform.?.os);

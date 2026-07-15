@@ -2,7 +2,8 @@
 //!
 //! This module owns process arguments, standard-output writers, the caller-owned
 //! HTTP client, and projection of process state into the public resolver
-//! configuration. Resolver command execution is not implemented in this adapter.
+//! configuration. The `resolve` command invokes the public resolver and routes
+//! its owned result or failure through the executable renderers.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -40,6 +41,16 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn run(init: std.process.Init, stdout: *Io.Writer, stderr: *Io.Writer) !cli.ExitCode {
+    return runWithResolve(init, stdout, stderr, z_oci.resolve, monotonicNow);
+}
+
+fn runWithResolve(
+    init: std.process.Init,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    comptime resolve_fn: anytype,
+    comptime now_fn: anytype,
+) !cli.ExitCode {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const outcome = try cli.parse(init.gpa, args);
 
@@ -59,7 +70,8 @@ fn run(init: std.process.Init, stdout: *Io.Writer, stderr: *Io.Writer) !cli.Exit
         },
         .command => |command| {
             var parsed = command;
-            defer parsed.deinit(init.gpa);
+            var reference_owned = true;
+            defer if (reference_owned) parsed.deinit(init.gpa);
 
             var config = configFromProcess(parsed.global, init.environ_map, init.io);
             var client = std.http.Client{
@@ -68,19 +80,117 @@ fn run(init: std.process.Init, stdout: *Io.Writer, stderr: *Io.Writer) !cli.Exit
             };
             defer client.deinit();
 
+            const started_at = if (parsed.command == .resolve and parsed.options.verbose)
+                now_fn(init.io)
+            else
+                null;
             config.applyToClient(&client) catch |err| {
                 const failure = cli.CliFailure{ .config = err };
-                switch (parsed.options.format) {
-                    .text => try cli.writeFailureText(stderr, failure),
-                    .json => try cli.writeFailureJson(stdout, failure),
+                try writeFailure(stdout, stderr, parsed.options.format, failure);
+                if (parsed.command == .resolve and parsed.options.verbose) {
+                    try cli.writeVerbose(
+                        stderr,
+                        .resolve,
+                        cli.verboseOutcomeForFailure(failure),
+                        elapsedMilliseconds(now_fn, init.io, started_at.?),
+                    );
                 }
                 return cli.exitCodeForFailure(failure);
             };
 
-            try stderr.writeAll(cli.COMMAND_NOT_IMPLEMENTED);
-            return .unexpected_failure;
+            if (parsed.command != .resolve) {
+                try stderr.writeAll(cli.COMMAND_NOT_IMPLEMENTED);
+                return .unexpected_failure;
+            }
+
+            const resolve_outcome = resolve_fn(
+                init.gpa,
+                &client,
+                config,
+                parsed.reference,
+                parsed.options.platform,
+            ) catch |err| {
+                const failure = cli.CliFailure{ .config = err };
+                try writeFailure(stdout, stderr, parsed.options.format, failure);
+                if (parsed.options.verbose) {
+                    try cli.writeVerbose(
+                        stderr,
+                        .resolve,
+                        cli.verboseOutcomeForFailure(failure),
+                        elapsedMilliseconds(now_fn, init.io, started_at.?),
+                    );
+                }
+                return cli.exitCodeForFailure(failure);
+            };
+            const elapsed_ms = if (parsed.options.verbose)
+                elapsedMilliseconds(now_fn, init.io, started_at.?)
+            else
+                0;
+
+            switch (resolve_outcome) {
+                .success => |result| {
+                    reference_owned = false;
+                    var owned_result = result;
+                    defer owned_result.deinit(init.gpa);
+                    try writeResolveSuccess(stdout, parsed.options.format, parsed.input, owned_result);
+                    if (parsed.options.verbose) {
+                        try cli.writeVerbose(stderr, .resolve, .success, elapsed_ms);
+                    }
+                    return .success;
+                },
+                .failure => |failure| {
+                    defer z_oci.deinitResolveFailure(failure, init.gpa);
+                    try writeFailure(stdout, stderr, parsed.options.format, .{ .resolve = failure });
+                    if (parsed.options.verbose) {
+                        try cli.writeVerbose(
+                            stderr,
+                            .resolve,
+                            cli.verboseOutcomeForFailure(.{ .resolve = failure }),
+                            elapsed_ms,
+                        );
+                    }
+                    return cli.exitCodeForFailure(.{ .resolve = failure });
+                },
+            }
         },
     }
+}
+
+fn writeResolveSuccess(
+    stdout: *Io.Writer,
+    format: cli.Format,
+    input: []const u8,
+    result: z_oci.ResolveResult,
+) Io.Writer.Error!void {
+    switch (format) {
+        .text => try cli.writeResolveText(stdout, result),
+        .json => try cli.writeResolveJson(stdout, input, result),
+    }
+}
+
+fn writeFailure(
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    format: cli.Format,
+    failure: cli.CliFailure,
+) Io.Writer.Error!void {
+    switch (format) {
+        .text => try cli.writeFailureText(stderr, failure),
+        .json => try cli.writeFailureJson(stdout, failure),
+    }
+}
+
+fn monotonicNow(io: Io) std.Io.Clock.Timestamp {
+    return std.Io.Clock.Timestamp.now(io, .awake);
+}
+
+fn elapsedMilliseconds(
+    comptime now_fn: anytype,
+    io: Io,
+    started_at: std.Io.Clock.Timestamp,
+) u64 {
+    const elapsed = started_at.durationTo(now_fn(io)).raw.toMilliseconds();
+    return if (elapsed < 0) 0 else @intCast(elapsed);
 }
 
 fn configFromProcess(
@@ -103,7 +213,7 @@ fn configFromProcess(
 test "process config projection preserves defaults and injects process sources" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
-    try environ_map.put("DOCKER_CONFIG", "/tmp/z-oci-test-config");
+    try environ_map.put("DOCKER_CONFIG", "config.json");
 
     const global = cli.GlobalOptions{
         .ca_bundle_path = "ca.pem",
@@ -161,20 +271,115 @@ fn testProcessInit(
     };
 }
 
+fn testResolveSuccess(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: z_oci.Config,
+    ref: z_oci.Reference,
+    _: ?z_oci.Platform,
+) z_oci.PublicApiError!z_oci.ResolveOutcome {
+    TestResolveCalls.calls += 1;
+    var resolved = ref;
+    const digest_raw = try allocator.dupe(u8, "sha256:" ++ ("a" ** 64));
+    resolved.digest_raw = digest_raw;
+    resolved.digest = z_oci.Digest.parse(digest_raw) catch unreachable;
+    return .{ .success = .{
+        .digest = resolved.digest.?,
+        .media_type = .oci_manifest_v1,
+        .platform = null,
+        .reference = resolved,
+    } };
+}
+
+fn testResolveNotFound(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: z_oci.Config,
+    ref: z_oci.Reference,
+    _: ?z_oci.Platform,
+) z_oci.PublicApiError!z_oci.ResolveOutcome {
+    TestResolveCalls.calls += 1;
+    const reference = try std.fmt.allocPrint(allocator, "{s}/{s}:{s}", .{
+        ref.registry,
+        ref.repository,
+        ref.refString(),
+    });
+    return .{ .failure = .{ .not_found = .{
+        .registry = ref.registry,
+        .reference = reference,
+        .http_status = 404,
+    } } };
+}
+
+fn testResolvePlatformSuccess(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: z_oci.Config,
+    ref: z_oci.Reference,
+    platform: ?z_oci.Platform,
+) z_oci.PublicApiError!z_oci.ResolveOutcome {
+    TestResolveCalls.calls += 1;
+    TestResolveCalls.platform = platform;
+    var resolved = ref;
+    const digest_raw = try allocator.dupe(u8, "sha256:" ++ ("b" ** 64));
+    errdefer allocator.free(digest_raw);
+    resolved.digest_raw = digest_raw;
+    resolved.digest = z_oci.Digest.parse(digest_raw) catch unreachable;
+    const os = try allocator.dupe(u8, "linux");
+    errdefer allocator.free(os);
+    const architecture = try allocator.dupe(u8, "amd64");
+    return .{ .success = .{
+        .digest = resolved.digest.?,
+        .media_type = .oci_manifest_v1,
+        .platform = .{ .os = os, .architecture = architecture },
+        .reference = resolved,
+    } };
+}
+
+const TestResolveCalls = struct {
+    var calls: usize = 0;
+    var platform: ?z_oci.Platform = null;
+
+    fn reset() void {
+        calls = 0;
+        platform = null;
+    }
+};
+
+const TestClock = struct {
+    var calls: usize = 0;
+
+    fn reset() void {
+        calls = 0;
+    }
+
+    fn now(_: Io) std.Io.Clock.Timestamp {
+        const nanoseconds: i96 = if (calls == 0) 0 else 37 * std.time.ns_per_ms;
+        calls += 1;
+        return .{
+            .raw = .{ .nanoseconds = nanoseconds },
+            .clock = .awake,
+        };
+    }
+};
+
 test "process command writer failure releases parsed command" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
 
-    const argv = [_][*:0]const u8{ "z-oci", "resolve", "ubuntu" };
+    const argv = [_][*:0]const u8{ "z-oci", "resolve", "--verbose", "ubuntu" };
     const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
 
     var stdout_buffer: [128]u8 = undefined;
     var stdout = Io.Writer.fixed(&stdout_buffer);
     var stderr_buffer: [0]u8 = .{};
     var stderr = Io.Writer.fixed(&stderr_buffer);
-    try std.testing.expectError(error.WriteFailed, run(init, &stdout, &stderr));
+    try std.testing.expectError(
+        error.WriteFailed,
+        runWithResolve(init, &stdout, &stderr, testResolveSuccess, TestClock.now),
+    );
 }
 
 test "process command allocation failure releases partial reference" {
@@ -194,7 +399,7 @@ test "process command allocation failure releases partial reference" {
             var stdout = Io.Writer.fixed(&stdout_buffer);
             var stderr_buffer: [128]u8 = undefined;
             var stderr = Io.Writer.fixed(&stderr_buffer);
-            const result = run(init, &stdout, &stderr) catch |err| switch (err) {
+            const result = runWithResolve(init, &stdout, &stderr, testResolveSuccess, TestClock.now) catch |err| switch (err) {
                 error.OutOfMemory => {
                     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
                     continue;
@@ -206,4 +411,180 @@ test "process command allocation failure releases partial reference" {
             try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
         }
     }
+}
+
+test "resolve command renders injected success and verbose timing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{
+        "z-oci",
+        "resolve",
+        "--verbose",
+        "ubuntu:22.04",
+    };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    TestResolveCalls.reset();
+    TestClock.reset();
+    defer TestResolveCalls.reset();
+    defer TestClock.reset();
+    try std.testing.expectEqual(
+        cli.ExitCode.success,
+        runWithResolve(init, &stdout, &stderr, testResolveSuccess, TestClock.now),
+    );
+    try std.testing.expectEqual(@as(usize, 1), TestResolveCalls.calls);
+    try std.testing.expectEqualStrings(
+        "registry-1.docker.io/library/ubuntu@sha256:" ++ ("a" ** 64) ++ "\n",
+        stdout_buffer[0..stdout.end],
+    );
+    try std.testing.expectEqualStrings(
+        "z-oci verbose: command=resolve outcome=success elapsed_ms=37\n",
+        stderr_buffer[0..stderr.end],
+    );
+}
+
+test "resolve command renders injected not-found JSON with code one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{
+        "z-oci",
+        "resolve",
+        "--format",
+        "json",
+        "ubuntu:22.04",
+    };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    TestResolveCalls.reset();
+    defer TestResolveCalls.reset();
+    try std.testing.expectEqual(
+        cli.ExitCode.not_found,
+        runWithResolve(init, &stdout, &stderr, testResolveNotFound, TestClock.now),
+    );
+    try std.testing.expectEqual(@as(usize, 1), TestResolveCalls.calls);
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"code\":\"not_found\",\"message\":\"not found\",\"http_status\":404}}",
+        stdout_buffer[0..stdout.end],
+    );
+    try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "resolve command preserves selected platform in JSON" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{
+        "z-oci",
+        "resolve",
+        "--format",
+        "json",
+        "--platform",
+        "linux/amd64",
+        "ubuntu:22.04",
+    };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [768]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    TestResolveCalls.reset();
+    defer TestResolveCalls.reset();
+    try std.testing.expectEqual(
+        cli.ExitCode.success,
+        runWithResolve(init, &stdout, &stderr, testResolvePlatformSuccess, TestClock.now),
+    );
+    try std.testing.expectEqual(@as(usize, 1), TestResolveCalls.calls);
+    try std.testing.expect(TestResolveCalls.platform != null);
+    try std.testing.expectEqualStrings("linux", TestResolveCalls.platform.?.os);
+    try std.testing.expectEqualStrings("amd64", TestResolveCalls.platform.?.architecture);
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"resolve\",\"input\":\"ubuntu:22.04\",\"reference\":\"registry-1.docker.io/library/ubuntu@sha256:" ++ ("b" ** 64) ++ "\",\"digest\":\"sha256:" ++ ("b" ** 64) ++ "\",\"media_type\":\"application/vnd.oci.image.manifest.v1+json\",\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\",\"variant\":null,\"os_version\":null,\"os_features\":null}}",
+        stdout_buffer[0..stdout.end],
+    );
+    try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "resolve command uses the live resolver on an anonymous loopback peer" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1},"layers":[]}
+    ;
+    const mock = try z_oci.testing.mock_registry.MockRegistry.start(allocator, std.testing.io, .{
+        .repository = "library/alpine",
+        .tag = "latest",
+        .body = body,
+        .content_type = z_oci.MediaType.oci_manifest_v1.toString(),
+    }, 1);
+    defer mock.deinit();
+
+    const reference_text = try mock.imageReferenceAlloc(allocator);
+    defer allocator.free(reference_text);
+    const reference_z = try allocator.dupeZ(u8, reference_text);
+    defer allocator.free(reference_z);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(allocator);
+    defer environ_map.deinit();
+    const argv = [_][*:0]const u8{ "z-oci", "resolve", reference_z.ptr };
+    const init = testProcessInit(allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    try std.testing.expectEqual(cli.ExitCode.success, run(init, &stdout, &stderr));
+    var expected_buffer: [512]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buffer, "{s}/library/alpine@{s}\n", .{
+        mock.registry_host,
+        mock.digest_header.?,
+    });
+    try std.testing.expectEqualStrings(expected, stdout_buffer[0..stdout.end]);
+    try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "process configuration preflight remains active for parsed non-resolve commands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{
+        "z-oci",
+        "--ca-bundle",
+        "missing-ca-bundle.pem",
+        "validate",
+        "ubuntu@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [128]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    try std.testing.expectEqual(
+        cli.ExitCode.local_configuration_failure,
+        runWithResolve(init, &stdout, &stderr, testResolveSuccess, TestClock.now),
+    );
+    try std.testing.expectEqualStrings(
+        "z-oci: error: local configuration failure (code=6)\n",
+        stderr_buffer[0..stderr.end],
+    );
 }

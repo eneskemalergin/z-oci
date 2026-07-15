@@ -7,7 +7,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [0.7.0] - Unreleased
 
-This release collects the public API and executable foundations added after v0.6.0. The resolver-backed CLI commands remain pending; the executable currently provides deterministic argument parsing, help, version, and usage handling.
+This release collects the public API and executable work added after v0.6.0. The executable now includes live `resolve` output on top of the public resolver; `validate` and `inspect` command execution remain pending.
 
 ### Added
 
@@ -15,6 +15,7 @@ This release collects the public API and executable foundations added after v0.6
 - Public `inspect` entry point for fetching top-level manifests and multi-arch documents, with optional selected-leaf data and explicit `InspectionResult.deinit()` ownership.
 - Executable command parsing for `resolve`, `validate`, and `inspect`, including global and command options, digest-pinned validation, platform selection syntax, deterministic usage failures, and standalone help and version output.
 - Build-time version wiring from `build.zig.zon` to the executable, keeping the package metadata as the single version source.
+- Resolver-backed `z-oci resolve` execution, including pinned text output, full JSON result output, selected-platform preservation, and shared resolver failure mapping.
 
 ### Changed
 
