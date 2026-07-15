@@ -2,8 +2,9 @@
 //!
 //! This module owns process arguments, standard-output writers, the caller-owned
 //! HTTP client, and projection of process state into the public resolver
-//! configuration. The `resolve` command invokes the public resolver and routes
-//! its owned result or failure through the executable renderers.
+//! configuration. The `resolve`, `validate`, and `inspect` commands invoke the
+//! public resolver and route owned results or failures through the executable
+//! renderers.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -41,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn run(init: std.process.Init, stdout: *Io.Writer, stderr: *Io.Writer) !cli.ExitCode {
-    return runWithOperations(init, stdout, stderr, z_oci.resolve, z_oci.validate, monotonicNow);
+    return runWithOperations(init, stdout, stderr, z_oci.resolve, z_oci.validate, z_oci.inspect, monotonicNow);
 }
 
 fn runWithResolve(
@@ -51,7 +52,7 @@ fn runWithResolve(
     comptime resolve_fn: anytype,
     comptime now_fn: anytype,
 ) !cli.ExitCode {
-    return runWithOperations(init, stdout, stderr, resolve_fn, z_oci.validate, now_fn);
+    return runWithOperations(init, stdout, stderr, resolve_fn, z_oci.validate, z_oci.inspect, now_fn);
 }
 
 fn runWithOperations(
@@ -60,6 +61,7 @@ fn runWithOperations(
     stderr: *Io.Writer,
     comptime resolve_fn: anytype,
     comptime validate_fn: anytype,
+    comptime inspect_fn: anytype,
     comptime now_fn: anytype,
 ) !cli.ExitCode {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -217,8 +219,60 @@ fn runWithOperations(
                     }
                 },
                 .inspect => {
-                    try stderr.writeAll(cli.COMMAND_NOT_IMPLEMENTED);
-                    return .unexpected_failure;
+                    const inspect_outcome = inspect_fn(
+                        init.gpa,
+                        &client,
+                        config,
+                        parsed.reference,
+                        parsed.options.platform,
+                    ) catch |err| {
+                        const failure = cli.CliFailure{ .config = err };
+                        try writeFailure(stdout, stderr, parsed.options.format, failure);
+                        if (started_at != null) {
+                            try cli.writeVerbose(
+                                stderr,
+                                .inspect,
+                                cli.verboseOutcomeForFailure(failure),
+                                elapsedMilliseconds(now_fn, init.io, started_at.?),
+                            );
+                        }
+                        return cli.exitCodeForFailure(failure);
+                    };
+                    const elapsed_ms = if (started_at != null)
+                        elapsedMilliseconds(now_fn, init.io, started_at.?)
+                    else
+                        0;
+
+                    switch (inspect_outcome) {
+                        .success => |result| {
+                            var owned_result = result;
+                            defer owned_result.deinit();
+                            try writeInspectSuccess(
+                                stdout,
+                                parsed.options.format,
+                                parsed.reference,
+                                parsed.options.platform,
+                                owned_result,
+                            );
+                            if (started_at != null) {
+                                try cli.writeVerbose(stderr, .inspect, .success, elapsed_ms);
+                            }
+                            return .success;
+                        },
+                        .failure => |failure| {
+                            defer z_oci.deinitResolveFailure(failure, init.gpa);
+                            try writeFailure(stdout, stderr, parsed.options.format, .{ .resolve = failure });
+                            if (started_at != null) {
+                                try cli.writeVerbose(
+                                    stderr,
+                                    .inspect,
+                                    cli.verboseOutcomeForFailure(.{ .resolve = failure }),
+                                    elapsed_ms,
+                                );
+                            }
+                            return cli.exitCodeForFailure(.{ .resolve = failure });
+                        },
+                    }
                 },
             }
         },
@@ -226,7 +280,7 @@ fn runWithOperations(
 }
 
 fn isExecutedCommand(command: cli.Command) bool {
-    return command == .resolve or command == .validate;
+    return command == .resolve or command == .validate or command == .inspect;
 }
 
 fn writeResolveSuccess(
@@ -250,6 +304,19 @@ fn writeValidateSuccess(
     switch (format) {
         .text => try cli.writeValidateText(stdout, valid),
         .json => try cli.writeValidateJson(stdout, reference, valid),
+    }
+}
+
+fn writeInspectSuccess(
+    stdout: *Io.Writer,
+    format: cli.Format,
+    reference: z_oci.Reference,
+    requested_platform: ?z_oci.Platform,
+    result: z_oci.InspectionResult,
+) Io.Writer.Error!void {
+    switch (format) {
+        .text => try cli.writeInspectText(stdout, reference, requested_platform, result),
+        .json => try cli.writeInspectJson(stdout, reference, requested_platform, result),
     }
 }
 
@@ -466,6 +533,54 @@ fn testValidateAuthFailure(
     } } };
 }
 
+const test_inspect_manifest_json =
+    "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:" ++ ("a" ** 64) ++ "\",\"size\":123},\"layers\":[]}";
+const test_inspect_index_json =
+    "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:" ++ ("b" ** 64) ++ "\",\"size\":456,\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\"}}]}";
+
+fn testInspectResult(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: z_oci.Config,
+    _: z_oci.Reference,
+    platform: ?z_oci.Platform,
+) z_oci.PublicApiError!z_oci.InspectionOutcome {
+    TestInspectCalls.calls += 1;
+    TestInspectCalls.platform = platform;
+    if (platform == null) {
+        const manifest = z_oci.json.parse(z_oci.Manifest, allocator, test_inspect_manifest_json) catch unreachable;
+        return .{ .success = .{ .top_level = .{ .manifest = manifest } } };
+    }
+
+    var result = z_oci.InspectionResult{
+        .top_level = .{ .oci_index = z_oci.json.parse(z_oci.OciImageIndex, allocator, test_inspect_index_json) catch unreachable },
+    };
+    errdefer result.deinit();
+    result.selected_leaf = z_oci.json.parse(z_oci.Manifest, allocator, test_inspect_manifest_json) catch unreachable;
+    return .{ .success = result };
+}
+
+fn testInspectPlatformFailure(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: z_oci.Config,
+    ref: z_oci.Reference,
+    platform: ?z_oci.Platform,
+) z_oci.PublicApiError!z_oci.InspectionOutcome {
+    TestInspectCalls.calls += 1;
+    TestInspectCalls.platform = platform;
+    const reference = try std.fmt.allocPrint(allocator, "{s}/{s}:{s}", .{
+        ref.registry,
+        ref.repository,
+        ref.refString(),
+    });
+    return .{ .failure = .{ .platform_not_found = .{
+        .registry = ref.registry,
+        .reference = reference,
+        .http_status = null,
+    } } };
+}
+
 const TestResolveCalls = struct {
     var calls: usize = 0;
     var platform: ?z_oci.Platform = null;
@@ -477,6 +592,16 @@ const TestResolveCalls = struct {
 };
 
 const TestValidateCalls = struct {
+    var calls: usize = 0;
+    var platform: ?z_oci.Platform = null;
+
+    fn reset() void {
+        calls = 0;
+        platform = null;
+    }
+};
+
+const TestInspectCalls = struct {
     var calls: usize = 0;
     var platform: ?z_oci.Platform = null;
 
@@ -724,7 +849,7 @@ test "validate command renders injected valid text and verbose timing" {
     defer TestClock.reset();
     try std.testing.expectEqual(
         cli.ExitCode.success,
-        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateValid, TestClock.now),
+        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateValid, testInspectResult, TestClock.now),
     );
     try std.testing.expectEqual(@as(usize, 1), TestValidateCalls.calls);
     try std.testing.expect(TestValidateCalls.platform == null);
@@ -758,7 +883,7 @@ test "validate command renders injected not-found JSON with code one" {
     defer TestValidateCalls.reset();
     try std.testing.expectEqual(
         cli.ExitCode.not_found,
-        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateNotFound, TestClock.now),
+        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateNotFound, testInspectResult, TestClock.now),
     );
     try std.testing.expectEqual(@as(usize, 1), TestValidateCalls.calls);
     try std.testing.expect(TestValidateCalls.platform == null);
@@ -792,7 +917,7 @@ test "validate command maps injected failure through shared JSON diagnostics" {
     defer TestValidateCalls.reset();
     try std.testing.expectEqual(
         cli.ExitCode.authentication_failure,
-        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateAuthFailure, TestClock.now),
+        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateAuthFailure, testInspectResult, TestClock.now),
     );
     try std.testing.expectEqual(@as(usize, 1), TestValidateCalls.calls);
     try std.testing.expect(TestValidateCalls.platform == null);
@@ -1012,6 +1137,160 @@ test "validate command maps a live transport failure" {
 
     try std.testing.expectEqual(cli.ExitCode.network_failure, run(init, &stdout, &stderr));
     try std.testing.expect(std.mem.startsWith(u8, stderr_buffer[0..stderr.end], "z-oci: error: network failure (code=4)"));
+}
+
+test "inspect command renders injected single-arch text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{ "z-oci", "inspect", "ubuntu:22.04" };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    TestInspectCalls.reset();
+    defer TestInspectCalls.reset();
+    try std.testing.expectEqual(
+        cli.ExitCode.success,
+        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateValid, testInspectResult, TestClock.now),
+    );
+    try std.testing.expectEqual(@as(usize, 1), TestInspectCalls.calls);
+    try std.testing.expect(TestInspectCalls.platform == null);
+    try std.testing.expectEqualStrings(
+        "inspect:\n" ++
+            "  reference: registry-1.docker.io/library/ubuntu:22.04\n" ++
+            "  top_level.kind: manifest\n" ++
+            "  top_level.media_type: application/vnd.oci.image.manifest.v1+json\n" ++
+            "  top_level.config_digest: sha256:" ++ ("a" ** 64) ++ "\n" ++
+            "  top_level.layers.count: 0\n",
+        stdout_buffer[0..stdout.end],
+    );
+    try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "inspect command renders verbose timing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{ "z-oci", "inspect", "--verbose", "ubuntu:22.04" };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    TestInspectCalls.reset();
+    TestClock.reset();
+    defer TestInspectCalls.reset();
+    defer TestClock.reset();
+    try std.testing.expectEqual(
+        cli.ExitCode.success,
+        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateValid, testInspectResult, TestClock.now),
+    );
+    try std.testing.expectEqual(@as(usize, 1), TestInspectCalls.calls);
+    try std.testing.expectEqualStrings(
+        "z-oci verbose: command=inspect outcome=success elapsed_ms=37\n",
+        stderr_buffer[0..stderr.end],
+    );
+}
+
+test "inspect command renders injected selected JSON" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{
+        "z-oci",
+        "inspect",
+        "--format",
+        "json",
+        "--platform",
+        "linux/amd64",
+        "ubuntu:22.04",
+    };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [2048]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    TestInspectCalls.reset();
+    defer TestInspectCalls.reset();
+    try std.testing.expectEqual(
+        cli.ExitCode.success,
+        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateValid, testInspectResult, TestClock.now),
+    );
+    try std.testing.expectEqual(@as(usize, 1), TestInspectCalls.calls);
+    try std.testing.expect(TestInspectCalls.platform != null);
+    try std.testing.expectEqualStrings("linux", TestInspectCalls.platform.?.os);
+    try std.testing.expectEqualStrings("amd64", TestInspectCalls.platform.?.architecture);
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"inspect\",\"reference\":\"registry-1.docker.io/library/ubuntu:22.04\",\"top_level\":{\"kind\":\"oci_image_index\",\"media_type\":\"application/vnd.oci.image.index.v1+json\",\"config_digest\":null,\"layer_count\":null,\"platforms\":[{\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\",\"variant\":null,\"os_version\":null,\"os_features\":null},\"media_type\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:" ++ ("b" ** 64) ++ "\",\"size\":456}]},\"selected_leaf\":{\"requested_platform\":{\"os\":\"linux\",\"architecture\":\"amd64\",\"variant\":null,\"os_version\":null,\"os_features\":null},\"media_type\":\"application/vnd.oci.image.manifest.v1+json\",\"config_digest\":\"sha256:" ++ ("a" ** 64) ++ "\",\"layer_count\":0}}",
+        stdout_buffer[0..stdout.end],
+    );
+    try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "inspect command maps injected platform failure through shared JSON diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{
+        "z-oci",
+        "inspect",
+        "--format",
+        "json",
+        "--platform",
+        "linux/amd64",
+        "ubuntu:22.04",
+    };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [512]u8 = undefined;
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [128]u8 = undefined;
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    TestInspectCalls.reset();
+    defer TestInspectCalls.reset();
+    try std.testing.expectEqual(
+        cli.ExitCode.platform_selection_failure,
+        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateValid, testInspectPlatformFailure, TestClock.now),
+    );
+    try std.testing.expectEqual(@as(usize, 1), TestInspectCalls.calls);
+    try std.testing.expect(TestInspectCalls.platform != null);
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"code\":\"platform_not_found\",\"message\":\"platform selection failure\",\"http_status\":null}}",
+        stdout_buffer[0..stdout.end],
+    );
+    try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "inspect command writer failure releases returned documents" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var environ_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const argv = [_][*:0]const u8{ "z-oci", "inspect", "ubuntu:22.04" };
+    const init = testProcessInit(std.testing.allocator, &arena, &environ_map, &argv);
+    var stdout_buffer: [0]u8 = .{};
+    var stdout = Io.Writer.fixed(&stdout_buffer);
+    var stderr_buffer: [0]u8 = .{};
+    var stderr = Io.Writer.fixed(&stderr_buffer);
+
+    try std.testing.expectError(
+        error.WriteFailed,
+        runWithOperations(init, &stdout, &stderr, testResolveSuccess, testValidateValid, testInspectResult, TestClock.now),
+    );
 }
 
 test "process configuration preflight remains active for parsed non-resolve commands" {

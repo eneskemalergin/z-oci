@@ -180,8 +180,6 @@ const INSPECT_HELP =
     \\
 ;
 
-pub const COMMAND_NOT_IMPLEMENTED = "z-oci: command execution is not implemented yet.\n";
-
 pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) ParseError!ParseOutcome {
     if (args.len <= 1) return usage(.missing_command, .top_level);
 
