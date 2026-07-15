@@ -174,6 +174,29 @@ switch (manifest_outcome) {
 
 `resolve`, `validate`, and `getManifest` all use a caller-owned `std.http.Client` and the same auth-backed resolver flow.
 
+`inspect` is the inspection-oriented library entry point. It returns the fetched top-level `Manifest`, `OciImageIndex`, or `DockerManifestList`. When a platform is supplied for a multi-arch document, the result also owns the selected leaf `Manifest`; without a platform, the top-level index or list is returned without `platform_required`.
+
+```zig
+const outcome = try z_oci.inspect(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+switch (outcome) {
+    .success => |result| {
+        var owned = result;
+        defer owned.deinit();
+        switch (owned.top_level) {
+            .manifest => |manifest| _ = manifest.value.config,
+            .oci_index => |index| _ = index.value.manifests,
+            .docker_manifest_list => |list| _ = list.value.manifests,
+        }
+        if (owned.selected_leaf) |leaf| _ = leaf.value.layers;
+    },
+    .failure => |failure| {
+        defer z_oci.deinitResolveFailure(failure, allocator);
+    },
+}
+```
+
+`InspectionResult.deinit()` releases both parsed values. Inspection uses the same auth, redirect, digest verification, body-size, retry, and platform-selection paths as the other resolver APIs.
+
 Credential sources are opt-in. A CLI-shaped Zig 0.16 entrypoint injects the process environment and helper Io through `Config.credential_sources` (no silent process reads):
 
 ```zig

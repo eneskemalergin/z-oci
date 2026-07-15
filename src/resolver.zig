@@ -29,6 +29,7 @@ pub const ResolverOperation = enum {
     resolve,
     validate,
     get_manifest,
+    inspect,
     resolve_child_manifest,
 };
 /// Built once at the public API boundary. `config` must match the `AuthEngine` snapshot.
@@ -420,6 +421,13 @@ pub const ManifestGetSuccess = struct {
         allocator.free(self.resolved_digest_raw);
         self.document.deinit();
         if (self.backing_body) |body| allocator.free(body);
+    }
+
+    /// Transfers the parsed document and leaves `deinit` safe to call.
+    pub fn detachDocument(self: *ManifestGetSuccess) ParsedManifestDocument {
+        const document = self.document;
+        self.document = .{ .manifest_media_type = document.mediaType() };
+        return document;
     }
 };
 pub const GetRequestOutcome = union(enum) {

@@ -4,7 +4,7 @@
 //! - offline OCI/Docker reference parsing and normalization
 //! - OCI manifest, index, and descriptor types with JSON round-trip support
 //! - auth engine: manifest HEAD/GET challenge handling, token exchange, credential providers
-//! - public manifest resolution for single-arch and supported multi-arch flows
+//! - public manifest resolution and inspection for single-arch and multi-arch flows
 //! - registry `/v2/` ping (`pingRegistry`); not used by resolve
 //! - offline in-process mock peer for integration tests (not a public product API)
 //!
@@ -36,6 +36,8 @@
 //!   while `Digest.hex` still aliases them. Failure promotes `ResolveError.reference`
 //!   to the caller allocator before arena teardown. `AuthEngine`, the input
 //!   `Reference`, and persistent token cache storage stay on the caller allocator.
+//! - `inspect` promotes its top-level parsed document and optional selected leaf
+//!   before arena teardown. Call `InspectionResult.deinit()` once to release both.
 //! - `validateWithEngine` is asymmetric: the initial manifest `HEAD` request allocates
 //!   `HeadRequestOutcome` metadata on the caller allocator (same as the public
 //!   `validate` contract). Only the optional GET fallback opens a transient arena,
@@ -60,7 +62,7 @@
 //!   Returned as the API error union, not inside `ResolveOutcome.failure`.
 //! - `Reference.ParseError` / `Digest.ParseError`: caller parses before invoking resolve APIs.
 //! - `ResolveError`: registry operation failures inside `ResolveOutcome.failure`,
-//!   `ValidateOutcome.failure`, or `ManifestOutcome.failure`.
+//!   `ValidateOutcome.failure`, `ManifestOutcome.failure`, or `InspectionOutcome.failure`.
 //! - `RegistryPingResult`: `/v2/` probe outcomes. Independent of resolve; resolve never calls ping.
 //!
 const std = @import("std");
@@ -274,6 +276,52 @@ pub const testing = struct {
         );
     }
 
+    pub fn inspectWithEngine(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        config: Config,
+        engine: *auth.AuthEngine,
+        ref: Reference,
+        platform: ?Platform,
+        token_exchanger: TokenHttpExchanger,
+        manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
+    ) PublicApiError!InspectionOutcome {
+        return root.inspectWithEngine(
+            allocator,
+            client,
+            config,
+            engine,
+            ref,
+            platform,
+            token_exchanger,
+            manifest_exchanger,
+            transport_hooks,
+        );
+    }
+
+    pub fn inspectWithExchangers(
+        allocator: std.mem.Allocator,
+        client: *std.http.Client,
+        config: Config,
+        ref: Reference,
+        platform: ?Platform,
+        token_exchanger: TokenHttpExchanger,
+        manifest_exchanger: ManifestHttpExchanger,
+        transport_hooks: resilience.TransportHooks,
+    ) PublicApiError!InspectionOutcome {
+        return root.inspectWithExchangers(
+            allocator,
+            client,
+            config,
+            ref,
+            platform,
+            token_exchanger,
+            manifest_exchanger,
+            transport_hooks,
+        );
+    }
+
     pub fn resolveManyWithExchangers(
         allocator: std.mem.Allocator,
         client: *std.http.Client,
@@ -312,6 +360,43 @@ pub const ValidateOutcome = union(enum) {
 /// `.success` owns a JSON arena (`parsed.deinit()`).
 pub const ManifestOutcome = union(enum) {
     success: std.json.Parsed(Manifest),
+    failure: ResolveError,
+};
+/// Caller-owned parsed document returned by `inspect`.
+pub const InspectionDocument = union(enum) {
+    manifest: std.json.Parsed(Manifest),
+    oci_index: std.json.Parsed(OciImageIndex),
+    docker_manifest_list: std.json.Parsed(DockerManifestList),
+
+    /// Releases the parsed document. Call once for a caller-owned result.
+    pub fn deinit(self: *InspectionDocument) void {
+        switch (self.*) {
+            inline else => |parsed| parsed.deinit(),
+        }
+    }
+
+    pub fn mediaType(self: InspectionDocument) MediaType {
+        return switch (self) {
+            .manifest => |parsed| parsed.value.media_type,
+            .oci_index => |parsed| parsed.value.media_type,
+            .docker_manifest_list => |parsed| parsed.value.media_type,
+        };
+    }
+};
+/// Top-level inspection data and an optional caller-owned selected leaf.
+pub const InspectionResult = struct {
+    top_level: InspectionDocument,
+    selected_leaf: ?std.json.Parsed(Manifest) = null,
+
+    /// Releases the top-level document and optional selected leaf.
+    pub fn deinit(self: *InspectionResult) void {
+        self.top_level.deinit();
+        if (self.selected_leaf) |*leaf| leaf.deinit();
+        self.selected_leaf = null;
+    }
+};
+pub const InspectionOutcome = union(enum) {
+    success: InspectionResult,
     failure: ResolveError,
 };
 /// One batch outcome. Failures own both `registry` and `reference`; never use `deinitResolveFailure`.
@@ -459,6 +544,27 @@ pub fn getManifest(
     );
 }
 
+/// Returns the fetched top-level document and, for a supplied platform on a
+/// multi-arch document, the selected leaf manifest.
+pub fn inspect(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+) PublicApiError!InspectionOutcome {
+    return inspectWithExchangers(
+        allocator,
+        client,
+        config,
+        ref,
+        platform,
+        auth.liveTokenHttpExchanger,
+        resolver.liveManifestHttpExchanger,
+        resilience.liveTransportHooks(),
+    );
+}
+
 /// Probe `https://{registry}/v2/`. Does not fetch manifests and is not used by resolve.
 pub fn pingRegistry(
     allocator: std.mem.Allocator,
@@ -588,6 +694,14 @@ const ResolvedManifestSuccess = struct {
 };
 const ResolvedManifestOutcome = union(enum) {
     success: ResolvedManifestSuccess,
+    failure: ResolveError,
+};
+const InspectionGetOutcome = union(enum) {
+    success: resolver.ManifestGetSuccess,
+    failure: ResolveError,
+};
+const InspectionLeafOutcome = union(enum) {
+    success: std.json.Parsed(Manifest),
     failure: ResolveError,
 };
 const ResolveManySessionCache = struct {
@@ -1146,6 +1260,267 @@ fn getManifestWithEngine(
             return .{ .failure = try promoteResolvedManifestFailure(allocator, transient, &outcome) };
         },
     }
+}
+fn inspectWithExchangers(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    ref: Reference,
+    platform: ?Platform,
+    token_exchanger: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+) PublicApiError!InspectionOutcome {
+    var engine = try initAuthEngineForPublicResolve(allocator, config, token_exchanger, transport_hooks);
+    defer engine.deinit();
+    return inspectWithEngine(
+        allocator,
+        client,
+        config,
+        &engine,
+        ref,
+        platform,
+        token_exchanger,
+        manifest_exchanger,
+        transport_hooks,
+    );
+}
+fn inspectWithEngine(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    ref: Reference,
+    platform: ?Platform,
+    _: auth.TokenHttpExchanger,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+) PublicApiError!InspectionOutcome {
+    try ensureClientConfigured(config, client);
+
+    var inspect_arena = std.heap.ArenaAllocator.init(allocator);
+    defer inspect_arena.deinit();
+    const transient = inspect_arena.allocator();
+    var manifest_throttle: resilience.ManifestThrottle = .{};
+
+    var root_outcome = try fetchInspectionGet(
+        transient,
+        client,
+        config,
+        engine,
+        referenceView(ref),
+        platform,
+        manifest_exchanger,
+        transport_hooks,
+        &manifest_throttle,
+    );
+    switch (root_outcome) {
+        .failure => |failure| return .{ .failure = try promoteResolveErrorAlloc(allocator, failure) },
+        .success => |*success| {
+            var top_level = success.detachDocument();
+            defer success.deinit(transient);
+            var top_level_live = true;
+            defer if (top_level_live) top_level.deinit();
+
+            var selected_leaf: ?std.json.Parsed(Manifest) = null;
+            errdefer if (selected_leaf) |*leaf| leaf.deinit();
+
+            if (platform) |requested| switch (top_level) {
+                .manifest => {},
+                .oci_index, .docker_manifest_list => {
+                    const descriptor = inspectionChildDescriptor(top_level, requested) orelse {
+                        const failure = try platformNotFoundErrorAlloc(transient, referenceView(ref));
+                        return .{ .failure = try promoteResolveErrorAlloc(allocator, failure) };
+                    };
+                    var child_ref_string_buffer: [128]u8 = undefined;
+                    const child_ref_view = childReferenceView(referenceView(ref), descriptor, &child_ref_string_buffer);
+                    const child_outcome = try fetchInspectionLeaf(
+                        transient,
+                        client,
+                        config,
+                        engine,
+                        child_ref_view,
+                        requested,
+                        1,
+                        manifest_exchanger,
+                        transport_hooks,
+                        &manifest_throttle,
+                    );
+                    switch (child_outcome) {
+                        .success => |leaf| selected_leaf = leaf,
+                        .failure => |failure| return .{ .failure = try promoteResolveErrorAlloc(allocator, failure) },
+                    }
+                },
+                .manifest_media_type => unreachable,
+            };
+
+            var promoted_selected_leaf: ?std.json.Parsed(Manifest) = null;
+            errdefer if (promoted_selected_leaf) |*leaf| leaf.deinit();
+            if (selected_leaf) |leaf| {
+                promoted_selected_leaf = json.promoteParsed(Manifest, allocator, leaf) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return .{ .failure = try manifestParseErrorAlloc(allocator, referenceView(ref)) },
+                };
+                selected_leaf = null;
+            }
+
+            const promoted_top_level = promoteInspectionDocument(&top_level, allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .{ .failure = try manifestParseErrorAlloc(allocator, referenceView(ref)) },
+            };
+            top_level_live = false;
+            return .{ .success = .{
+                .top_level = promoted_top_level,
+                .selected_leaf = promoted_selected_leaf,
+            } };
+        },
+    }
+}
+fn fetchInspectionGet(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    ref_view: AuthReferenceView,
+    platform: ?Platform,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+    manifest_throttle: *resilience.ManifestThrottle,
+) PublicApiError!InspectionGetOutcome {
+    const ctx = resolver.ResolverParams.initWithTransportHooks(
+        allocator,
+        client,
+        config,
+        ref_view,
+        platform,
+        .inspect,
+        transport_hooks,
+    ).withManifestThrottle(manifest_throttle);
+    const outcome = try resolver.performManifestGet(ctx, engine, manifest_exchanger, manifestAcceptValues());
+    return switch (outcome) {
+        .success => |success| .{ .success = success },
+        .not_found => .{ .failure = try notFoundErrorAlloc(allocator, ref_view) },
+        .redirect => |metadata| blk: {
+            defer metadata.deinitOwned(allocator);
+            break :blk .{ .failure = try networkErrorAlloc(allocator, ref_view, metadata.httpStatus()) };
+        },
+        .failure => |failure| .{ .failure = failure },
+    };
+}
+fn fetchInspectionLeaf(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    config: Config,
+    engine: *auth.AuthEngine,
+    ref_view: AuthReferenceView,
+    platform: Platform,
+    depth: usize,
+    manifest_exchanger: resolver.ManifestHttpExchanger,
+    transport_hooks: resilience.TransportHooks,
+    manifest_throttle: *resilience.ManifestThrottle,
+) PublicApiError!InspectionLeafOutcome {
+    if (depth > MAX_CHILD_MANIFEST_DEPTH) {
+        return .{ .failure = try depthLimitExceededErrorAlloc(allocator, ref_view) };
+    }
+
+    var outcome = try fetchInspectionGet(
+        allocator,
+        client,
+        config,
+        engine,
+        ref_view,
+        platform,
+        manifest_exchanger,
+        transport_hooks,
+        manifest_throttle,
+    );
+    switch (outcome) {
+        .failure => |failure| return .{ .failure = failure },
+        .success => |*success| {
+            var document = success.detachDocument();
+            defer success.deinit(allocator);
+            var document_live = true;
+            defer if (document_live) document.deinit();
+
+            switch (document) {
+                .manifest => |parsed| {
+                    document_live = false;
+                    return .{ .success = parsed };
+                },
+                .oci_index, .docker_manifest_list => {
+                    const child_descriptor = inspectionChildDescriptor(document, platform) orelse {
+                        return .{ .failure = try platformNotFoundErrorAlloc(allocator, ref_view) };
+                    };
+                    var child_ref_string_buffer: [128]u8 = undefined;
+                    const child_ref_view = childReferenceView(ref_view, child_descriptor, &child_ref_string_buffer);
+                    document.deinit();
+                    document_live = false;
+                    return fetchInspectionLeaf(
+                        allocator,
+                        client,
+                        config,
+                        engine,
+                        child_ref_view,
+                        platform,
+                        depth + 1,
+                        manifest_exchanger,
+                        transport_hooks,
+                        manifest_throttle,
+                    );
+                },
+                .manifest_media_type => unreachable,
+            }
+        },
+    }
+}
+fn inspectionChildDescriptor(document: resolver.ParsedManifestDocument, platform: Platform) ?Descriptor {
+    return switch (document) {
+        .oci_index => |parsed| (MultiArchManifest{ .oci = parsed.value }).selectChildDescriptorByPlatform(platform),
+        .docker_manifest_list => |parsed| (MultiArchManifest{ .docker = parsed.value }).selectChildDescriptorByPlatform(platform),
+        .manifest, .manifest_media_type => null,
+    };
+}
+fn childReferenceView(
+    parent_ref: AuthReferenceView,
+    descriptor: Descriptor,
+    buffer: *[128]u8,
+) AuthReferenceView {
+    const ref_string = std.fmt.bufPrint(
+        buffer,
+        "{s}:{s}",
+        .{ @tagName(descriptor.digest.algorithm), descriptor.digest.hex },
+    ) catch unreachable;
+    return .{
+        .registry = parent_ref.registry,
+        .repository_path = parent_ref.repository_path,
+        .ref_string = ref_string,
+    };
+}
+fn promoteInspectionDocument(
+    document: *resolver.ParsedManifestDocument,
+    allocator: std.mem.Allocator,
+) !InspectionDocument {
+    return switch (document.*) {
+        .manifest => |parsed| blk: {
+            const media_type = parsed.value.media_type;
+            const promoted = try json.promoteParsed(Manifest, allocator, parsed);
+            document.* = .{ .manifest_media_type = media_type };
+            break :blk .{ .manifest = promoted };
+        },
+        .oci_index => |parsed| blk: {
+            const media_type = parsed.value.media_type;
+            const promoted = try json.promoteParsed(OciImageIndex, allocator, parsed);
+            document.* = .{ .manifest_media_type = media_type };
+            break :blk .{ .oci_index = promoted };
+        },
+        .docker_manifest_list => |parsed| blk: {
+            const media_type = parsed.value.media_type;
+            const promoted = try json.promoteParsed(DockerManifestList, allocator, parsed);
+            document.* = .{ .manifest_media_type = media_type };
+            break :blk .{ .docker_manifest_list = promoted };
+        },
+        .manifest_media_type => unreachable,
+    };
 }
 fn validateResolvedManifestFromChildHead(
     allocator: std.mem.Allocator,
@@ -2130,6 +2505,44 @@ test "mock registry core: anonymous single-arch resolve over loopback http" {
             try std.testing.expectEqualStrings("library/alpine", result.reference.repository);
         },
         .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "mock registry core: inspect single-arch manifest over loopback http" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const body = try readFixtureAlloc(allocator, "fixtures/manifests/oci-image-manifest-spec-example.json", 16 * 1024);
+    defer allocator.free(body);
+
+    const mock = try mock_registry_peer.MockRegistry.start(allocator, io, .{
+        .repository = "library/alpine",
+        .tag = "latest",
+        .body = body,
+        .content_type = MediaType.oci_manifest_v1.toString(),
+    }, 1);
+    defer mock.deinit();
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const ref_str = try mock.imageReferenceAlloc(allocator);
+    defer allocator.free(ref_str);
+    var ref = try Reference.parse(allocator, ref_str);
+    defer ref.deinit(allocator);
+
+    const outcome = try inspect(allocator, &client, Config{}, ref, null);
+    switch (outcome) {
+        .success => |result| {
+            var owned = result;
+            defer owned.deinit();
+            try std.testing.expectEqual(.manifest, std.meta.activeTag(owned.top_level));
+            try std.testing.expect(owned.selected_leaf == null);
+            try std.testing.expectEqual(@as(u8, 2), owned.top_level.manifest.value.schema_version);
+        },
+        .failure => |failure| {
+            deinitOwnedResolveError(failure, allocator);
+            return error.TestUnexpectedResult;
+        },
     }
 }
 
@@ -5490,6 +5903,375 @@ test "getManifestWithExchangers: nested index resolves to leaf manifest" {
             return error.TestUnexpectedResult;
         },
     }
+}
+
+test "inspectWithExchangers: preserves top-level index and selected leaf" {
+    const MockHarness = struct {
+        var top_body: []u8 = undefined;
+        var top_digest: []u8 = undefined;
+        var top_content_type: []const u8 = undefined;
+        var leaf_body: []u8 = undefined;
+        var leaf_digest: []u8 = undefined;
+        var leaf_content_type: []const u8 = undefined;
+
+        fn manifestExchange(allocator: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(allocator);
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = top_content_type,
+                    .docker_content_digest = top_digest,
+                }, top_body);
+            }
+            if (std.mem.endsWith(u8, request.url, leaf_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(allocator, .{
+                    .status = .ok,
+                    .content_type = leaf_content_type,
+                    .docker_content_digest = leaf_digest,
+                }, leaf_body);
+            }
+            return error.TransportFailed;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    MockHarness.leaf_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:{s}\",\"size\":123}},\"layers\":[]}}",
+        .{ MediaType.oci_manifest_v1.toString(), "a" ** 64 },
+    );
+    defer allocator.free(MockHarness.leaf_body);
+    MockHarness.leaf_digest = try sha256DigestStringAlloc(allocator, MockHarness.leaf_body);
+    defer allocator.free(MockHarness.leaf_digest);
+
+    MockHarness.top_body = try buildIndexBodyAlloc(
+        allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        MockHarness.leaf_digest,
+        "linux",
+        "arm64",
+    );
+    defer allocator.free(MockHarness.top_body);
+    MockHarness.top_digest = try sha256DigestStringAlloc(allocator, MockHarness.top_body);
+    defer allocator.free(MockHarness.top_digest);
+    MockHarness.top_content_type = MediaType.oci_index_v1.toString();
+    MockHarness.leaf_content_type = MediaType.oci_manifest_v1.toString();
+
+    var client: std.http.Client = undefined;
+    const no_platform = try testing.inspectWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        busybox_literal_ref,
+        null,
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    const owned_no_platform = no_platform;
+    defer switch (owned_no_platform) {
+        .success => |result| {
+            var owned_result = result;
+            owned_result.deinit();
+        },
+        .failure => |failure| deinitOwnedResolveError(failure, allocator),
+    };
+    switch (owned_no_platform) {
+        .success => |result| {
+            try std.testing.expectEqual(.oci_index, std.meta.activeTag(result.top_level));
+            try std.testing.expect(result.selected_leaf == null);
+            try std.testing.expectEqual(@as(usize, 1), result.top_level.oci_index.value.manifests.len);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+
+    const selected = try testing.inspectWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        busybox_literal_ref,
+        .{ .os = "linux", .architecture = "arm64" },
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    const owned_selected = selected;
+    defer switch (owned_selected) {
+        .success => |result| {
+            var owned_result = result;
+            owned_result.deinit();
+        },
+        .failure => |failure| deinitOwnedResolveError(failure, allocator),
+    };
+    switch (owned_selected) {
+        .success => |result| {
+            try std.testing.expectEqual(.oci_index, std.meta.activeTag(result.top_level));
+            try std.testing.expect(result.selected_leaf != null);
+            try std.testing.expectEqual(@as(u64, 123), result.selected_leaf.?.value.config.size);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+
+    const platform_miss = try testing.inspectWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        busybox_literal_ref,
+        .{ .os = "windows", .architecture = "amd64" },
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer switch (platform_miss) {
+        .success => |result| {
+            var owned_result = result;
+            owned_result.deinit();
+        },
+        .failure => |failure| deinitOwnedResolveError(failure, allocator),
+    };
+    switch (platform_miss) {
+        .success => return error.TestUnexpectedResult,
+        .failure => |failure| try std.testing.expectEqual(.platform_not_found, std.meta.activeTag(failure)),
+    }
+}
+
+test "inspectWithExchangers: Docker manifest list and malformed content preserve contract" {
+    const allocator = std.testing.allocator;
+    const docker_leaf_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:{s}\",\"size\":456}},\"layers\":[]}}",
+        .{ MediaType.docker_manifest_v2.toString(), "b" ** 64 },
+    );
+    defer allocator.free(docker_leaf_body);
+    const docker_leaf_digest = try sha256DigestStringAlloc(allocator, docker_leaf_body);
+    defer allocator.free(docker_leaf_digest);
+    const docker_list_body = try buildIndexBodyAlloc(
+        allocator,
+        MediaType.docker_manifest_list_v2.toString(),
+        MediaType.docker_manifest_v2.toString(),
+        docker_leaf_digest,
+        "linux",
+        "amd64",
+    );
+    defer allocator.free(docker_list_body);
+    const docker_list_digest = try sha256DigestStringAlloc(allocator, docker_list_body);
+    defer allocator.free(docker_list_digest);
+
+    const MockHarness = struct {
+        var list_body: []u8 = undefined;
+        var list_digest: []u8 = undefined;
+        var leaf_body: []u8 = undefined;
+        var leaf_digest: []u8 = undefined;
+        var malformed: bool = false;
+
+        fn manifestExchange(a: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(a);
+            if (malformed) {
+                const body = try a.dupe(u8, "{}");
+                return resolver.ManifestHttpResponse.initOwnedAlloc(a, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_manifest_v1.toString(),
+                }, body);
+            }
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(a, .{
+                    .status = .ok,
+                    .content_type = MediaType.docker_manifest_list_v2.toString(),
+                    .docker_content_digest = list_digest,
+                }, list_body);
+            }
+            return resolver.ManifestHttpResponse.initOwnedAlloc(a, .{
+                .status = .ok,
+                .content_type = MediaType.docker_manifest_v2.toString(),
+                .docker_content_digest = leaf_digest,
+            }, leaf_body);
+        }
+    };
+    MockHarness.list_body = docker_list_body;
+    MockHarness.list_digest = docker_list_digest;
+    MockHarness.leaf_body = docker_leaf_body;
+    MockHarness.leaf_digest = docker_leaf_digest;
+
+    var client: std.http.Client = undefined;
+    const outcome = try testing.inspectWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        busybox_literal_ref,
+        .{ .os = "linux", .architecture = "amd64" },
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    const owned = outcome;
+    defer switch (owned) {
+        .success => |result| {
+            var owned_result = result;
+            owned_result.deinit();
+        },
+        .failure => |failure| deinitOwnedResolveError(failure, allocator),
+    };
+    switch (owned) {
+        .success => |result| {
+            try std.testing.expectEqual(.docker_manifest_list, std.meta.activeTag(result.top_level));
+            try std.testing.expect(result.selected_leaf != null);
+            try std.testing.expectEqual(@as(u64, 456), result.selected_leaf.?.value.config.size);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+
+    MockHarness.malformed = true;
+    const malformed = try testing.inspectWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        busybox_literal_ref,
+        null,
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer switch (malformed) {
+        .success => |result| {
+            var owned_result = result;
+            owned_result.deinit();
+        },
+        .failure => |failure| deinitOwnedResolveError(failure, allocator),
+    };
+    switch (malformed) {
+        .success => return error.TestUnexpectedResult,
+        .failure => |failure| try std.testing.expectEqual(.manifest_parse_error, std.meta.activeTag(failure)),
+    }
+}
+
+test "inspectWithExchangers: keeps the outer index while selecting through a nested index" {
+    const allocator = std.testing.allocator;
+    const nested_leaf_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:{s}\",\"size\":789}},\"layers\":[]}}",
+        .{ MediaType.oci_manifest_v1.toString(), "c" ** 64 },
+    );
+    defer allocator.free(nested_leaf_body);
+    const nested_leaf_digest = try sha256DigestStringAlloc(allocator, nested_leaf_body);
+    defer allocator.free(nested_leaf_digest);
+    const nested_inner_body = try buildIndexBodyAlloc(
+        allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        nested_leaf_digest,
+        "linux",
+        "arm64",
+    );
+    defer allocator.free(nested_inner_body);
+    const nested_inner_digest = try sha256DigestStringAlloc(allocator, nested_inner_body);
+    defer allocator.free(nested_inner_digest);
+    const nested_outer_body = try buildIndexBodyAlloc(
+        allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_index_v1.toString(),
+        nested_inner_digest,
+        "linux",
+        "arm64",
+    );
+    defer allocator.free(nested_outer_body);
+    const nested_outer_digest = try sha256DigestStringAlloc(allocator, nested_outer_body);
+    defer allocator.free(nested_outer_digest);
+
+    const MockHarness = struct {
+        var outer_body: []u8 = undefined;
+        var outer_digest: []u8 = undefined;
+        var inner_body: []u8 = undefined;
+        var inner_digest: []u8 = undefined;
+        var leaf_body: []u8 = undefined;
+        var leaf_digest: []u8 = undefined;
+
+        fn manifestExchange(a: std.mem.Allocator, _: *std.http.Client, request: resolver.ManifestHttpRequest) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
+            defer request.deinit(a);
+            if (std.mem.endsWith(u8, request.url, "/manifests/latest")) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(a, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = outer_digest,
+                }, outer_body);
+            }
+            if (std.mem.endsWith(u8, request.url, inner_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(a, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_index_v1.toString(),
+                    .docker_content_digest = inner_digest,
+                }, inner_body);
+            }
+            if (std.mem.endsWith(u8, request.url, leaf_digest)) {
+                return resolver.ManifestHttpResponse.initOwnedAlloc(a, .{
+                    .status = .ok,
+                    .content_type = MediaType.oci_manifest_v1.toString(),
+                    .docker_content_digest = leaf_digest,
+                }, leaf_body);
+            }
+            return error.TransportFailed;
+        }
+    };
+    MockHarness.outer_body = nested_outer_body;
+    MockHarness.outer_digest = nested_outer_digest;
+    MockHarness.inner_body = nested_inner_body;
+    MockHarness.inner_digest = nested_inner_digest;
+    MockHarness.leaf_body = nested_leaf_body;
+    MockHarness.leaf_digest = nested_leaf_digest;
+
+    var client: std.http.Client = undefined;
+    const outcome = try testing.inspectWithExchangers(
+        allocator,
+        &client,
+        Config{},
+        busybox_literal_ref,
+        .{ .os = "linux", .architecture = "arm64" },
+        refuseToken,
+        MockHarness.manifestExchange,
+        .{},
+    );
+    defer switch (outcome) {
+        .success => |result| {
+            var owned_result = result;
+            owned_result.deinit();
+        },
+        .failure => |failure| deinitOwnedResolveError(failure, allocator),
+    };
+    switch (outcome) {
+        .success => |result| {
+            try std.testing.expectEqual(.oci_index, std.meta.activeTag(result.top_level));
+            try std.testing.expectEqual(@as(usize, 1), result.top_level.oci_index.value.manifests.len);
+            try std.testing.expect(result.selected_leaf != null);
+            try std.testing.expectEqual(@as(u64, 789), result.selected_leaf.?.value.config.size);
+        },
+        .failure => return error.TestUnexpectedResult,
+    }
+}
+
+test "inspectWithExchangers: allocation failures release promoted documents" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var client: std.http.Client = undefined;
+            const outcome = try testing.inspectWithExchangers(
+                allocator,
+                &client,
+                Config{},
+                busybox_literal_ref,
+                null,
+                refuseToken,
+                busyboxManifestExchange,
+                .{},
+            );
+            const owned = outcome;
+            switch (owned) {
+                .success => |result| {
+                    var owned_result = result;
+                    owned_result.deinit();
+                },
+                .failure => |failure| deinitOwnedResolveError(failure, allocator),
+            }
+        }
+    }.run, .{});
 }
 
 test "WithEngine: platform_required failures are leak-free across resolve, validate, and get_manifest" {
