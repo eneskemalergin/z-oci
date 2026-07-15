@@ -36,10 +36,10 @@
 //!   while `Digest.hex` still aliases them. Failure promotes `ResolveError.reference`
 //!   to the caller allocator before arena teardown. `AuthEngine`, the input
 //!   `Reference`, and persistent token cache storage stay on the caller allocator.
-//! - `validateWithEngine` is asymmetric: the initial manifest `HEAD` phase allocates
+//! - `validateWithEngine` is asymmetric: the initial manifest `HEAD` request allocates
 //!   `HeadRequestOutcome` metadata on the caller allocator (same as the public
 //!   `validate` contract). Only the optional GET fallback opens a transient arena,
-//!   matching `resolve`/`getManifest` fetch semantics for that phase.
+//!   matching `resolve`/`getManifest` fetch semantics for that GET fallback.
 //! - `ResolveManyResult` owns every item it returns. Deinit the batch result once
 //!   to release every successful `ResolveResult`, every failed `ResolveError`, and
 //!   the item array. Batch item failures own both `registry` and `reference`; never

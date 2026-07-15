@@ -10,7 +10,7 @@
 const std = @import("std");
 
 pub const usage_message =
-    \\z-oci: CLI scaffold (not implemented yet).
+    \\z-oci: command-line interface is not implemented yet.
     \\
     \\Use packaged examples instead:
     \\  zig build example-resolve-reference -- ubuntu:22.04
@@ -32,5 +32,5 @@ test "main: usage message lists packaged example entrypoints" {
     try std.testing.expect(std.mem.indexOf(u8, usage_message, "example-normalize-reference") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage_message, "example-inspect-manifest") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage_message, "example-select-platform") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage_message, "CLI scaffold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage_message, "command-line interface is not implemented") != null);
 }

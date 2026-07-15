@@ -1,17 +1,17 @@
-//! Build graph for z-oci: library module, CLI scaffold, tests, examples, and bench.
+//! Build graph for z-oci: library module, CLI executable, tests, examples, and bench.
 //!
 //! Primary steps:
 //! - `test`: library tests, executable tests, workflow smoke, security-check, and
 //!   `examples-smoke` (offline examples only; live `resolve-reference` is excluded).
-//! - `run`: installed CLI scaffold.
+//! - `run`: installed CLI executable, currently providing usage text only.
 //! - `workflow-smoke`: offline workflow smoke tests only.
 //! - `examples`: build all packaged example programs.
 //! - `example-normalize-reference`, `example-inspect-manifest`, `example-select-platform`,
 //!   `example-resolve-many`, and `example-resolve-reference`: run one example with forwarded CLI args.
 //! - `examples-smoke`: run offline examples with fixed fixture inputs.
 //! - `bench`: build and install the benchmark CLI to `zig-out/bin/z-oci-bench`.
-//! - `security-check`: reject private-key PEM blocks and high-confidence credential
-//!   material in tracked repo paths.
+//! - `security-check`: reject private-key PEM blocks, high-confidence credential
+//!   material, and development-only visibility leaks in public repo paths.
 //! - `integration-registry`: opt-in local `registry:2` checks (requires Docker;
 //!   clear-fails if absent; never part of `test`).
 
@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Current CLI scaffold. Real user-facing commands land in the later CLI implementation.
+    // The executable keeps a stable entrypoint while it currently provides usage text only.
     const exe = b.addExecutable(.{
         .name = "z-oci",
         .root_module = b.createModule(.{
@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
     }) });
     const run_security_check_tests = b.addRunArtifact(security_check_tests);
 
-    const security_check_step = b.step("security-check", "Reject private keys and credential material in tracked paths");
+    const security_check_step = b.step("security-check", "Reject secrets and development-only references in public paths");
     security_check_step.dependOn(&run_security_check.step);
     test_step.dependOn(security_check_step);
     test_step.dependOn(&run_security_check_tests.step);

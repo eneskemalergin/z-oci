@@ -97,7 +97,7 @@ pub const RetryBudgetConfig = struct {
     max_network_retries: u8,
     max_rate_limit_retries: u8,
 };
-/// Narrow view of `Config` fields reserved for upcoming resilience milestones.
+/// Narrow view of `Config` fields that are visible to resilience policy.
 ///
 /// `configView` projects the full struct for callers that need one
 /// snapshot. Only `max_network_retries` and `max_rate_limit_retries` feed
@@ -235,7 +235,7 @@ pub const RetryPolicy = struct {
 /// Inputs that actually drive `RetryPolicy` today.
 ///
 /// `Config` only supplies the budget half via `retryPolicyConfig`. Backoff stays
-/// on fixed defaults until a future milestone exposes tuning fields.
+/// on fixed defaults until configuration exposes tuning fields.
 pub const RetryPolicyConfig = struct {
     budget: RetryBudgetConfig,
     backoff: RetryBackoffConfig = .{},

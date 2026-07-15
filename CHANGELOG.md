@@ -130,7 +130,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
     - Manifest and token retry loops cache built request fields lazily (attempt 2+) so single-shot paths pay no cache overhead.
     - Single-attempt paths no longer allocate retry caches up front; retryable GET failures keep the downloaded body for the next attempt.
 - **Docs**
-    - Comment and docstring pass across library, examples, and tools: removed internal roadmap language from public docs, fixed scrambled auth API docs, and filled missing public API doc comments.
+    - Comment and docstring pass across the library, examples, and tools: corrected auth API docs and filled missing public API contract comments.
     - Public docs (`README.md`, `Config.zig`, `resilience.zig`) describe live retry budgets, CA bundle behavior, and registry header assumptions.
     - `examples/resolve-reference` documents default `Config` behavior and when to set `ca_bundle_path`, credentials, and rate-limit flags.
 - **TLS**
@@ -179,13 +179,13 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 - Platform-aware multi-arch resolution for OCI indexes and Docker manifest lists, including recursive child selection, auxiliary-descriptor skipping, selected-platform preservation in `ResolveResult`, and explicit depth-limit failures.
 - A live `resolve-reference` packaged example for end-to-end resolver usage, while the existing offline examples remain fixture-backed.
 - Synthetic malformed manifest fixtures with explicit provenance (`invalid-empty-manifest.json`, `invalid-truncated-oci-manifest.json`) for deterministic malformed-body coverage in parser and resolver tests.
-- Resolver benchmark coverage now exists in `z-oci-bench` through deterministic `resolve-single`, `resolve-multi`, `validate-single`, and `get-manifest` operations, and the repo now carries a `benchmarks/baselines/v0.3.0.json` Phase 3 baseline alongside the older auth-only snapshot.
+- Resolver benchmark coverage now exists in `z-oci-bench` through deterministic `resolve-single`, `resolve-multi`, `validate-single`, and `get-manifest` operations, and the repo now carries a `benchmarks/baselines/v0.3.0.json` resolver baseline alongside the older auth-only snapshot.
 
 ### Changed
 
 - No-platform multi-arch calls now fail with the structured `platform_required` resolver error instead of surfacing `error.NotYetImplemented` or guessing a default child manifest.
 - `validate` now accepts an optional platform and follows the selected child manifest on supported multi-arch inputs, matching `resolve` and `getManifest` semantics.
-- `validate` now uses the internal HEAD path first for top-level existence checks, returning early for single-arch manifests and no-platform multi-arch failures before falling back to GET only when child selection still requires parsing.
+- `validate` now uses the manifest HEAD path first for top-level existence checks, returning early for single-arch manifests and no-platform multi-arch failures before falling back to GET only when child selection still requires parsing.
 - Public resolver ownership contracts are now explicit: public failures support owned teardown, and `ResolveResult.deinit()` is valid for live resolver results as well as cloned results.
 - Resolver result shaping now reuses owned verified digest strings, and multi-arch child selection formats digest references on the stack instead of allocating them per child fetch, trimming the current ReleaseFast counting snapshot to roughly `95us / 13 allocs` for `resolve-single` and `284us / 28 allocs` for `resolve-multi`.
 - Packaged example builds are now distinct from the offline `examples-smoke` step, allowing a live resolver example without making the smoke gate network-dependent.
@@ -204,7 +204,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Added
 
-- Phase 2 auth engine: `/v2/` probe, Bearer challenge parsing, token exchange (GET + POST fallback), credential-provider chain (config -> env -> Docker config -> anonymous), per-scope token cache with TTL expiry, 401 invalidation retry. Full mock-transport test suite with 299 auth tests covering Docker Hub, GHCR, Quay, and generic self-hosted registries.
+- Auth engine: `/v2/` probe, Bearer challenge parsing, token exchange (GET + POST fallback), credential-provider chain (config -> env -> Docker config -> anonymous), per-scope token cache with TTL expiry, 401 invalidation retry. Full mock-transport test suite with 299 auth tests covering Docker Hub, GHCR, Quay, and generic self-hosted registries.
 - `benchmarks/` directory with `z-oci-bench` CLI (7 subcommands: `reference-parse`, `digest-parse`, `manifest-parse`, `challenge-parse`, `platform-match`, `authenticate-miss`, `authenticate-hit`), `CountingAllocator`, and `tools/zebrac` integration for statistical sampling.
 - Memory stress tests: 7 DebugAllocator tests at 1000x iterations each (auth engine 3 variants, Reference.parse 2 variants, all JSON types, parseDockerConfig). 358 total tests.
 - Token cache sizing documented in `AuthEngine` doc comment (unbounded by design for CLI use).
@@ -216,7 +216,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Changed
 
-- Auth engine is now the Phase 2 deliverable, ready for Phase 3 resolver integration.
+- Auth engine is now complete and ready for resolver integration.
 - `build.zig` builds and installs `z-oci-bench`.
 - `build.zig.zon` version bumped to `0.2.0`.
 
@@ -232,7 +232,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Added
 
-- CI workflow (`.github/workflows/ci.yml`) now runs `zig build test`, `examples-smoke`, and `zig fmt --check` on every push and PR to `main` and `phase2-auth`.
+- CI workflow (`.github/workflows/ci.yml`) now runs `zig build test`, `examples-smoke`, and `zig fmt --check` on every push and PR to `main`.
 - 59 new tests across all modules: JSON round-trip, allocation-failure, DebugAllocator leak detection, fuzz coverage for auth header parsers, edge-case tests for Config and ResolveError formats, and allocation-failure safety for every JSON-backed type.
 - Fuzz coverage now spans 40,000 pseudo-random inputs across Digest parse, Reference parse, JSON manifest parse, and auth header/challenge parser paths.
 - Allocation-failure coverage (`checkAllAllocationFailures`) now covers Digest, MediaType, Platform, Descriptor, Manifest, OciImageIndex, DockerManifestList, json.parse, auth token response, auth token request, and auth cache insertion.
@@ -266,12 +266,12 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 - Auth token request building now expands space-delimited bearer challenge scopes into repeated `scope=` query parameters, matching the Docker registry token-auth contract instead of collapsing them into a single encoded value.
 - Auth request-builder coverage now includes documented Docker Hub, GHCR, and Quay token endpoint examples so registry-specific realm and service values stay pinned in tests.
-- Docker Hub env-backed auth now composes with Phase 1 reference normalization, so `docker.io/...` references that normalize to `registry-1.docker.io` still pick up configured Docker Hub credentials.
+- Docker Hub env-backed auth now composes with reference normalization, so `docker.io/...` references that normalize to `registry-1.docker.io` still pick up configured Docker Hub credentials.
 - Docker Hub auth coverage now explicitly distinguishes authenticated and anonymous token requests, proving optional basic auth is attached only when a Docker Hub credential source matches.
 - Plain-host credential matching is now case-insensitive for registry auth inputs, which hardens GHCR and Quay flows against mixed-case registry hosts.
 - Helper-backed credential lookup now canonicalizes registry server names before invoking Docker helpers, so GHCR and Quay helper flows no longer depend on caller casing.
-- The Phase 3 auth-resolver handoff is now explicit in the public code docs and exports: resolver code consumes `AuthReferenceView`, `referenceView(...)`, `ProbeHttpResponse.classify()`, `AuthenticateRequest`, `AuthEngine.authenticate(...)`, and the one-shot cached-401 retry hook `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)` with documented ownership and retry guarantees.
-- Public docs now distinguish shipped Phase 2 auth-engine behavior from still-unimplemented Phase 3 resolver work, so `resolve`, `validate`, and `getManifest` are not presented as live manifest-fetch APIs yet.
+- The auth-resolver handoff is now explicit in the public code docs and exports: resolver code consumes `AuthReferenceView`, `referenceView(...)`, `ProbeHttpResponse.classify()`, `AuthenticateRequest`, `AuthEngine.authenticate(...)`, and the one-shot cached-401 retry hook `AuthEngine.retryAuthenticateAfterCachedUnauthorized(...)` with documented ownership and retry guarantees.
+- Public docs now describe the resolver API status accurately and distinguish shipped behavior from work that was not yet available.
 - The `v0.1.7` registry scope is now explicit: Docker Hub, GHCR, and Quay remain the named registry-hardened targets, GitLab and Harbor now have explicit mock coverage through a generic self-hosted bearer-registry validation target, other standards-based registries like Artifactory, `registry.k8s.io`, `mcr.microsoft.com`, and BioContainers distribution paths remain documentation-only, and cloud-provider registries such as Google Artifact Registry, ECR, ACR, OCIR, IBM Cloud Container Registry, Alibaba ACR, and DigitalOcean Container Registry are deferred to later support work.
 - Auth bug-hunt coverage now includes empty-query token requests, conflicting duplicate token fields, empty refresh tokens, and eager eviction of expired cached tokens before cache misses.
 - Release-gate allocation-failure coverage now extends beyond cache insertion to token-response ownership and token-request construction, so owned auth paths fail cleanly without leaks when allocations are denied.
@@ -351,7 +351,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 ### Added
 
 - The auth credential chain now supports an environment-backed provider through an injected `std.process.Environ.Map`, keeping env-based auth std-only and testable.
-- Phase 2 environment variable names are now fixed in code as `Z_OCI_REGISTRY_HOST`, `Z_OCI_REGISTRY_USER`, and `Z_OCI_REGISTRY_TOKEN`.
+- Environment variable names are now fixed in code as `Z_OCI_REGISTRY_HOST`, `Z_OCI_REGISTRY_USER`, and `Z_OCI_REGISTRY_TOKEN`.
 - Additional zero-network auth tests now cover explicit-config precedence, env fallback, registry mismatch, partial env state, and anonymous behavior.
 
 ### Changed
@@ -372,7 +372,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 - Token exchange now builds authenticated Bearer-token requests from `AuthenticateRequest`, including `GET` query construction and `POST` body construction from parsed challenge fields.
 - Optional Basic auth header construction landed for credentialed token requests using provider-supplied credentials.
-- `TokenResponse` now returns owned token data with explicit teardown, preserving `refresh_token` as parsed-but-deferred data for later phases.
+- `TokenResponse` now returns owned token data with explicit teardown, preserving `refresh_token` as parsed-but-deferred data for future use.
 
 ### Changed
 
@@ -401,7 +401,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Changed
 
-- The auth probe/parser layer now consumes the canonical `Reference` outputs directly for `/v2/` probing and challenge handling, keeping Docker Hub normalization and repository-path ownership in Phase 1.
+- The auth probe/parser layer now consumes the canonical `Reference` outputs directly for `/v2/` probing and challenge handling, keeping Docker Hub normalization and repository-path ownership in the reference parser.
 - `WWW-Authenticate` parsing now handles mixed-case schemes, spacing normalization, unknown parameters, duplicate parameters, malformed quoting, and escaped quoted content deterministically.
 - The credential-provider seam now returns a `CredentialHandle` with an optional release hook, so provider-owned secrets can be torn down deliberately after auth uses them.
 
@@ -421,14 +421,14 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Added
 
-- `src/auth.zig`: initial Phase 2 auth scaffolding with `AuthError`, `AuthChallenge`, `BearerChallenge`, `ProbeResult`, `Token`, `TokenResponse`, `TokenCacheKey`, `CachedToken`, `HelperProcessContext`, and `AuthEngine`.
-- `Phase2ConfigView` and `AuthReferenceView` to make the Phase 1/Phase 2 boundary explicit in code.
+- `src/auth.zig`: initial auth engine with `AuthError`, `AuthChallenge`, `BearerChallenge`, `ProbeResult`, `Token`, `TokenResponse`, `TokenCacheKey`, `CachedToken`, `HelperProcessContext`, and `AuthEngine`.
+- `AuthReferenceView` and configuration views to keep the auth and reference boundaries explicit in code.
 - Root exports for the new auth surface in `src/root.zig`.
 - Initial auth-focused tests covering type compilation, helper-process context wiring, provider borrow semantics, cache/key ownership, config review, and normalized `Reference` consumption.
 
 ### Changed
 
-- The auth subsystem now keeps auth-specific errors internal to Phase 2 instead of extending the public `ResolveError` surface prematurely.
+- The auth subsystem now keeps auth-specific errors scoped to the auth module without widening the public `ResolveError` surface.
 - Ownership rules for transient tokens versus owned cached tokens are now encoded directly in code and doc comments.
 - The Zig 0.16 helper/process boundary is now explicit: HTTP continues through `std.http.Client`, while helper execution is modeled through a dedicated `std.Io`-backed process context.
 
@@ -441,7 +441,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Changed
 
-- Release-facing docs, package metadata, examples, and plan notes now consistently describe `z-oci` as a public offline toolkit release rather than a pre-release milestone snapshot.
+- Release-facing docs, package metadata, examples, and release notes now consistently describe `z-oci` as a public offline toolkit release rather than a pre-release snapshot.
 - `build.zig.zon` now packages `examples/`, `fixtures/`, and `assets/` alongside `src/` so the documented offline examples, fixture-backed tests, and README asset references remain valid for package consumers.
 - The JSON-heavy tests in `Descriptor.zig`, `Manifest.zig`, and `Index.zig` now use clearer names that distinguish parse-only coverage from real stringify/reparse coverage.
 
@@ -470,8 +470,8 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Changed
 
-- `README.md` now explicitly documents the supported offline workflows and adds a dedicated `What Phase 2 Adds` section.
-- Public roadmap and shipped-surface language now treat `v0.0.7` as the offline usefulness and release-readiness pass ahead of `v0.1.0`.
+- `README.md` now explicitly documents the supported offline workflows and adds a dedicated auth capabilities section.
+- Public capability and shipped-surface language now treat `v0.0.7` as the offline usefulness and release-readiness pass ahead of `v0.1.0`.
 
 ### Verified
 
@@ -513,8 +513,8 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Changed
 
-- `README.md` now reflects the current offline Phase 1 toolkit instead of the old `v0.0.2` shape and outdated `client`/`types` examples.
-- `root.zig` module docs now describe the current package surface and ownership model without embedding milestone history.
+- `README.md` now reflects the current offline toolkit instead of the old `v0.0.2` shape and outdated `client`/`types` examples.
+- `root.zig` module docs now describe the current package surface and ownership model without embedding release-process history.
 - Ownership notes in `Reference.zig` and `ResolveResult.zig` were tightened so owned vs borrowed fields are clearer.
 - Type-specific JSON contract tests were moved out of `json.zig` and back into `Descriptor.zig`, `Manifest.zig`, and `Index.zig`.
 

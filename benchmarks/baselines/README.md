@@ -1,6 +1,6 @@
 # Benchmark Baselines
 
-JSON files in this directory are zebrac output snapshots from milestone releases. Each file captures wall-clock time, peak RSS, and CPU performance counter statistics for every benchmark operation sampled in that release.
+JSON files in this directory are zebrac output snapshots from versioned releases. Each file captures wall-clock time, peak RSS, and CPU performance counter statistics for every benchmark operation sampled in that release.
 
 Baselines are generated with `./tools/zebrac` (currently **0.6.0**, tracked in-repo). zebrac 0.6.0 adds `branch_misses`, `minor_faults`, `major_faults`, and `failed_sample_count` per benchmark, and accepts `-i/--min-samples` (default 5) and `-a/--max-samples` (default 10000) alongside `-d/--duration-ms` and `-w/--warmup`.
 
@@ -37,10 +37,10 @@ Current operations (run `./zig-out/bin/z-oci-bench` with no args for the same li
 
 ## Available Baselines
 
-- `v0.2.0.json` is the tagged Phase 2 auth-engine release baseline.
-- `v0.3.0.json` is the Phase 3 resolver baseline generated after the public resolver and packaged benchmark CLI gained deterministic resolver operations.
-- `v0.4.0.json` is the Phase 4 pre-release baseline: reactive transport retries (wave 1) plus v0.3.9 performance hot-path work (wave 2). Includes `resolve-single-retry`, `authenticate-rate-limit`, and `resolve-session`. Regenerated with zebrac 0.6.0 after the token-cache LRU pre-insert eviction fix.
-- `v0.5.0.json` is the Phase 5 batch-resolve baseline. Adds `resolve-many` and `resolve-many-unique` to the full operation set. Captured 2026-07-10 with zebrac 0.6.0.
+- `v0.2.0.json` is the tagged auth-engine release baseline.
+- `v0.3.0.json` is the resolver baseline generated after the public resolver and packaged benchmark CLI gained deterministic resolver operations.
+- `v0.4.0.json` is the resilience and hot-path baseline. It includes `resolve-single-retry`, `authenticate-rate-limit`, and `resolve-session`, and was regenerated with zebrac 0.6.0 after the token-cache LRU pre-insert eviction fix.
+- `v0.5.0.json` is the batch-resolve baseline. It adds `resolve-many` and `resolve-many-unique` to the full operation set and was captured 2026-07-10 with zebrac 0.6.0.
 - `v0.5.0-debug-counting.txt` is the Debug `--counting` snapshot for `resolve-single`, `resolve-session`, `resolve-many`, and `resolve-many-unique` (100 iterations each).
 - `v0.6.0.json` is the current release-baseline snapshot for v0.6.0. It includes all 16 operations and was captured with zebrac 0.6.0.
 - `v0.6.0-debug-counting.txt` is the current release-debug snapshot for core resolve batch behavior: `resolve-single`, `resolve-session`, `resolve-many`, and `resolve-many-unique` (100 iterations each).
@@ -186,4 +186,4 @@ zig build -Doptimize=ReleaseFast install
 
 Debug allocation snapshots use `zig build -Doptimize=Debug install` and `./zig-out/bin/z-oci-bench <operation> --iterations <n> --counting`.
 
-On-the-fly comparison snapshots (not committed) can go under `benchmarks/tmp/`.
+On-the-fly comparison snapshots are not committed; keep them outside the repository tree.

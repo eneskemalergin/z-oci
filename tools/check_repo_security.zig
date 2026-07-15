@@ -1,8 +1,9 @@
-//! Build-time guard: reject private-key PEM blocks and high-confidence credential
-//! material in tracked repo paths.
+//! Build-time guard: reject private-key PEM blocks, high-confidence credential
+//! material, and development-only visibility leaks in tracked repo paths.
 //!
-//! This tool is not linked into the z-oci library. It walks only the roots listed
-//! in `SCAN_ROOTS` during `zig build security-check` / `zig build test`.
+//! This tool is not linked into the z-oci library. It walks the roots listed in
+//! `SCAN_ROOTS` plus selected public root files during `zig build security-check`
+//! / `zig build test`.
 //!
 //! Scan classes:
 //! - Key-like extensions (`.pem`, `.key`, `.crt`, `.p12`, `.pfx`, `.jks`, `.netrc`):
@@ -16,6 +17,11 @@
 //! - `.zig` sources: reject non-placeholder Docker `auths` `"auth"` values only.
 //!   PEM markers and `.env`-style assignments are not scanned in `.zig` (field names
 //!   like `max_token_cache_entries` and test literals false-positive otherwise).
+//! - Production text and Zig sources: reject development-only paths and numbered
+//!   project phase/stage labels. Stable technical terms and user-visible limitations
+//!   such as an unimplemented CLI are allowed.
+//! - `benchmarks/tmp/` is ignored benchmark scratch and is skipped like the other
+//!   development-only paths.
 //!
 //! Files larger than `MAX_SCAN_BYTES` (10 MiB) are rejected. Empty files are allowed.
 const std = @import("std");
@@ -57,9 +63,33 @@ const TEXT_EXTENSIONS = [_][]const u8{
     ".sh",
 };
 
+const PUBLIC_ROOT_FILES = [_][]const u8{
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "build.zig",
+    "build.zig.zon",
+};
+
+const DEVELOPMENT_REFERENCE_MARKERS = [_][]const u8{
+    "plan/",
+    "temp/",
+    "benchmarks/tmp/",
+    ".agents/",
+    ".codex/",
+    "experiments/",
+    "milestone",
+    "roadmap",
+    "scaffold",
+    "scaffolding",
+    "dev-level",
+    "work-stage",
+};
+
 const MAX_SCAN_BYTES: u64 = 10 * 1024 * 1024;
-const STACK_BUF_SIZE = 128 * 1024;
-const CHUNK_SIZE = 8192;
+const STACK_BUF_SIZE: usize = 128 * 1024;
+const CHUNK_SIZE: usize = 8192;
 
 const MAX_MARKER_LEN = blk: {
     var longest: usize = 0;
@@ -69,6 +99,14 @@ const MAX_MARKER_LEN = blk: {
 
 const MARKER_OVERLAP = MAX_MARKER_LEN - 1;
 
+const MAX_DEVELOPMENT_MARKER_LEN: usize = blk: {
+    var longest: usize = 0;
+    for (DEVELOPMENT_REFERENCE_MARKERS) |marker| longest = @max(longest, marker.len);
+    break :blk longest;
+};
+
+const SCAN_OVERLAP: usize = @max(MARKER_OVERLAP, MAX_DEVELOPMENT_MARKER_LEN - 1);
+
 const BASE64_DECODER = std.base64.standard.decoderWithIgnore(" \t\r\n");
 
 const ScanClass = enum {
@@ -76,6 +114,8 @@ const ScanClass = enum {
     credential_file,
     text_pem_only,
     zig_source,
+    public_text,
+    security_tool,
 };
 
 const Finding = enum {
@@ -85,6 +125,7 @@ const Finding = enum {
     oversized,
     short_read,
     size_overflow,
+    development_reference,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -92,6 +133,14 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     var failures: usize = 0;
+
+    const cwd = std.Io.Dir.cwd();
+    for (PUBLIC_ROOT_FILES) |path| {
+        if (try scanFile(io, cwd, path, .public_text)) |finding| {
+            std.log.err("{s} in {s}", .{ @tagName(finding), path });
+            failures += 1;
+        }
+    }
 
     for (SCAN_ROOTS) |root| {
         var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
@@ -105,6 +154,12 @@ pub fn main(init: std.process.Init) !void {
 
         while (try walker.next(io)) |entry| {
             if (entry.kind != .file) continue;
+            if (isIgnoredDevelopmentPath(entry.path)) continue;
+            if (containsDevelopmentReference(entry.path)) {
+                std.log.err("development_reference in {s}", .{entry.path});
+                failures += 1;
+                continue;
+            }
             const class = classifyPath(entry.path, entry.basename) orelse continue;
             if (try scanFile(io, entry.dir, entry.basename, class)) |finding| {
                 std.log.err("{s} in {s}", .{ @tagName(finding), entry.path });
@@ -114,12 +169,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (failures > 0) {
-        std.log.err("found {d} file(s) with credential or private-key material", .{failures});
-        return error.CredentialMaterialFound;
+        std.log.err("found {d} file(s) with security or development-visibility findings", .{failures});
+        return error.SecurityFinding;
     }
 }
 
 fn classifyPath(path: []const u8, basename: []const u8) ?ScanClass {
+    if (std.mem.eql(u8, basename, "check_repo_security.zig")) return .security_tool;
     if (isCredentialBasename(basename) or isDockerConfigPath(path, basename)) {
         return .credential_file;
     }
@@ -131,6 +187,10 @@ fn classifyPath(path: []const u8, basename: []const u8) ?ScanClass {
         if (std.mem.endsWith(u8, basename, ext)) return .text_pem_only;
     }
     return null;
+}
+
+fn isIgnoredDevelopmentPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "tmp") or std.mem.startsWith(u8, path, "tmp/");
 }
 
 fn isCredentialBasename(name: []const u8) bool {
@@ -154,6 +214,49 @@ fn containsPrivateKeyMarker(body: []const u8) bool {
         if (std.mem.indexOf(u8, body, marker) != null) return true;
     }
     return false;
+}
+
+fn containsAsciiIgnoreCase(body: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > body.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= body.len) : (start += 1) {
+        var matches = true;
+        for (needle, 0..) |expected, offset| {
+            if (std.ascii.toLower(body[start + offset]) != std.ascii.toLower(expected)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
+    }
+    return false;
+}
+
+fn containsNumberedDevelopmentLabel(body: []const u8) bool {
+    const labels = [_][]const u8{ "phase", "stage" };
+
+    var start: usize = 0;
+    while (start < body.len) : (start += 1) {
+        for (labels) |label| {
+            if (start + label.len > body.len) continue;
+            if (!std.ascii.eqlIgnoreCase(body[start .. start + label.len], label)) continue;
+
+            var after = start + label.len;
+            while (after < body.len and (body[after] == ' ' or body[after] == '\t' or
+                body[after] == '_' or body[after] == '-')) : (after += 1)
+            {}
+            if (after < body.len and std.ascii.isDigit(body[after])) return true;
+        }
+    }
+    return false;
+}
+
+fn containsDevelopmentReference(body: []const u8) bool {
+    for (DEVELOPMENT_REFERENCE_MARKERS) |marker| {
+        if (containsAsciiIgnoreCase(body, marker)) return true;
+    }
+    return containsNumberedDevelopmentLabel(body);
 }
 
 fn containsDockerAuths(body: []const u8) bool {
@@ -355,10 +458,22 @@ fn containsEnvSecretAssignment(body: []const u8) bool {
 
 fn findingForBody(body: []const u8, class: ScanClass) ?Finding {
     switch (class) {
+        .zig_source, .public_text, .security_tool => {
+            if (class == .security_tool) return if (containsNonPlaceholderDockerAuths(body)) .docker_auths else null;
+            if (containsDevelopmentReference(body)) return .development_reference;
+        },
+        .credential_file, .text_pem_only => {
+            if (containsDevelopmentReference(body)) return .development_reference;
+        },
+        .key_material => {},
+    }
+
+    switch (class) {
         .zig_source => {
             if (containsNonPlaceholderDockerAuths(body)) return .docker_auths;
             return null;
         },
+        .public_text => return null,
         else => {
             if (containsPrivateKeyMarker(body)) return .private_key_pem;
             switch (class) {
@@ -368,7 +483,7 @@ fn findingForBody(body: []const u8, class: ScanClass) ?Finding {
                     if (containsEnvSecretAssignment(body)) return .env_secret;
                     return null;
                 },
-                .zig_source => unreachable,
+                .zig_source, .public_text, .security_tool => unreachable,
             }
         },
     }
@@ -401,11 +516,11 @@ fn scanFromBuffer(io: std.Io, file: *std.Io.File, buf: []u8, class: ScanClass) !
 }
 
 fn scanFileStreaming(io: std.Io, file: *std.Io.File, class: ScanClass) !?Finding {
-    // Streaming path only needs PEM overlap detection; credential heuristics require
-    // full-file context and are limited to STACK_BUF_SIZE files via scanFromBuffer.
-    _ = class;
+    // Credential heuristics require full-file context and are limited to
+    // STACK_BUF_SIZE files via scanFromBuffer. Marker checks remain streaming-safe.
+    const check_visibility = class != .key_material;
     var file_reader = file.reader(io, &.{});
-    var carry: [MARKER_OVERLAP]u8 = undefined;
+    var carry: [SCAN_OVERLAP]u8 = undefined;
     var carry_len: usize = 0;
 
     while (true) {
@@ -415,19 +530,23 @@ fn scanFileStreaming(io: std.Io, file: *std.Io.File, class: ScanClass) !?Finding
 
         const body = chunk[0..n];
         if (carry_len > 0) {
-            var window: [MARKER_OVERLAP + CHUNK_SIZE]u8 = undefined;
+            var window: [SCAN_OVERLAP + CHUNK_SIZE]u8 = undefined;
             @memcpy(window[0..carry_len], carry[0..carry_len]);
             @memcpy(window[carry_len..][0..body.len], body);
-            if (containsPrivateKeyMarker(window[0 .. carry_len + body.len])) return .private_key_pem;
+            const combined = window[0 .. carry_len + body.len];
+            if (containsPrivateKeyMarker(combined)) return .private_key_pem;
+            if (check_visibility and containsDevelopmentReference(combined)) return .development_reference;
         } else if (containsPrivateKeyMarker(body)) {
             return .private_key_pem;
+        } else if (check_visibility and containsDevelopmentReference(body)) {
+            return .development_reference;
         }
 
-        if (body.len >= MARKER_OVERLAP) {
-            @memcpy(carry[0..MARKER_OVERLAP], body[body.len - MARKER_OVERLAP ..]);
-            carry_len = MARKER_OVERLAP;
+        if (body.len >= SCAN_OVERLAP) {
+            @memcpy(carry[0..SCAN_OVERLAP], body[body.len - SCAN_OVERLAP ..]);
+            carry_len = SCAN_OVERLAP;
         } else {
-            const keep = @min(carry_len, MARKER_OVERLAP - body.len);
+            const keep = @min(carry_len, SCAN_OVERLAP - body.len);
             if (keep > 0) {
                 std.mem.copyForwards(u8, carry[0..keep], carry[carry_len - keep ..][0..keep]);
             }
@@ -436,7 +555,11 @@ fn scanFileStreaming(io: std.Io, file: *std.Io.File, class: ScanClass) !?Finding
         }
     }
 
-    if (carry_len > 0 and containsPrivateKeyMarker(carry[0..carry_len])) return .private_key_pem;
+    if (carry_len > 0) {
+        const remaining = carry[0..carry_len];
+        if (containsPrivateKeyMarker(remaining)) return .private_key_pem;
+        if (check_visibility and containsDevelopmentReference(remaining)) return .development_reference;
+    }
     return null;
 }
 
@@ -453,6 +576,23 @@ test "containsPrivateKeyMarker detects private key markers" {
     inline for (PRIVATE_KEY_MARKERS) |marker| {
         try std.testing.expect(containsPrivateKeyMarker(marker));
     }
+}
+
+test "containsDevelopmentReference rejects development-only paths and numbered labels" {
+    try std.testing.expect(containsDevelopmentReference("See plan/phase6.1-pre-phase7.md"));
+    try std.testing.expect(containsDevelopmentReference("Phase 1.4"));
+    try std.testing.expect(containsDevelopmentReference("stage_2_auth"));
+    try std.testing.expect(containsDevelopmentReference("temporary roadmap scaffold"));
+    try std.testing.expect(!containsDevelopmentReference("HEAD request and temporary buffer"));
+    try std.testing.expect(!containsDevelopmentReference("HTTP 307 temporary_redirect"));
+}
+
+test "findingForBody reports development references" {
+    try std.testing.expectEqual(
+        Finding.development_reference,
+        findingForBody("phase6.1", .public_text).?,
+    );
+    try std.testing.expect(findingForBody("phase6.1", .key_material) == null);
 }
 
 test "classifyPath covers key, credential, and text classes" {
@@ -482,6 +622,17 @@ test "classifyPath covers key, credential, and text classes" {
         classifyPath("integration/registry2/README.md", "README.md").?,
     );
     try std.testing.expect(classifyPath("fixtures/blob.bin", "blob.bin") == null);
+}
+
+test "isIgnoredDevelopmentPath skips benchmark scratch only" {
+    try std.testing.expect(isIgnoredDevelopmentPath("tmp/phase6-debug.txt"));
+    try std.testing.expect(!isIgnoredDevelopmentPath("baselines/v0.6.0.json"));
+}
+
+test "development references are rejected in production paths" {
+    try std.testing.expect(containsDevelopmentReference("src/phase1_4.zig"));
+    try std.testing.expect(containsDevelopmentReference("benchmarks/tmp/results.json"));
+    try std.testing.expect(!containsDevelopmentReference("benchmarks/baselines/v0.6.0.json"));
 }
 
 test "containsDockerAuths detects non-empty auth values" {
@@ -544,12 +695,12 @@ test "findingForBody zig_source flags live docker auths" {
 test "streaming overlap window catches split marker" {
     const marker = PRIVATE_KEY_MARKERS[1];
     const split_at = 11;
-    var carry: [MARKER_OVERLAP]u8 = undefined;
+    var carry: [SCAN_OVERLAP]u8 = undefined;
     @memcpy(carry[0..split_at], marker[0..split_at]);
     const carry_len = split_at;
     const rest = marker[split_at..];
 
-    var window: [MARKER_OVERLAP + CHUNK_SIZE]u8 = undefined;
+    var window: [SCAN_OVERLAP + CHUNK_SIZE]u8 = undefined;
     @memcpy(window[0..carry_len], carry[0..carry_len]);
     @memcpy(window[carry_len..][0..rest.len], rest);
     try std.testing.expect(containsPrivateKeyMarker(window[0 .. carry_len + rest.len]));

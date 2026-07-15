@@ -2,7 +2,7 @@
 //!
 //! Tests stay colocated with the owning source files, so small test helpers live
 //! in src/ as well. These helpers are intentionally narrow: they only cover the
-//! repeated fixture loading and parsing scaffolding used across the colocated
+//! repeated fixture loading and parsing helpers used across the colocated
 //! descriptor, manifest, and index tests.
 
 const std = @import("std");

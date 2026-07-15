@@ -1,4 +1,4 @@
-//! Internal manifest resolver: HEAD/GET transport, response classification, and error mapping.
+//! Manifest resolver implementation: HEAD/GET transport, response classification, and error mapping.
 //!
 //! Owned by the resolve/validate/get pipeline in `root.zig`; not re-exported from the
 //! public package root. Integrators inject mock transports via `root.testing` exchanger

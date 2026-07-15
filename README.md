@@ -40,8 +40,20 @@ z-oci is a read-only OCI registry client for Zig. Give it an image reference, an
 - **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
 - **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, and `MultiArchManifest`, all with JSON round-trip support.
 - **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Live auth starts from manifest `HEAD`/`GET` challenges (not a separate `/v2/` probe). It parses `WWW-Authenticate` headers, exchanges tokens, and caches tokens per scope with TTL expiry. Credentials on the public path come from an optional `Config.credential_provider` and optional caller-injected `Config.credential_sources` (environment map, Docker `config.json` bytes or file load, and process Io for credential helpers). Bare `Config{}` is anonymous: the library does not silently read the process environment or spawn helpers.
-- **Public resolver path**: `resolve`, `validate`, `getManifest`, and `resolveMany` perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a bounded nested-index recursion limit. `resolveMany` is sequential over one shared client and auth engine; it does not parallelize registry traffic.
+- **Public resolver path**: `resolve`, `validate`, `getManifest`, and `resolveMany` perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a maximum of four nested child levels. `resolveMany` is sequential over one shared client and auth engine; it does not parallelize registry traffic.
 - **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
+
+### Memory and ownership
+
+Public results and persistent state use the allocator supplied by the caller and expose explicit teardown functions. Resolver operations use a transient arena for request, response, parsing, and intermediate multi-arch selection work; successful results and owned failures are promoted to the caller allocator before that arena is released. This provides bulk cleanup for short-lived work without forcing retained results to share an arena lifetime.
+
+- Call `ResolveResult.deinit(allocator)` for a successful resolve result.
+- Call `deinitResolveFailure(failure, allocator)` for a single-resolve failure.
+- Call `ResolveManyResult.deinit(allocator)` once for a batch result.
+- Call `Parsed(Manifest).deinit()` for a successful `getManifest` result.
+- Call `AuthEngine.deinit()` when a caller-owned authentication engine is no longer needed.
+
+Inputs such as `Reference` values and the caller-owned HTTP client remain caller-owned unless an API's ownership documentation says otherwise.
 
 ### Current limitations
 
@@ -286,9 +298,9 @@ This repository vendors Zig 0.16 under `./zig-0.16.0/`. Prefer the bundled compi
 ./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib
 ```
 
-- `zig build`: build and install the current `z-oci` CLI scaffold and `z-oci-bench` executable
+- `zig build`: build and install the current `z-oci` executable and `z-oci-bench` executable
 - `zig build test`: run all unit tests, smoke checks, and the `security-check` PEM scan (`tools/check_repo_security.zig`)
-- `zig build security-check`: standalone credential and private-key scan (same tool as inside `test`)
+- `zig build security-check`: standalone credential, private-key, and public-visibility scan (same tool as inside `test`)
 - `zig build examples`: build all packaged example programs
 - `zig build examples-smoke`: run a small smoke pass over the offline example programs
 - `zig build workflow-smoke`: run the offline workflow smoke-test matrix
