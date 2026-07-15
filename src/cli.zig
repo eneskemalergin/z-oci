@@ -1,8 +1,9 @@
-//! Executable-only command parsing and help/version output for z-oci.
+//! Executable-only command parsing, rendering, and process-facing output for z-oci.
 //!
 //! Parsed option slices borrow the argument storage. Parsed references own their
 //! fields through the allocator passed to `parse` and must be released with
-//! `ParsedCommand.deinit`.
+//! `ParsedCommand.deinit`. Renderers borrow public resolver results and stream
+//! output without copying them.
 
 const std = @import("std");
 const z_oci = @import("z_oci");
@@ -81,6 +82,44 @@ pub const ParseOutcome = union(enum) {
 
 pub const ParseError = error{
     OutOfMemory,
+};
+
+pub const ExitCode = enum(u8) {
+    success = 0,
+    not_found = 1,
+    authentication_failure = 2,
+    rate_limited = 3,
+    network_failure = 4,
+    usage_failure = 5,
+    local_configuration_failure = 6,
+    digest_failure = 7,
+    content_type_failure = 8,
+    manifest_content_failure = 9,
+    timeout = 10,
+    platform_selection_failure = 11,
+    unexpected_failure = 12,
+};
+
+pub const VerboseOutcome = enum {
+    success,
+    not_found,
+    auth_failed,
+    rate_limited,
+    network_error,
+    local_config,
+    digest,
+    content_type,
+    manifest_content,
+    timeout,
+    platform_selection,
+    unexpected,
+};
+
+pub const CliFailure = union(enum) {
+    resolve: z_oci.ResolveError,
+    config: z_oci.Config.ApplyError,
+    out_of_memory,
+    unexpected,
 };
 
 pub const TOP_LEVEL_HELP =
@@ -268,6 +307,500 @@ pub fn writeUsageError(writer: *std.Io.Writer, failure: UsageFailure) std.Io.Wri
         @tagName(failure.reason),
         helpCommand(failure.help_target),
     });
+}
+
+pub fn writeResolveText(writer: *std.Io.Writer, result: z_oci.ResolveResult) std.Io.Writer.Error!void {
+    try writePinnedReference(writer, result.reference, result.digest);
+    try writer.writeByte('\n');
+}
+
+pub fn writeValidateText(writer: *std.Io.Writer, valid: bool) std.Io.Writer.Error!void {
+    try writer.writeAll(if (valid) "validate success: valid\n" else "validate not found: not-found\n");
+}
+
+pub fn writeInspectText(
+    writer: *std.Io.Writer,
+    reference: z_oci.Reference,
+    requested_platform: ?Platform,
+    result: z_oci.InspectionResult,
+) std.Io.Writer.Error!void {
+    try writer.writeAll("inspect:\n  reference: ");
+    try writeReference(writer, reference);
+    try writer.writeByte('\n');
+
+    switch (result.top_level) {
+        .manifest => |parsed| {
+            try writer.writeAll("  top_level.kind: manifest\n  top_level.media_type: ");
+            try writer.writeAll(parsed.value.media_type.toString());
+            try writer.writeAll("\n  top_level.config_digest: ");
+            try parsed.value.config.digest.format(writer);
+            try writer.print("\n  top_level.layers.count: {d}\n", .{parsed.value.layers.len});
+        },
+        .oci_index => |parsed| {
+            try writeIndexText(writer, parsed.value.manifests, "oci_image_index", parsed.value.media_type);
+        },
+        .docker_manifest_list => |parsed| {
+            try writeIndexText(writer, parsed.value.manifests, "docker_manifest_list", parsed.value.media_type);
+        },
+    }
+
+    if (result.selected_leaf) |leaf| {
+        try writer.writeAll("  selected.requested_platform: ");
+        try writeTextPlatform(writer, requested_platform.?);
+        try writer.writeAll("\n  selected.media_type: ");
+        try writer.writeAll(leaf.value.media_type.toString());
+        try writer.writeAll("\n  selected.config_digest: ");
+        try leaf.value.config.digest.format(writer);
+        try writer.print("\n  selected.layers.count: {d}\n", .{leaf.value.layers.len});
+    }
+}
+
+pub fn writeResolveJson(
+    writer: *std.Io.Writer,
+    input: []const u8,
+    result: z_oci.ResolveResult,
+) std.Io.Writer.Error!void {
+    var json = std.json.Stringify{ .writer = writer };
+    try json.beginObject();
+    try json.objectField("command");
+    try json.write("resolve");
+    try json.objectField("input");
+    try writeJsonStringValue(&json, input);
+    try json.objectField("reference");
+    try writeJsonPinnedReference(&json, result.reference, result.digest);
+    try json.objectField("digest");
+    try json.write(result.digest);
+    try json.objectField("media_type");
+    try json.write(result.media_type.toString());
+    try json.objectField("platform");
+    try writeJsonPlatform(&json, result.platform);
+    try json.endObject();
+}
+
+pub fn writeValidateJson(
+    writer: *std.Io.Writer,
+    reference: z_oci.Reference,
+    valid: bool,
+) std.Io.Writer.Error!void {
+    var json = std.json.Stringify{ .writer = writer };
+    try json.beginObject();
+    try json.objectField("command");
+    try json.write("validate");
+    try json.objectField("reference");
+    try writeJsonReference(&json, reference);
+    try json.objectField("valid");
+    try json.write(valid);
+    try json.endObject();
+}
+
+pub fn writeInspectJson(
+    writer: *std.Io.Writer,
+    reference: z_oci.Reference,
+    requested_platform: ?Platform,
+    result: z_oci.InspectionResult,
+) std.Io.Writer.Error!void {
+    var json = std.json.Stringify{ .writer = writer };
+    try json.beginObject();
+    try json.objectField("command");
+    try json.write("inspect");
+    try json.objectField("reference");
+    try writeJsonReference(&json, reference);
+    try json.objectField("top_level");
+    try writeJsonInspectionTopLevel(&json, result.top_level);
+    try json.objectField("selected_leaf");
+    if (result.selected_leaf) |leaf| {
+        try writeJsonSelectedLeaf(&json, requested_platform.?, leaf.value);
+    } else {
+        try json.write(@as(?[]const u8, null));
+    }
+    try json.endObject();
+}
+
+pub fn writeFailureText(writer: *std.Io.Writer, failure: CliFailure) std.Io.Writer.Error!void {
+    try writer.print("z-oci: error: {s} (code={d})", .{
+        failureSummary(failure),
+        @intFromEnum(exitCodeForFailure(failure)),
+    });
+    switch (failure) {
+        .resolve => |resolve_failure| {
+            try writer.print(" [registry={s}] [reference={s}]", .{
+                resolveFailureRegistry(resolve_failure),
+                resolveFailureReference(resolve_failure),
+            });
+            if (resolveFailureHttpStatus(resolve_failure)) |status| {
+                try writer.print(" [http_status={d}]", .{status});
+            }
+        },
+        .config, .out_of_memory, .unexpected => {},
+    }
+    try writer.writeByte('\n');
+}
+
+pub fn writeFailureJson(writer: *std.Io.Writer, failure: CliFailure) std.Io.Writer.Error!void {
+    var json = std.json.Stringify{ .writer = writer };
+    try json.beginObject();
+    try json.objectField("error");
+    try json.beginObject();
+    try json.objectField("code");
+    try json.write(failureCode(failure));
+    try json.objectField("message");
+    try json.write(failureSummary(failure));
+    try json.objectField("http_status");
+    switch (failure) {
+        .resolve => |resolve_failure| try json.write(resolveFailureHttpStatus(resolve_failure)),
+        .config, .out_of_memory, .unexpected => try json.write(@as(?u16, null)),
+    }
+    try json.endObject();
+    try json.endObject();
+}
+
+pub fn writeVerbose(
+    writer: *std.Io.Writer,
+    command: Command,
+    outcome: VerboseOutcome,
+    elapsed_ms: u64,
+) std.Io.Writer.Error!void {
+    try writer.print("z-oci verbose: command={s} outcome={s} elapsed_ms={d}\n", .{
+        @tagName(command),
+        @tagName(outcome),
+        elapsed_ms,
+    });
+}
+
+pub fn exitCodeForFailure(failure: CliFailure) ExitCode {
+    return switch (failure) {
+        .resolve => |resolve_failure| exitCodeForResolveError(resolve_failure),
+        .config => |config_failure| if (config_failure == error.OutOfMemory) .unexpected_failure else .local_configuration_failure,
+        .out_of_memory, .unexpected => .unexpected_failure,
+    };
+}
+
+pub fn exitCodeForResolveError(failure: z_oci.ResolveError) ExitCode {
+    return switch (failure) {
+        .not_found => .not_found,
+        .auth_failed => .authentication_failure,
+        .rate_limited => .rate_limited,
+        .network_error => .network_failure,
+        .digest_mismatch, .unsupported_algorithm => .digest_failure,
+        .content_type_mismatch => .content_type_failure,
+        .manifest_parse_error, .response_too_large, .depth_limit_exceeded => .manifest_content_failure,
+        .timeout => .timeout,
+        .platform_not_found, .platform_required => .platform_selection_failure,
+    };
+}
+
+pub fn failureCode(failure: CliFailure) []const u8 {
+    return switch (failure) {
+        .resolve => |resolve_failure| resolveFailureCode(resolve_failure),
+        .config => |config_failure| configFailureCode(config_failure),
+        .out_of_memory => "out_of_memory",
+        .unexpected => "unexpected",
+    };
+}
+
+pub fn verboseOutcomeForFailure(failure: CliFailure) VerboseOutcome {
+    return switch (failure) {
+        .resolve => |resolve_failure| switch (resolve_failure) {
+            .not_found => .not_found,
+            .auth_failed => .auth_failed,
+            .rate_limited => .rate_limited,
+            .network_error => .network_error,
+            .digest_mismatch, .unsupported_algorithm => .digest,
+            .content_type_mismatch => .content_type,
+            .manifest_parse_error, .response_too_large, .depth_limit_exceeded => .manifest_content,
+            .timeout => .timeout,
+            .platform_not_found, .platform_required => .platform_selection,
+        },
+        .config => |config_failure| if (config_failure == error.OutOfMemory) .unexpected else .local_config,
+        .out_of_memory, .unexpected => .unexpected,
+    };
+}
+
+fn writeIndexText(
+    writer: *std.Io.Writer,
+    manifests: []const z_oci.Descriptor,
+    kind: []const u8,
+    media_type: z_oci.MediaType,
+) std.Io.Writer.Error!void {
+    try writer.writeAll("  top_level.kind: ");
+    try writer.writeAll(kind);
+    try writer.writeAll("\n  top_level.media_type: ");
+    try writer.writeAll(media_type.toString());
+    try writer.writeByte('\n');
+
+    for (manifests, 0..) |descriptor, index| {
+        try writer.print("  platform[{d}].platform: ", .{index});
+        try writeTextPlatform(writer, descriptor.platform);
+        try writer.print("\n  platform[{d}].media_type: {s}\n", .{ index, descriptor.media_type.toString() });
+        try writer.print("  platform[{d}].digest: ", .{index});
+        try descriptor.digest.format(writer);
+        try writer.print("\n  platform[{d}].size: {d}\n", .{ index, descriptor.size });
+    }
+}
+
+fn writeReference(writer: *std.Io.Writer, reference: z_oci.Reference) std.Io.Writer.Error!void {
+    try writer.print("{s}/{s}{s}{s}", .{
+        reference.registry,
+        reference.repository,
+        if (reference.digest != null) "@" else ":",
+        reference.refString(),
+    });
+}
+
+fn writePinnedReference(writer: *std.Io.Writer, reference: z_oci.Reference, digest: z_oci.Digest) std.Io.Writer.Error!void {
+    try writer.print("{s}/{s}@", .{ reference.registry, reference.repository });
+    try digest.format(writer);
+}
+
+fn writeJsonReference(json: *std.json.Stringify, reference: z_oci.Reference) std.Io.Writer.Error!void {
+    try json.beginWriteRaw();
+    try json.writer.writeByte('"');
+    try writeJsonBytes(json.writer, reference.registry);
+    try json.writer.writeByte('/');
+    try writeJsonBytes(json.writer, reference.repository);
+    try json.writer.writeByte(if (reference.digest != null) '@' else ':');
+    try writeJsonBytes(json.writer, reference.refString());
+    try json.writer.writeByte('"');
+    json.endWriteRaw();
+}
+
+fn writeJsonPinnedReference(json: *std.json.Stringify, reference: z_oci.Reference, digest: z_oci.Digest) std.Io.Writer.Error!void {
+    try json.beginWriteRaw();
+    try json.writer.writeByte('"');
+    try writeJsonBytes(json.writer, reference.registry);
+    try json.writer.writeByte('/');
+    try writeJsonBytes(json.writer, reference.repository);
+    try json.writer.writeByte('@');
+    try json.writer.writeAll(@tagName(digest.algorithm));
+    try json.writer.writeByte(':');
+    try writeJsonBytes(json.writer, digest.hex);
+    try json.writer.writeByte('"');
+    json.endWriteRaw();
+}
+
+fn writeJsonStringValue(json: *std.json.Stringify, value: []const u8) std.Io.Writer.Error!void {
+    try json.beginWriteRaw();
+    try json.writer.writeByte('"');
+    try writeJsonBytes(json.writer, value);
+    try json.writer.writeByte('"');
+    json.endWriteRaw();
+}
+
+fn writeJsonBytes(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
+    const hex = "0123456789abcdef";
+    for (value) |byte| {
+        switch (byte) {
+            '"', '\\' => {
+                try writer.writeByte('\\');
+                try writer.writeByte(byte);
+            },
+            8 => try writer.writeAll("\\b"),
+            12 => try writer.writeAll("\\f"),
+            10 => try writer.writeAll("\\n"),
+            13 => try writer.writeAll("\\r"),
+            9 => try writer.writeAll("\\t"),
+            0...7, 11, 14...0x1f, 0x7f => {
+                try writer.writeAll("\\u00");
+                try writer.writeByte(hex[byte >> 4]);
+                try writer.writeByte(hex[byte & 0xf]);
+            },
+            else => try writer.writeByte(byte),
+        }
+    }
+}
+
+fn writeTextPlatform(writer: *std.Io.Writer, platform: ?Platform) std.Io.Writer.Error!void {
+    const value = platform orelse {
+        try writer.writeAll("null");
+        return;
+    };
+    try writeTextPlatformPart(writer, value.os);
+    try writer.writeAll("\\/");
+    try writeTextPlatformPart(writer, value.architecture);
+    if (value.variant) |variant| {
+        try writer.writeAll("\\/");
+        try writeTextPlatformPart(writer, variant);
+    }
+}
+
+fn writeTextPlatformPart(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
+    const hex = "0123456789abcdef";
+    for (value) |byte| {
+        switch (byte) {
+            '\\' => try writer.writeAll("\\\\"),
+            '/' => try writer.writeAll("\\/"),
+            0...0x1f, 0x7f => {
+                try writer.writeAll("\\x");
+                try writer.writeByte(hex[byte >> 4]);
+                try writer.writeByte(hex[byte & 0xf]);
+            },
+            else => try writer.writeByte(byte),
+        }
+    }
+}
+
+fn writeJsonPlatform(json: *std.json.Stringify, platform: ?Platform) std.Io.Writer.Error!void {
+    if (platform) |value| {
+        try json.beginObject();
+        try json.objectField("os");
+        try writeJsonStringValue(json, value.os);
+        try json.objectField("architecture");
+        try writeJsonStringValue(json, value.architecture);
+        try json.objectField("variant");
+        try json.write(value.variant);
+        try json.objectField("os_version");
+        try json.write(value.os_version);
+        try json.objectField("os_features");
+        try json.write(value.os_features);
+        try json.endObject();
+    } else {
+        try json.write(@as(?[]const u8, null));
+    }
+}
+
+fn writeJsonInspectionTopLevel(json: *std.json.Stringify, document: z_oci.InspectionDocument) std.Io.Writer.Error!void {
+    try json.beginObject();
+    switch (document) {
+        .manifest => |parsed| {
+            try json.objectField("kind");
+            try json.write("manifest");
+            try json.objectField("media_type");
+            try json.write(parsed.value.media_type.toString());
+            try json.objectField("config_digest");
+            try json.write(@as(?z_oci.Digest, parsed.value.config.digest));
+            try json.objectField("layer_count");
+            try json.write(@as(?usize, parsed.value.layers.len));
+            try json.objectField("platforms");
+            try json.write(@as(?[]const u8, null));
+        },
+        .oci_index => |parsed| {
+            try writeJsonIndexTopLevel(json, "oci_image_index", parsed.value.media_type, parsed.value.manifests);
+        },
+        .docker_manifest_list => |parsed| {
+            try writeJsonIndexTopLevel(json, "docker_manifest_list", parsed.value.media_type, parsed.value.manifests);
+        },
+    }
+    try json.endObject();
+}
+
+fn writeJsonIndexTopLevel(
+    json: *std.json.Stringify,
+    kind: []const u8,
+    media_type: z_oci.MediaType,
+    manifests: []const z_oci.Descriptor,
+) std.Io.Writer.Error!void {
+    try json.objectField("kind");
+    try json.write(kind);
+    try json.objectField("media_type");
+    try json.write(media_type.toString());
+    try json.objectField("config_digest");
+    try json.write(@as(?[]const u8, null));
+    try json.objectField("layer_count");
+    try json.write(@as(?usize, null));
+    try json.objectField("platforms");
+    try json.beginArray();
+    for (manifests) |descriptor| {
+        try json.beginObject();
+        try json.objectField("platform");
+        try writeJsonPlatform(json, descriptor.platform);
+        try json.objectField("media_type");
+        try json.write(descriptor.media_type.toString());
+        try json.objectField("digest");
+        try json.write(descriptor.digest);
+        try json.objectField("size");
+        try json.write(descriptor.size);
+        try json.endObject();
+    }
+    try json.endArray();
+}
+
+fn writeJsonSelectedLeaf(
+    json: *std.json.Stringify,
+    requested_platform: Platform,
+    manifest: z_oci.Manifest,
+) std.Io.Writer.Error!void {
+    try json.beginObject();
+    try json.objectField("requested_platform");
+    try writeJsonPlatform(json, requested_platform);
+    try json.objectField("media_type");
+    try json.write(manifest.media_type.toString());
+    try json.objectField("config_digest");
+    try json.write(manifest.config.digest);
+    try json.objectField("layer_count");
+    try json.write(manifest.layers.len);
+    try json.endObject();
+}
+
+fn failureSummary(failure: CliFailure) []const u8 {
+    return switch (failure) {
+        .resolve => |resolve_failure| resolveFailureSummary(resolve_failure),
+        .config => |config_failure| if (config_failure == error.OutOfMemory) "unexpected failure" else "local configuration failure",
+        .out_of_memory, .unexpected => "unexpected failure",
+    };
+}
+
+fn resolveFailureSummary(failure: z_oci.ResolveError) []const u8 {
+    return switch (failure) {
+        .auth_failed => "authentication failure",
+        .not_found => "not found",
+        .rate_limited => "rate limited",
+        .digest_mismatch, .unsupported_algorithm => "digest failure",
+        .platform_not_found, .platform_required => "platform selection failure",
+        .manifest_parse_error, .depth_limit_exceeded, .response_too_large => "manifest content failure",
+        .network_error => "network failure",
+        .content_type_mismatch => "content type failure",
+        .timeout => "timeout",
+    };
+}
+
+fn resolveFailureCode(failure: z_oci.ResolveError) []const u8 {
+    return switch (failure) {
+        .auth_failed => "auth_failed",
+        .not_found => "not_found",
+        .rate_limited => "rate_limited",
+        .digest_mismatch => "digest_mismatch",
+        .platform_not_found => "platform_not_found",
+        .platform_required => "platform_required",
+        .manifest_parse_error => "manifest_parse_error",
+        .network_error => "network_error",
+        .unsupported_algorithm => "unsupported_algorithm",
+        .content_type_mismatch => "content_type_mismatch",
+        .timeout => "timeout",
+        .depth_limit_exceeded => "depth_limit_exceeded",
+        .response_too_large => "response_too_large",
+    };
+}
+
+fn configFailureCode(failure: z_oci.Config.ApplyError) []const u8 {
+    return switch (failure) {
+        error.OutOfMemory => "out_of_memory",
+        error.CaBundleFileNotFound => "ca_bundle_file_not_found",
+        error.CaBundleInvalid => "ca_bundle_invalid",
+        error.CaBundleEmpty => "ca_bundle_empty",
+        error.CaBundleTlsDisabled => "ca_bundle_tls_disabled",
+        error.CaBundleInsecurePermissions => "ca_bundle_insecure_permissions",
+        error.CaBundleContainsPrivateKey => "ca_bundle_contains_private_key",
+        error.InvalidDockerConfig => "invalid_docker_config",
+        error.CredentialSourcesIncomplete => "credential_sources_incomplete",
+    };
+}
+
+fn resolveFailureRegistry(failure: z_oci.ResolveError) []const u8 {
+    return switch (failure) {
+        inline else => |value| value.registry,
+    };
+}
+
+fn resolveFailureReference(failure: z_oci.ResolveError) []const u8 {
+    return switch (failure) {
+        inline else => |value| value.reference,
+    };
+}
+
+fn resolveFailureHttpStatus(failure: z_oci.ResolveError) ?u16 {
+    return switch (failure) {
+        inline else => |value| value.http_status,
+    };
 }
 
 fn usage(reason: UsageReason, target: HelpTarget) ParseOutcome {
@@ -554,4 +1087,316 @@ test "usage diagnostics use two lines and the selected help command" {
             buffer[0..writer.end],
         );
     }
+}
+
+const renderer_hex_a = "a" ** 64;
+const renderer_hex_b = "b" ** 64;
+const renderer_manifest_json =
+    "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:" ++ renderer_hex_a ++ "\",\"size\":256},\"layers\":[{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"sha256:" ++ renderer_hex_b ++ "\",\"size\":4096}]}";
+const renderer_index_json =
+    "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[" ++
+    "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:" ++ renderer_hex_a ++ "\",\"size\":512,\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\",\"variant\":\"v3\",\"os.version\":\"6.1\",\"os.features\":[\"feature-a\"]}}," ++
+    "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:" ++ renderer_hex_b ++ "\",\"size\":1024,\"platform\":{\"os\":\"linux\",\"architecture\":\"arm64\"}}," ++
+    "{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:" ++ renderer_hex_a ++ "\",\"size\":2048,\"platform\":null}]}";
+const renderer_control_index_json =
+    "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:" ++ renderer_hex_a ++ "\",\"size\":512,\"platform\":{\"os\":\"li\\u0001n\",\"architecture\":\"amd64\",\"variant\":\"v/\\\\\\u007f\",\"os.version\":\"6.1\",\"os.features\":[\"feature-a\"]}}]}";
+
+fn makeRendererResolveResult() !z_oci.ResolveResult {
+    var reference = try z_oci.Reference.parse(std.testing.allocator, "ubuntu:22.04");
+    errdefer reference.deinit(std.testing.allocator);
+    const digest_hex = try std.testing.allocator.dupe(u8, renderer_hex_a);
+    errdefer std.testing.allocator.free(digest_hex);
+    return .{
+        .digest = .{ .algorithm = .sha256, .hex = digest_hex },
+        .media_type = .oci_manifest_v1,
+        .platform = null,
+        .reference = reference,
+    };
+}
+
+fn rendererResolveFailure(tag: std.meta.Tag(z_oci.ResolveError)) z_oci.ResolveError {
+    return switch (tag) {
+        .auth_failed => .{ .auth_failed = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = 401 } },
+        .not_found => .{ .not_found = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = 404 } },
+        .rate_limited => .{ .rate_limited = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = 429, .transport_retries_exhausted = true } },
+        .digest_mismatch => .{ .digest_mismatch = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = 200 } },
+        .platform_not_found => .{ .platform_not_found = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = null } },
+        .platform_required => .{ .platform_required = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = null } },
+        .manifest_parse_error => .{ .manifest_parse_error = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = 200 } },
+        .network_error => .{ .network_error = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = null, .transport_retries_exhausted = true } },
+        .unsupported_algorithm => .{ .unsupported_algorithm = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = null } },
+        .content_type_mismatch => .{ .content_type_mismatch = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = 200 } },
+        .timeout => .{ .timeout = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = null, .transport_retries_exhausted = true } },
+        .depth_limit_exceeded => .{ .depth_limit_exceeded = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = null } },
+        .response_too_large => .{ .response_too_large = .{ .registry = "registry.example", .reference = "registry.example/app:v1", .http_status = null } },
+    };
+}
+
+fn expectJsonObjectKeys(value: std.json.Value, expected: []const []const u8) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.ExpectedJsonObject,
+    };
+    try std.testing.expectEqual(expected.len, object.count());
+    for (expected) |key| try std.testing.expect(object.get(key) != null);
+}
+
+fn expectFailureJsonCode(failure: CliFailure, expected_code: []const u8) !void {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeFailureJson(&writer, failure);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, buffer[0..writer.end], .{});
+    defer parsed.deinit();
+    try expectJsonObjectKeys(parsed.value, &.{"error"});
+    const error_object = parsed.value.object.get("error").?.object;
+    try expectJsonObjectKeys(.{ .object = error_object }, &.{ "code", "message", "http_status" });
+    try std.testing.expectEqualStrings(expected_code, error_object.get("code").?.string);
+}
+
+test "render: text snapshots cover resolve, validate, and inspection presence rules" {
+    var resolve_result = try makeRendererResolveResult();
+    defer resolve_result.deinit(std.testing.allocator);
+
+    var resolve_buffer: [256]u8 = undefined;
+    var resolve_writer = std.Io.Writer.fixed(&resolve_buffer);
+    try writeResolveText(&resolve_writer, resolve_result);
+    try std.testing.expectEqualStrings(
+        "registry-1.docker.io/library/ubuntu@sha256:" ++ renderer_hex_a ++ "\n",
+        resolve_buffer[0..resolve_writer.end],
+    );
+
+    var validate_buffer: [128]u8 = undefined;
+    var validate_writer = std.Io.Writer.fixed(&validate_buffer);
+    try writeValidateText(&validate_writer, true);
+    try std.testing.expectEqualStrings("validate success: valid\n", validate_buffer[0..validate_writer.end]);
+    validate_writer = std.Io.Writer.fixed(&validate_buffer);
+    try writeValidateText(&validate_writer, false);
+    try std.testing.expectEqualStrings("validate not found: not-found\n", validate_buffer[0..validate_writer.end]);
+
+    var reference = try z_oci.Reference.parse(std.testing.allocator, "ubuntu:22.04");
+    defer reference.deinit(std.testing.allocator);
+    const manifest = try z_oci.json.parse(z_oci.Manifest, std.testing.allocator, renderer_manifest_json);
+    var single_arch = z_oci.InspectionResult{ .top_level = .{ .manifest = manifest } };
+    defer single_arch.deinit();
+
+    var inspect_buffer: [4096]u8 = undefined;
+    var inspect_writer = std.Io.Writer.fixed(&inspect_buffer);
+    try writeInspectText(&inspect_writer, reference, null, single_arch);
+    try std.testing.expectEqualStrings(
+        "inspect:\n" ++
+            "  reference: registry-1.docker.io/library/ubuntu:22.04\n" ++
+            "  top_level.kind: manifest\n" ++
+            "  top_level.media_type: application/vnd.oci.image.manifest.v1+json\n" ++
+            "  top_level.config_digest: sha256:" ++ renderer_hex_a ++ "\n" ++
+            "  top_level.layers.count: 1\n",
+        inspect_buffer[0..inspect_writer.end],
+    );
+
+    const index = try z_oci.json.parse(z_oci.OciImageIndex, std.testing.allocator, renderer_index_json);
+    const leaf = try z_oci.json.parse(z_oci.Manifest, std.testing.allocator, renderer_manifest_json);
+    var multi_arch = z_oci.InspectionResult{
+        .top_level = .{ .oci_index = index },
+        .selected_leaf = leaf,
+    };
+    defer multi_arch.deinit();
+    inspect_writer = std.Io.Writer.fixed(&inspect_buffer);
+    try writeInspectText(&inspect_writer, reference, .{ .os = "linux", .architecture = "amd64", .variant = "v3" }, multi_arch);
+    try std.testing.expectEqualStrings(
+        "inspect:\n" ++
+            "  reference: registry-1.docker.io/library/ubuntu:22.04\n" ++
+            "  top_level.kind: oci_image_index\n" ++
+            "  top_level.media_type: application/vnd.oci.image.index.v1+json\n" ++
+            "  platform[0].platform: linux\\/amd64\\/v3\n" ++
+            "  platform[0].media_type: application/vnd.oci.image.manifest.v1+json\n" ++
+            "  platform[0].digest: sha256:" ++ renderer_hex_a ++ "\n" ++
+            "  platform[0].size: 512\n" ++
+            "  platform[1].platform: linux\\/arm64\n" ++
+            "  platform[1].media_type: application/vnd.oci.image.manifest.v1+json\n" ++
+            "  platform[1].digest: sha256:" ++ renderer_hex_b ++ "\n" ++
+            "  platform[1].size: 1024\n" ++
+            "  platform[2].platform: null\n" ++
+            "  platform[2].media_type: application/vnd.oci.image.manifest.v1+json\n" ++
+            "  platform[2].digest: sha256:" ++ renderer_hex_a ++ "\n" ++
+            "  platform[2].size: 2048\n" ++
+            "  selected.requested_platform: linux\\/amd64\\/v3\n" ++
+            "  selected.media_type: application/vnd.oci.image.manifest.v1+json\n" ++
+            "  selected.config_digest: sha256:" ++ renderer_hex_a ++ "\n" ++
+            "  selected.layers.count: 1\n",
+        inspect_buffer[0..inspect_writer.end],
+    );
+
+    const control_index = try z_oci.json.parse(z_oci.OciImageIndex, std.testing.allocator, renderer_control_index_json);
+    var control_inspection = z_oci.InspectionResult{ .top_level = .{ .oci_index = control_index } };
+    defer control_inspection.deinit();
+    inspect_writer = std.Io.Writer.fixed(&inspect_buffer);
+    try writeInspectText(&inspect_writer, reference, null, control_inspection);
+    const escaped_platform = "li\\x01n" ++ "\\/" ++ "amd64" ++ "\\/" ++ "v" ++ "\\/" ++ "\\\\" ++ "\\x7f";
+    try std.testing.expect(std.mem.indexOf(u8, inspect_buffer[0..inspect_writer.end], "  platform[0].platform: " ++ escaped_platform ++ "\n") != null);
+}
+
+test "render: JSON snapshots preserve exact fields, nulls, and platform details" {
+    var resolve_result = try makeRendererResolveResult();
+    defer resolve_result.deinit(std.testing.allocator);
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeResolveJson(&writer, "ubuntu:22.04", resolve_result);
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"resolve\",\"input\":\"ubuntu:22.04\",\"reference\":\"registry-1.docker.io/library/ubuntu@sha256:" ++ renderer_hex_a ++ "\",\"digest\":\"sha256:" ++ renderer_hex_a ++ "\",\"media_type\":\"application/vnd.oci.image.manifest.v1+json\",\"platform\":null}",
+        buffer[0..writer.end],
+    );
+    const resolve_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, buffer[0..writer.end], .{ .parse_numbers = true });
+    defer resolve_json.deinit();
+    try expectJsonObjectKeys(resolve_json.value, &.{ "command", "input", "reference", "digest", "media_type", "platform" });
+    try std.testing.expectEqualStrings("resolve", resolve_json.value.object.get("command").?.string);
+    try std.testing.expect(resolve_json.value.object.get("platform").? == .null);
+
+    var reference = try z_oci.Reference.parse(std.testing.allocator, "ubuntu@sha256:" ++ renderer_hex_a);
+    defer reference.deinit(std.testing.allocator);
+    writer = std.Io.Writer.fixed(&buffer);
+    try writeValidateJson(&writer, reference, false);
+    try std.testing.expectEqualStrings(
+        "{\"command\":\"validate\",\"reference\":\"registry-1.docker.io/library/ubuntu@sha256:" ++ renderer_hex_a ++ "\",\"valid\":false}",
+        buffer[0..writer.end],
+    );
+
+    const index = try z_oci.json.parse(z_oci.OciImageIndex, std.testing.allocator, renderer_control_index_json);
+    var inspection = z_oci.InspectionResult{ .top_level = .{ .oci_index = index } };
+    defer inspection.deinit();
+    writer = std.Io.Writer.fixed(&buffer);
+    try writeInspectJson(&writer, reference, null, inspection);
+    try std.testing.expect(std.mem.indexOf(u8, buffer[0..writer.end], "\\u0001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer[0..writer.end], "os_version") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer[0..writer.end], "os_features") != null);
+    const inspect_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, buffer[0..writer.end], .{ .parse_numbers = true });
+    defer inspect_json.deinit();
+    try expectJsonObjectKeys(inspect_json.value, &.{ "command", "reference", "top_level", "selected_leaf" });
+    const top_level = inspect_json.value.object.get("top_level").?.object;
+    try expectJsonObjectKeys(.{ .object = top_level }, &.{ "kind", "media_type", "config_digest", "layer_count", "platforms" });
+    try std.testing.expect((top_level.get("config_digest").? == .null));
+    try std.testing.expect((top_level.get("layer_count").? == .null));
+    try std.testing.expect(top_level.get("platforms").?.array.items.len == 1);
+    const platform = top_level.get("platforms").?.array.items[0].object.get("platform").?.object;
+    try expectJsonObjectKeys(.{ .object = platform }, &.{ "os", "architecture", "variant", "os_version", "os_features" });
+    try std.testing.expectEqualStrings("li\x01n", platform.get("os").?.string);
+    try std.testing.expect(platform.get("os_features").?.array.items.len == 1);
+    try std.testing.expect((inspect_json.value.object.get("selected_leaf").? == .null));
+}
+
+test "render: resolver and process failures map exhaustively" {
+    const cases = [_]struct {
+        tag: std.meta.Tag(z_oci.ResolveError),
+        code: []const u8,
+        exit_code: ExitCode,
+        verbose: VerboseOutcome,
+    }{
+        .{ .tag = .auth_failed, .code = "auth_failed", .exit_code = .authentication_failure, .verbose = .auth_failed },
+        .{ .tag = .not_found, .code = "not_found", .exit_code = .not_found, .verbose = .not_found },
+        .{ .tag = .rate_limited, .code = "rate_limited", .exit_code = .rate_limited, .verbose = .rate_limited },
+        .{ .tag = .digest_mismatch, .code = "digest_mismatch", .exit_code = .digest_failure, .verbose = .digest },
+        .{ .tag = .platform_not_found, .code = "platform_not_found", .exit_code = .platform_selection_failure, .verbose = .platform_selection },
+        .{ .tag = .platform_required, .code = "platform_required", .exit_code = .platform_selection_failure, .verbose = .platform_selection },
+        .{ .tag = .manifest_parse_error, .code = "manifest_parse_error", .exit_code = .manifest_content_failure, .verbose = .manifest_content },
+        .{ .tag = .network_error, .code = "network_error", .exit_code = .network_failure, .verbose = .network_error },
+        .{ .tag = .unsupported_algorithm, .code = "unsupported_algorithm", .exit_code = .digest_failure, .verbose = .digest },
+        .{ .tag = .content_type_mismatch, .code = "content_type_mismatch", .exit_code = .content_type_failure, .verbose = .content_type },
+        .{ .tag = .timeout, .code = "timeout", .exit_code = .timeout, .verbose = .timeout },
+        .{ .tag = .depth_limit_exceeded, .code = "depth_limit_exceeded", .exit_code = .manifest_content_failure, .verbose = .manifest_content },
+        .{ .tag = .response_too_large, .code = "response_too_large", .exit_code = .manifest_content_failure, .verbose = .manifest_content },
+    };
+    for (cases) |case| {
+        const failure = CliFailure{ .resolve = rendererResolveFailure(case.tag) };
+        try std.testing.expectEqual(case.exit_code, exitCodeForFailure(failure));
+        try std.testing.expectEqualStrings(case.code, failureCode(failure));
+        try std.testing.expectEqual(case.verbose, verboseOutcomeForFailure(failure));
+        try expectFailureJsonCode(failure, case.code);
+    }
+
+    const config_cases = [_]struct {
+        value: z_oci.Config.ApplyError,
+        code: []const u8,
+        exit_code: ExitCode,
+        verbose: VerboseOutcome,
+    }{
+        .{ .value = error.OutOfMemory, .code = "out_of_memory", .exit_code = .unexpected_failure, .verbose = .unexpected },
+        .{ .value = error.CaBundleFileNotFound, .code = "ca_bundle_file_not_found", .exit_code = .local_configuration_failure, .verbose = .local_config },
+        .{ .value = error.CaBundleInvalid, .code = "ca_bundle_invalid", .exit_code = .local_configuration_failure, .verbose = .local_config },
+        .{ .value = error.CaBundleEmpty, .code = "ca_bundle_empty", .exit_code = .local_configuration_failure, .verbose = .local_config },
+        .{ .value = error.CaBundleTlsDisabled, .code = "ca_bundle_tls_disabled", .exit_code = .local_configuration_failure, .verbose = .local_config },
+        .{ .value = error.CaBundleInsecurePermissions, .code = "ca_bundle_insecure_permissions", .exit_code = .local_configuration_failure, .verbose = .local_config },
+        .{ .value = error.CaBundleContainsPrivateKey, .code = "ca_bundle_contains_private_key", .exit_code = .local_configuration_failure, .verbose = .local_config },
+        .{ .value = error.InvalidDockerConfig, .code = "invalid_docker_config", .exit_code = .local_configuration_failure, .verbose = .local_config },
+        .{ .value = error.CredentialSourcesIncomplete, .code = "credential_sources_incomplete", .exit_code = .local_configuration_failure, .verbose = .local_config },
+    };
+    for (config_cases) |case| {
+        const failure = CliFailure{ .config = case.value };
+        try std.testing.expectEqual(case.exit_code, exitCodeForFailure(failure));
+        try std.testing.expectEqualStrings(case.code, failureCode(failure));
+        try std.testing.expectEqual(case.verbose, verboseOutcomeForFailure(failure));
+        try expectFailureJsonCode(failure, case.code);
+    }
+
+    try expectFailureJsonCode(.{ .out_of_memory = {} }, "out_of_memory");
+    try expectFailureJsonCode(.{ .unexpected = {} }, "unexpected");
+
+    const all_exit_codes = [_]ExitCode{
+        .success,
+        .not_found,
+        .authentication_failure,
+        .rate_limited,
+        .network_failure,
+        .usage_failure,
+        .local_configuration_failure,
+        .digest_failure,
+        .content_type_failure,
+        .manifest_content_failure,
+        .timeout,
+        .platform_selection_failure,
+        .unexpected_failure,
+    };
+    for (all_exit_codes, 0..) |code, index| try std.testing.expectEqual(@as(u8, @intCast(index)), @intFromEnum(code));
+}
+
+test "render: diagnostics use fixed safe context" {
+    const failure = CliFailure{ .resolve = .{ .auth_failed = .{
+        .registry = "registry.example",
+        .reference = "registry.example/app:v1",
+        .http_status = 401,
+    } } };
+    var text_buffer: [512]u8 = undefined;
+    var text_writer = std.Io.Writer.fixed(&text_buffer);
+    try writeFailureText(&text_writer, failure);
+    try std.testing.expectEqualStrings(
+        "z-oci: error: authentication failure (code=2) [registry=registry.example] [reference=registry.example/app:v1] [http_status=401]\n",
+        text_buffer[0..text_writer.end],
+    );
+
+    var json_buffer: [512]u8 = undefined;
+    var json_writer = std.Io.Writer.fixed(&json_buffer);
+    try writeFailureJson(&json_writer, failure);
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"code\":\"auth_failed\",\"message\":\"authentication failure\",\"http_status\":401}}",
+        json_buffer[0..json_writer.end],
+    );
+    text_writer = std.Io.Writer.fixed(&text_buffer);
+    try writeFailureText(&text_writer, .{ .config = error.CaBundleInvalid });
+    try std.testing.expectEqualStrings("z-oci: error: local configuration failure (code=6)\n", text_buffer[0..text_writer.end]);
+    text_writer = std.Io.Writer.fixed(&text_buffer);
+    try writeFailureText(&text_writer, .{ .unexpected = {} });
+    try std.testing.expectEqualStrings("z-oci: error: unexpected failure (code=12)\n", text_buffer[0..text_writer.end]);
+    json_writer = std.Io.Writer.fixed(&json_buffer);
+    try writeFailureJson(&json_writer, .{ .out_of_memory = {} });
+    try std.testing.expectEqualStrings(
+        "{\"error\":{\"code\":\"out_of_memory\",\"message\":\"unexpected failure\",\"http_status\":null}}",
+        json_buffer[0..json_writer.end],
+    );
+}
+
+test "render: verbose lines use the locked timing grammar" {
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeVerbose(&writer, .resolve, .success, 0);
+    try std.testing.expectEqualStrings("z-oci verbose: command=resolve outcome=success elapsed_ms=0\n", buffer[0..writer.end]);
+    writer = std.Io.Writer.fixed(&buffer);
+    try writeVerbose(&writer, .inspect, .manifest_content, 37);
+    try std.testing.expectEqualStrings("z-oci verbose: command=inspect outcome=manifest_content elapsed_ms=37\n", buffer[0..writer.end]);
 }
