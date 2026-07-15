@@ -61,38 +61,38 @@ Session-oriented batch resolution for multi-image workflows: public `resolveMany
 ### Added
 
 - **Batch resolve**
-    - Public `resolveMany(allocator, client, config, refs, options)` resolves references sequentially and returns one `ResolveManyItem` per input. One item failure does not abort the batch.
-    - `ResolveManyResult` owns the item slice and every item; call `deinit` once. Successful items own `ResolveResult`. Failed items own both `registry` and `reference` (unlike single-resolve failures, where `registry` still borrows the input).
-    - `ResolveManyOptions.platform` is batch-wide. Per-item platforms need separate batches.
-    - Input `Reference` values are borrowed; the batch path deep-clones per item so callers keep uniform ownership of the input slice.
+  - Public `resolveMany(allocator, client, config, refs, options)` resolves references sequentially and returns one `ResolveManyItem` per input. One item failure does not abort the batch.
+  - `ResolveManyResult` owns the item slice and every item; call `deinit` once. Successful items own `ResolveResult`. Failed items own both `registry` and `reference` (unlike single-resolve failures, where `registry` still borrows the input).
+  - `ResolveManyOptions.platform` is batch-wide. Per-item platforms need separate batches.
+  - Input `Reference` values are borrowed; the batch path deep-clones per item so callers keep uniform ownership of the input slice.
 - **Session digest cache**
-    - Within one `resolveMany` call, successful tag pins and implicit `latest` pins can be reused for later duplicate inputs.
-    - Digest-addressed references bypass the session cache.
-    - The cache lives only for that call.
+  - Within one `resolveMany` call, successful tag pins and implicit `latest` pins can be reused for later duplicate inputs.
+  - Digest-addressed references bypass the session cache.
+  - The cache lives only for that call.
 - **Progress reporting**
-    - Optional `ResolveManyOptions.progress_fn` receives `item_started`, `cache_hit`, `item_succeeded`, and `item_failed`.
-    - Progress reference views borrow for the callback duration only. Callbacks are `void` and cannot cancel the batch.
+  - Optional `ResolveManyOptions.progress_fn` receives `item_started`, `cache_hit`, `item_succeeded`, and `item_failed`.
+  - Progress reference views borrow for the callback duration only. Callbacks are `void` and cannot cancel the batch.
 - **Examples and benchmarks**
-    - Offline `examples/resolve-many.zig` pin-flow demo, wired as `zig build example-resolve-many` and included in `examples-smoke`.
-    - New `z-oci-bench` operations: `resolve-many` (duplicate-heavy batch) and `resolve-many-unique` (unique-reference batch).
+  - Offline `examples/resolve-many.zig` pin-flow demo, wired as `zig build example-resolve-many` and included in `examples-smoke`.
+  - New `z-oci-bench` operations: `resolve-many` (duplicate-heavy batch) and `resolve-many-unique` (unique-reference batch).
 
 ### Changed
 
 - **Docs**
-    - README documents `resolveMany` ownership, sequential behavior, session-cache rules, progress semantics, and the offline batch example build step.
-    - Benchmark baseline docs list every current `z-oci-bench` operation name and record `benchmarks/baselines/v0.5.0.json` plus the Debug counting snapshot for batch ops.
+  - README documents `resolveMany` ownership, sequential behavior, session-cache rules, progress semantics, and the offline batch example build step.
+  - Benchmark baseline docs list every current `z-oci-bench` operation name and record `benchmarks/baselines/v0.5.0.json` plus the Debug counting snapshot for batch ops.
 - **Public API clarity**
-    - `deinitResolveFailure` is documented as single-resolve only. Batch failures must tear down through `ResolveManyResult.deinit` or `ResolveManyItem.deinit`.
+  - `deinitResolveFailure` is documented as single-resolve only. Batch failures must tear down through `ResolveManyResult.deinit` or `ResolveManyItem.deinit`.
 - **Hot-path allocation**
-    - Manifest URI and canonical reference builders use exact-size allocation instead of `allocPrint` where the final length is known.
-    - Live token and manifest header collection paths add `errdefer` cleanup between multi-step dupes so OOM cannot leak partial header or body buffers.
+  - Manifest URI and canonical reference builders use exact-size allocation instead of `allocPrint` where the final length is known.
+  - Live token and manifest header collection paths add `errdefer` cleanup between multi-step dupes so OOM cannot leak partial header or body buffers.
 
 ### Fixed
 
 - **Example ownership**
-    - Live `resolve-reference` success path no longer double-frees moved reference fields; failure path keeps input `registry` alive until after error formatting.
+  - Live `resolve-reference` success path no longer double-frees moved reference fields; failure path keeps input `registry` alive until after error formatting.
 - **Batch teardown**
-    - Partial batch construction and per-item failure promotion free owned registry/reference pairs without leaking or double-freeing under allocation failure.
+  - Partial batch construction and per-item failure promotion free owned registry/reference pairs without leaking or double-freeing under allocation failure.
 
 ### Verified
 
@@ -110,59 +110,59 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 ### Added
 
 - **Retries and rate limits**
-    - Reactive transport retries on manifest `HEAD`/`GET` and token HTTP exchangers, with separate `max_network_retries` and `max_rate_limit_retries` budgets.
-    - Opt-in pre-emptive manifest throttling when `Config.rate_limit_enabled` is true and registry `RateLimit-*` headers are trustworthy (`remaining == 0`).
-    - `ResolveError.rate_limited`, `network_error`, and `timeout` expose `transport_retries_exhausted` so callers can tell immediate failures from post-retry exhaustion.
+  - Reactive transport retries on manifest `HEAD`/`GET` and token HTTP exchangers, with separate `max_network_retries` and `max_rate_limit_retries` budgets.
+  - Opt-in pre-emptive manifest throttling when `Config.rate_limit_enabled` is true and registry `RateLimit-*` headers are trustworthy (`remaining == 0`).
+  - `ResolveError.rate_limited`, `network_error`, and `timeout` expose `transport_retries_exhausted` so callers can tell immediate failures from post-retry exhaustion.
 - **TLS and request limits**
-    - `Config.ca_bundle_path` to load a PEM CA trust bundle at `resolve`, `validate`, and `getManifest` for enterprise and self-hosted registries.
-    - `Config.max_manifest_bytes`, `max_token_response_bytes`, and `max_token_cache_entries` to cap live HTTP bodies and token-cache growth.
+  - `Config.ca_bundle_path` to load a PEM CA trust bundle at `resolve`, `validate`, and `getManifest` for enterprise and self-hosted registries.
+  - `Config.max_manifest_bytes`, `max_token_response_bytes`, and `max_token_cache_entries` to cap live HTTP bodies and token-cache growth.
 - **Parsing helpers**
-    - `Manifest.parseMediaTypeShallow` for workloads that need only manifest media type, not a full document parse.
-    - `json.parseBorrowing` and `json.promoteParsed` to borrow input bytes or move a parsed value onto the caller allocator.
+  - `Manifest.parseMediaTypeShallow` for workloads that need only manifest media type, not a full document parse.
+  - `json.parseBorrowing` and `json.promoteParsed` to borrow input bytes or move a parsed value onto the caller allocator.
 - **Tooling**
-    - Build-time PEM private-key scan via `zig build security-check` (also runs as part of `zig build test`).
-    - New `z-oci-bench` operations: `resolve-single-retry`, `authenticate-rate-limit`, and `resolve-session` (reused `AuthEngine`).
+  - Build-time PEM private-key scan via `zig build security-check` (also runs as part of `zig build test`).
+  - New `z-oci-bench` operations: `resolve-single-retry`, `authenticate-rate-limit`, and `resolve-session` (reused `AuthEngine`).
 
 ### Changed
 
 - **Transport**
-    - Manifest and token HTTP wrappers share one reactive retry loop in `resilience.zig` instead of duplicating sleep/retry logic in `auth.zig` and `resolver.zig`.
-    - Manifest and token retry loops cache built request fields lazily (attempt 2+) so single-shot paths pay no cache overhead.
-    - Single-attempt paths no longer allocate retry caches up front; retryable GET failures keep the downloaded body for the next attempt.
+  - Manifest and token HTTP wrappers share one reactive retry loop in `resilience.zig` instead of duplicating sleep/retry logic in `auth.zig` and `resolver.zig`.
+  - Manifest and token retry loops cache built request fields lazily (attempt 2+) so single-shot paths pay no cache overhead.
+  - Single-attempt paths no longer allocate retry caches up front; retryable GET failures keep the downloaded body for the next attempt.
 - **Docs**
-    - Comment and docstring pass across the library, examples, and tools: corrected auth API docs and filled missing public API contract comments.
-    - Public docs (`README.md`, `Config.zig`, `resilience.zig`) describe live retry budgets, CA bundle behavior, and registry header assumptions.
-    - `examples/resolve-reference` documents default `Config` behavior and when to set `ca_bundle_path`, credentials, and rate-limit flags.
+  - Comment and docstring pass across the library, examples, and tools: corrected auth API docs and filled missing public API contract comments.
+  - Public docs (`README.md`, `Config.zig`, `resilience.zig`) describe live retry budgets, CA bundle behavior, and registry header assumptions.
+  - `examples/resolve-reference` documents default `Config` behavior and when to set `ca_bundle_path`, credentials, and rate-limit flags.
 - **TLS**
-    - `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, rejects private-key PEM markers in CA bundles, and skips reload when path and mtime are unchanged for the same client.
+  - `Config.applyToClient` rejects world-writable CA bundle files on POSIX, reads the bundle in one pass, rejects private-key PEM markers in CA bundles, and skips reload when path and mtime are unchanged for the same client.
 - **Auth and credentials**
-    - Docker config loading builds a registry index at parse time and decodes credentials lazily per registry instead of materializing the full auth tree up front.
-    - Token cache uses a bounded `HashMap` with LRU eviction, borrowed key lookup on hits, remembered GET/POST method per realm, default 60s TTL when `expires_in` is absent, and single-owner token storage on cache miss.
-    - `AuthEngine.credentialForRegistry` returns `AuthError!?CredentialHandle`: allocation failures propagate as `OutOfMemory` instead of anonymous fallback; malformed docker-config auth for the requested registry still yields `null`.
+  - Docker config loading builds a registry index at parse time and decodes credentials lazily per registry instead of materializing the full auth tree up front.
+  - Token cache uses a bounded `HashMap` with LRU eviction, borrowed key lookup on hits, remembered GET/POST method per realm, default 60s TTL when `expires_in` is absent, and single-owner token storage on cache miss.
+  - `AuthEngine.credentialForRegistry` returns `AuthError!?CredentialHandle`: allocation failures propagate as `OutOfMemory` instead of anonymous fallback; malformed docker-config auth for the requested registry still yields `null`.
 - **Resolver performance and memory model**
-    - `resolve`, `validate`, and `getManifest` run transient work in a per-call arena and promote caller-owned success values (`Parsed(Manifest)`, references, errors) onto the caller allocator.
-    - Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; uses stack SHA-256 hex before digest string allocation; drops wasted GET metadata clones.
-    - Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
-    - Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
+  - `resolve`, `validate`, and `getManifest` run transient work in a per-call arena and promote caller-owned success values (`Parsed(Manifest)`, references, errors) onto the caller allocator.
+  - Resolve hot path avoids full manifest JSON parse when only `media_type` is needed; uses stack SHA-256 hex before digest string allocation; drops wasted GET metadata clones.
+  - Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
+  - Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
 - **Testing**
-    - Duplicate resolver, auth, and workflow tests now run through scenario loops in `test_matrix.zig`, shared by `root.zig` and `workflow_smoke.zig`. The release gate reports 204/204 tests (down from 535); the same `ResolveError` arms, validate/get-manifest failure paths, and C4 public API entries are still covered.
+  - Duplicate resolver, auth, and workflow tests now run through scenario loops in `test_matrix.zig`, shared by `root.zig` and `workflow_smoke.zig`. The release gate reports 204/204 tests (down from 535); the same `ResolveError` arms, validate/get-manifest failure paths, and C4 public API entries are still covered.
 
 ### Fixed
 
 - **Credentials and secrets**
-    - Owned credential and token HTTP POST secret buffers are zeroed before release.
-    - Docker config parse and teardown under allocation failure no longer double-free registry index keys.
+  - Owned credential and token HTTP POST secret buffers are zeroed before release.
+  - Docker config parse and teardown under allocation failure no longer double-free registry index keys.
 - **Ownership and promotion**
-    - Resolve, validate, and getManifest preserve caller-owned reference strings on failure and clear transient storage after promotion.
-    - Manifest promotion detaches digest and parsed-document fields from the transient resolve shell before teardown, avoiding digest alias use-after-free.
-    - `json.promoteParsed` destroys the source parse tree only after a successful promotion onto the caller allocator.
-    - Validate manifest HEAD path releases owned response metadata through one outcome teardown (including GET-fallback and redirect arms).
+  - Resolve, validate, and getManifest preserve caller-owned reference strings on failure and clear transient storage after promotion.
+  - Manifest promotion detaches digest and parsed-document fields from the transient resolve shell before teardown, avoiding digest alias use-after-free.
+  - `json.promoteParsed` destroys the source parse tree only after a successful promotion onto the caller allocator.
+  - Validate manifest HEAD path releases owned response metadata through one outcome teardown (including GET-fallback and redirect arms).
 - **Transport errors**
-    - Redirect-without-`Location` and exhausted reactive failures preserve HTTP status and retry-budget context on the public resolver error path.
+  - Redirect-without-`Location` and exhausted reactive failures preserve HTTP status and retry-budget context on the public resolver error path.
 - **Multi-arch**
-    - `recurseIntoMultiArchDocument` tears down the parent index document correctly on `platform_required` and `platform_not_found` early returns.
+  - `recurseIntoMultiArchDocument` tears down the parent index document correctly on `platform_required` and `platform_not_found` early returns.
 - **Token cache**
-    - LRU eviction now runs before inserting a new cache entry, so a freshly stored token is never selected as the eviction victim when many entries share the same `last_used` timestamp (fixes `authenticate-miss` and `authenticate-rate-limit` benches at high iteration counts).
+  - LRU eviction now runs before inserting a new cache entry, so a freshly stored token is never selected as the eviction victim when many entries share the same `last_used` timestamp (fixes `authenticate-miss` and `authenticate-rate-limit` benches at high iteration counts).
 
 ### Verified
 
@@ -462,10 +462,10 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 ### Added
 
 - `src/workflow_smoke.zig` now defines a small offline workflow smoke matrix covering:
-    - manifest fixture parse -> stringify summary fields
-    - reference parse -> `repositoryPath()` and `refString()`
-    - index fixture parse -> platform selection -> descriptor digest assertion
-    - `ResolveResult.clone()` surviving arena teardown
+  - manifest fixture parse -> stringify summary fields
+  - reference parse -> `repositoryPath()` and `refString()`
+  - index fixture parse -> platform selection -> descriptor digest assertion
+  - `ResolveResult.clone()` surviving arena teardown
 - `build.zig` now exposes `zig build workflow-smoke` and includes that workflow-smoke layer in `zig build test`.
 
 ### Changed
@@ -485,9 +485,9 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 - `fixtures/` now contains a typed offline fixture set spanning spec-derived OCI/Docker examples plus live public-registry snapshots from Docker Hub and Quay.
 - `fixtures/SOURCES.md` now records provenance, exact capture URLs, and exact `Accept` headers for the live snapshots.
 - Three offline example programs were added under `examples/`:
-    - `normalize-reference.zig`
-    - `inspect-manifest.zig`
-    - `select-platform.zig`
+  - `normalize-reference.zig`
+  - `inspect-manifest.zig`
+  - `select-platform.zig`
 - `build.zig` now exposes explicit example steps plus `examples-smoke` for a minimal usage-path pass.
 - `Reference.zig` now includes a real-world parser corpus covering Docker Hub, GHCR, Quay, MCR, `registry.k8s.io`, localhost with port, nested paths, and digest-pinned inputs.
 - `Index.zig` now includes additional fixture-driven platform-selection tests for real `arm64`, variant-bearing selection, and a dedicated no-match regression.
