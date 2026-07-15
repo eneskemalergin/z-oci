@@ -3,7 +3,7 @@
 //! Primary steps:
 //! - `test`: library tests, executable tests, workflow smoke, security-check, and
 //!   `examples-smoke` (offline examples only; live `resolve-reference` is excluded).
-//! - `run`: installed CLI executable, currently providing usage text only.
+//! - `run`: installed CLI executable.
 //! - `workflow-smoke`: offline workflow smoke tests only.
 //! - `examples`: build all packaged example programs.
 //! - `example-normalize-reference`, `example-inspect-manifest`, `example-select-platform`,
@@ -16,6 +16,7 @@
 //!   clear-fails if absent; never part of `test`).
 
 const std = @import("std");
+const package = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -27,7 +28,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The executable keeps a stable entrypoint while it currently provides usage text only.
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "package_version", package.version);
+
     const exe = b.addExecutable(.{
         .name = "z-oci",
         .root_module = b.createModule(.{
@@ -39,6 +42,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.addOptions("build_options", cli_options);
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the CLI");
@@ -55,6 +59,16 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const cli_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "z_oci", .module = mod },
+        },
+    }) });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+
     const workflow_smoke_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/workflow_smoke.zig"),
         .target = target,
@@ -68,6 +82,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_workflow_smoke_tests.step);
 
     const security_check = b.addExecutable(.{

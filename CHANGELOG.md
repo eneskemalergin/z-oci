@@ -5,47 +5,59 @@ All notable changes to z-oci are documented here. The format follows [Keep a Cha
 
 Versions listed here may be prepared ahead of the matching git tag. Tags follow once the release is cut.
 
-## [Unreleased]
+## [0.7.0] - Unreleased
+
+This release collects the public API and executable foundations added after v0.6.0. The resolver-backed CLI commands remain pending; the executable currently provides deterministic argument parsing, help, version, and usage handling.
 
 ### Added
 
 - Public `Config.credential_sources` for caller-injected environment maps, Docker config JSON (or environ file load), process Io for credential helpers, and optional `helper_runner` override. Wired through `resolve`, `validate`, `getManifest`, and `resolveMany`. Default remains provider-only / anonymous with no hidden process reads.
+- Public `inspect` entry point for fetching top-level manifests and multi-arch documents, with optional selected-leaf data and explicit `InspectionResult.deinit()` ownership.
+- Executable command parsing for `resolve`, `validate`, and `inspect`, including global and command options, digest-pinned validation, platform selection syntax, deterministic usage failures, and standalone help and version output.
+- Build-time version wiring from `build.zig.zon` to the executable, keeping the package metadata as the single version source.
 
 ### Changed
 
 - README and auth docs describe the live public credential contract truthfully: env / Docker / helpers require `credential_sources` injection.
+- The executable build now installs the CLI process adapter and runs its parser and output tests as part of the default test step.
 
 ## [0.6.0] - 2026-07-13 - [Tagged]
 
-Integration and compatibility verification on top of the v0.5.0 client: deeper offline coverage, a local mock registry peer for the real HTTP client path, optional `registry:2`, and documented registry compatibility coverage. Resolve and auth stay on the shipped seams unless compat testing finds a defect.
+v0.6.0 is the compatibility release. It takes the v0.5.0 client through deeper offline checks, real `std.http.Client` registry scenarios, and an opt-in `registry:2` harness, then records what the client covers across common registry implementations. The resolver and auth architecture stay on their existing seams while the release hardens the ownership and failure paths around them.
 
 ### Added
 
-- Offline parser coverage: Manifest empty/truncated exact-error cases and fixed-seed fuzz; Index empty-list and empty/truncated exact-error cases plus Docker manifest-list fuzz; resilience conflicting `Retry-After` fixture wired; auth empty/trailing-junk authenticate-header cases.
-- Public-path `ResolveError` matrix: `getManifest` covers all 13 variants; `validate` covers 11/13 with documented skips plus a digest-pinned `digest_mismatch` proof.
-- Credential-helper hang timeout keyed from `Config.read_timeout_ms`; helper failure stays terminal when `credHelpers` is set; `max_retries` does not gate token rate-limit retries.
-- `pingRegistry` probes `https://{registry}/v2/` for anonymous reachability or auth-required; independent of resolve.
-- In-process loopback mock registry peer for offline tests that drive a real `std.http.Client` (not a public product API).
-- Mock hard-case coverage against a real `std.http.Client`: bearer auth, redirect keep/strip, content-type/digest/size errors, multi-arch, depth limit, 429/503 retry, and ping status classification.
-- Opt-in local `registry:2` harness (`zig build integration-registry`): resolve by tag and digest, validate missing -> `not_found`. Clear-fails when Docker is absent; never part of `zig build test`.
-- `security-check` scans `integration/` and flags non-placeholder Docker `auths` embedded in `.zig` sources.
-- Registry compatibility coverage in README (Hub, GHCR, Quay, generic bearer, loopback `registry:2`; fixtures, mocks, opt-in harness, and live commands).
-- Offline test coverage for mock/ping/loopback edge cases and ownership invariants.
-- Integration-style offline checks: public `resolveMany` pin-list, ping-then-resolve caller flow, and batch failure ownership on a loopback mock peer; recorded `registry:2` recipe in `integration/registry2/README.md`.
+- **Registry access and inspection**
+  - `pingRegistry` probes `https://{registry}/v2/` for anonymous reachability or auth-required, independently of resolve.
+  - An in-process loopback mock registry peer drives a real `std.http.Client` through offline tests without becoming part of the public product API.
+  - Mock hard-case coverage exercises bearer auth, redirect keep/strip, content-type, digest, body-size, multi-arch, depth-limit, 429/503 retry, and ping status behavior.
+  - An opt-in local `registry:2` harness (`zig build integration-registry`) resolves tags and digests and validates a missing reference as `not_found`. It clear-fails when Docker is absent and never runs as part of `zig build test`.
+- **Parser, resolver, and ownership coverage**
+  - Offline parser coverage adds Manifest empty/truncated exact-error cases and fixed-seed fuzzing; Index empty-list and empty/truncated exact-error cases plus Docker manifest-list fuzzing; a conflicting `Retry-After` resilience fixture; and empty/trailing-junk authentication-header cases.
+  - The public-path `ResolveError` matrix covers all 13 variants in `getManifest`, and 11/13 in `validate` with documented skips plus a digest-pinned `digest_mismatch` proof.
+  - Offline tests cover mock, ping, and loopback edge cases and ownership invariants.
+  - Integration-style offline checks cover the public `resolveMany` pin-list, the ping-then-resolve caller flow, and batch failure ownership on a loopback mock peer.
+- **Authentication, resilience, and security**
+  - Credential-helper hangs use the `Config.read_timeout_ms` timeout; helper failure remains terminal when `credHelpers` is set; and `max_retries` does not gate token rate-limit retries.
+  - `security-check` scans `integration/` and flags non-placeholder Docker `auths` embedded in `.zig` sources.
 
 ### Changed
 
-- The `testing` namespace re-exports the in-process mock peer for callers writing integration tests.
-- Ping URL ownership is centralized in `pingRegistryWithExchanger`; exchangers borrow the probe URL only.
-- README and CONTRIBUTING list the same build steps as the repository gate (`security-check`, `integration-registry`, bundled toolchain, `fmt --check`).
-- v0.6.0 documentation now points at `benchmarks/baselines/v0.6.0.json` and `benchmarks/baselines/v0.6.0-debug-counting.txt` as current comparison snapshots.
+- **Public testing and documentation**
+  - The `testing` namespace re-exports the in-process mock peer for callers writing integration tests.
+  - README documents registry compatibility across Hub, GHCR, Quay, generic bearer registries, and loopback `registry:2`, including fixtures, mocks, the opt-in harness, and live commands.
+  - README and CONTRIBUTING list the same build steps as the repository gate: `security-check`, `integration-registry`, the bundled toolchain, and `fmt --check`.
+  - v0.6.0 documentation points at `benchmarks/baselines/v0.6.0.json` and `benchmarks/baselines/v0.6.0-debug-counting.txt` as the current comparison snapshots.
+  - The recorded `registry:2` recipe lives in `integration/registry2/README.md`.
 
 ### Fixed
 
-- Live manifest redirect follow rewrites loopback `https://` Locations to cleartext before the keep-authorization origin compare, so same-origin bearer auth is not stripped on local mock peers.
-- Cross-module workflow tests: `deinitResolveOutcome` tears down success and failure paths; arena-backed preemptive rate-limit smoke skips double-free on success.
-- `pingRegistryWithExchanger` owns the probe URL buffer; ping exchangers borrow only (prevents double-free when mock exchangers also freed the URL).
-- Docker credential-helper timeout path relies on `defer child.kill` for reap (removed redundant kill on timeout).
+- **Registry and authentication safety**
+  - Live manifest redirect follow rewrites loopback `https://` Locations to cleartext before the keep-authorization origin comparison, so same-origin bearer auth is not stripped on local mock peers.
+  - `pingRegistryWithExchanger` owns the probe URL buffer while ping exchangers borrow it, preventing a double-free when mock exchangers also release the URL.
+  - The Docker credential-helper timeout path relies on `defer child.kill` for reap and no longer kills the child redundantly on timeout.
+- **Workflow ownership**
+  - Cross-module workflow tests now tear down success and failure paths through `deinitResolveOutcome`; arena-backed pre-emptive rate-limit smoke avoids double-free on success.
 
 ### Verified
 
