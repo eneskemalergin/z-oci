@@ -30,7 +30,8 @@
 //!   process Io for helpers). Public resolve applies these; no hidden getenv
 //!   or helper spawn. `*WithEngine` leaves wiring to the caller.
 //! Tokens and passwords exist in memory for the auth/resolve session. Owned bearer
-//! bytes, helper stdout secrets, and POST bodies are zeroed before free.
+//! bytes, Docker config JSON, helper stdout/stderr, sensitive JSON parser arenas,
+//! and POST bodies are zeroed before raw allocator release.
 //! `ResolveError` payloads carry registry, reference, and HTTP status only; do not
 //! log them expecting embedded secrets.
 //! Token cache entries are bounded by `Config.max_token_cache_entries` and cleared on
@@ -42,7 +43,6 @@ const Config = ConfigModule.Config;
 const CredentialHandle = ConfigModule.CredentialHandle;
 const CredentialProvider = ConfigModule.CredentialProvider;
 const Reference = @import("Reference.zig");
-const json = @import("json.zig");
 const resilience = @import("resilience.zig");
 const testing_loopback = @import("testing_loopback.zig");
 
@@ -82,7 +82,7 @@ pub const TokenHttpRequest = struct {
     body: ?[]u8 = null,
     max_response_body_bytes: usize = ConfigModule.DEFAULT_MAX_TOKEN_RESPONSE_BYTES,
 
-    /// `secureZero`s authorization/body before free.
+    /// `secureZero`s authorization/body before raw allocator release.
     pub fn deinit(self: TokenHttpRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
         freeOwnedOptionalSecretSlice(allocator, self.authorization);
@@ -102,8 +102,7 @@ pub const TokenExchangeResponse = struct {
             resilience.deinitOwnedHttpHeaders(allocator, headers);
         }
         const owned_body = self.owned_body orelse return;
-        std.crypto.secureZero(u8, owned_body);
-        allocator.free(owned_body);
+        secureFree(allocator, owned_body);
     }
 };
 /// Takes ownership of `request`; must `request.deinit` on every path. Engine does not.
@@ -156,12 +155,10 @@ pub const TokenResponse = struct {
     /// Zeroes and frees owned access/refresh bytes only.
     pub fn deinit(self: *TokenResponse, allocator: std.mem.Allocator) void {
         if (self.owns_access_token) {
-            std.crypto.secureZero(u8, @constCast(self.access_token.value));
-            allocator.free(self.access_token.value);
+            secureFree(allocator, @constCast(self.access_token.value));
         }
         if (self.refresh_token) |refresh_token| {
-            std.crypto.secureZero(u8, @constCast(refresh_token));
-            allocator.free(refresh_token);
+            secureFree(allocator, @constCast(refresh_token));
         }
     }
 };
@@ -235,8 +232,7 @@ pub const CachedToken = struct {
     }
 
     pub fn deinit(self: *CachedToken, allocator: std.mem.Allocator) void {
-        std.crypto.secureZero(u8, @constCast(self.token.value));
-        allocator.free(self.token.value);
+        secureFree(allocator, @constCast(self.token.value));
     }
 };
 /// Configuration values used by auth.
@@ -467,8 +463,7 @@ pub const AuthEngine = struct {
             else => return false,
         };
         defer {
-            std.crypto.secureZero(u8, docker_config_json);
-            self.allocator.free(docker_config_json);
+            secureFree(self.allocator, docker_config_json);
         }
 
         try self.setDockerConfigBytes(docker_config_json);
@@ -515,8 +510,7 @@ pub const AuthEngine = struct {
             return err;
         };
         if (token_response.refresh_token) |refresh_token| {
-            std.crypto.secureZero(u8, @constCast(refresh_token));
-            self.allocator.free(refresh_token);
+            secureFree(self.allocator, @constCast(refresh_token));
             token_response.refresh_token = null;
         }
         return cached_response;
@@ -870,8 +864,7 @@ pub fn buildBasicAuthorizationAlloc(allocator: std.mem.Allocator, credential: Co
     const joined_len = credential.username.len + 1 + credential.secret.len;
     const joined = try allocator.alloc(u8, joined_len);
     defer {
-        std.crypto.secureZero(u8, joined);
-        allocator.free(joined);
+        secureFree(allocator, joined);
     }
     @memcpy(joined[0..credential.username.len], credential.username);
     joined[credential.username.len] = ':';
@@ -952,8 +945,7 @@ pub fn liveTokenHttpExchanger(
 
     const owned_body = resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return mapLiveTokenTransportError(err);
     errdefer {
-        std.crypto.secureZero(u8, owned_body);
-        allocator.free(owned_body);
+        secureFree(allocator, owned_body);
     }
 
     const owned_headers = try resilience_headers.toOwnedSlice(allocator);
@@ -966,31 +958,30 @@ pub fn liveTokenHttpExchanger(
     };
 }
 pub fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) AuthError!TokenResponse {
-    const parsed = json.parse(ParsedTokenBody, allocator, body) catch |err| switch (err) {
+    var parsed = parseSensitiveJson(ParsedTokenBody, allocator, body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidTokenResponse,
     };
     defer parsed.deinit();
 
-    const token_value = tokenValueFromParsedBody(parsed.value) orelse return error.InvalidTokenResponse;
+    const token_value = tokenValueFromParsedBody(parsed.parsed.value) orelse return error.InvalidTokenResponse;
     if (token_value.len == 0) return error.InvalidTokenResponse;
 
-    const expires_in_seconds: ?u64 = if (parsed.value.expires_in) |expires_in| blk: {
+    const expires_in_seconds: ?u64 = if (parsed.parsed.value.expires_in) |expires_in| blk: {
         if (expires_in == 0 or expires_in > std.math.maxInt(u32)) return error.InvalidTokenResponse;
         break :blk expires_in;
     } else null;
 
-    if (parsed.value.refresh_token) |refresh_token| {
+    if (parsed.parsed.value.refresh_token) |refresh_token| {
         if (refresh_token.len == 0) return error.InvalidTokenResponse;
     }
 
     const access_token_value = try allocator.dupe(u8, token_value);
     errdefer {
-        std.crypto.secureZero(u8, access_token_value);
-        allocator.free(access_token_value);
+        secureFree(allocator, access_token_value);
     }
 
-    const owned_refresh_token = if (parsed.value.refresh_token) |refresh_token|
+    const owned_refresh_token = if (parsed.parsed.value.refresh_token) |refresh_token|
         try allocator.dupe(u8, refresh_token)
     else
         null;
@@ -1054,14 +1045,21 @@ pub fn parseAuthenticateHeader(raw: []const u8) AuthError!AuthChallenge {
     return error.UnsupportedAuthenticateScheme;
 }
 
-/// `secureZero` then free when present.
+/// `secureZero` then releases the allocation through the allocator's raw-free
+/// hook when present. `allocator.free` is intentionally not used after zeroing
+/// because Zig 0.16 may overwrite freed bytes with undefined data.
 pub fn freeOwnedOptionalSecretSlice(allocator: std.mem.Allocator, bytes: ?[]u8) void {
     const slice = bytes orelse return;
-    std.crypto.secureZero(u8, slice);
+    secureFree(allocator, slice);
+}
+
+fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
+    if (bytes.len == 0) return;
+    std.crypto.secureZero(u8, bytes);
     if (builtin.is_test) {
-        for (slice) |byte| std.debug.assert(byte == 0);
+        for (bytes) |byte| std.debug.assert(byte == 0);
     }
-    allocator.free(slice);
+    allocator.rawFree(bytes, .of(u8), @returnAddress());
 }
 const DOCKER_CONFIG_FILE_SIZE_LIMIT = 1024 * 1024;
 const DOCKER_HELPER_STDOUT_LIMIT = 64 * 1024;
@@ -1098,7 +1096,7 @@ const DockerConfig = struct {
     helper_suffix_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     fn deinit(self: *DockerConfig, allocator: std.mem.Allocator) void {
-        allocator.free(self.owned_json);
+        secureFree(allocator, self.owned_json);
 
         for (self.registry_entries.items) |entry| entry.deinit(allocator);
         self.registry_entries.deinit(allocator);
@@ -1111,8 +1109,7 @@ const DockerConfig = struct {
         while (auth_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
             allocator.free(entry.value_ptr.username);
-            std.crypto.secureZero(u8, @constCast(entry.value_ptr.secret));
-            allocator.free(entry.value_ptr.secret);
+            secureFree(allocator, @constCast(entry.value_ptr.secret));
         }
         self.auth_cache.deinit(allocator);
 
@@ -1142,13 +1139,12 @@ const DockerConfig = struct {
         if (self.auth_cache.get(cache_key)) |cached| return cached;
 
         const encoded_auth = try self.authEncodedForRegistry(allocator, registry) orelse return null;
-        defer allocator.free(encoded_auth);
+        defer secureFree(allocator, @constCast(encoded_auth));
 
         const credential = try decodeDockerConfigAuthCredential(allocator, encoded_auth);
         errdefer {
             allocator.free(@constCast(credential.username));
-            std.crypto.secureZero(u8, @constCast(credential.secret));
-            allocator.free(@constCast(credential.secret));
+            secureFree(allocator, @constCast(credential.secret));
         }
 
         const owned_key = try allocator.dupe(u8, cache_key);
@@ -1266,6 +1262,82 @@ const ParsedTokenBody = struct {
     expires_in: ?u64 = null,
     refresh_token: ?[]const u8 = null,
 };
+const SensitiveJsonAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *SensitiveJsonAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *SensitiveJsonAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        const self: *SensitiveJsonAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        const self: *SensitiveJsonAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *SensitiveJsonAllocator = @ptrCast(@alignCast(ctx));
+        std.crypto.secureZero(u8, memory);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+fn SensitiveJsonParsed(comptime T: type) type {
+    return struct {
+        parsed: std.json.Parsed(T),
+        secure_allocator: *SensitiveJsonAllocator,
+        allocator: std.mem.Allocator,
+
+        fn deinit(self: *@This()) void {
+            self.parsed.deinit();
+            self.allocator.destroy(self.secure_allocator);
+        }
+    };
+}
+fn parseSensitiveJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !SensitiveJsonParsed(T) {
+    const secure_allocator = try allocator.create(SensitiveJsonAllocator);
+    secure_allocator.* = .{ .child = allocator };
+    errdefer allocator.destroy(secure_allocator);
+
+    const parsed = try std.json.parseFromSlice(T, secure_allocator.allocator(), bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+
+    return .{
+        .parsed = parsed,
+        .secure_allocator = secure_allocator,
+        .allocator = allocator,
+    };
+}
 const TokenCacheMap = std.HashMapUnmanaged(TokenCacheKey, CachedToken, TokenCacheKeyHash, 80);
 const TokenCacheKeyHash = struct {
     pub fn hash(_: @This(), key: TokenCacheKey) u64 {
@@ -1481,7 +1553,7 @@ fn dockerConfigStringFromScannerToken(allocator: std.mem.Allocator, token: std.j
     switch (token) {
         .string => |value| return try allocator.dupe(u8, value),
         .allocated_string => |value| {
-            defer std.heap.page_allocator.free(value);
+            defer secureFree(std.heap.page_allocator, @constCast(value));
             return try allocator.dupe(u8, value);
         },
         else => {
@@ -1554,8 +1626,7 @@ fn decodeDockerConfigAuthCredential(
     const decoded_len = decoder.calcSizeForSlice(encoded_auth) catch return error.InvalidDockerConfig;
     const decoded_auth = try allocator.alloc(u8, decoded_len);
     defer {
-        std.crypto.secureZero(u8, decoded_auth);
-        allocator.free(decoded_auth);
+        secureFree(allocator, decoded_auth);
     }
 
     decoder.decode(decoded_auth, encoded_auth) catch return error.InvalidDockerConfig;
@@ -1567,8 +1638,7 @@ fn decodeDockerConfigAuthCredential(
     errdefer allocator.free(username);
     const secret = try allocator.dupe(u8, decoded[separator_index + 1 ..]);
     errdefer {
-        std.crypto.secureZero(u8, secret);
-        allocator.free(secret);
+        secureFree(allocator, secret);
     }
 
     return .{
@@ -1707,12 +1777,13 @@ fn runDockerCredentialHelperCommand(
 
     const stdout_contents = try multi_reader.toOwnedSlice(0);
     defer {
-        std.crypto.secureZero(u8, stdout_contents);
-        allocator.free(stdout_contents);
+        secureFree(allocator, stdout_contents);
     }
 
     const stderr_contents = try multi_reader.toOwnedSlice(1);
-    defer allocator.free(stderr_contents);
+    defer {
+        secureFree(allocator, stderr_contents);
+    }
 
     switch (term) {
         .exited => |code| if (code != 0) return error.HelperFailed,
@@ -1725,11 +1796,11 @@ fn parseDockerCredentialHelperResponse(
     allocator: std.mem.Allocator,
     helper_stdout: []const u8,
 ) AuthError!CredentialHandle {
-    const parsed = json.parse(ParsedDockerCredentialHelperResponse, allocator, helper_stdout) catch return error.HelperFailed;
+    var parsed = parseSensitiveJson(ParsedDockerCredentialHelperResponse, allocator, helper_stdout) catch return error.HelperFailed;
     defer parsed.deinit();
 
-    const username = parsed.value.Username orelse return error.HelperFailed;
-    const secret = parsed.value.Secret orelse return error.HelperFailed;
+    const username = parsed.parsed.value.Username orelse return error.HelperFailed;
+    const secret = parsed.parsed.value.Secret orelse return error.HelperFailed;
     if (username.len == 0 or secret.len == 0) return error.HelperFailed;
 
     return ownedCredentialHandle(allocator, username, secret);
@@ -1744,8 +1815,7 @@ fn ownedCredentialHandle(
 
     const owned_secret = try allocator.dupe(u8, secret);
     errdefer {
-        std.crypto.secureZero(u8, owned_secret);
-        allocator.free(owned_secret);
+        secureFree(allocator, owned_secret);
     }
 
     return .{
@@ -2379,6 +2449,33 @@ test "AuthEngine.credentialForRegistry: precedence matrix" {
         try std.testing.expectEqualStrings("env-token", handle.credential.secret);
     }
 }
+
+const NoFreeFixed = struct {
+    fn free(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {}
+};
+
+fn noFreeFixedAllocator(fixed: *std.heap.FixedBufferAllocator) std.mem.Allocator {
+    return .{
+        .ptr = fixed,
+        .vtable = &.{
+            .alloc = std.heap.FixedBufferAllocator.alloc,
+            .resize = std.heap.FixedBufferAllocator.resize,
+            .remap = std.heap.FixedBufferAllocator.remap,
+            .free = NoFreeFixed.free,
+        },
+    };
+}
+
+fn countByteSliceOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (std.mem.findPos(u8, haystack, offset, needle)) |position| {
+        count += 1;
+        offset = position + needle.len;
+    }
+    return count;
+}
+
 // --- Docker config parsing and lookup ---
 
 test "parseDockerConfig: lookup, helpers, and alias matrix" {
@@ -2415,6 +2512,79 @@ test "parseDockerConfig: lookup, helpers, and alias matrix" {
     const mixed_case_auth = (try case_insensitive.authCredentialForRegistry(std.testing.allocator, "ghcr.io")).?;
     try std.testing.expectEqualStrings("octocat", mixed_case_auth.username);
 }
+
+test "DockerConfig.deinit: zeroes retained raw JSON before free" {
+    var storage: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = noFreeFixedAllocator(&fixed);
+    const docker_config_json =
+        \\{
+        \\  "auths": {
+        \\    "ghcr.io": {
+        \\      "auth": "dXNlcjpzZWNyZXQ="
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var docker_config = try parseDockerConfig(allocator, docker_config_json);
+    const retained_json = docker_config.owned_json;
+    try std.testing.expect(std.mem.indexOf(u8, retained_json, "dXNlcjpzZWNyZXQ=") != null);
+
+    docker_config.deinit(allocator);
+    for (retained_json) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "DockerConfig.authCredentialForRegistry: zeroes encoded auth temporary" {
+    var storage: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = noFreeFixedAllocator(&fixed);
+    const encoded_auth = "dXNlcjpzZWNyZXQ=";
+    const docker_config_json =
+        "{\"auths\":{\"ghcr.io\":{\"auth\":\"" ++ encoded_auth ++ "\"}}}";
+
+    var docker_config = try parseDockerConfig(allocator, docker_config_json);
+    defer docker_config.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), countByteSliceOccurrences(&storage, encoded_auth));
+
+    const credential = (try docker_config.authCredentialForRegistry(allocator, "ghcr.io")).?;
+
+    try std.testing.expectEqualStrings("user", credential.username);
+    try std.testing.expectEqualStrings("secret", credential.secret);
+    try std.testing.expectEqual(@as(usize, 1), countByteSliceOccurrences(&storage, encoded_auth));
+}
+
+test "parseTokenResponse: zeroes sensitive JSON parser arena" {
+    var storage: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = noFreeFixedAllocator(&fixed);
+    const body = "{\"access_token\":\"sensitive-token\",\"refresh_token\":\"sensitive-refresh\"}";
+
+    {
+        var response = try parseTokenResponse(allocator, body);
+        defer response.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, &storage, "sensitive-token") != null);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, &storage, "sensitive-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, &storage, "sensitive-refresh") == null);
+}
+
+test "parseDockerCredentialHelperResponse: zeroes sensitive JSON parser arena" {
+    var storage: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = noFreeFixedAllocator(&fixed);
+    const body = "{\"Username\":\"helper-user\",\"Secret\":\"helper-secret\"}";
+
+    {
+        var handle = try parseDockerCredentialHelperResponse(allocator, body);
+        defer handle.release();
+        try std.testing.expect(std.mem.indexOf(u8, &storage, "helper-secret") != null);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, &storage, "helper-secret") == null);
+}
+
 test "AuthEngine.applyCredentialSources: env, docker bytes, incomplete load, and invalid JSON" {
     const allocator = std.testing.allocator;
 
@@ -4828,8 +4998,7 @@ test "auth: allocation failures do not leak across core paths" {
             const credential = try decodeDockerConfigAuthCredential(allocator, "b2N0b2NhdDpnaHBfZXhhbXBsZQ==");
             defer {
                 allocator.free(@constCast(credential.username));
-                std.crypto.secureZero(u8, @constCast(credential.secret));
-                allocator.free(@constCast(credential.secret));
+                secureFree(allocator, @constCast(credential.secret));
             }
 
             var docker_config = try parseDockerConfig(allocator, docker_config_json);
