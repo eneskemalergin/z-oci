@@ -7,7 +7,7 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [0.7.0] - Unreleased
 
-This release collects the public API and executable work added after v0.6.0. The executable now includes live `resolve`, digest-only `validate`, and metadata `inspect` commands on top of the public resolver.
+This unreleased version collects the public API and executable work added after v0.6.0. The executable includes live `resolve`, digest-only `validate`, and metadata `inspect` commands on top of the public resolver.
 
 ### Added
 
@@ -23,7 +23,14 @@ This release collects the public API and executable work added after v0.6.0. The
 
 - README and auth docs describe the live public credential contract truthfully: env / Docker / helpers require `credential_sources` injection.
 - The executable build now installs the CLI process adapter and runs its parser and output tests as part of the default test step.
-- The process adapter now owns bounded standard-output writers and one caller-owned HTTP client, projects process credential sources explicitly, applies custom CA and helper-timeout settings through `Config`, and maps pre-flight configuration failures to stable CLI output.
+- The process adapter now owns bounded standard-output writers and one command-scoped HTTP client, projects process credential sources explicitly, applies custom CA and helper-timeout settings through `Config`, and maps pre-flight configuration failures to stable CLI output.
+
+### Verified
+
+- `./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes: 37/37 build steps, 417/417 tests, CLI smoke, examples smoke, workflow smoke, and security check.
+- Standalone `workflow-smoke`, `examples-smoke`, `security-check`, `cli-smoke`, and `bench` steps pass.
+- `./zig-0.16.0/zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/` passes.
+- Linux `ReleaseFast` and `ReleaseSmall` installs contain one statically linked `z-oci` executable with no dynamic-library dependency. Example and benchmark executables remain separate artifacts.
 
 ## [0.6.0] - 2026-07-13 - [Tagged]
 
