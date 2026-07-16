@@ -2170,8 +2170,8 @@ const AuthTestHarness = struct {
         \\}
     ;
 
-    fn tmpHomePath(tmp: std.testing.TmpDir) ![]const u8 {
-        return std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    fn tmpHomePath(tmp: std.testing.TmpDir) ![:0]u8 {
+        return tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     }
 
     fn writeDockerConfigAt(

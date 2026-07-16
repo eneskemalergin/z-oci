@@ -1,10 +1,15 @@
-//! z-oci executable process adapter.
+//! z-oci executable entry point and process adapter.
 //!
-//! This module owns process arguments, standard-output writers, the caller-owned
-//! HTTP client, and projection of process state into the public resolver
-//! configuration. The `resolve`, `validate`, and `inspect` commands invoke the
-//! public resolver and route owned results or failures through the executable
-//! renderers.
+//! `main` handles process arguments, bounded standard-output and standard-error
+//! writers, one command-scoped HTTP client, and projection of process state into
+//! the public resolver configuration. Help, version, and usage failures return
+//! before client setup or credential lookup.
+//!
+//! The `resolve`, `validate`, and `inspect` commands call the existing public
+//! resolver APIs. The adapter projects explicit credential sources, custom CA
+//! configuration, and credential-helper timeout settings, then routes owned
+//! results and failures through the executable renderers. It deinitializes the
+//! client and command results before returning the mapped process exit code.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -362,7 +367,7 @@ fn configFromProcess(
     return config;
 }
 
-test "process config projection preserves defaults and injects process sources" {
+test "process adapter projects options and process sources into Config" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
     try environ_map.put("DOCKER_CONFIG", "config.json");
@@ -393,7 +398,7 @@ test "process config projection preserves defaults and injects process sources" 
     try std.testing.expectEqual(defaults.max_token_cache_entries, config.max_token_cache_entries);
 }
 
-test "process config projection keeps default values when options are absent" {
+test "process adapter preserves Config defaults without optional options" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
 
@@ -628,7 +633,7 @@ const TestClock = struct {
     }
 };
 
-test "process command writer failure releases parsed command" {
+test "process adapter releases parsed command when output fails" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
@@ -647,7 +652,7 @@ test "process command writer failure releases parsed command" {
     );
 }
 
-test "process command allocation failure releases partial reference" {
+test "process adapter releases partial reference on allocation failure" {
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
     defer environ_map.deinit();
 
@@ -1293,7 +1298,7 @@ test "inspect command writer failure releases returned documents" {
     );
 }
 
-test "process configuration preflight remains active for parsed non-resolve commands" {
+test "process adapter keeps configuration preflight active for parsed commands" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var environ_map = std.process.Environ.Map.init(std.testing.allocator);
