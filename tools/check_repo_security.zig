@@ -41,6 +41,7 @@ const SCAN_ROOTS = [_][]const u8{
     "fixtures",
     "src",
     "examples",
+    "docs",
     "benchmarks",
     "tools",
     "integration",
