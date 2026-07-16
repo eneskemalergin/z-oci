@@ -1794,7 +1794,7 @@ test "workflow smoke: public path load_docker_config_from_environ supplies Basic
         try file_writer.interface.writeAll(ghcr_config_json);
         try file_writer.interface.flush();
     }
-    const home_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp_dir.sub_path[0..] });
+    const home_dir = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(home_dir);
 
     var environ_map = std.process.Environ.Map.init(allocator);

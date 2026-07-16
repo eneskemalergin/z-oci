@@ -3,7 +3,7 @@
 //! Used by `root.zig` and `workflow_smoke.zig` so scenario wiring stays
 //! in one place.
 //!
-//! Test conventions (Q10): per-test mock structs are named `MockHarness`;
+//! Test conventions: per-test mock structs are named `MockHarness`;
 //! scenario tests use AAA spacing (blank lines between arrange, act, assert).
 
 const std = @import("std");

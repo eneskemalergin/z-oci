@@ -6248,6 +6248,303 @@ test "inspectWithExchangers: keeps the outer index while selecting through a nes
     }
 }
 
+test "mock registry core: inspect loopback matrix preserves document and failure contracts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const oci_leaf_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:{s}\",\"size\":123}},\"layers\":[]}}",
+        .{ MediaType.oci_manifest_v1.toString(), "a" ** 64 },
+    );
+    defer allocator.free(oci_leaf_body);
+    const oci_leaf_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, oci_leaf_body);
+    defer allocator.free(oci_leaf_digest);
+    const oci_index_body = try buildIndexBodyAlloc(
+        allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_manifest_v1.toString(),
+        oci_leaf_digest,
+        "linux",
+        "amd64",
+    );
+    defer allocator.free(oci_index_body);
+    const oci_index_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, oci_index_body);
+    defer allocator.free(oci_index_digest);
+    const nested_index_body = try buildIndexBodyAlloc(
+        allocator,
+        MediaType.oci_index_v1.toString(),
+        MediaType.oci_index_v1.toString(),
+        oci_index_digest,
+        "linux",
+        "amd64",
+    );
+    defer allocator.free(nested_index_body);
+    const nested_index_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, nested_index_body);
+    defer allocator.free(nested_index_digest);
+
+    const docker_leaf_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"digest\":\"sha256:{s}\",\"size\":456}},\"layers\":[]}}",
+        .{ MediaType.docker_manifest_v2.toString(), "b" ** 64 },
+    );
+    defer allocator.free(docker_leaf_body);
+    const docker_leaf_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, docker_leaf_body);
+    defer allocator.free(docker_leaf_digest);
+    const docker_list_body = try buildIndexBodyAlloc(
+        allocator,
+        MediaType.docker_manifest_list_v2.toString(),
+        MediaType.docker_manifest_v2.toString(),
+        docker_leaf_digest,
+        "linux",
+        "amd64",
+    );
+    defer allocator.free(docker_list_body);
+    const docker_list_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, docker_list_body);
+    defer allocator.free(docker_list_digest);
+
+    const malformed_body = try allocator.dupe(u8, "{}");
+    defer allocator.free(malformed_body);
+    const malformed_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, malformed_body);
+    defer allocator.free(malformed_digest);
+    const oversized_body = try allocator.alloc(u8, 64);
+    defer allocator.free(oversized_body);
+    @memset(oversized_body, 'x');
+    const oversized_digest = try mock_registry_peer.sha256DigestHeaderAlloc(allocator, oversized_body);
+    defer allocator.free(oversized_digest);
+
+    var depth_arena = std.heap.ArenaAllocator.init(allocator);
+    defer depth_arena.deinit();
+    const depth_allocator = depth_arena.allocator();
+    var depth_bodies: [6][]u8 = undefined;
+    var depth_digests: [6][]u8 = undefined;
+    depth_bodies[5] = try std.fmt.allocPrint(depth_allocator, "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[]}}", .{MediaType.oci_index_v1.toString()});
+    depth_digests[5] = try mock_registry_peer.sha256DigestHeaderAlloc(depth_allocator, depth_bodies[5]);
+    var depth_index: isize = 4;
+    while (depth_index >= 0) : (depth_index -= 1) {
+        const index: usize = @intCast(depth_index);
+        depth_bodies[index] = try buildIndexBodyAlloc(
+            depth_allocator,
+            MediaType.oci_index_v1.toString(),
+            MediaType.oci_index_v1.toString(),
+            depth_digests[index + 1],
+            "linux",
+            "amd64",
+        );
+        depth_digests[index] = try mock_registry_peer.sha256DigestHeaderAlloc(depth_allocator, depth_bodies[index]);
+    }
+
+    const Case = enum { single, oci_index, docker_list, nested, depth_limit, platform_miss, malformed, oversized };
+    const cases = [_]Case{ .single, .oci_index, .docker_list, .nested, .depth_limit, .platform_miss, .malformed, .oversized };
+    const MockHarness = struct {
+        case: Case,
+        oci_leaf_body: []const u8,
+        oci_leaf_digest: []const u8,
+        oci_index_body: []const u8,
+        oci_index_digest: []const u8,
+        nested_index_body: []const u8,
+        nested_index_digest: []const u8,
+        docker_leaf_body: []const u8,
+        docker_leaf_digest: []const u8,
+        docker_list_body: []const u8,
+        docker_list_digest: []const u8,
+        malformed_body: []const u8,
+        malformed_digest: []const u8,
+        oversized_body: []const u8,
+        oversized_digest: []const u8,
+        depth_bodies: []const []u8,
+        depth_digests: []const []u8,
+
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+
+            if (std.mem.eql(u8, target, "/v2/") or std.mem.eql(u8, target, "/v2")) {
+                try request.respond("{}", .{ .status = .ok, .keep_alive = false });
+                return;
+            }
+
+            const root_body: []const u8 = switch (self.case) {
+                .single => self.oci_leaf_body,
+                .oci_index, .platform_miss => self.oci_index_body,
+                .docker_list => self.docker_list_body,
+                .nested => self.nested_index_body,
+                .depth_limit => self.depth_bodies[0],
+                .malformed => self.malformed_body,
+                .oversized => self.oversized_body,
+            };
+            const root_digest: []const u8 = switch (self.case) {
+                .single => self.oci_leaf_digest,
+                .oci_index, .platform_miss => self.oci_index_digest,
+                .docker_list => self.docker_list_digest,
+                .nested => self.nested_index_digest,
+                .depth_limit => self.depth_digests[0],
+                .malformed => self.malformed_digest,
+                .oversized => self.oversized_digest,
+            };
+            const root_content_type: []const u8 = switch (self.case) {
+                .single => MediaType.oci_manifest_v1.toString(),
+                .oci_index, .platform_miss, .nested, .depth_limit => MediaType.oci_index_v1.toString(),
+                .docker_list => MediaType.docker_manifest_list_v2.toString(),
+                .malformed, .oversized => MediaType.oci_manifest_v1.toString(),
+            };
+            var root_path_buf: [128]u8 = undefined;
+            const root_path = try std.fmt.bufPrint(&root_path_buf, "/v2/library/alpine/manifests/latest", .{});
+            if (std.mem.eql(u8, target, root_path)) {
+                const headers = [_]std.http.Header{
+                    .{ .name = "Content-Type", .value = root_content_type },
+                    .{ .name = "Docker-Content-Digest", .value = root_digest },
+                };
+                try request.respond(root_body, .{ .status = .ok, .keep_alive = false, .extra_headers = &headers });
+                return;
+            }
+
+            if (self.case == .nested and std.mem.endsWith(u8, target, self.oci_index_digest)) {
+                const headers = [_]std.http.Header{
+                    .{ .name = "Content-Type", .value = MediaType.oci_index_v1.toString() },
+                    .{ .name = "Docker-Content-Digest", .value = self.oci_index_digest },
+                };
+                try request.respond(self.oci_index_body, .{ .status = .ok, .keep_alive = false, .extra_headers = &headers });
+                return;
+            }
+
+            if (self.case == .depth_limit) {
+                for (self.depth_digests, 0..) |digest, index| {
+                    if (std.mem.endsWith(u8, target, digest)) {
+                        const headers = [_]std.http.Header{
+                            .{ .name = "Content-Type", .value = MediaType.oci_index_v1.toString() },
+                            .{ .name = "Docker-Content-Digest", .value = digest },
+                        };
+                        try request.respond(self.depth_bodies[index], .{ .status = .ok, .keep_alive = false, .extra_headers = &headers });
+                        return;
+                    }
+                }
+            }
+
+            if ((self.case == .oci_index or self.case == .nested or self.case == .platform_miss) and std.mem.endsWith(u8, target, self.oci_leaf_digest)) {
+                const headers = [_]std.http.Header{
+                    .{ .name = "Content-Type", .value = MediaType.oci_manifest_v1.toString() },
+                    .{ .name = "Docker-Content-Digest", .value = self.oci_leaf_digest },
+                };
+                try request.respond(self.oci_leaf_body, .{ .status = .ok, .keep_alive = false, .extra_headers = &headers });
+                return;
+            }
+
+            if (self.case == .docker_list and std.mem.endsWith(u8, target, self.docker_leaf_digest)) {
+                const headers = [_]std.http.Header{
+                    .{ .name = "Content-Type", .value = MediaType.docker_manifest_v2.toString() },
+                    .{ .name = "Docker-Content-Digest", .value = self.docker_leaf_digest },
+                };
+                try request.respond(self.docker_leaf_body, .{ .status = .ok, .keep_alive = false, .extra_headers = &headers });
+                return;
+            }
+
+            try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
+        }
+    };
+
+    for (cases) |case| {
+        {
+            var harness = MockHarness{
+                .case = case,
+                .oci_leaf_body = oci_leaf_body,
+                .oci_leaf_digest = oci_leaf_digest,
+                .oci_index_body = oci_index_body,
+                .oci_index_digest = oci_index_digest,
+                .nested_index_body = nested_index_body,
+                .nested_index_digest = nested_index_digest,
+                .docker_leaf_body = docker_leaf_body,
+                .docker_leaf_digest = docker_leaf_digest,
+                .docker_list_body = docker_list_body,
+                .docker_list_digest = docker_list_digest,
+                .malformed_body = malformed_body,
+                .malformed_digest = malformed_digest,
+                .oversized_body = oversized_body,
+                .oversized_digest = oversized_digest,
+                .depth_bodies = &depth_bodies,
+                .depth_digests = &depth_digests,
+            };
+            const mock = try mock_registry_peer.MockRegistry.startWithHandler(allocator, io, 8, MockHarness.handle, &harness);
+            defer mock.deinit();
+
+            const ref_str = try std.fmt.allocPrint(allocator, "{s}/library/alpine:latest", .{mock.registry_host});
+            defer allocator.free(ref_str);
+            var ref = try Reference.parse(allocator, ref_str);
+            defer ref.deinit(allocator);
+            const platform: ?Platform = switch (case) {
+                .oci_index, .docker_list, .nested, .depth_limit => .{ .os = "linux", .architecture = "amd64" },
+                .platform_miss => .{ .os = "windows", .architecture = "amd64" },
+                .single, .malformed, .oversized => null,
+            };
+            const config: Config = if (case == .oversized) .{ .max_manifest_bytes = 16 } else .{};
+            var client = std.http.Client{ .allocator = allocator, .io = io };
+            defer client.deinit();
+            var outcome = try inspect(allocator, &client, config, ref, platform);
+
+            switch (case) {
+                .single => switch (outcome) {
+                    .success => |*result| {
+                        defer result.deinit();
+                        try std.testing.expectEqual(.manifest, std.meta.activeTag(result.top_level));
+                        try std.testing.expect(result.selected_leaf == null);
+                    },
+                    .failure => return error.TestUnexpectedResult,
+                },
+                .oci_index, .docker_list, .nested, .depth_limit => switch (outcome) {
+                    .success => |*result| {
+                        defer result.deinit();
+                        if (case == .depth_limit) return error.TestUnexpectedResult;
+                        try std.testing.expect(result.selected_leaf != null);
+                        if (case == .docker_list) {
+                            try std.testing.expectEqual(.docker_manifest_list, std.meta.activeTag(result.top_level));
+                        } else {
+                            try std.testing.expectEqual(.oci_index, std.meta.activeTag(result.top_level));
+                        }
+                    },
+                    .failure => |failure| {
+                        defer deinitResolveFailure(failure, allocator);
+                        if (case == .depth_limit) {
+                            try std.testing.expectEqual(.depth_limit_exceeded, std.meta.activeTag(failure));
+                        } else {
+                            return error.TestUnexpectedResult;
+                        }
+                    },
+                },
+                .platform_miss => switch (outcome) {
+                    .success => |*result| {
+                        result.deinit();
+                        return error.TestUnexpectedResult;
+                    },
+                    .failure => |failure| {
+                        defer deinitResolveFailure(failure, allocator);
+                        try std.testing.expectEqual(.platform_not_found, std.meta.activeTag(failure));
+                    },
+                },
+                .malformed => switch (outcome) {
+                    .success => |*result| {
+                        result.deinit();
+                        return error.TestUnexpectedResult;
+                    },
+                    .failure => |failure| {
+                        defer deinitResolveFailure(failure, allocator);
+                        try std.testing.expectEqual(.manifest_parse_error, std.meta.activeTag(failure));
+                    },
+                },
+                .oversized => switch (outcome) {
+                    .success => |*result| {
+                        result.deinit();
+                        return error.TestUnexpectedResult;
+                    },
+                    .failure => |failure| {
+                        defer deinitResolveFailure(failure, allocator);
+                        try std.testing.expectEqual(.response_too_large, std.meta.activeTag(failure));
+                    },
+                },
+            }
+        }
+    }
+}
+
 test "inspectWithExchangers: allocation failures release promoted documents" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {

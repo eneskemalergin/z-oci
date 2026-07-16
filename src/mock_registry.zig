@@ -210,8 +210,13 @@ fn anonymousManifestHandler(self: *MockRegistry, request: *http.Server.Request) 
         script.tag,
     });
     defer self.allocator.free(manifest_path);
+    const digest_path = try std.fmt.allocPrint(self.allocator, "/v2/{s}/manifests/{s}", .{
+        script.repository,
+        digest_header,
+    });
+    defer self.allocator.free(digest_path);
 
-    if (!std.mem.eql(u8, target, manifest_path)) {
+    if (!std.mem.eql(u8, target, manifest_path) and !std.mem.eql(u8, target, digest_path)) {
         try request.respond("not found", .{ .status = .not_found, .keep_alive = false });
         return;
     }

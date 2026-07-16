@@ -1,9 +1,10 @@
-//! Build graph for z-oci: library module, CLI executable, tests, examples, and bench.
+//! Build graph for z-oci: library, executable, tests, examples, and benchmarks.
 //!
 //! Primary steps:
-//! - `test`: library tests, executable tests, workflow smoke, security-check, and
-//!   `examples-smoke` (offline examples only; live `resolve-reference` is excluded).
-//! - `run`: installed CLI executable, currently providing usage text only.
+//! - `test`: library, executable, workflow, CLI smoke, example smoke, and security
+//!   checks (offline examples only; live `resolve-reference` is excluded).
+//! - `run`: installed `z-oci` executable with forwarded build arguments.
+//! - `cli-smoke`: installed `z-oci` help, version, usage, and stream checks.
 //! - `workflow-smoke`: offline workflow smoke tests only.
 //! - `examples`: build all packaged example programs.
 //! - `example-normalize-reference`, `example-inspect-manifest`, `example-select-platform`,
@@ -16,6 +17,7 @@
 //!   clear-fails if absent; never part of `test`).
 
 const std = @import("std");
+const package = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -27,7 +29,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The executable keeps a stable entrypoint while it currently provides usage text only.
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "package_version", package.version);
+
     const exe = b.addExecutable(.{
         .name = "z-oci",
         .root_module = b.createModule(.{
@@ -39,13 +43,44 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(exe);
+    exe.root_module.addOptions("build_options", cli_options);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
 
-    const run_step = b.step("run", "Run the CLI");
+    const run_step = b.step("run", "Run installed z-oci with forwarded arguments");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
+
+    const cli_smoke_step = b.step("cli-smoke", "Check installed z-oci process behavior");
+    addCliSmokeCase(cli_smoke_step, exe, &.{"--help"}, "Usage:\n  z-oci [global-options]", null, "", 0);
+    addCliSmokeCase(cli_smoke_step, exe, &.{"--version"}, null, b.fmt("z-oci {s}\n", .{package.version}), "", 0);
+    addCliSmokeCase(cli_smoke_step, exe, &.{ "resolve", "--help" }, "Usage:\n  z-oci resolve", null, "", 0);
+    addCliSmokeCase(cli_smoke_step, exe, &.{ "validate", "--help" }, "Usage:\n  z-oci validate", null, "", 0);
+    addCliSmokeCase(cli_smoke_step, exe, &.{ "inspect", "--help" }, "Usage:\n  z-oci inspect", null, "", 0);
+    addCliSmokeCase(cli_smoke_step, exe, &.{ "resolve", "--version" }, null, b.fmt("z-oci {s}\n", .{package.version}), "", 0);
+    addCliSmokeCase(cli_smoke_step, exe, &.{ "validate", "--version" }, null, b.fmt("z-oci {s}\n", .{package.version}), "", 0);
+    addCliSmokeCase(cli_smoke_step, exe, &.{ "inspect", "--version" }, null, b.fmt("z-oci {s}\n", .{package.version}), "", 0);
+    addCliSmokeCase(
+        cli_smoke_step,
+        exe,
+        &.{ "unknown", "ubuntu" },
+        "",
+        null,
+        "z-oci: usage error: code=unknown_command\nRun \"z-oci --help\" for help.\n",
+        5,
+    );
+    cli_smoke_step.dependOn(&install_exe.step);
+    addCliSmokeCase(
+        cli_smoke_step,
+        exe,
+        &.{ "resolve", "--format", "json" },
+        "",
+        null,
+        "z-oci: usage error: code=missing_argument\nRun \"z-oci resolve --help\" for help.\n",
+        5,
+    );
 
     // --- Tests ---
 
@@ -54,6 +89,16 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+
+    const cli_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "z_oci", .module = mod },
+        },
+    }) });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
 
     const workflow_smoke_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/workflow_smoke.zig"),
@@ -68,7 +113,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_workflow_smoke_tests.step);
+    test_step.dependOn(cli_smoke_step);
 
     const security_check = b.addExecutable(.{
         .name = "check-repo-security",
@@ -254,4 +301,24 @@ pub fn build(b: *std.Build) void {
         "Opt-in registry:2 interoperability (requires Docker; clear-fails if absent)",
     );
     integration_registry_step.dependOn(&run_registry2.step);
+}
+
+fn addCliSmokeCase(
+    step: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    args: []const []const u8,
+    stdout_match: ?[]const u8,
+    stdout_exact: ?[]const u8,
+    stderr: []const u8,
+    exit_code: u8,
+) void {
+    const run = std.Build.Step.Run.create(step.owner, "run cli-smoke case");
+    run.producer = exe;
+    run.addArtifactArg(exe);
+    run.addArgs(args);
+    run.expectExitCode(exit_code);
+    if (stdout_match) |match| run.expectStdOutMatch(match);
+    if (stdout_exact) |exact| run.expectStdOutEqual(exact);
+    run.expectStdErrEqual(stderr);
+    step.dependOn(&run.step);
 }

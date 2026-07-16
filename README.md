@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.6.0-8B5CF6?style=flat-square" alt="v0.6.0">
-    <img src="https://img.shields.io/badge/status-compat%20testing-2D7D46?style=flat-square" alt="Status: compat testing">
+    <img src="https://img.shields.io/badge/version-v0.7.0-8B5CF6?style=flat-square" alt="v0.7.0">
+    <img src="https://img.shields.io/badge/status-released-2D7D46?style=flat-square" alt="Status: released">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -19,115 +19,34 @@
 
 ---
 
-## What z-oci does
+## What is z-oci?
 
-z-oci is a read-only OCI registry client for Zig. Give it an image reference, and it can normalize the name, authenticate with the registry, fetch the manifest, verify the digest, and pick the right child manifest for a platform when the image is multi-arch. Everything is built on Zig 0.16 std with no external dependencies.
+z-oci is a read-only OCI and Docker Registry client for Zig. It parses image references, authenticates when configured, fetches manifests, verifies digests, and selects a platform from multi-arch images. It does not pull image layers.
 
-## What you can do today
+The current package and latest tagged release are `v0.7.0`.
 
-- Parse and normalize Docker and OCI image references, including tags, digests, Docker Hub defaults, and host-plus-port registries.
-- Resolve a tag to a pinned digest with `resolve`.
-- Resolve many references in one call with `resolveMany` (sequential, partial success, in-call tag cache).
-- Check whether a registry answers `/v2/` with `pingRegistry` (anonymous OK or auth required). Independent of resolve: resolve never calls ping.
-- Check whether a manifest exists with `validate`.
-- Fetch and parse a manifest with `getManifest`.
-- Follow OCI indexes and Docker manifest lists when you provide a target platform.
-- Run packaged examples for offline parsing, offline batch pinning, and live resolution.
-- Measure parser, auth, resolver, and batch costs with `z-oci-bench`.
+## Why z-oci?
 
-### Capabilities
+- Library-first: the CLI is a thin process adapter over the same public resolver API.
+- Explicit ownership: callers provide allocators and clients, and owned results have explicit teardown.
+- No hidden process state: environment variables, Docker configuration, and credential helpers are opt-in.
+- OCI-aware: references, manifests, indexes, platform selection, and digest verification share one resolver path.
+- Small dependency surface: Zig 0.16 and the standard library, with no external runtime dependencies.
+- Testable by design: injected HTTP, process I/O, clocks, and offline registry fixtures keep core behavior deterministic.
 
-- **Reference parsing**: normalize `ubuntu:22.04`, `ghcr.io/owner/repo@sha256:...`, `localhost:5000/myimage:dev`, and every other Docker/OCI reference form.
-- **OCI types**: `Digest`, `MediaType`, `Platform`, `Descriptor`, `Manifest`, `OciImageIndex`, `DockerManifestList`, and `MultiArchManifest`, all with JSON round-trip support.
-- **Auth engine**: Bearer token flow compatible with Docker Hub, GHCR, Quay, and self-hosted registries. Live auth starts from manifest `HEAD`/`GET` challenges (not a separate `/v2/` probe). It parses `WWW-Authenticate` headers, exchanges tokens, and caches tokens per scope with TTL expiry. Credentials on the public path come from an optional `Config.credential_provider` and optional caller-injected `Config.credential_sources` (environment map, Docker `config.json` bytes or file load, and process Io for credential helpers). Bare `Config{}` is anonymous: the library does not silently read the process environment or spawn helpers.
-- **Public resolver path**: `resolve`, `validate`, `getManifest`, and `resolveMany` perform live manifest fetches through Zig 0.16 `std.http.Client`, reuse the auth engine, verify manifest digests against pinned references and `Docker-Content-Digest`, follow OCI indexes and Docker manifest lists to a selected child manifest when a platform is provided, preserve the selected platform in `ResolveResult`, and enforce a maximum of four nested child levels. `resolveMany` is sequential over one shared client and auth engine; it does not parallelize registry traffic.
-- **Benchmarking**: `z-oci-bench` measures per-call timing and allocation counts using a counting allocator and [zebrac](https://github.com/eneskemalergin/zebrac) for statistical sampling.
+## Install
 
-### Memory and ownership
+Requirements: Zig **0.16.0** or later.
 
-Public results and persistent state use the allocator supplied by the caller and expose explicit teardown functions. Resolver operations use a transient arena for request, response, parsing, and intermediate multi-arch selection work; successful results and owned failures are promoted to the caller allocator before that arena is released. This provides bulk cleanup for short-lived work without forcing retained results to share an arena lifetime.
+### Use as a dependency
 
-- Call `ResolveResult.deinit(allocator)` for a successful resolve result.
-- Call `deinitResolveFailure(failure, allocator)` for a single-resolve failure.
-- Call `ResolveManyResult.deinit(allocator)` once for a batch result.
-- Call `Parsed(Manifest).deinit()` for a successful `getManifest` result.
-- Call `AuthEngine.deinit()` when a caller-owned authentication engine is no longer needed.
-
-Inputs such as `Reference` values and the caller-owned HTTP client remain caller-owned unless an API's ownership documentation says otherwise.
-
-### Current limitations
-
-- Multi-arch public calls without an explicit platform fail explicitly with `ResolveError.platform_required` instead of guessing a default child.
-- Per-request HTTP read/connect timeouts are not wired through `std.http.Client.request` on Zig 0.16 yet (`connect_timeout_ms` is exposed for caller-owned `connectTcpOptions` recipes; see `Config` docs and zig#31305).
-- Windows is not a supported host for live HTTPS registry traffic. Offline parsing works cross-platform; TLS to registries is validated on Linux and macOS only.
-- `pingRegistry` is a status probe. `200` reports anonymous reachability, `401` reports auth required, and everything else maps to `unexpected_status`. Redirects are not followed.
-- `resolve` does not call ping, and ping does not call resolve.
-- Live exchangers rewrite `https://` to cleartext `http://` only for loopback registry hosts (`127.0.0.1`, `localhost`, `::1`) so offline mock / local `registry:2` tests can use a real `std.http.Client`. Public hostnames stay HTTPS. There is no public Config switch for cleartext.
-- User-facing CLI commands built on top of the live resolver surface are still future work.
-- Environment variables, Docker `config.json`, and credential helpers are opt-in via `Config.credential_sources`. Without that injection, only `credential_provider` (or anonymous access) is used.
-
-### Resilience
-
-Reactive transport retries are live on manifest `HEAD`/`GET` and token HTTP paths:
-
-- `Config.max_network_retries` retries transient `5xx` responses and socket-level transport errors.
-- `Config.max_rate_limit_retries` retries `429` responses using `Retry-After` / `X-Retry-After` (and response `Date` when present).
-- `Config.max_retries` stays auth-only: cached-token invalidation after a manifest `401`.
-- `Config.rate_limit_enabled` (default `false`) opts into pre-emptive manifest throttling when trustworthy registry `RateLimit-*` headers show `remaining == 0`.
-- `Config.ca_bundle_path` loads a PEM CA trust bundle at the public API boundary (`resolve`, `validate`, `getManifest`, `resolveMany`, `pingRegistry`).
-- `ResolveError.rate_limited`, `network_error`, and `timeout` carry `transport_retries_exhausted` so callers can distinguish immediate hard failures from post-retry exhaustion.
-
-See [CHANGELOG.md](CHANGELOG.md) and `src/resilience.zig` for registry header assumptions (Docker Hub epoch `Retry-After`, `X-RateLimit-Reset`, and related parser behavior).
-
-### Registry coverage
-
-Docker Hub, Quay, and GHCR are the main named targets in the current code and tests.
-
-- Docker Hub: covered in auth tests and exercised on the live resolver path.
-- Quay: covered in auth tests and fixture-backed resolver coverage.
-- GHCR: covered in auth and challenge-flow tests.
-- GitLab and Harbor: covered through generic bearer-registry mock tests.
-- Distribution `registry:2` on loopback: opt-in `zig build integration-registry` (see [integration/registry2/README.md](integration/registry2/README.md)).
-- ECR, GCR, and ACR: not first-class targets yet. Callers can inject Docker config and credential-helper Io through `Config.credential_sources` where that fits the deployment.
-
-Checked-in fixtures and in-process mocks cover most paths in `zig build test`. Live registry checks use packaged examples and are not part of the default gate.
-
-### Performance
-
-ReleaseFast baseline for this version is `benchmarks/baselines/v0.6.0.json`:
-
-| Operation                 | Mean per iteration | Mean RSS | Samples |
-| ------------------------- | ------------------ | -------- | ------- |
-| `reference-parse`         | 306847.4 us        | 1.05 MB  | 14      |
-| `digest-parse`            | 1331.9 us          | 1.05 MB  | 2985    |
-| `manifest-parse`          | 262327.0 us        | 1.07 MB  | 16      |
-| `challenge-parse`         | 5318.3 us          | 1.10 MB  | 751     |
-| `platform-match`          | 1319.3 us          | 1.29 MB  | 3013    |
-| `authenticate-miss`       | 69191.6 us         | 3.05 MB  | 58      |
-| `authenticate-hit`        | 1589.2 us          | 1.70 MB  | 2505    |
-| `authenticate-rate-limit` | 83847.2 us         | 3.05 MB  | 48      |
-| `resolve-single`          | 42199.9 us         | 1.97 MB  | 95      |
-| `resolve-single-retry`    | 42154.7 us         | 1.99 MB  | 95      |
-| `resolve-session`         | 43309.9 us         | 2.01 MB  | 93      |
-| `resolve-many`            | 199525.9 us        | 2.02 MB  | 21      |
-| `resolve-many-unique`     | 385818.8 us        | 2.03 MB  | 11      |
-| `resolve-multi`           | 175768.9 us        | 2.03 MB  | 23      |
-| `validate-single`         | 25160.7 us         | 2.04 MB  | 159     |
-| `get-manifest`            | 54015.5 us         | 2.07 MB  | 75      |
-
-v0.6.0 Debug `--counting` snapshot for core resolve ops (100 iterations; see `benchmarks/baselines/v0.6.0-debug-counting.txt`): `resolve-single` 500 allocs/call, `resolve-session` 500 allocs/call, `resolve-many` 2700 allocs/batch, `resolve-many-unique` 5000 allocs/batch.
-
-## Getting started
-
-**Requirements:** Zig **0.16.0** or later.
-
-### Add as a dependency
+The latest tagged release can be fetched with:
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.6.0
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.7.0
 ```
 
-Then in `build.zig`, import the package:
+Then import the module from `build.zig`:
 
 ```zig
 const z_oci = b.dependency("z_oci", .{
@@ -137,57 +56,37 @@ const z_oci = b.dependency("z_oci", .{
 exe.root_module.addImport("z_oci", z_oci.module("z_oci"));
 ```
 
-### Live resolver entry points
+### Build the current checkout
 
-```zig
-const outcome = try z_oci.resolve(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
-switch (outcome) {
-    .success => |result| {
-        defer result.deinit(allocator);
-        // use result.digest, result.reference, ...
-    },
-    .failure => |failure| {
-        defer z_oci.deinitResolveFailure(failure, allocator);
-        // handle failure
-    },
-}
-const validity = try z_oci.validate(allocator, &client, config, ref, null);
-switch (validity) {
-    .valid, .not_found => {},
-    .failure => |failure| {
-        defer z_oci.deinitResolveFailure(failure, allocator);
-        // handle failure
-    },
-}
-const manifest_outcome = try z_oci.getManifest(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
-switch (manifest_outcome) {
-    .success => |manifest| {
-        defer manifest.deinit();
-        // use manifest
-    },
-    .failure => |failure| {
-        defer z_oci.deinitResolveFailure(failure, allocator);
-        // handle failure
-    },
-}
+The repository includes the Zig toolchain used by its checks:
+
+```sh
+./zig-0.16.0/zig build
+./zig-out/bin/z-oci --help
 ```
 
-`resolve`, `validate`, and `getManifest` all use a caller-owned `std.http.Client` and the same auth-backed resolver flow.
+## Choose an interface
 
-`inspect` is the inspection-oriented library entry point. It returns the fetched top-level `Manifest`, `OciImageIndex`, or `DockerManifestList`. When a platform is supplied for a multi-arch document, the result also owns the selected leaf `Manifest`; without a platform, the top-level index or list is returned without `platform_required`.
+GitHub Markdown does not provide native tabs. These collapsible panels keep the library and CLI quick starts together without making either path dominate the page.
+
+<details open>
+<summary>Library API</summary>
+
+The public API covers reference parsing, manifest resolution, exact digest validation, manifest inspection, batch resolution, and registry reachability checks.
 
 ```zig
-const outcome = try z_oci.inspect(allocator, &client, config, ref, .{ .os = "linux", .architecture = "amd64" });
+const outcome = try z_oci.resolve(
+    allocator,
+    &client,
+    config,
+    reference,
+    .{ .os = "linux", .architecture = "amd64" },
+);
+
 switch (outcome) {
     .success => |result| {
         var owned = result;
-        defer owned.deinit();
-        switch (owned.top_level) {
-            .manifest => |manifest| _ = manifest.value.config,
-            .oci_index => |index| _ = index.value.manifests,
-            .docker_manifest_list => |list| _ = list.value.manifests,
-        }
-        if (owned.selected_leaf) |leaf| _ = leaf.value.layers;
+        defer owned.deinit(allocator);
     },
     .failure => |failure| {
         defer z_oci.deinitResolveFailure(failure, allocator);
@@ -195,176 +94,81 @@ switch (outcome) {
 }
 ```
 
-`InspectionResult.deinit()` releases both parsed values. Inspection uses the same auth, redirect, digest verification, body-size, retry, and platform-selection paths as the other resolver APIs.
+Main entry points:
 
-Credential sources are opt-in. A CLI-shaped Zig 0.16 entrypoint injects the process environment and helper Io through `Config.credential_sources` (no silent process reads):
+- `Reference.parse` normalizes Docker and OCI image references.
+- `resolve` resolves a tag or digest and returns a verified pinned result.
+- `validate` checks whether an exact digest exists.
+- `getManifest` returns a parsed manifest document.
+- `inspect` returns top-level manifest or index metadata, with an optional selected leaf.
+- `resolveMany` resolves references sequentially with one client and auth session.
+- `pingRegistry` checks `/v2/` reachability independently of resolution.
 
-```zig
-pub fn main(init: std.process.Init) !void {
-    // … build std.http.Client with init.io …
-    const config = z_oci.Config{
-        .credential_sources = .{
-            .environ_map = init.environ_map,
-            .load_docker_config_from_environ = true,
-            .process_io = init.io,
-        },
-    };
-    // … resolve / validate / getManifest …
-}
-```
+Results use the caller's allocator. Single-resolve successes and failures have dedicated teardown paths; `ResolveManyResult.deinit` owns the complete batch. `Config{}` is anonymous and does not read process state. Callers that want environment, Docker config, or helper credentials inject them through `Config.credential_sources`.
 
-Bare `Config{}` stays anonymous. Prefer `docker_config_json` when you already hold `config.json` bytes. `helper_runner` overrides the default `docker-credential-*` spawn (tests / advanced callers).
+</details>
 
-On single-resolve `.failure`, keep the input `Reference` alive until after you finish reading or formatting the error: `registry` borrows that input. Then call `deinitResolveFailure` (or `ResolveError.deinitOwned`) and `Reference.deinit`.
+<details>
+<summary>CLI</summary>
 
-### Batch resolve (`resolveMany`)
-
-`resolveMany` resolves a slice of references in order and returns one outcome per input. One item failure does not abort the rest. There is no parallel registry traffic in this API: one caller-owned `std.http.Client` and one shared `AuthEngine` serve the whole batch.
-
-```zig
-var result = try z_oci.resolveMany(allocator, &client, config, refs[0..], .{
-    .platform = .{ .os = "linux", .architecture = "amd64" },
-});
-defer result.deinit(allocator); // tears down every item; do not use deinitResolveFailure here
-
-for (result.items) |item| {
-    switch (item) {
-        .success => |resolved| {
-            // use resolved.digest / resolved.reference
-        },
-        .failure => |failure| {
-            // batch failures own both registry and reference; result.deinit frees them
-            _ = failure;
-        },
-    }
-}
-```
-
-Ownership:
-
-- Input `refs` are borrowed. Callers keep and free their own `Reference` values.
-- `ResolveManyResult` owns the item slice and every item. Call `result.deinit(allocator)` once.
-- Successful items own a `ResolveResult` (same teardown as single-resolve success).
-- Failed items own both `registry` and `reference`. Do not call `deinitResolveFailure` on them; that helper is single-resolve only and would leak `registry`.
-
-Platform is batch-wide via `ResolveManyOptions.platform`. Per-item platforms need separate batches.
-
-Session cache (in-call only):
-
-- Within one `resolveMany` call, successful tag pins and implicit `latest` pins can be reused for later duplicate inputs.
-- Digest-addressed references never hit the session cache.
-- The cache does not survive past the call. A second `resolveMany` starts empty.
-
-Progress callbacks (optional `ResolveManyOptions.progress_fn`):
-
-- Events are `item_started`, `cache_hit`, `item_succeeded`, and `item_failed`.
-- `event.reference` borrows input slices for the callback duration only. Copy any strings you need to keep.
-- Callbacks are `void`: they cannot fail or cancel the batch.
-
-Offline demo (injected exchangers, no live network):
+Build the executable, then run one of the three commands:
 
 ```sh
-zig build example-resolve-many
+./zig-0.16.0/zig build
+
+./zig-out/bin/z-oci resolve ubuntu:22.04 --platform linux/amd64
+./zig-out/bin/z-oci validate ubuntu@sha256:<64-hex-digest>
+./zig-out/bin/z-oci inspect ubuntu:22.04 --format json
 ```
 
-See [examples/resolve-many.zig](examples/resolve-many.zig). Live callers should use public `resolveMany` with a real `std.http.Client`.
+The CLI also supports:
 
-### Normalize an image reference
+- `--format text|json` for shell-friendly or structured output.
+- `--verbose` for a safe elapsed-time summary on stderr.
+- `--ca-bundle <path>` for a certificate-only HTTPS trust bundle.
+- `--helper-timeout-ms <ms>` for credential-helper I/O only.
+- `--platform os/arch[/variant]` on `resolve` and `inspect`.
+- `--help` and `--version` on the top level and each command.
 
-```zig
-const std = @import("std");
-const z_oci = @import("z_oci");
+Text resolve output is a pinned reference:
 
-pub fn main() !void {
-    var ref = try z_oci.Reference.parse(std.heap.page_allocator, "ubuntu:22.04");
-    defer ref.deinit(std.heap.page_allocator);
-
-    std.debug.print("registry: {s}\n", .{ref.registry});
-    std.debug.print("repository: {s}\n", .{ref.repository});
-    std.debug.print("ref: {s}\n", .{ref.refString()});
-}
+```text
+registry-1.docker.io/library/ubuntu@sha256:<64-hex-digest>
 ```
 
-### Parse a manifest JSON payload offline
+JSON output contains the command, input, pinned reference, digest, media type, and selected platform. Diagnostics use stable exit codes and never print credentials, authorization values, helper data, raw headers, or response bodies.
 
-```zig
-const std = @import("std");
-const z_oci = @import("z_oci");
+The executable explicitly wires process credentials into the library. It does not create a second authentication or registry implementation. Live HTTPS registry traffic is supported on Linux and macOS; Windows is currently limited to non-network behavior because of Zig 0.16 TLS support.
 
-pub fn main() !void {
-    const json_bytes =
-        \\{
-        \\  "schemaVersion": 2,
-        \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
-        \\  "config": {
-        \\    "mediaType": "application/vnd.oci.image.config.v1+json",
-        \\    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        \\    "size": 256
-        \\  },
-        \\  "layers": []
-        \\}
-    ;
+</details>
 
-    const parsed = try z_oci.json.parse(z_oci.Manifest, std.heap.page_allocator, json_bytes);
-    defer parsed.deinit();
+## Documentation
 
-    std.debug.print("schemaVersion: {d}\n", .{parsed.value.schema_version});
-    std.debug.print("mediaType: {s}\n", .{parsed.value.media_type.toString()});
-}
+This README is the quick orientation and first-run guide. Detailed API contracts, ownership rules, credential configuration, output schemas, platform behavior, troubleshooting, and design notes will live in the [z-oci GitHub Wiki](https://github.com/eneskemalergin/z-oci/wiki).
+
+## Examples
+
+The repository includes small programs for common library paths:
+
+```sh
+./zig-0.16.0/zig build example-normalize-reference -- ubuntu:22.04
+./zig-0.16.0/zig build example-inspect-manifest
+./zig-0.16.0/zig build example-select-platform
+./zig-0.16.0/zig build example-resolve-many
+./zig-0.16.0/zig build example-resolve-reference -- ubuntu:22.04
 ```
 
-## Build steps
+The first four examples are offline. `example-resolve-reference` may contact a live registry. Source is in [examples](examples).
 
-This repository vendors Zig 0.16 under `./zig-0.16.0/`. Prefer the bundled compiler and pass `--zig-lib-dir ./zig-0.16.0/lib` so builds match the documented offline gate:
+## Build and test
+
+The default gate is deterministic and offline:
 
 ```sh
 ./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib
 ```
 
-- `zig build`: build and install the current `z-oci` executable and `z-oci-bench` executable
-- `zig build test`: run all unit tests, smoke checks, and the `security-check` PEM scan (`tools/check_repo_security.zig`)
-- `zig build security-check`: standalone credential, private-key, and public-visibility scan (same tool as inside `test`)
-- `zig build examples`: build all packaged example programs
-- `zig build examples-smoke`: run a small smoke pass over the offline example programs
-- `zig build workflow-smoke`: run the offline workflow smoke-test matrix
-- `zig build bench`: build the benchmark CLI (`z-oci-bench`)
-- `zig build integration-registry`: opt-in local `registry:2` checks (requires Docker; clear-fails if absent)
-
-Fixtures under `fixtures/` include checked-in live registry snapshots plus synthetic malformed payloads for deterministic negative-path tests. Their provenance and refresh notes live in [fixtures/SOURCES.md](fixtures/SOURCES.md).
-
-Offline tests can drive a real `std.http.Client` against an in-process loopback mock peer. That peer is test infrastructure only, not part of the public library API.
-
-For Distribution `registry:2` interoperability, use the opt-in step (requires a Docker daemon; clear-fails if absent):
-
-```sh
-./zig-0.16.0/zig build integration-registry --zig-lib-dir ./zig-0.16.0/lib
-```
-
-See `integration/registry2/README.md`. This step is never part of `zig build test`.
-
-The Zig package contents in this repository bundle `src/`, `examples/`, `fixtures/`, `assets/`, `benchmarks/`, and the build files, so the documented examples and tests work from a dependency fetch.
-
-## Examples
-
-Live example:
-
-- `zig build example-resolve-reference -- ubuntu:22.04`
-- `zig build example-resolve-reference -- ubuntu:22.04 linux/amd64`
-
-This example uses the live public `resolve` API and may make network requests or trigger registry auth.
-
-Offline examples:
-
-- `zig build example-normalize-reference -- ubuntu:22.04`
-- `zig build example-inspect-manifest`
-- `zig build example-select-platform`
-- `zig build example-resolve-many` (offline batch pin flow; see Batch resolve above)
-
-See [examples](examples) for the source of the packaged examples.
-
-## Next
-
-- CLI for resolve, validate, and inspect
+It covers library and CLI tests, workflow and example smoke checks, and the repository security scan. The opt-in `integration-registry` step uses Docker and is separate from the default gate.
 
 ## References
 
