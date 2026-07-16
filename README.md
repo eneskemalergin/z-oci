@@ -21,32 +21,35 @@
 
 ## What is z-oci?
 
-z-oci is a read-only OCI and Docker Registry client for Zig. It parses image references, authenticates when configured, fetches manifests, verifies digests, and selects a platform from multi-arch images. It does not pull image layers.
+z-oci is a read-only OCI and Docker Registry client for Zig. It parses image references, authenticates when configured, fetches manifests, verifies digests, and selects platforms from multi-arch images. It does not pull layers or push images.
 
 The current package and latest tagged release are `v0.7.0`.
 
-## Why z-oci?
+## What it provides
 
-- Library-first: the CLI is a thin process adapter over the same public resolver API.
-- Explicit ownership: callers provide allocators and clients, and owned results have explicit teardown.
-- No hidden process state: environment variables, Docker configuration, and credential helpers are opt-in.
-- OCI-aware: references, manifests, indexes, platform selection, and digest verification share one resolver path.
-- Small dependency surface: Zig 0.16 and the standard library, with no external runtime dependencies.
-- Testable by design: injected HTTP, process I/O, clocks, and offline registry fixtures keep core behavior deterministic.
+- A library API with caller-owned allocators, HTTP clients, I/O, and results. The CLI uses the same public resolver API.
+- Reference parsing for Docker and OCI image references.
+- `resolve` for verified digest-pinned results.
+- `validate` for checking an exact digest without returning a manifest.
+- `getManifest` and `inspect` for manifest and index metadata.
+- `resolveMany` for sequential batch resolution with in-call caching for repeated tag pins.
+- `pingRegistry` for independent `/v2/` reachability checks.
+- OCI Bearer authentication and explicitly injected credential sources.
+- OCI image index and Docker manifest list platform selection.
+
+The library uses Zig 0.16.0 or later and has no third-party runtime dependencies. It is read-only by design: blob, layer, push, build, and container-runtime operations are outside its scope.
 
 ## Install
 
-Requirements: Zig **0.16.0** or later.
-
 ### Use as a dependency
 
-The latest tagged release can be fetched with:
+Fetch the current tagged release:
 
 ```sh
 zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.7.0
 ```
 
-Then import the module from `build.zig`:
+Import the module from `build.zig`:
 
 ```zig
 const z_oci = b.dependency("z_oci", .{
@@ -58,123 +61,81 @@ exe.root_module.addImport("z_oci", z_oci.module("z_oci"));
 
 ### Build the current checkout
 
-The repository includes the Zig toolchain used by its checks:
+With Zig 0.16.0 installed and available as `zig`:
 
 ```sh
-./zig-0.16.0/zig build
+zig build
 ./zig-out/bin/z-oci --help
 ```
 
-## Choose an interface
+## Library usage
 
-GitHub Markdown does not provide native tabs. These collapsible panels keep the library and CLI quick starts together without making either path dominate the page.
+Use the library when your application should own process setup, credentials, HTTP clients, allocators, and result lifetime. Start with the [library quick start](docs/Library.md), which shows a `resolve` call and both result cleanup paths.
 
-<details open>
-<summary>Library API</summary>
+The default `Config{}` is anonymous. It does not read environment variables, Docker configuration, or credential helpers. Applications that need them inject `Config.credential_sources` explicitly. See [Credentials](docs/Credentials.md) for the supported sources and precedence.
 
-The public API covers reference parsing, manifest resolution, exact digest validation, manifest inspection, batch resolution, and registry reachability checks.
+## CLI usage
 
-```zig
-const outcome = try z_oci.resolve(
-    allocator,
-    &client,
-    config,
-    reference,
-    .{ .os = "linux", .architecture = "amd64" },
-);
-
-switch (outcome) {
-    .success => |result| {
-        var owned = result;
-        defer owned.deinit(allocator);
-    },
-    .failure => |failure| {
-        defer z_oci.deinitResolveFailure(failure, allocator);
-    },
-}
-```
-
-Main entry points:
-
-- `Reference.parse` normalizes Docker and OCI image references.
-- `resolve` resolves a tag or digest and returns a verified pinned result.
-- `validate` checks whether an exact digest exists.
-- `getManifest` returns a parsed manifest document.
-- `inspect` returns top-level manifest or index metadata, with an optional selected leaf.
-- `resolveMany` resolves references sequentially with one client and auth session.
-- `pingRegistry` checks `/v2/` reachability independently of resolution.
-
-Results use the caller's allocator. Single-resolve successes and failures have dedicated teardown paths; `ResolveManyResult.deinit` owns the complete batch. `Config{}` is anonymous and does not read process state. Callers that want environment, Docker config, or helper credentials inject them through `Config.credential_sources`.
-
-</details>
-
-<details>
-<summary>CLI</summary>
-
-Build the executable, then run one of the three commands:
+The executable provides `resolve`, `validate`, and `inspect` through the public resolver API:
 
 ```sh
-./zig-0.16.0/zig build
+zig build
 
-./zig-out/bin/z-oci resolve ubuntu:22.04 --platform linux/amd64
+./zig-out/bin/z-oci resolve --platform linux/amd64 ubuntu:22.04
 ./zig-out/bin/z-oci validate ubuntu@sha256:<64-hex-digest>
-./zig-out/bin/z-oci inspect ubuntu:22.04 --format json
+./zig-out/bin/z-oci inspect --format json ubuntu:22.04
 ```
 
-The CLI also supports:
+Use `--format text|json` for output selection, `--verbose` for elapsed time and outcome on stderr, `--ca-bundle <path>` for a certificate-only trust bundle, and `--helper-timeout-ms <ms>` for credential-helper I/O only. `--platform os/arch[/variant]` is available on `resolve` and `inspect`.
 
-- `--format text|json` for shell-friendly or structured output.
-- `--verbose` for a safe elapsed-time summary on stderr.
-- `--ca-bundle <path>` for a certificate-only HTTPS trust bundle.
-- `--helper-timeout-ms <ms>` for credential-helper I/O only.
-- `--platform os/arch[/variant]` on `resolve` and `inspect`.
-- `--help` and `--version` on the top level and each command.
+Command options go before the image argument. The [CLI guide](docs/CLI.md) has the complete grammar, output examples, stream routing, and exit-code mapping.
 
-Text resolve output is a pinned reference:
+## Credentials and limits
 
-```text
-registry-1.docker.io/library/ubuntu@sha256:<64-hex-digest>
-```
+Credentials are never accepted as CLI arguments. The CLI explicitly wires process credential sources into the library, while the library remains anonymous unless its caller injects credentials.
 
-JSON output contains the command, input, pinned reference, digest, media type, and selected platform. Diagnostics use stable exit codes and never print credentials, authorization values, helper data, raw headers, or response bodies.
+Live HTTPS registry traffic is verified on Linux and macOS. Windows is not a verified supported build target for this repository. Per-request network timeout control is also limited by the Zig 0.16 HTTP client. The helper timeout applies to credential-helper I/O, not registry requests.
 
-The executable explicitly wires process credentials into the library. It does not create a second authentication or registry implementation. Live HTTPS registry traffic is supported on Linux and macOS; Windows is currently limited to non-network behavior because of Zig 0.16 TLS support.
-
-</details>
-
-## Documentation
-
-This README is the quick orientation and first-run guide. Detailed API contracts, ownership rules, credential configuration, output schemas, platform behavior, troubleshooting, and design notes will live in the [z-oci GitHub Wiki](https://github.com/eneskemalergin/z-oci/wiki).
+For platform matching, CA bundles, configuration defaults, timeout scope, registry coverage, and other boundaries, see [Platform and limits](docs/Platform.md), [Registry compatibility](docs/RegistryCompatibility.md), and [Troubleshooting](docs/Troubleshooting.md).
 
 ## Examples
 
-The repository includes small programs for common library paths:
+The first four examples use checked-in fixtures or injected exchanges and are offline:
 
 ```sh
-./zig-0.16.0/zig build example-normalize-reference -- ubuntu:22.04
-./zig-0.16.0/zig build example-inspect-manifest
-./zig-0.16.0/zig build example-select-platform
-./zig-0.16.0/zig build example-resolve-many
-./zig-0.16.0/zig build example-resolve-reference -- ubuntu:22.04
+zig build example-normalize-reference -- ubuntu:22.04
+zig build example-inspect-manifest
+zig build example-select-platform
+zig build example-resolve-many
 ```
 
-The first four examples are offline. `example-resolve-reference` may contact a live registry. Source is in [examples](examples).
+The live example may contact a registry:
 
-## Build and test
+```sh
+zig build example-resolve-reference -- ubuntu:22.04
+```
+
+See the [examples guide](docs/Examples.md) for the source files, ownership notes, and offline versus live boundaries.
+
+## Documentation
+
+The [documentation home](docs/Home.md) links to installation, library, CLI, credentials, platform, troubleshooting, compatibility, and examples pages. The repository pages are the current documentation source. The same content is intended for the [z-oci GitHub Wiki](https://github.com/eneskemalergin/z-oci/wiki) when it is published.
+
+## Development
 
 The default gate is deterministic and offline:
 
 ```sh
-./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib
+zig build test --summary all
 ```
 
-It covers library and CLI tests, workflow and example smoke checks, and the repository security scan. The opt-in `integration-registry` step uses Docker and is separate from the default gate.
+It covers library and CLI tests, workflow and example smoke checks, and the repository security scan. Formatting, release builds, benchmark compilation, contributor workflow, and opt-in Docker checks are described in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## References
 
 - [OCI Distribution Specification](https://github.com/opencontainers/distribution-spec): the registry API this client implements
 - [OCI Image Layout Specification](https://github.com/opencontainers/image-spec): manifest and descriptor formats
-- [Docker Registry HTTP API V2](https://docs.docker.com/registry/spec/api/): Docker Hub compatibility layer
+- [Docker Registry HTTP API V2](https://docs.docker.com/reference/api/registry/latest/): Docker Registry compatibility
 
 ## License
 

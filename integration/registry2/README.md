@@ -9,7 +9,7 @@ Clear-fail when Docker is absent. Running `zig build integration-registry` witho
 ## Run
 
 ```sh
-./zig-0.16.0/zig build integration-registry --zig-lib-dir ./zig-0.16.0/lib
+zig build integration-registry
 ```
 
 Requires Docker Engine, the Docker Compose plugin, `curl`, and network access to pull `registry:2` and `busybox:1.36.1` on first run.
@@ -46,7 +46,7 @@ Evidence tag: `registry:2`. Run only when Docker is available. This is not part 
 
 ```sh
 # One-shot (compose up, pull/tag/push busybox, harness, teardown):
-./zig-0.16.0/zig build integration-registry --zig-lib-dir ./zig-0.16.0/lib
+zig build integration-registry
 ```
 
 Expected stdout (digest hex will match the pushed busybox manifest):

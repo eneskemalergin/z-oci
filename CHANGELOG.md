@@ -7,51 +7,72 @@ Versions listed here may be prepared ahead of the matching git tag. Tags follow 
 
 ## [0.7.1] - Unreleased
 
-This release collects the cleanup, hardening, and documentation work after `v0.7.0`. The entries below describe changes already present and verified in the current development state. Further user-facing documentation updates will be added only after they are written and checked; this section is not a release announcement.
-
-### Changed
-
-- Simplified ownership boundaries by removing shared CA-bundle cache state, narrowing internal test seams, and removing unused resolver helpers.
-- Normalized source and benchmark terminology, corrected fixture and benchmark guidance, and kept the public README focused on orientation rather than reference detail.
-- Extended the benchmark `--counting` report with freed bytes, peak live bytes, and end-of-loop live bytes. Cache-retaining authentication cases report their retained state instead of treating it as a leak.
-
-### Fixed
-
-- CA-bundle validation and repository security scanning now reject DSA and Ed25519 private-key PEM labels as well as the previously covered key formats.
-- Added bounded generated-input coverage for platform and descriptor parsing, including an explicit descriptor-size overflow case.
-- Corrected example and local registry integration ownership paths so parsed references, clients, and outcomes are cleaned up on their owning success and failure paths.
-
-### Verified
-
-- The complete gate passes with 37/37 build steps and 419/419 tests, including CLI, workflow, examples, and security checks.
-- ReleaseFast and ReleaseSmall builds, formatting, benchmark compilation, and the opt-in local `registry:2` integration pass. The integration resolves a tag and digest and maps a missing tag to `not_found`.
-- Representative counting runs show zero live bytes after non-cache operations. Authentication cache-retaining cases report their live bytes before engine teardown; no timing, RSS, or allocation threshold is claimed.
-
-## [0.7.0] - 2026-07-15 - [Tagged]
-
-v0.7.0 collects the public API and executable work added after v0.6.0. The executable includes live `resolve`, digest-only `validate`, and metadata `inspect` commands on top of the public resolver.
+v0.7.1 collects the audit, cleanup, security, and documentation work after `v0.7.0`. It tightens ownership and sensitive-data cleanup, adds boundary coverage, and aligns public guidance with the shipped library and CLI.
 
 ### Added
 
-- Public `Config.credential_sources` for caller-injected environment maps, Docker config JSON (or environ file load), process Io for credential helpers, and optional `helper_runner` override. Wired through `resolve`, `validate`, `getManifest`, and `resolveMany`. Default remains provider-only / anonymous with no hidden process reads.
-- Public `inspect` entry point for fetching top-level manifests and multi-arch documents, with optional selected-leaf data and explicit `InspectionResult.deinit()` ownership.
-- Executable command parsing for `resolve`, `validate`, and `inspect`, including global and command options, digest-pinned validation, platform selection syntax, deterministic usage failures, and standalone help and version output.
-- Build-time version wiring from `build.zig.zon` to the executable, keeping the package metadata as the single version source.
-- Resolver-backed `z-oci resolve` execution, including pinned text output, full JSON result output, selected-platform preservation, and shared resolver failure mapping.
-- Resolver-backed `z-oci validate` execution, including digest-only input, exact valid/not-found text and JSON output, and shared resolver failure mapping.
-- Resolver-backed `z-oci inspect` execution, including single-arch and multi-arch text/JSON metadata, selected leaves, and shared resolver failure mapping.
+- **Coverage**
+  - Bounded generated-input tests cover platform and descriptor parsing, including descriptor-size overflow.
+- **Documentation**
+  - Added the registry compatibility page and expanded library, CLI, credential, configuration, platform, and troubleshooting guidance.
 
 ### Changed
 
-- README and auth docs describe the live public credential contract truthfully: env / Docker / helpers require `credential_sources` injection.
-- The executable build now installs the CLI process adapter and runs its parser and output tests as part of the default test step.
-- The process adapter now owns bounded standard-output writers and one command-scoped HTTP client, projects process credential sources explicitly, applies custom CA and helper-timeout settings through `Config`, and maps pre-flight configuration failures to stable CLI output.
+- **Ownership and benchmarks**
+  - Simplified ownership boundaries by removing shared CA-bundle cache state, narrowing internal test seams, and removing unused resolver helpers.
+  - Extended the benchmark `--counting` report with allocated, freed, peak, and live byte counts. Non-cache cases assert zero live bytes; authentication cache cases report retained state before engine teardown.
+- **Public guidance**
+  - Normalized source and benchmark terminology, corrected fixture and benchmark guidance, and kept the README focused on orientation rather than reference detail.
+
+### Fixed
+
+- **Security and credentials**
+  - CA-bundle validation and repository security scanning now reject DSA and Ed25519 private-key PEM labels as well as the previously covered key formats.
+  - Sensitive authentication buffers, including Docker config JSON, encoded auth temporaries, helper output, parser arenas, token bodies, cached tokens, and credential material, are zeroed before raw allocator release.
+- **Resilience**
+  - `RateLimit-*` collection is case-insensitive, extreme retry delays are clamped safely, and impossible HTTP calendar dates are rejected.
+- **Examples and documentation**
+  - Corrected example and local registry integration ownership paths so parsed references, clients, and outcomes are cleaned up on their owning success and failure paths.
+  - Corrected CLI option order and separated proven registry behavior from manual or unavailable compatibility coverage.
 
 ### Verified
 
-- `./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes: 37/37 build steps, 417/417 tests, CLI smoke, examples smoke, workflow smoke, and security check.
+- The complete gate passes with 37/37 build steps and 426/426 tests, including CLI, workflow, examples, and security checks.
+- ReleaseFast and ReleaseSmall builds, formatting, and benchmark compilation pass. The opt-in local `registry:2` integration remains separate and was not run as part of this offline verification.
+- Representative counting runs show zero live bytes after non-cache operations; cache-miss authentication reports retained token-cache bytes before engine teardown.
+
+## [0.7.0] - 2026-07-15 - [Tagged]
+
+v0.7.0 adds caller-injected credential sources, public inspection, and a standalone CLI for live `resolve`, digest-only `validate`, and metadata `inspect` commands. It keeps library ownership explicit and maps resolver failures into stable CLI output.
+
+### Added
+
+- **Public API and credentials**
+  - Public `Config.credential_sources` accepts caller-injected environment maps, Docker config JSON or environ file loads, process I/O for credential helpers, and an optional `helper_runner` override. Public `resolve`, `validate`, `getManifest`, and `resolveMany` apply these sources; bare `Config{}` remains provider-only and anonymous.
+  - Public `inspect` fetches top-level manifests and multi-arch documents, optionally returning selected-leaf data with explicit `InspectionResult.deinit()` ownership.
+- **CLI**
+  - Command parsing supports `resolve`, `validate`, and `inspect`, global and command options, digest-pinned validation, platform selection, deterministic usage failures, and standalone help and version output.
+  - Resolver-backed commands provide pinned text output, JSON output, selected-platform preservation, and shared resolver failure mapping.
+- **Build integration**
+  - `build.zig.zon` supplies the package version used by the executable, and the build installs the CLI process adapter.
+
+### Changed
+
+- **CLI process adapter**
+  - The process adapter projects process credential sources explicitly, owns bounded output writers and one command-scoped HTTP client, applies custom CA and helper-timeout settings through `Config`, and maps pre-flight configuration failures to stable output.
+- **Documentation and tests**
+  - README and credential guidance describe the injected process-source contract. CLI parser and output tests run as part of the default test step.
+
+### Fixed
+
+- **Credential boundaries**
+  - Public resolver calls keep process credential discovery explicit: bare `Config{}` does not read the environment or spawn helpers without injected `credential_sources`.
+
+### Verified
+
+- `zig build test --summary all` passes: 37/37 build steps, 417/417 tests, CLI smoke, examples smoke, workflow smoke, and security check.
 - Standalone `workflow-smoke`, `examples-smoke`, `security-check`, `cli-smoke`, and `bench` steps pass.
-- `./zig-0.16.0/zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/` passes.
+- `zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/` passes.
 - Linux `ReleaseFast` and `ReleaseSmall` installs contain one statically linked `z-oci` executable with no dynamic-library dependency. Example and benchmark executables remain separate artifacts.
 
 ## [0.6.0] - 2026-07-13 - [Tagged]
@@ -79,7 +100,7 @@ v0.6.0 is the compatibility release. It takes the v0.5.0 client through deeper o
 - **Public testing and documentation**
   - The `testing` namespace re-exports the in-process mock peer for callers writing integration tests.
   - README documents registry compatibility across Hub, GHCR, Quay, generic bearer registries, and loopback `registry:2`, including fixtures, mocks, the opt-in harness, and live commands.
-  - README and CONTRIBUTING list the same build steps as the repository gate: `security-check`, `integration-registry`, the bundled toolchain, and `fmt --check`.
+  - README and CONTRIBUTING list the same build steps as the repository gate: `security-check`, `integration-registry`, Zig 0.16.0, and `fmt --check`.
   - v0.6.0 documentation points at `benchmarks/baselines/v0.6.0.json` and `benchmarks/baselines/v0.6.0-debug-counting.txt` as the current comparison snapshots.
   - The recorded `registry:2` recipe lives in `integration/registry2/README.md`.
 
@@ -94,9 +115,9 @@ v0.6.0 is the compatibility release. It takes the v0.5.0 client through deeper o
 
 ### Verified
 
-- `./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes (350/350 tests, examples-smoke, workflow-smoke, security-check).
-- `./zig-0.16.0/zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/` passes on `src/`, `examples/`, `benchmarks/`, `build.zig`, `tools/`, `integration/`.
-- `./zig-0.16.0/zig build security-check` passes on tracked roots including `integration/`.
+- `zig build test --summary all` passes (350/350 tests, examples-smoke, workflow-smoke, security-check).
+- `zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/` passes on `src/`, `examples/`, `benchmarks/`, `build.zig`, `tools/`, `integration/`.
+- `zig build security-check` passes on tracked roots including `integration/`.
 - Debug `--counting` for core resolve bench ops matches `benchmarks/baselines/v0.6.0-debug-counting.txt` allocation counts (`resolve-single` 500, `resolve-session` 500, `resolve-many` 2700, `resolve-many-unique` 5000). ReleaseFast baseline is `benchmarks/baselines/v0.6.0.json`.
 
 ## [0.5.0] - 2026-07-10 - [Tagged]
@@ -334,9 +355,9 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 - Live `GET /v2/` challenge checks confirm Docker Hub returns `realm="https://auth.docker.io/token",service="registry.docker.io"`, GHCR returns `realm="https://ghcr.io/token",service="ghcr.io"`, and Quay returns `realm="https://quay.io/v2/auth",service="quay.io"`.
 - Live repository challenge checks confirm GHCR returns a repository-scoped bearer challenge for public manifests, while public Quay manifests can still succeed anonymously without forcing auth.
-- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 246 tests.
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 293 tests.
-- `zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib` passes with 297/297 tests.
+- `zig test src/auth.zig` passes with 246 tests.
+- `zig test src/root.zig` passes with 293 tests.
+- `zig build test --summary all` passes with 297/297 tests.
 
 ---
 
@@ -361,8 +382,8 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Verified
 
-- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 231 tests.
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 278 tests.
+- `zig test src/auth.zig` passes with 231 tests.
+- `zig test src/root.zig` passes with 278 tests.
 - `zig build test --summary all` passes with 282/282 tests.
 
 ## [0.1.5] - 2026-05-11
@@ -387,8 +408,8 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Verified
 
-- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 220 tests.
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 267 tests.
+- `zig test src/auth.zig` passes with 220 tests.
+- `zig test src/root.zig` passes with 267 tests.
 - `zig build test --summary all` passes with 271/271 tests.
 
 ## [0.1.4] - 2026-05-11
@@ -407,8 +428,8 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Verified
 
-- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 196 tests.
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 243 tests.
+- `zig test src/auth.zig` passes with 196 tests.
+- `zig test src/root.zig` passes with 243 tests.
 - `zig build test --summary all` passes with 247/247 tests.
 
 ## [0.1.3] - 2026-05-11
@@ -432,8 +453,8 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Verified
 
-- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 191 tests.
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 238 tests.
+- `zig test src/auth.zig` passes with 191 tests.
+- `zig test src/root.zig` passes with 238 tests.
 - `zig build test --summary all` passes with 242/242 tests.
 
 ## [0.1.2] - 2026-05-11
@@ -458,8 +479,8 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Verified
 
-- `zig test src/auth.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 92 tests.
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 228 tests.
+- `zig test src/auth.zig` passes with 92 tests.
+- `zig test src/root.zig` passes with 228 tests.
 - `zig build test --summary all` passes with 232/232 tests.
 
 ## [0.1.1] - 2026-05-11
@@ -479,7 +500,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Verified
 
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with 215 tests.
+- `zig test src/root.zig` passes with 215 tests.
 - `zig build test --summary all` passes with 219/219 tests.
 
 ## [0.1.0] - 2026-05-05 - [Tagged]
@@ -550,7 +571,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Verified
 
-- `zig test src/root.zig --zig-lib-dir ./zig-0.16.0/lib` passes with the real fixture and parser corpus coverage.
+- `zig test src/root.zig` passes with the real fixture and parser corpus coverage.
 - `zig build examples-smoke --summary all` passes and exercises the three offline example programs.
 - `zig build test --summary all` passes deterministically offline with fixture-backed tests and example smoke coverage.
 
@@ -590,7 +611,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 
 ### Verified
 
-- `zig test src/root.zig --zig-lib-dir zig-0.16.0/lib/` passes with 161 tests.
+- `zig test src/root.zig` passes with 161 tests.
 - `zig build test --summary all` passes and reports the same suite.
 - `zig build -Doptimize=ReleaseSmall` produces a 4.8 KB artifact at `zig-out/bin/z-oci`.
 

@@ -1,5 +1,19 @@
 # Contributing
 
+First of all, thank you for considering contributing to this small but mighty project of mine, and for reading the contributing guide first. I want to give you a few things to keep in mind before opening a PR. They should help us avoid unnecessary work for both of us and make review easier.
+
+Note: Changes should follow the existing ownership boundaries. Library behavior belongs in the owning `src/` module, the process adapter belongs in `src/main.zig`, and examples should call the public API instead of creating a second resolver path. Start from the source and its tests, then update public documentation after the behavior is verified.
+
+## Before you change code
+
+- Use Zig 0.16.0 or later and run commands from the repository root.
+- Read the public contract in the source before changing caller-visible behavior.
+- Keep tests beside the implementation unless the case crosses modules and belongs in workflow or smoke coverage.
+- Give every owned result, parsed document, client, reference, and helper resource an explicit cleanup path.
+- Keep the default test path offline and deterministic. Live registry and Docker checks are opt-in.
+
+Please keep a PR focused on one logical change where possible. If the behavior changes, explain what changed, why it belongs in that layer, and how you verified it. If something could not be verified, please say so directly.
+
 ## Test types
 
 The current release gate covers the codebase from a few complementary angles:
@@ -12,24 +26,46 @@ The current release gate covers the codebase from a few complementary angles:
 
 ## Running tests
 
-Prefer the bundled toolchain and lib dir so builds match the documented offline gate:
+Use Zig 0.16.0 or later with `zig` available on `PATH`:
 
 ```sh
-./zig-0.16.0/zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/
-./zig-0.16.0/zig build test --summary all --zig-lib-dir ./zig-0.16.0/lib
-./zig-0.16.0/zig build security-check --zig-lib-dir ./zig-0.16.0/lib
-./zig-0.16.0/zig build examples-smoke --zig-lib-dir ./zig-0.16.0/lib
-./zig-0.16.0/zig build workflow-smoke --zig-lib-dir ./zig-0.16.0/lib
+zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/
+zig build test --summary all
+zig build security-check
+zig build examples-smoke
+zig build workflow-smoke
 ```
 
-`zig build test` already runs `security-check`, `workflow-smoke`, and `examples-smoke`. The standalone steps above are for narrower iteration.
+`zig build test` already runs `security-check`, `workflow-smoke`, and `examples-smoke`. The standalone steps above are useful for narrower iteration.
 
-Opt-in interoperability (requires Docker; never part of `zig build test`):
+For the broader local release check, also run:
 
 ```sh
-./zig-0.16.0/zig build integration-registry --zig-lib-dir ./zig-0.16.0/lib
+zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseSmall
+zig build bench
 ```
+
+When a change affects public API or cross-module behavior, run `workflow-smoke` and `examples-smoke` directly while iterating. When it affects credentials, fixtures, or registry integration, run `security-check` and keep the Docker integration opt-in.
+
+## Opt-in interoperability (requires Docker; never part of `zig build test`)
+
+```sh
+zig build integration-registry
+```
+
+This check needs Docker and network access. It is separate from the offline release gate and should not be treated as a replacement for the default tests.
+
+## Documentation and examples
+
+Public examples must state whether they use fixtures, injected exchanges, or live network access. Use placeholders for registry credentials and never commit real tokens, Docker auth values, private keys, copied authorization headers, or response bodies. Examples that allocate through the caller must show the matching `deinit` or arena lifetime.
+
+Public documentation describes observable behavior and user ownership. It must not expose ignored local paths, internal work labels, or local-only commands. Source comments should explain non-obvious ownership, security, compatibility, or failure decisions. Keep prose direct and use fenced code blocks for commands and examples.
+
+## Security
+
+Run `zig build security-check` before handing off changes. Do not broaden cleartext HTTP, log credentials or authorization headers, or add process credential lookup to the bare library `Config{}` path. Use the existing injected credential and loopback test seams when coverage needs them.
 
 ## Requirements
 
-Zig **0.16.0** (bundled under `./zig-0.16.0/` in this repository).
+Zig **0.16.0** or later.
