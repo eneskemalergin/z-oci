@@ -37,8 +37,10 @@
 //!   credential helpers are unaffected; this check applies only to `ca_bundle_path`.
 //!   On POSIX, that bundle file must not be world-writable (`other` write bit).
 //!   Each public API entry reloads the file when this path is set.
-//! - Custom CA support does not make Windows a supported host. Zig 0.16 TLS on
-//!   Windows remains out of scope for z-oci regardless of bundle configuration.
+//! - Windows is not a verified supported build target for this repository. The
+//!   bundled Zig 0.16 standard library contains Windows certificate and TLS
+//!   support, but the current project also uses POSIX clock APIs in retry and
+//!   auth policy. A custom CA bundle does not establish Windows support.
 //!
 //! CredentialProvider / CredentialSources are interface slots here; lookup
 //! lives in `auth.zig`. Public resolve applies `credential_sources` only when

@@ -22,8 +22,8 @@
 //! - Batch workloads should reuse one `std.http.Client` and one `AuthEngine` across
 //!   multiple manifest operations so per-scope token cache entries stay warm.
 //!   Public `resolve`/`validate`/`getManifest` create a fresh engine per call and
-//!   apply `Config.credential_sources`. `testing.resolveWithEngine` does not
-//!   re-apply sources onto a caller-owned engine.
+//!   apply `Config.credential_sources`. `testing.resolveWithEngine` applies client
+//!   configuration but does not re-apply sources onto a caller-owned engine.
 //! - Per-operation transient arena (`resolveWithEngine`, `getManifestWithEngine`, and
 //!   the GET fallback inside `validateWithEngine`): one bump arena wraps the caller
 //!   allocator for manifest fetch work, including multi-arch child fetches where
@@ -172,6 +172,7 @@ pub const testing = struct {
         manifest_exchanger: ManifestHttpExchanger,
         transport_hooks: resilience.TransportHooks,
     ) PublicApiError!ResolveOutcome {
+        try root.ensureClientConfigured(config, client);
         return root.resolveWithEngine(
             allocator,
             client,
@@ -6567,6 +6568,32 @@ test "inspectWithExchangers: allocation failures release promoted documents" {
             }
         }
     }.run, .{});
+}
+
+test "testing.resolveWithEngine: applies client configuration before resolving" {
+    var client = std.http.Client{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    var engine = auth.AuthEngine.initWithTokenHttpExchanger(std.testing.allocator, .{}, refuseToken);
+    defer engine.deinit();
+
+    var ref = try Reference.parse(std.testing.allocator, "registry-1.docker.io/library/busybox:latest");
+    defer ref.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.CaBundleFileNotFound,
+        testing.resolveWithEngine(
+            std.testing.allocator,
+            &client,
+            .{ .ca_bundle_path = "/nonexistent/z-oci-ca-bundle.pem" },
+            &engine,
+            ref,
+            null,
+            refuseToken,
+            busyboxManifestExchange,
+            .{},
+        ),
+    );
 }
 
 test "WithEngine: platform_required failures are leak-free across resolve, validate, and get_manifest" {
