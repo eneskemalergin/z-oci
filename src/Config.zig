@@ -206,6 +206,8 @@ const PRIVATE_KEY_PEM_MARKERS = [_][]const u8{
     "-----BEGIN PRIVATE KEY-----",
     "-----BEGIN RSA PRIVATE KEY-----",
     "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN DSA PRIVATE KEY-----",
+    "-----BEGIN ED25519 PRIVATE KEY-----",
     "-----BEGIN ENCRYPTED PRIVATE KEY-----",
     "-----BEGIN OPENSSH PRIVATE KEY-----",
 };
@@ -590,16 +592,26 @@ test "Config.applyToClient: rejects PEM containing a private key marker" {
     const enterprise = try readTlsFixture("fixtures/tls/enterprise-test-ca.pem");
     defer std.testing.allocator.free(enterprise);
 
-    const rel_path = "ca-with-key.pem";
-    {
-        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, enterprise);
-        try file.writeStreamingAll(std.testing.io, "\n-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n");
-    }
-
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    try expectApplyError(try tmpFileAbsPath(tmp, rel_path, &abs_buf), error.CaBundleContainsPrivateKey);
+    const markers = [_][]const u8{
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN DSA PRIVATE KEY-----",
+        "-----BEGIN ED25519 PRIVATE KEY-----",
+    };
+    for (markers, 0..) |marker, index| {
+        var rel_buf: [32]u8 = undefined;
+        const rel_path = try std.fmt.bufPrint(&rel_buf, "ca-with-key-{d}.pem", .{index});
+        {
+            var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, enterprise);
+            try file.writeStreamingAll(std.testing.io, "\n");
+            try file.writeStreamingAll(std.testing.io, marker);
+            try file.writeStreamingAll(std.testing.io, "\nZm9v\n");
+        }
+
+        try expectApplyError(try tmpFileAbsPath(tmp, rel_path, &abs_buf), error.CaBundleContainsPrivateKey);
+    }
 }
 
 test "Config.applyToClient: allocation failures do not leak" {

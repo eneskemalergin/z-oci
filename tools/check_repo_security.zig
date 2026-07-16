@@ -14,9 +14,10 @@
 //!   secret assignments.
 //! - Non-source text under scan roots (`.md`, `.toml`, `.json`, `.yml`, `.yaml`,
 //!   `.txt`, `.sh`): reject private-key PEM markers.
-//! - `.zig` sources: reject non-placeholder Docker `auths` `"auth"` values only.
-//!   PEM markers and `.env`-style assignments are not scanned in `.zig` (field names
-//!   like `max_token_cache_entries` and test literals false-positive otherwise).
+//! - Credential content in `.zig` sources: reject non-placeholder Docker `auths`
+//!   `"auth"` values. PEM markers and `.env`-style assignments are not scanned in
+//!   `.zig` (field names like `max_token_cache_entries` and test literals false-positive
+//!   otherwise).
 //! - Production text and Zig sources: reject development-only paths and numbered
 //!   project phase/stage labels. Stable technical terms and user-visible limitations
 //!   such as an unimplemented CLI are allowed.
@@ -30,6 +31,8 @@ const PRIVATE_KEY_MARKERS = [_][]const u8{
     "-----BEGIN PRIVATE KEY-----",
     "-----BEGIN RSA PRIVATE KEY-----",
     "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN DSA PRIVATE KEY-----",
+    "-----BEGIN ED25519 PRIVATE KEY-----",
     "-----BEGIN ENCRYPTED PRIVATE KEY-----",
     "-----BEGIN OPENSSH PRIVATE KEY-----",
 };

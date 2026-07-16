@@ -184,6 +184,7 @@ test "Descriptor jsonParse: malformed field values return specific errors" {
         .{ prefix ++ "\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":\"not-a-number\"}", error.InvalidCharacter },
         .{ prefix ++ "\"digest\":\"not-a-digest\",\"size\":1234}", error.UnexpectedToken },
         .{ prefix ++ "\"digest\":\"sha256:" ++ ("a" ** 63) ++ "\",\"size\":1}", error.UnexpectedToken },
+        .{ prefix ++ "\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":18446744073709551616}", error.Overflow },
         .{ "{\"mediaType\":\"application/x-custom-unknown-type\",\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1}", error.UnexpectedToken },
         .{ prefix ++ "\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1,\"platform\":\"linux\"}", error.UnexpectedToken },
         .{ prefix ++ "\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":1,\"urls\":\"https://example.com/blob\"}", error.UnexpectedToken },
@@ -217,6 +218,22 @@ test "Descriptor jsonParse: allocation failures do not leak" {
             try std.testing.expectEqual(@as(usize, 1), parsed.value.urls.?.len);
         }
     }.run, .{json_bytes});
+}
+
+test "Descriptor jsonParse: bounded generated inputs never panic" {
+    var seed: u64 = 0xdec1_a7e;
+    var buf: [256]u8 = undefined;
+    for (0..256) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const parsed = std.json.parseFromSlice(Descriptor, std.testing.allocator, buf[0..len], .{ .ignore_unknown_fields = true }) catch continue;
+        parsed.deinit();
+    }
 }
 
 test "Descriptor jsonParse: repeated parse rounds leave no residual allocations under DebugAllocator" {

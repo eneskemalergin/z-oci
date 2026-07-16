@@ -398,6 +398,22 @@ test "Platform jsonParse: allocation failures do not leak" {
     }.run, .{});
 }
 
+test "Platform jsonParse: bounded generated inputs never panic" {
+    var seed: u64 = 0x50a7_1f9;
+    var buf: [192]u8 = undefined;
+    for (0..256) |_| {
+        seed = seed *% 6364136223846793005 +% 1;
+        const len: usize = @intCast(seed % (buf.len + 1));
+        for (buf[0..len]) |*b| {
+            seed = seed *% 6364136223846793005 +% 1;
+            b.* = @truncate(seed >> 32);
+        }
+
+        const parsed = std.json.parseFromSlice(Platform, std.testing.allocator, buf[0..len], .{ .ignore_unknown_fields = true }) catch continue;
+        parsed.deinit();
+    }
+}
+
 test "Platform jsonStringify: round-trip preserves fields via eql" {
     const features = [_][]const u8{ "seccomp", "apparmor" };
     const original = Platform{

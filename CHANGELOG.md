@@ -5,6 +5,28 @@ All notable changes to z-oci are documented here. The format follows [Keep a Cha
 
 Versions listed here may be prepared ahead of the matching git tag. Tags follow once the release is cut.
 
+## [0.7.1] - Unreleased
+
+This release collects the cleanup, hardening, and documentation work after `v0.7.0`. The entries below describe changes already present and verified in the current development state. Further user-facing documentation updates will be added only after they are written and checked; this section is not a release announcement.
+
+### Changed
+
+- Simplified ownership boundaries by removing shared CA-bundle cache state, narrowing internal test seams, and removing unused resolver helpers.
+- Normalized source and benchmark terminology, corrected fixture and benchmark guidance, and kept the public README focused on orientation rather than reference detail.
+- Extended the benchmark `--counting` report with freed bytes, peak live bytes, and end-of-loop live bytes. Cache-retaining authentication cases report their retained state instead of treating it as a leak.
+
+### Fixed
+
+- CA-bundle validation and repository security scanning now reject DSA and Ed25519 private-key PEM labels as well as the previously covered key formats.
+- Added bounded generated-input coverage for platform and descriptor parsing, including an explicit descriptor-size overflow case.
+- Corrected example and local registry integration ownership paths so parsed references, clients, and outcomes are cleaned up on their owning success and failure paths.
+
+### Verified
+
+- The complete gate passes with 37/37 build steps and 419/419 tests, including CLI, workflow, examples, and security checks.
+- ReleaseFast and ReleaseSmall builds, formatting, benchmark compilation, and the opt-in local `registry:2` integration pass. The integration resolves a tag and digest and maps a missing tag to `not_found`.
+- Representative counting runs show zero live bytes after non-cache operations. Authentication cache-retaining cases report their live bytes before engine teardown; no timing, RSS, or allocation threshold is claimed.
+
 ## [0.7.0] - 2026-07-15 - [Tagged]
 
 v0.7.0 collects the public API and executable work added after v0.6.0. The executable includes live `resolve`, digest-only `validate`, and metadata `inspect` commands on top of the public resolver.
@@ -168,7 +190,7 @@ Production resilience for live registry traffic: reactive retries and rate-limit
   - Live manifest GET uses a bounded transient workspace during digest verification and JSON parse, copies only response headers needed per HTTP status, and enforces caps on `WWW-Authenticate` count and header value size.
   - Multi-arch child fetches forward caller `operation` correctly; parent index document is torn down before child GET.
 - **Testing**
-  - Duplicate resolver, auth, and workflow tests now run through scenario loops in `test_matrix.zig`, shared by `root.zig` and `workflow_smoke.zig`. The release gate reports 204/204 tests (down from 535); the same `ResolveError` arms, validate/get-manifest failure paths, and C4 public API entries are still covered.
+  - Duplicate resolver, auth, and workflow tests now run through scenario loops in `test_matrix.zig`, shared by `root.zig` and `workflow_smoke.zig`. The release gate reports 204/204 tests (down from 535); the same `ResolveError` arms, validate/get-manifest failure paths, and public API coverage entries are still covered.
 
 ### Fixed
 

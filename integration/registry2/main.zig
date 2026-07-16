@@ -40,7 +40,10 @@ pub fn main(init: std.process.Init) !void {
     const config = z_oci.Config{};
 
     var tag_ref = try z_oci.Reference.parse(gpa, tag_ref_str);
-    const tag_outcome = try z_oci.resolve(gpa, &client, config, tag_ref, null);
+    const tag_outcome = blk: {
+        errdefer tag_ref.deinit(gpa);
+        break :blk try z_oci.resolve(gpa, &client, config, tag_ref, null);
+    };
     const tag_result = switch (tag_outcome) {
         .success => |result| result,
         .failure => |failure| {
@@ -70,7 +73,10 @@ pub fn main(init: std.process.Init) !void {
         digest_str,
     });
     var digest_ref = try z_oci.Reference.parse(gpa, digest_ref_str);
-    const digest_outcome = try z_oci.resolve(gpa, &client, config, digest_ref, null);
+    const digest_outcome = blk: {
+        errdefer digest_ref.deinit(gpa);
+        break :blk try z_oci.resolve(gpa, &client, config, digest_ref, null);
+    };
     const digest_result = switch (digest_outcome) {
         .success => |result| result,
         .failure => |failure| {

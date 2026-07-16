@@ -134,8 +134,8 @@ fn nanoTime() i128 {
     return @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
 }
 
-fn printReport(name: []const u8, detail: []const u8, io: Io, iterations: usize, wall_ns: i128, alloc_count: usize, alloc_bytes: usize) void {
-    printReportWithExchanges(name, detail, io, iterations, wall_ns, alloc_count, alloc_bytes, null);
+fn printReport(name: []const u8, detail: []const u8, io: Io, iterations: usize, wall_ns: i128, allocator_stats: ?*const CountingAllocator) void {
+    printReportWithExchanges(name, detail, io, iterations, wall_ns, allocator_stats, null);
 }
 
 fn printReportWithExchanges(
@@ -144,8 +144,7 @@ fn printReportWithExchanges(
     io: Io,
     iterations: usize,
     wall_ns: i128,
-    alloc_count: usize,
-    alloc_bytes: usize,
+    allocator_stats: ?*const CountingAllocator,
     manifest_exchanges: ?usize,
 ) void {
     var buf: [4096]u8 = undefined;
@@ -157,9 +156,12 @@ fn printReportWithExchanges(
     out.print("  wall_ns     {d}\n", .{wall_ns}) catch {};
     const mean = @divFloor(wall_ns, @as(i128, @intCast(iterations)));
     out.print("  mean_ns     {d}\n", .{mean}) catch {};
-    if (alloc_count > 0) {
-        out.print("  allocs      {d}\n", .{alloc_count}) catch {};
-        out.print("  alloc_bytes {d}\n", .{alloc_bytes}) catch {};
+    if (allocator_stats) |stats| {
+        out.print("  allocs      {d}\n", .{stats.allocation_count}) catch {};
+        out.print("  alloc_bytes {d}\n", .{stats.bytes_allocated}) catch {};
+        out.print("  freed_bytes {d}\n", .{stats.bytes_freed}) catch {};
+        out.print("  peak_bytes  {d}\n", .{stats.peak_bytes}) catch {};
+        out.print("  live_bytes  {d}\n", .{stats.current_bytes}) catch {};
     }
     if (manifest_exchanges) |exchanges| {
         out.print("  manifest_exchanges {d}\n", .{exchanges}) catch {};
@@ -260,6 +262,10 @@ const CountingAllocator = struct {
     }
 };
 
+fn expectNoLiveBytes(counting: bool, stats: *const CountingAllocator) !void {
+    if (counting and stats.current_bytes != 0) return error.BenchmarkCleanupFailure;
+}
+
 // --- Shared fixtures ---
 
 const OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json";
@@ -293,7 +299,8 @@ fn benchReferenceParse(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("reference-parse", input, io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    try expectNoLiveBytes(counting, &ca);
+    printReport("reference-parse", input, io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchDigestParse(io: Io, iterations: usize, counting: bool) !void {
@@ -312,7 +319,7 @@ fn benchDigestParse(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("digest-parse", input, io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    printReport("digest-parse", input, io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchManifestParse(io: Io, iterations: usize, counting: bool) !void {
@@ -336,7 +343,8 @@ fn benchManifestParse(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("manifest-parse", fixture_path, io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    try expectNoLiveBytes(counting, &ca);
+    printReport("manifest-parse", fixture_path, io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchChallengeParse(io: Io, iterations: usize, counting: bool) !void {
@@ -351,7 +359,7 @@ fn benchChallengeParse(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("challenge-parse", input, io, iterations, elapsed, 0, 0);
+    printReport("challenge-parse", input, io, iterations, elapsed, null);
 }
 
 fn benchPlatformMatch(io: Io, iterations: usize, counting: bool) !void {
@@ -367,7 +375,7 @@ fn benchPlatformMatch(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("platform-match", "candidate linux/arm64/v8 vs filter linux/arm64", io, iterations, elapsed, 0, 0);
+    printReport("platform-match", "candidate linux/arm64/v8 vs filter linux/arm64", io, iterations, elapsed, null);
 }
 
 // --- Auth benchmarks ---
@@ -417,7 +425,7 @@ fn benchAuthenticateMiss(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("authenticate-miss", "unique scope per call", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    printReport("authenticate-miss", "unique scope per call", io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
@@ -459,7 +467,8 @@ fn benchAuthenticateHit(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("authenticate-hit", "same scope, cached", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    try expectNoLiveBytes(counting, &ca);
+    printReport("authenticate-hit", "same scope, cached", io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchAuthenticateRateLimit(io: Io, iterations: usize, counting: bool) !void {
@@ -522,7 +531,7 @@ fn benchAuthenticateRateLimit(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("authenticate-rate-limit", "429 then success via injected token transport", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    printReport("authenticate-rate-limit", "429 then success via injected token transport", io, iterations, elapsed, if (counting) &ca else null);
 }
 
 // --- Resolver fixtures ---
@@ -733,14 +742,14 @@ fn benchResolveSingle(io: Io, iterations: usize, counting: bool) !void {
     const elapsed = nanoTime() - start;
 
     if (SingleManifestBenchFixture.manifest_calls != iterations) return error.UnexpectedBenchmarkFailure;
+    try expectNoLiveBytes(counting, &ca);
     printReportWithExchanges(
         "resolve-single",
         "single-arch resolve via injected manifest fixture",
         io,
         iterations,
         elapsed,
-        ca.allocation_count,
-        ca.bytes_allocated,
+        if (counting) &ca else null,
         SingleManifestBenchFixture.manifest_calls,
     );
 }
@@ -787,7 +796,8 @@ fn benchResolveSession(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("resolve-session", "single-arch resolve with reused AuthEngine", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    try expectNoLiveBytes(counting, &ca);
+    printReport("resolve-session", "single-arch resolve with reused AuthEngine", io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchResolveMany(io: Io, iterations: usize, counting: bool) !void {
@@ -864,14 +874,14 @@ fn benchResolveMany(io: Io, iterations: usize, counting: bool) !void {
     if (BatchManifestBenchFixture.manifest_calls != iterations) return error.UnexpectedBenchmarkFailure;
     // Four duplicate inputs resolved independently would cost 4 exchanges per batch.
     if (!(BatchManifestBenchFixture.manifest_calls < iterations * refs.len)) return error.UnexpectedBenchmarkFailure;
+    try expectNoLiveBytes(counting, &ca);
     printReportWithExchanges(
         "resolve-many",
         "4-item duplicate-heavy batch with one manifest fetch",
         io,
         iterations,
         elapsed,
-        ca.allocation_count,
-        ca.bytes_allocated,
+        if (counting) &ca else null,
         BatchManifestBenchFixture.manifest_calls,
     );
 }
@@ -948,14 +958,14 @@ fn benchResolveManyUnique(io: Io, iterations: usize, counting: bool) !void {
     const elapsed = nanoTime() - start;
 
     if (BatchManifestBenchFixture.manifest_calls != iterations * refs.len) return error.UnexpectedBenchmarkFailure;
+    try expectNoLiveBytes(counting, &ca);
     printReportWithExchanges(
         "resolve-many-unique",
         "4-item unique-reference batch with four manifest fetches",
         io,
         iterations,
         elapsed,
-        ca.allocation_count,
-        ca.bytes_allocated,
+        if (counting) &ca else null,
         BatchManifestBenchFixture.manifest_calls,
     );
 }
@@ -1000,7 +1010,8 @@ fn benchResolveSingleRetry(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("resolve-single-retry", "503 then success via injected manifest transport", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    try expectNoLiveBytes(counting, &ca);
+    printReport("resolve-single-retry", "503 then success via injected manifest transport", io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchResolveMulti(io: Io, iterations: usize, counting: bool) !void {
@@ -1042,7 +1053,8 @@ fn benchResolveMulti(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("resolve-multi", "multi-arch resolve with child selection via injected fixtures", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    try expectNoLiveBytes(counting, &ca);
+    printReport("resolve-multi", "multi-arch resolve with child selection via injected fixtures", io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchValidateSingle(io: Io, iterations: usize, counting: bool) !void {
@@ -1085,7 +1097,8 @@ fn benchValidateSingle(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("validate-single", "single-arch validate HEAD path via injected metadata", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    try expectNoLiveBytes(counting, &ca);
+    printReport("validate-single", "single-arch validate HEAD path via injected metadata", io, iterations, elapsed, if (counting) &ca else null);
 }
 
 fn benchGetManifest(io: Io, iterations: usize, counting: bool) !void {
@@ -1133,7 +1146,8 @@ fn benchGetManifest(io: Io, iterations: usize, counting: bool) !void {
     }
     const elapsed = nanoTime() - start;
 
-    printReport("get-manifest", "single-arch getManifest via injected manifest fixture", io, iterations, elapsed, ca.allocation_count, ca.bytes_allocated);
+    try expectNoLiveBytes(counting, &ca);
+    printReport("get-manifest", "single-arch getManifest via injected manifest fixture", io, iterations, elapsed, if (counting) &ca else null);
 }
 
 // --- Outcome helpers ---

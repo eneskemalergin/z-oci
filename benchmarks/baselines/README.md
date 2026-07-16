@@ -11,7 +11,7 @@ Baselines are generated with `./tools/zebrac` (currently **0.6.0**, tracked in-r
 - CLI dispatch / `USAGE` in `benchmarks/src/main.zig`
 - `printReport(...)` labels
 - zebrac command lines in this file
-- README performance tables
+- the benchmark baseline tables and commands in this file
 
 Current operations (run `./zig-out/bin/z-oci-bench` with no args for the same list):
 
@@ -64,22 +64,22 @@ Captured with `zig build -Doptimize=ReleaseFast install`, `./tools/zebrac -d 400
 
 | Operation | Mean per iteration | Mean RSS | Samples |
 | --- | --- | --- | --- |
-| `reference-parse` | 306847.4 us | 1.05 MB | 14 |
-| `digest-parse` | 1331.9 us | 1.05 MB | 2985 |
-| `manifest-parse` | 262327.0 us | 1.07 MB | 16 |
-| `challenge-parse` | 5318.3 us | 1.10 MB | 751 |
-| `platform-match` | 1319.3 us | 1.29 MB | 3013 |
-| `authenticate-miss` | 69191.6 us | 3.05 MB | 58 |
-| `authenticate-hit` | 1589.2 us | 1.70 MB | 2505 |
-| `authenticate-rate-limit` | 83847.2 us | 3.05 MB | 48 |
-| `resolve-single` | 42199.9 us | 1.97 MB | 95 |
-| `resolve-single-retry` | 42154.7 us | 1.99 MB | 95 |
-| `resolve-session` | 43309.9 us | 2.01 MB | 93 |
-| `resolve-many` | 199525.9 us | 2.02 MB | 21 |
-| `resolve-many-unique` | 385818.8 us | 2.03 MB | 11 |
-| `resolve-multi` | 175768.9 us | 2.03 MB | 23 |
-| `validate-single` | 25160.7 us | 2.04 MB | 159 |
-| `get-manifest` | 54015.5 us | 2.07 MB | 75 |
+| `reference-parse` | 30.7 us | 1.05 MB | 14 |
+| `digest-parse` | 0.1 us | 1.05 MB | 2985 |
+| `manifest-parse` | 26.2 us | 1.07 MB | 16 |
+| `challenge-parse` | 0.5 us | 1.10 MB | 751 |
+| `platform-match` | 0.1 us | 1.29 MB | 3013 |
+| `authenticate-miss` | 69.2 us | 3.05 MB | 58 |
+| `authenticate-hit` | 1.6 us | 1.70 MB | 2505 |
+| `authenticate-rate-limit` | 83.8 us | 3.05 MB | 48 |
+| `resolve-single` | 42.2 us | 1.97 MB | 95 |
+| `resolve-single-retry` | 42.2 us | 1.99 MB | 95 |
+| `resolve-session` | 43.3 us | 2.01 MB | 93 |
+| `resolve-many` | 199.5 us | 2.02 MB | 21 |
+| `resolve-many-unique` | 385.8 us | 2.03 MB | 11 |
+| `resolve-multi` | 175.8 us | 2.03 MB | 23 |
+| `validate-single` | 25.2 us | 2.04 MB | 159 |
+| `get-manifest` | 54.0 us | 2.07 MB | 75 |
 
 ### `v0.5.0.json`: ReleaseFast zebrac (per iteration)
 

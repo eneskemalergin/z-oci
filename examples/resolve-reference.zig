@@ -44,14 +44,16 @@ pub fn main(init: std.process.Init) !void {
         null;
 
     var reference = try z_oci.Reference.parse(gpa, args[1]);
-
     var client = std.http.Client{
         .allocator = gpa,
         .io = init.io,
     };
     defer client.deinit();
 
-    const outcome = try z_oci.resolve(gpa, &client, z_oci.Config{}, reference, platform);
+    const outcome = blk: {
+        errdefer reference.deinit(gpa);
+        break :blk try z_oci.resolve(gpa, &client, z_oci.Config{}, reference, platform);
+    };
     switch (outcome) {
         .success => |result| {
             var owned_result = result;

@@ -89,7 +89,7 @@ pub const get_manifest_failure_scenarios = [_]Scenario{
 
 pub const PublicApi = enum { resolve, validate, get_manifest };
 
-pub const C4Surface = enum {
+pub const ApiCoverageSurface = enum {
     success,
     resolve_error,
     validate_valid,
@@ -98,33 +98,15 @@ pub const C4Surface = enum {
     public_api_error,
 };
 
-pub const C4Entry = struct {
+pub const ApiCoverageEntry = struct {
     api: PublicApi,
-    surface: C4Surface,
+    surface: ApiCoverageSurface,
     tier: []const u8,
     owner_test: []const u8,
     scenario: ?Scenario = null,
 };
 
-pub const c4_success_entries = [_]C4Entry{
-    .{ .api = .resolve, .surface = .success, .tier = "T2", .owner_test = "resolveWithExchangers returns pinned single-arch result for tag reference" },
-    .{ .api = .resolve, .surface = .success, .tier = "T2", .owner_test = "resolveWithExchangers resolves multi-arch index to selected child manifest" },
-    .{ .api = .resolve, .surface = .success, .tier = "T2", .owner_test = "resolveWithExchangers authenticates on challenge and resolves manifest" },
-    .{ .api = .validate, .surface = .validate_valid, .tier = "T2", .owner_test = "validateWithExchangers returns valid from HEAD for single-arch manifest" },
-    .{ .api = .validate, .surface = .validate_valid, .tier = "T2", .owner_test = "validateWithExchangers returns valid for selected multi-arch child manifest" },
-    .{ .api = .validate, .surface = .validate_valid, .tier = "T3", .owner_test = "workflow smoke: public validate follows selected multi-arch child" },
-    .{ .api = .get_manifest, .surface = .manifest_success, .tier = "T2", .owner_test = "getManifestWithExchangers returns parsed single-arch manifest" },
-    .{ .api = .get_manifest, .surface = .manifest_success, .tier = "T2", .owner_test = "getManifestWithExchangers resolves nested index to leaf manifest" },
-};
-
-pub const c4_public_api_error_entries = [_]C4Entry{
-    .{ .api = .resolve, .surface = .public_api_error, .tier = "T3", .owner_test = "workflow smoke: public resolve returns CaBundleFileNotFound for missing ca bundle path" },
-    .{ .api = .resolve, .surface = .public_api_error, .tier = "T2", .owner_test = "resolveWithEngine per-resolve arena promotes failures without leaking" },
-    .{ .api = .validate, .surface = .public_api_error, .tier = "T2", .owner_test = "validateWithEngine per-resolve arena promotes failures without leaking" },
-    .{ .api = .get_manifest, .surface = .public_api_error, .tier = "T2", .owner_test = "getManifestWithEngine per-resolve arena promotes failures without leaking" },
-};
-
-pub fn c4ResolveErrorEntries(out: []C4Entry) usize {
+pub fn resolveErrorCoverageEntries(out: []ApiCoverageEntry) usize {
     var count: usize = 0;
     for (resolve_failure_scenarios) |scenario| {
         out[count] = .{
@@ -139,10 +121,10 @@ pub fn c4ResolveErrorEntries(out: []C4Entry) usize {
     return count;
 }
 
-pub fn c4ValidateFailureEntries(out: []C4Entry, offset: usize) usize {
+pub fn validateFailureCoverageEntries(out: []ApiCoverageEntry, offset: usize) usize {
     var count: usize = 0;
     for (validate_failure_scenarios) |scenario| {
-        const surface: C4Surface = if (scenario == .not_found) .validate_not_found else .resolve_error;
+        const surface: ApiCoverageSurface = if (scenario == .not_found) .validate_not_found else .resolve_error;
         out[offset + count] = .{
             .api = .validate,
             .surface = surface,
@@ -155,7 +137,7 @@ pub fn c4ValidateFailureEntries(out: []C4Entry, offset: usize) usize {
     return count;
 }
 
-pub fn c4GetManifestFailureEntries(out: []C4Entry, offset: usize) usize {
+pub fn getManifestFailureCoverageEntries(out: []ApiCoverageEntry, offset: usize) usize {
     var count: usize = 0;
     for (get_manifest_failure_scenarios) |scenario| {
         out[offset + count] = .{
@@ -515,17 +497,17 @@ fn expectScenarioTagMatchesResolveError(scenario: Scenario) !void {
     return error.TestUnexpectedResult;
 }
 
-test "test_matrix: failure scenario tables align with ResolveError tags and C4 builders" {
+test "test_matrix: failure scenario tables align with ResolveError tags and coverage builders" {
     try std.testing.expectEqual(@typeInfo(ResolveError).@"union".fields.len, resolve_failure_scenarios.len);
 
-    var resolve_errors: [resolve_failure_scenarios.len]C4Entry = undefined;
-    try std.testing.expectEqual(resolve_failure_scenarios.len, c4ResolveErrorEntries(&resolve_errors));
+    var resolve_errors: [resolve_failure_scenarios.len]ApiCoverageEntry = undefined;
+    try std.testing.expectEqual(resolve_failure_scenarios.len, resolveErrorCoverageEntries(&resolve_errors));
 
-    var validate_errors: [validate_failure_scenarios.len]C4Entry = undefined;
-    try std.testing.expectEqual(validate_failure_scenarios.len, c4ValidateFailureEntries(&validate_errors, 0));
+    var validate_errors: [validate_failure_scenarios.len]ApiCoverageEntry = undefined;
+    try std.testing.expectEqual(validate_failure_scenarios.len, validateFailureCoverageEntries(&validate_errors, 0));
 
-    var get_manifest_errors: [get_manifest_failure_scenarios.len]C4Entry = undefined;
-    try std.testing.expectEqual(get_manifest_failure_scenarios.len, c4GetManifestFailureEntries(&get_manifest_errors, 0));
+    var get_manifest_errors: [get_manifest_failure_scenarios.len]ApiCoverageEntry = undefined;
+    try std.testing.expectEqual(get_manifest_failure_scenarios.len, getManifestFailureCoverageEntries(&get_manifest_errors, 0));
 
     for (resolve_failure_scenarios) |scenario| {
         try expectScenarioTagMatchesResolveError(scenario);
@@ -540,7 +522,7 @@ test "test_matrix: failure scenario tables align with ResolveError tags and C4 b
 
     for (validate_failure_scenarios) |scenario| {
         try std.testing.expect(scenarioInList(scenario, &resolve_failure_scenarios));
-        const expected_surface: C4Surface = if (scenario == .not_found) .validate_not_found else .resolve_error;
+        const expected_surface: ApiCoverageSurface = if (scenario == .not_found) .validate_not_found else .resolve_error;
         var listed = false;
         for (validate_errors) |entry| {
             if (entry.scenario == scenario) {
@@ -559,7 +541,7 @@ test "test_matrix: failure scenario tables align with ResolveError tags and C4 b
             if (entry.scenario == scenario) {
                 listed = true;
                 try std.testing.expectEqual(PublicApi.get_manifest, entry.api);
-                try std.testing.expectEqual(C4Surface.resolve_error, entry.surface);
+                try std.testing.expectEqual(ApiCoverageSurface.resolve_error, entry.surface);
             }
         }
         try std.testing.expect(listed);

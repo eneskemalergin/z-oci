@@ -3,8 +3,8 @@
 //! Run: `zig build example-resolve-many`
 //!
 //! Offline demo only: uses `testing.resolveManyWithExchangers` (not public
-//! `resolveMany`); `Client` is unused. Live callers need a real client and
-//! registry host.
+//! `resolveMany`); the injected exchangers ignore the client. Live callers need
+//! a real client and registry host.
 //!
 //! Ownership: input refs and `result` use `init.gpa`; never `deinitResolveFailure`
 //! on batch items (use `result.deinit`). Progress views borrow for the callback
@@ -120,8 +120,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var progress_printer = ProgressPrinter{ .stdout = stdout };
-    // Exchangers never use this client; live callers need a real Client.
-    var client: std.http.Client = undefined;
+    // Injected exchangers do not make requests; keep the caller-owned client valid.
+    var client = std.http.Client{
+        .allocator = init.gpa,
+        .io = init.io,
+    };
+    defer client.deinit();
     var result = try z_oci.testing.resolveManyWithExchangers(
         init.gpa,
         &client,
