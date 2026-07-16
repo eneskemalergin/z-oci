@@ -11,7 +11,7 @@
 
 <p align="center">
     <img src="https://img.shields.io/badge/version-v0.7.0-8B5CF6?style=flat-square" alt="v0.7.0">
-    <img src="https://img.shields.io/badge/status-compat%20testing-2D7D46?style=flat-square" alt="Status: compat testing">
+    <img src="https://img.shields.io/badge/status-released-2D7D46?style=flat-square" alt="Status: released">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -23,7 +23,7 @@
 
 z-oci is a read-only OCI and Docker Registry client for Zig. It parses image references, authenticates when configured, fetches manifests, verifies digests, and selects a platform from multi-arch images. It does not pull image layers.
 
-The current package metadata is `0.7.0` and remains unreleased. The latest tagged package is `v0.6.0`.
+The current package and latest tagged release are `v0.7.0`.
 
 ## Why z-oci?
 
@@ -43,7 +43,7 @@ Requirements: Zig **0.16.0** or later.
 The latest tagged release can be fetched with:
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.6.0
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.7.0
 ```
 
 Then import the module from `build.zig`:

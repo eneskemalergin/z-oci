@@ -5,9 +5,9 @@ All notable changes to z-oci are documented here. The format follows [Keep a Cha
 
 Versions listed here may be prepared ahead of the matching git tag. Tags follow once the release is cut.
 
-## [0.7.0] - Unreleased
+## [0.7.0] - 2026-07-15 - [Tagged]
 
-This unreleased version collects the public API and executable work added after v0.6.0. The executable includes live `resolve`, digest-only `validate`, and metadata `inspect` commands on top of the public resolver.
+v0.7.0 collects the public API and executable work added after v0.6.0. The executable includes live `resolve`, digest-only `validate`, and metadata `inspect` commands on top of the public resolver.
 
 ### Added
 
@@ -620,3 +620,4 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 [0.4.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.4.0
 [0.5.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.5.0
 [0.6.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.6.0
+[0.7.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.7.0
