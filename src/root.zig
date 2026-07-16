@@ -71,7 +71,7 @@ const resilience = @import("resilience.zig");
 const registry_ping = @import("registry_ping.zig");
 const testing_loopback = @import("testing_loopback.zig");
 const mock_registry_peer = @import("mock_registry.zig");
-pub const test_matrix = @import("test_matrix.zig");
+const test_matrix = @import("test_matrix.zig");
 
 pub const Digest = @import("Digest.zig");
 pub const MediaType = @import("MediaType.zig").MediaType;
@@ -109,8 +109,9 @@ pub const RegistryPingFailure = registry_ping.RegistryPingFailure;
 pub const RegistryPingFailureKind = registry_ping.RegistryPingFailureKind;
 pub const RegistryPingResult = registry_ping.RegistryPingResult;
 pub const testing = struct {
-    pub const FailureScenario = test_matrix.Scenario;
-    pub const refuseTokenExchange = test_matrix.refuseTokenExchange;
+    pub const test_matrix = @import("test_matrix.zig");
+    pub const FailureScenario = @import("test_matrix.zig").Scenario;
+    pub const refuseTokenExchange = @import("test_matrix.zig").refuseTokenExchange;
     pub const TokenHttpExchanger = auth.TokenHttpExchanger;
     pub const ManifestHttpExchanger = resolver.ManifestHttpExchanger;
     pub const ManifestHttpRequest = resolver.ManifestHttpRequest;
@@ -1551,9 +1552,6 @@ fn validateResolvedManifestFromChildHead(
 }
 fn digestMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .digest_mismatch, null, false);
-}
-fn contentTypeMismatchErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
-    return allocatedResolveError(allocator, ref, .content_type_mismatch, null, false);
 }
 fn manifestParseErrorAlloc(allocator: std.mem.Allocator, ref: AuthReferenceView) !ResolveError {
     return allocatedResolveError(allocator, ref, .manifest_parse_error, null, false);

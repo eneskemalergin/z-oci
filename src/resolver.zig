@@ -552,7 +552,7 @@ pub fn canonicalReferenceAlloc(allocator: std.mem.Allocator, reference: auth.Aut
     std.debug.assert(written.len == len);
     return canonical;
 }
-pub fn buildManifestHttpRequestAlloc(
+fn buildManifestHttpRequestAlloc(
     allocator: std.mem.Allocator,
     request: ManifestRequest,
     bearer_token: ?[]const u8,

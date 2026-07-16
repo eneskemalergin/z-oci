@@ -7,7 +7,7 @@
 const std = @import("std");
 const z_oci = @import("z_oci");
 
-const tm = z_oci.test_matrix;
+const tm = z_oci.testing.test_matrix;
 
 const busybox_ref = z_oci.Reference{
     .registry = "registry-1.docker.io",

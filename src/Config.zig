@@ -177,14 +177,6 @@ pub const Config = struct {
         const stat = file.stat(io) catch return error.CaBundleInvalid;
         try validateCaBundleFileStat(stat);
 
-        const mtime_nsec = stat.mtime.toNanoseconds();
-
-        if (client.ca_bundle.bytes.items.len > 0 and
-            caBundleApplyCacheMatches(client, resolved_path, mtime_nsec))
-        {
-            return;
-        }
-
         var loaded: std.crypto.Certificate.Bundle = .empty;
         errdefer loaded.deinit(gpa);
 
@@ -201,39 +193,10 @@ pub const Config = struct {
         client.ca_bundle = .empty;
         client.now = now;
         std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &loaded);
-
-        caBundleApplyCacheRemember(client, resolved_path, mtime_nsec);
     }
 };
 
 // --- CA bundle helpers ---
-
-const CaBundleApplyCache = struct {
-    client: ?*std.http.Client = null,
-    path: [std.fs.max_path_bytes]u8 = undefined,
-    path_len: usize = 0,
-    mtime_nsec: i128 = 0,
-};
-
-var ca_bundle_apply_cache: CaBundleApplyCache = .{};
-
-fn caBundleApplyCacheMatches(client: *std.http.Client, path: []const u8, mtime_nsec: i128) bool {
-    return ca_bundle_apply_cache.client == client and
-        ca_bundle_apply_cache.mtime_nsec == mtime_nsec and
-        ca_bundle_apply_cache.path_len == path.len and
-        std.mem.eql(u8, ca_bundle_apply_cache.path[0..ca_bundle_apply_cache.path_len], path);
-}
-
-fn caBundleApplyCacheRemember(
-    client: *std.http.Client,
-    path: []const u8,
-    mtime_nsec: i128,
-) void {
-    @memcpy(ca_bundle_apply_cache.path[0..path.len], path);
-    ca_bundle_apply_cache.client = client;
-    ca_bundle_apply_cache.path_len = path.len;
-    ca_bundle_apply_cache.mtime_nsec = mtime_nsec;
-}
 
 const BASE64_DECODER = std.base64.standard.decoderWithIgnore(" \t\r\n");
 const MAX_CA_BUNDLE_BYTES: u64 = 10 * 1024 * 1024;
@@ -466,7 +429,7 @@ test "Config.applyToClient: no-op when ca_bundle_path is null" {
     try config.applyToClient(&client);
 }
 
-test "Config.applyToClient: loads PEM and skips reload when path and mtime are unchanged" {
+test "Config.applyToClient: applies PEM repeatedly when path and mtime are unchanged" {
     try skipUnlessTls();
 
     const rel_path = "fixtures/tls/enterprise-test-ca.pem";
