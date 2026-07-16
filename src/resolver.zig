@@ -813,7 +813,7 @@ fn shouldCollectManifestResilienceHeader(status: std.http.Status, header_name: [
         return resilience.isTrackedResilienceHeaderName(header_name);
     }
     if (status == .ok) {
-        return std.mem.startsWith(u8, header_name, "RateLimit-") or
+        return std.ascii.startsWithIgnoreCase(header_name, "RateLimit-") or
             std.ascii.startsWithIgnoreCase(header_name, "X-RateLimit-");
     }
     return false;
@@ -1969,9 +1969,9 @@ test "ownedManifestResponseMetadataFromHead: header collection matrix" {
     const ok_rate_limit_head = try testHttpHeadFromLines(std.testing.allocator, "HTTP/1.1 200 OK", &.{
         "WWW-Authenticate: Bearer realm=\"https://auth.example.test/token\"",
         "Retry-After: 30",
-        "RateLimit-Limit: 100;w=21600",
-        "RateLimit-Remaining: 99;w=21600",
-        "RateLimit-Reset: 1746136938;w=21600",
+        "ratelimit-limit: 100;w=21600",
+        "rAtElImIt-Remaining: 99;w=21600",
+        "RATELIMIT-RESET: 1746136938;w=21600",
     });
     defer std.testing.allocator.free(ok_rate_limit_head.bytes);
     var ok_rate_limit = try ownedManifestResponseMetadataFromHead(std.testing.allocator, ok_rate_limit_head);

@@ -292,7 +292,7 @@ pub fn runHttpRetryLoop(
 }
 /// Unlisted headers are dropped early; only retry/throttle metadata is retained.
 pub fn isTrackedResilienceHeaderName(name: []const u8) bool {
-    if (std.mem.startsWith(u8, name, "RateLimit-")) return true;
+    if (std.ascii.startsWithIgnoreCase(name, "RateLimit-")) return true;
     if (std.ascii.startsWithIgnoreCase(name, "X-RateLimit-")) return true;
     if (std.ascii.eqlIgnoreCase(name, "Retry-After")) return true;
     if (std.ascii.eqlIgnoreCase(name, "X-Retry-After")) return true;
@@ -343,15 +343,27 @@ pub fn duplicateHttpHeadersAlloc(
 }
 pub fn retryAfterDelayMs(retry_after: RetryAfter, now_unix_seconds: i64) u32 {
     switch (retry_after) {
-        .delay_seconds => |seconds| return seconds * 1000,
+        .delay_seconds => |seconds| return clampDelaySecondsMs(seconds),
         .retry_at_unix_seconds => |retry_at| {
-            const delta_seconds = retry_at - now_unix_seconds;
-            if (delta_seconds <= 0) return 0;
-            const delta_ms = delta_seconds * 1000;
-            if (delta_ms > std.math.maxInt(u32)) return std.math.maxInt(u32);
-            return @intCast(delta_ms);
+            if (retry_at <= now_unix_seconds) return 0;
+
+            const delta_seconds: u64 = if (now_unix_seconds >= 0) blk: {
+                break :blk @as(u64, @intCast(retry_at)) - @as(u64, @intCast(now_unix_seconds));
+            } else if (retry_at >= 0) blk: {
+                const magnitude = @as(u64, @intCast(-(now_unix_seconds + 1))) + 1;
+                break :blk @as(u64, @intCast(retry_at)) + magnitude;
+            } else blk: {
+                break :blk @as(u64, @intCast(retry_at - now_unix_seconds));
+            };
+
+            return clampDelaySecondsMs(delta_seconds);
         },
     }
+}
+fn clampDelaySecondsMs(seconds: u64) u32 {
+    const max_delay_seconds = @as(u64, std.math.maxInt(u32)) / 1000;
+    if (seconds > max_delay_seconds) return std.math.maxInt(u32);
+    return @intCast(seconds * 1000);
 }
 pub fn retryBudgetConfig(config: Config) RetryBudgetConfig {
     return .{
@@ -727,6 +739,7 @@ fn parseImfFixdateHttpDate(raw: []const u8) ResilienceParseError!i64 {
 
     if (part_count != 4) return error.InvalidHttpDate;
     if (day == 0 or day > 31 or hour > 23 or minute > 59 or second > 59) return error.InvalidHttpDate;
+    if (day > epoch.getDaysInMonth(year, month)) return error.InvalidHttpDate;
 
     return unixSecondsFromUtc(.{
         .year = year,
@@ -770,7 +783,7 @@ fn unixSecondsFromUtc(date_time: UtcDateTime) ResilienceParseError!i64 {
     return @intCast(seconds);
 }
 fn parseHttpMonthAbbrev(token: []const u8) ?epoch.Month {
-    if (token.len < 3) return null;
+    if (token.len != 3) return null;
     const abbrev = token[0..3];
     if (std.ascii.eqlIgnoreCase(abbrev, "Jan")) return .jan;
     if (std.ascii.eqlIgnoreCase(abbrev, "Feb")) return .feb;
@@ -1162,10 +1175,38 @@ test "resilience: retryAfterDelayMs converts delays and clamps past instants" {
     try std.testing.expectEqual(@as(u32, 30_000), retryAfterDelayMs(.{ .retry_at_unix_seconds = test_epoch_seconds }, test_epoch_seconds - 30));
 }
 
+test "resilience: retryAfterDelayMs clamps large delays without overflow" {
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        retryAfterDelayMs(.{ .delay_seconds = std.math.maxInt(u32) }, 0),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        retryAfterDelayMs(.{ .retry_at_unix_seconds = std.math.maxInt(i64) }, 0),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        retryAfterDelayMs(.{ .retry_at_unix_seconds = std.math.maxInt(i64) }, std.math.minInt(i64)),
+    );
+}
+
+test "resilience: HTTP-date parser rejects impossible calendar dates" {
+    try std.testing.expectError(
+        error.InvalidHttpDate,
+        parseRetryAfterValue("Thu, 31 Feb 2025 00:00:00 GMT"),
+    );
+    try std.testing.expectError(
+        error.InvalidHttpDate,
+        parseRetryAfterValue("Thu, 01 January 2025 00:00:00 GMT"),
+    );
+}
+
 test "resilience: isTrackedResilienceHeaderName filters retry metadata families" {
     for ([_][]const u8{
         "RateLimit-Limit",
         "X-RateLimit-Reset",
+        "ratelimit-remaining",
+        "rAtElImIt-Reset",
         "Retry-After",
         "Date",
     }) |name| try std.testing.expect(isTrackedResilienceHeaderName(name));
