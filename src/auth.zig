@@ -19,8 +19,8 @@
 //! - Config `CredentialProvider` hits borrow caller-owned slices for the resolve call.
 //! - Environment and docker-credential-helper hits dup username/secret onto the engine
 //!   allocator and set `release_fn`; call `release()` when the handle is done.
-//!   Secrets are zeroed via `freeOwnedOptionalSecretSlice` before `free` (same as
-//!   token POST bodies).
+//!   Secrets are zeroed via `freeOwnedOptionalSecretSlice` before raw allocator
+//!   release (same as token POST bodies).
 //! - Docker config inline auth borrows from the engine `auth_cache` until `deinit()`;
 //!   `release()` is a no-op for those hits.
 //!
@@ -209,7 +209,7 @@ pub const TokenCacheKey = struct {
         if (self.scope) |s| allocator.free(s);
     }
 };
-/// Owns token bytes; `deinit` zeroes before free.
+/// Owns token bytes; `deinit` zeroes before raw allocator release.
 pub const CachedToken = struct {
     token: Token,
     valid_until_unix_seconds: ?u64 = null,
@@ -943,7 +943,7 @@ pub fn liveTokenHttpExchanger(
         try resilience_headers.append(allocator, .{ .name = name, .value = value });
     }
 
-    const owned_body = resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return mapLiveTokenTransportError(err);
+    const owned_body = readTokenHttpResponseBodyAlloc(allocator, response.reader(&.{}), request.max_response_body_bytes) catch |err| return err;
     errdefer {
         secureFree(allocator, owned_body);
     }
@@ -1060,6 +1060,18 @@ fn secureFree(allocator: std.mem.Allocator, bytes: []u8) void {
         for (bytes) |byte| std.debug.assert(byte == 0);
     }
     allocator.rawFree(bytes, .of(u8), @returnAddress());
+}
+fn readTokenHttpResponseBodyAlloc(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    max_bytes: usize,
+) AuthError![]u8 {
+    var sensitive_allocator = SensitiveAllocator{ .child = allocator };
+    return resilience.readHttpResponseBodyAlloc(
+        sensitive_allocator.allocator(),
+        reader,
+        max_bytes,
+    ) catch |err| return mapLiveTokenTransportError(err);
 }
 const DOCKER_CONFIG_FILE_SIZE_LIMIT = 1024 * 1024;
 const DOCKER_HELPER_STDOUT_LIMIT = 64 * 1024;
@@ -1262,10 +1274,10 @@ const ParsedTokenBody = struct {
     expires_in: ?u64 = null,
     refresh_token: ?[]const u8 = null,
 };
-const SensitiveJsonAllocator = struct {
+const SensitiveAllocator = struct {
     child: std.mem.Allocator,
 
-    fn allocator(self: *SensitiveJsonAllocator) std.mem.Allocator {
+    fn allocator(self: *SensitiveAllocator) std.mem.Allocator {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -1278,7 +1290,7 @@ const SensitiveJsonAllocator = struct {
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *SensitiveJsonAllocator = @ptrCast(@alignCast(ctx));
+        const self: *SensitiveAllocator = @ptrCast(@alignCast(ctx));
         return self.child.rawAlloc(len, alignment, ret_addr);
     }
 
@@ -1289,8 +1301,12 @@ const SensitiveJsonAllocator = struct {
         new_len: usize,
         ret_addr: usize,
     ) bool {
-        const self: *SensitiveJsonAllocator = @ptrCast(@alignCast(ctx));
-        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return false;
     }
 
     fn remap(
@@ -1300,12 +1316,16 @@ const SensitiveJsonAllocator = struct {
         new_len: usize,
         ret_addr: usize,
     ) ?[*]u8 {
-        const self: *SensitiveJsonAllocator = @ptrCast(@alignCast(ctx));
-        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        const self: *SensitiveAllocator = @ptrCast(@alignCast(ctx));
+        const new_memory = self.child.rawAlloc(new_len, alignment, ret_addr) orelse return null;
+        @memcpy(new_memory[0..@min(memory.len, new_len)], memory[0..@min(memory.len, new_len)]);
+        std.crypto.secureZero(u8, memory);
+        self.child.rawFree(memory, alignment, ret_addr);
+        return new_memory;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *SensitiveJsonAllocator = @ptrCast(@alignCast(ctx));
+        const self: *SensitiveAllocator = @ptrCast(@alignCast(ctx));
         std.crypto.secureZero(u8, memory);
         self.child.rawFree(memory, alignment, ret_addr);
     }
@@ -1313,7 +1333,7 @@ const SensitiveJsonAllocator = struct {
 fn SensitiveJsonParsed(comptime T: type) type {
     return struct {
         parsed: std.json.Parsed(T),
-        secure_allocator: *SensitiveJsonAllocator,
+        secure_allocator: *SensitiveAllocator,
         allocator: std.mem.Allocator,
 
         fn deinit(self: *@This()) void {
@@ -1323,7 +1343,7 @@ fn SensitiveJsonParsed(comptime T: type) type {
     };
 }
 fn parseSensitiveJson(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) !SensitiveJsonParsed(T) {
-    const secure_allocator = try allocator.create(SensitiveJsonAllocator);
+    const secure_allocator = try allocator.create(SensitiveAllocator);
     secure_allocator.* = .{ .child = allocator };
     errdefer allocator.destroy(secure_allocator);
 
@@ -1367,8 +1387,11 @@ fn mapDockerConfigJsonError(err: anyerror) AuthError {
 fn dockerConfigScannerNext(scanner: *std.json.Scanner) AuthError!std.json.Scanner.Token {
     return scanner.next() catch |err| return mapDockerConfigJsonError(err);
 }
-fn dockerConfigScannerNextAllocMax(scanner: *std.json.Scanner) AuthError!std.json.Scanner.Token {
-    return scanner.nextAllocMax(std.heap.page_allocator, .alloc_if_needed, DOCKER_CONFIG_FILE_SIZE_LIMIT) catch |err| return mapDockerConfigJsonError(err);
+fn dockerConfigScannerNextAllocMax(
+    allocator: std.mem.Allocator,
+    scanner: *std.json.Scanner,
+) AuthError!std.json.Scanner.Token {
+    return scanner.nextAllocMax(allocator, .alloc_if_needed, DOCKER_CONFIG_FILE_SIZE_LIMIT) catch |err| return mapDockerConfigJsonError(err);
 }
 fn dockerConfigScannerSkipValue(scanner: *std.json.Scanner) AuthError!void {
     return scanner.skipValue() catch |err| return mapDockerConfigJsonError(err);
@@ -1409,7 +1432,7 @@ fn validateAndBuildDockerConfigIndex(
     registry_entries: *std.ArrayList(DockerConfigIndexedRegistry),
     exact_registry_entry: *std.StringHashMapUnmanaged(usize),
 ) AuthError!void {
-    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json);
+    var scanner = std.json.Scanner.initCompleteInput(allocator, docker_config_json);
     defer scanner.deinit();
 
     switch (try dockerConfigScannerNext(&scanner)) {
@@ -1418,7 +1441,7 @@ fn validateAndBuildDockerConfigIndex(
     }
 
     while (true) {
-        const key_token = try dockerConfigScannerNextAllocMax(&scanner);
+        const key_token = try dockerConfigScannerNextAllocMax(allocator, &scanner);
         switch (key_token) {
             .string, .allocated_string => |key| {
                 const section: ?DockerConfigSection = if (std.mem.eql(u8, key, "auths"))
@@ -1428,7 +1451,7 @@ fn validateAndBuildDockerConfigIndex(
                 else
                     null;
 
-                freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                freeDockerConfigScannerToken(allocator, key_token);
 
                 if (section) |indexed_section| {
                     switch (try dockerConfigScannerPeekTokenType(&scanner)) {
@@ -1438,7 +1461,7 @@ fn validateAndBuildDockerConfigIndex(
 
                     _ = try dockerConfigScannerNext(&scanner);
                     while (true) {
-                        const entry_key_token = try dockerConfigScannerNextAllocMax(&scanner);
+                        const entry_key_token = try dockerConfigScannerNextAllocMax(allocator, &scanner);
                         switch (entry_key_token) {
                             .string, .allocated_string => |entry_key| {
                                 _ = try dockerConfigScannerPeekTokenType(&scanner);
@@ -1469,10 +1492,10 @@ fn validateAndBuildDockerConfigIndex(
                                     cache_key_owned = false;
                                 }
 
-                                freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
+                                freeDockerConfigScannerToken(allocator, entry_key_token);
                             },
                             .object_end => {
-                                freeDockerConfigScannerToken(std.heap.page_allocator, entry_key_token);
+                                freeDockerConfigScannerToken(allocator, entry_key_token);
                                 break;
                             },
                             else => return error.InvalidDockerConfig,
@@ -1493,22 +1516,22 @@ fn validateAndBuildDockerConfigIndex(
         else => return error.InvalidDockerConfig,
     }
 }
-fn validateDockerConfigJson(docker_config_json: []const u8) AuthError!void {
+fn validateDockerConfigJson(allocator: std.mem.Allocator, docker_config_json: []const u8) AuthError!void {
     var registry_entries: std.ArrayList(DockerConfigIndexedRegistry) = .empty;
     defer {
-        for (registry_entries.items) |entry| entry.deinit(std.heap.page_allocator);
-        registry_entries.deinit(std.heap.page_allocator);
+        for (registry_entries.items) |entry| entry.deinit(allocator);
+        registry_entries.deinit(allocator);
     }
 
     var exact_registry_entry: std.StringHashMapUnmanaged(usize) = .empty;
     defer {
         var it = exact_registry_entry.iterator();
-        while (it.next()) |entry| std.heap.page_allocator.free(entry.key_ptr.*);
-        exact_registry_entry.deinit(std.heap.page_allocator);
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        exact_registry_entry.deinit(allocator);
     }
 
     try validateAndBuildDockerConfigIndex(
-        std.heap.page_allocator,
+        allocator,
         docker_config_json,
         &registry_entries,
         &exact_registry_entry,
@@ -1522,7 +1545,7 @@ fn dockerConfigValueFromIndexEntry(
 ) AuthError!?[]const u8 {
     if (entry.value_offset >= docker_config_json.len) return error.InvalidDockerConfig;
 
-    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json[entry.value_offset..]);
+    var scanner = std.json.Scanner.initCompleteInput(allocator, docker_config_json[entry.value_offset..]);
     defer scanner.deinit();
 
     if (object_field) |field_name| {
@@ -1533,7 +1556,7 @@ fn dockerConfigValueFromIndexEntry(
         return dockerConfigReadObjectStringField(allocator, &scanner, field_name);
     }
 
-    const value_token = try dockerConfigScannerNextAllocMax(&scanner);
+    const value_token = try dockerConfigScannerNextAllocMax(allocator, &scanner);
     return try dockerConfigStringFromScannerToken(allocator, value_token);
 }
 fn dockerConfigRegistryCacheKeyAlloc(allocator: std.mem.Allocator, registry: []const u8) AuthError![]u8 {
@@ -1553,11 +1576,11 @@ fn dockerConfigStringFromScannerToken(allocator: std.mem.Allocator, token: std.j
     switch (token) {
         .string => |value| return try allocator.dupe(u8, value),
         .allocated_string => |value| {
-            defer secureFree(std.heap.page_allocator, @constCast(value));
+            defer secureFree(allocator, @constCast(value));
             return try allocator.dupe(u8, value);
         },
         else => {
-            freeDockerConfigScannerToken(std.heap.page_allocator, token);
+            freeDockerConfigScannerToken(allocator, token);
             return error.InvalidDockerConfig;
         },
     }
@@ -1567,7 +1590,7 @@ fn dockerConfigRootStringField(
     docker_config_json: []const u8,
     field_name: []const u8,
 ) AuthError!?[]const u8 {
-    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, docker_config_json);
+    var scanner = std.json.Scanner.initCompleteInput(allocator, docker_config_json);
     defer scanner.deinit();
 
     switch (try dockerConfigScannerNext(&scanner)) {
@@ -1576,17 +1599,17 @@ fn dockerConfigRootStringField(
     }
 
     while (true) {
-        const key_token = try dockerConfigScannerNextAllocMax(&scanner);
+        const key_token = try dockerConfigScannerNextAllocMax(allocator, &scanner);
         switch (key_token) {
             .string, .allocated_string => |key| {
                 if (!std.mem.eql(u8, key, field_name)) {
-                    freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                    freeDockerConfigScannerToken(allocator, key_token);
                     try dockerConfigScannerSkipValue(&scanner);
                     continue;
                 }
-                freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                freeDockerConfigScannerToken(allocator, key_token);
 
-                const value_token = try dockerConfigScannerNextAllocMax(&scanner);
+                const value_token = try dockerConfigScannerNextAllocMax(allocator, &scanner);
                 return try dockerConfigStringFromScannerToken(allocator, value_token);
             },
             .object_end => return null,
@@ -1600,17 +1623,17 @@ fn dockerConfigReadObjectStringField(
     field_name: []const u8,
 ) AuthError!?[]const u8 {
     while (true) {
-        const key_token = try dockerConfigScannerNextAllocMax(scanner);
+        const key_token = try dockerConfigScannerNextAllocMax(allocator, scanner);
         switch (key_token) {
             .string, .allocated_string => |key| {
                 if (!std.mem.eql(u8, key, field_name)) {
-                    freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                    freeDockerConfigScannerToken(allocator, key_token);
                     try dockerConfigScannerSkipValue(scanner);
                     continue;
                 }
-                freeDockerConfigScannerToken(std.heap.page_allocator, key_token);
+                freeDockerConfigScannerToken(allocator, key_token);
 
-                const value_token = try dockerConfigScannerNextAllocMax(scanner);
+                const value_token = try dockerConfigScannerNextAllocMax(allocator, scanner);
                 return try dockerConfigStringFromScannerToken(allocator, value_token);
             },
             .object_end => return null,
@@ -1759,7 +1782,13 @@ fn runDockerCredentialHelperCommand(
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    var sensitive_allocator = SensitiveAllocator{ .child = allocator };
+    multi_reader.init(
+        sensitive_allocator.allocator(),
+        io,
+        multi_reader_buffer.toStreams(),
+        &.{ child.stdout.?, child.stderr.? },
+    );
     defer multi_reader.deinit();
 
     while (multi_reader.fill(1, timeout)) |_| {
@@ -2570,6 +2599,38 @@ test "parseTokenResponse: zeroes sensitive JSON parser arena" {
     try std.testing.expect(std.mem.indexOf(u8, &storage, "sensitive-refresh") == null);
 }
 
+test "readTokenHttpResponseBodyAlloc: clears oversized body" {
+    var storage: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = noFreeFixedAllocator(&fixed);
+    var reader = std.Io.Reader.fixed("sensitive-token-body");
+
+    try std.testing.expectError(
+        error.TokenResponseTooLarge,
+        readTokenHttpResponseBodyAlloc(allocator, &reader, 8),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, &storage, "sensitive-token-body") == null);
+}
+
+test "SensitiveAllocator: zeroes old bytes during reallocation" {
+    var storage: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = noFreeFixedAllocator(&fixed);
+    var sensitive_allocator = SensitiveAllocator{ .child = allocator };
+    const sensitive = sensitive_allocator.allocator();
+    const bytes = try sensitive.alloc(u8, "sensitive-body".len);
+    @memcpy(bytes, "sensitive-body");
+    const old_start = @intFromPtr(bytes.ptr) - @intFromPtr(&storage);
+    const old_len = bytes.len;
+
+    const grown = try sensitive.realloc(bytes, bytes.len * 2);
+    defer sensitive.free(grown);
+
+    for (storage[old_start .. old_start + old_len]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
 test "parseDockerCredentialHelperResponse: zeroes sensitive JSON parser arena" {
     var storage: [8192]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&storage);
@@ -3086,6 +3147,30 @@ test "runDockerCredentialHelperCommand: repeated timeouts reap each subprocess" 
             timeout,
         ));
     }
+}
+
+test "runDockerCredentialHelperCommand: clears buffered output on timeout" {
+    if (builtin.os.tag == .windows) return;
+
+    var storage: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = noFreeFixedAllocator(&fixed);
+    try std.testing.expectError(error.HelperTimedOut, runDockerCredentialHelperCommand(
+        allocator,
+        std.testing.io,
+        &.{
+            "/bin/sh",
+            "-c",
+            "IFS= read -r _ || exit 7\nprintf 'timeout-secret'\nprintf 'timeout-error' >&2\nsleep 1\n",
+            "docker-credential-secretservice",
+            "get",
+        },
+        "ghcr.io",
+        dockerCredentialHelperTimeout(.{ .read_timeout_ms = 10 }),
+    ));
+
+    try std.testing.expect(std.mem.indexOf(u8, &storage, "timeout-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, &storage, "timeout-error") == null);
 }
 
 test "runDockerCredentialHelperCommand: subprocess matrix" {
@@ -5006,7 +5091,7 @@ test "auth: allocation failures do not leak across core paths" {
             _ = try docker_config.authCredentialForRegistry(allocator, "ghcr.io");
 
             const basic = try buildBasicAuthorizationAlloc(allocator, .{ .username = "user", .secret = "pass" });
-            allocator.free(basic);
+            freeOwnedOptionalSecretSlice(allocator, basic);
 
             const request = try AuthenticateRequest.init(
                 "ghcr.io",

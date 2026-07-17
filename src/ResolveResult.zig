@@ -160,9 +160,9 @@ fn slicePointsInto(inner: []const u8, outer: []const u8) bool {
     return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
 }
 
-const sha256_a = "a" ** 64;
-const sha256_b = "b" ** 64;
-const sha256_f = "f" ** 64;
+const SHA256_A = "a" ** 64;
+const SHA256_B = "b" ** 64;
+const SHA256_F = "f" ** 64;
 
 fn dupe(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return allocator.dupe(u8, bytes);
@@ -193,7 +193,7 @@ test "ResolveResult.clone: deep copies owned fields and survives arena teardown"
                 .basic_with_tag => blk: {
                     registry_buf = try dupe(arena_alloc, "ghcr.io");
                     break :blk ResolveResult{
-                        .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, sha256_a) },
+                        .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, SHA256_A) },
                         .media_type = .oci_manifest_v1,
                         .platform = null,
                         .reference = .{
@@ -229,7 +229,7 @@ test "ResolveResult.clone: deep copies owned fields and survives arena teardown"
                             .os = try dupe(arena_alloc, "linux"),
                             .architecture = try dupe(arena_alloc, "arm64"),
                             .variant = try dupe(arena_alloc, "v8"),
-                            .os_version = null,
+                            .os_version = try dupe(arena_alloc, "10.0.17763"),
                             .os_features = &features,
                         },
                         .reference = .{
@@ -242,15 +242,15 @@ test "ResolveResult.clone: deep copies owned fields and survives arena teardown"
                     };
                 },
                 .distinct_reference_digest => ResolveResult{
-                    .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, sha256_a) },
+                    .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, SHA256_A) },
                     .media_type = .oci_manifest_v1,
                     .platform = null,
                     .reference = .{
                         .registry = try dupe(arena_alloc, "ghcr.io"),
                         .repository = try dupe(arena_alloc, "owner/repo"),
                         .tag = null,
-                        .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, sha256_b) },
-                        .digest_raw = try dupe(arena_alloc, "sha256:" ++ sha256_b),
+                        .digest = .{ .algorithm = .sha256, .hex = try dupe(arena_alloc, SHA256_B) },
+                        .digest_raw = try dupe(arena_alloc, "sha256:" ++ SHA256_B),
                     },
                 },
             };
@@ -263,7 +263,7 @@ test "ResolveResult.clone: deep copies owned fields and survives arena teardown"
 
         switch (scenario) {
             .basic_with_tag => {
-                try std.testing.expectEqualSlices(u8, sha256_a, cloned.digest.hex);
+                try std.testing.expectEqualSlices(u8, SHA256_A, cloned.digest.hex);
                 try std.testing.expectEqualSlices(u8, "ghcr.io", cloned.reference.registry);
                 try std.testing.expectEqualSlices(u8, "owner/repo", cloned.reference.repository);
                 try std.testing.expectEqualSlices(u8, "v1.0", cloned.reference.tag.?);
@@ -274,14 +274,15 @@ test "ResolveResult.clone: deep copies owned fields and survives arena teardown"
                 try std.testing.expectEqualSlices(u8, "linux", platform.os);
                 try std.testing.expectEqualSlices(u8, "arm64", platform.architecture);
                 try std.testing.expectEqualSlices(u8, "v8", platform.variant.?);
+                try std.testing.expectEqualSlices(u8, "10.0.17763", platform.os_version.?);
                 const features = platform.os_features.?;
                 try std.testing.expectEqual(@as(usize, 2), features.len);
                 try std.testing.expectEqualSlices(u8, "win32k", features[0]);
                 try std.testing.expectEqualSlices(u8, "hyperv", features[1]);
             },
             .distinct_reference_digest => {
-                try std.testing.expectEqualSlices(u8, sha256_a, cloned.digest.hex);
-                try std.testing.expectEqualSlices(u8, sha256_b, cloned.reference.digest.?.hex);
+                try std.testing.expectEqualSlices(u8, SHA256_A, cloned.digest.hex);
+                try std.testing.expectEqualSlices(u8, SHA256_B, cloned.reference.digest.?.hex);
                 try std.testing.expect(!std.mem.eql(u8, cloned.digest.hex, cloned.reference.digest.?.hex));
             },
         }
@@ -349,7 +350,7 @@ test "ResolveResult: digest alias layouts deinit and clone safely" {
                 defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
                 const alloc = gpa.allocator();
 
-                const digest_raw = try alloc.dupe(u8, "sha256:" ++ sha256_f);
+                const digest_raw = try alloc.dupe(u8, "sha256:" ++ SHA256_F);
                 const features = try alloc.alloc([]const u8, 2);
                 features[0] = try alloc.dupe(u8, "win32k");
                 features[1] = try alloc.dupe(u8, "hyperv");

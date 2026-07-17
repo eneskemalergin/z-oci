@@ -538,9 +538,9 @@ fn testValidateAuthFailure(
     } } };
 }
 
-const test_inspect_manifest_json =
+const TEST_INSPECT_MANIFEST_JSON =
     "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:" ++ ("a" ** 64) ++ "\",\"size\":123},\"layers\":[]}";
-const test_inspect_index_json =
+const TEST_INSPECT_INDEX_JSON =
     "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:" ++ ("b" ** 64) ++ "\",\"size\":456,\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\"}}]}";
 
 fn testInspectResult(
@@ -553,15 +553,15 @@ fn testInspectResult(
     TestInspectCalls.calls += 1;
     TestInspectCalls.platform = platform;
     if (platform == null) {
-        const manifest = z_oci.json.parse(z_oci.Manifest, allocator, test_inspect_manifest_json) catch unreachable;
+        const manifest = z_oci.json.parse(z_oci.Manifest, allocator, TEST_INSPECT_MANIFEST_JSON) catch unreachable;
         return .{ .success = .{ .top_level = .{ .manifest = manifest } } };
     }
 
     var result = z_oci.InspectionResult{
-        .top_level = .{ .oci_index = z_oci.json.parse(z_oci.OciImageIndex, allocator, test_inspect_index_json) catch unreachable },
+        .top_level = .{ .oci_index = z_oci.json.parse(z_oci.OciImageIndex, allocator, TEST_INSPECT_INDEX_JSON) catch unreachable },
     };
     errdefer result.deinit();
-    result.selected_leaf = z_oci.json.parse(z_oci.Manifest, allocator, test_inspect_manifest_json) catch unreachable;
+    result.selected_leaf = z_oci.json.parse(z_oci.Manifest, allocator, TEST_INSPECT_MANIFEST_JSON) catch unreachable;
     return .{ .success = result };
 }
 

@@ -162,6 +162,9 @@ pub const ResolveError = union(enum) {
         }
     }
 
+    /// Returns a copy with `reference` replaced by `owned_reference`; it does not free
+    /// the old reference. Release the old slice separately when `self.reference` is
+    /// allocator-owned.
     pub fn withOwnedReference(self: ResolveError, owned_reference: []const u8) ResolveError {
         return switch (self) {
             .auth_failed => |value| .{ .auth_failed = .{ .registry = value.registry, .reference = owned_reference, .http_status = value.http_status } },

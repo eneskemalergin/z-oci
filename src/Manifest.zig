@@ -19,6 +19,17 @@ annotations: ?std.json.Value = null,
 
 const Manifest = @This();
 
+const DuplicateFieldAction = enum { parse, ignore };
+
+fn duplicateFieldAction(options: std.json.ParseOptions, seen: bool) !DuplicateFieldAction {
+    if (!seen) return .parse;
+    return switch (options.duplicate_field_behavior) {
+        .use_first => .ignore,
+        .@"error" => error.DuplicateField,
+        .use_last => .parse,
+    };
+}
+
 pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Manifest {
     if (.object_begin != try source.next()) return error.UnexpectedToken;
     var result = Manifest{
@@ -31,6 +42,7 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
     var seen_media_type = false;
     var seen_config = false;
     var seen_layers = false;
+    var seen_annotations = false;
     while (true) {
         const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         const field_name: []const u8 = switch (tok) {
@@ -43,19 +55,40 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
             else => {},
         };
         if (std.mem.eql(u8, field_name, "schemaVersion")) {
-            result.schema_version = try std.json.innerParse(u8, allocator, source, options);
-            seen_schema_version = true;
+            if (try duplicateFieldAction(options, seen_schema_version) == .ignore) {
+                _ = try std.json.innerParse(u8, allocator, source, options);
+            } else {
+                result.schema_version = try std.json.innerParse(u8, allocator, source, options);
+                seen_schema_version = true;
+            }
         } else if (std.mem.eql(u8, field_name, "mediaType")) {
-            result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
-            seen_media_type = true;
+            if (try duplicateFieldAction(options, seen_media_type) == .ignore) {
+                _ = try std.json.innerParse(MediaType, allocator, source, options);
+            } else {
+                result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
+                seen_media_type = true;
+            }
         } else if (std.mem.eql(u8, field_name, "config")) {
-            result.config = try std.json.innerParse(Descriptor, allocator, source, options);
-            seen_config = true;
+            if (try duplicateFieldAction(options, seen_config) == .ignore) {
+                _ = try std.json.innerParse(Descriptor, allocator, source, options);
+            } else {
+                result.config = try std.json.innerParse(Descriptor, allocator, source, options);
+                seen_config = true;
+            }
         } else if (std.mem.eql(u8, field_name, "layers")) {
-            result.layers = try std.json.innerParse([]const Descriptor, allocator, source, options);
-            seen_layers = true;
+            if (try duplicateFieldAction(options, seen_layers) == .ignore) {
+                _ = try std.json.innerParse([]const Descriptor, allocator, source, options);
+            } else {
+                result.layers = try std.json.innerParse([]const Descriptor, allocator, source, options);
+                seen_layers = true;
+            }
         } else if (std.mem.eql(u8, field_name, "annotations")) {
-            result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+            if (try duplicateFieldAction(options, seen_annotations) == .ignore) {
+                _ = try std.json.innerParse(?std.json.Value, allocator, source, options);
+            } else {
+                result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+                seen_annotations = true;
+            }
         } else {
             if (!options.ignore_unknown_fields) return error.UnknownField;
             try source.skipValue();
@@ -103,8 +136,12 @@ const ManifestMediaTypeProbe = struct {
                 else => {},
             };
             if (std.mem.eql(u8, field_name, "mediaType")) {
-                media_type = try std.json.innerParse(MediaType, allocator, source, options);
-                seen_media_type = true;
+                if (try duplicateFieldAction(options, seen_media_type) == .ignore) {
+                    _ = try std.json.innerParse(MediaType, allocator, source, options);
+                } else {
+                    media_type = try std.json.innerParse(MediaType, allocator, source, options);
+                    seen_media_type = true;
+                }
             } else {
                 try source.skipValue();
             }
@@ -131,24 +168,30 @@ pub fn jsonStringify(self: Manifest, jw: anytype) !void {
     try jw.endObject();
 }
 
-const hex_a = "a" ** 64;
-const hex_b = "b" ** 64;
-const hex_c = "c" ** 64;
-const hex_1 = "1" ** 64;
-const oci_manifest_mt = "application/vnd.oci.image.manifest.v1+json";
-const docker_manifest_mt = "application/vnd.docker.distribution.manifest.v2+json";
-const oci_config_mt = "application/vnd.oci.image.config.v1+json";
-const oci_layer_mt = "application/vnd.oci.image.layer.v1.tar+gzip";
+const HEX_A = "a" ** 64;
+const HEX_B = "b" ** 64;
+const HEX_C = "c" ** 64;
+const HEX_1 = "1" ** 64;
+const OCI_MANIFEST_MT = "application/vnd.oci.image.manifest.v1+json";
+const DOCKER_MANIFEST_MT = "application/vnd.docker.distribution.manifest.v2+json";
+const OCI_CONFIG_MT = "application/vnd.oci.image.config.v1+json";
+const OCI_LAYER_MT = "application/vnd.oci.image.layer.v1.tar+gzip";
 
-const config_field = "{\"mediaType\":\"" ++ oci_config_mt ++ "\",\"digest\":\"sha256:" ++ hex_a ++ "\",\"size\":256}";
-const layer_field = "{\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"digest\":\"sha256:" ++ hex_b ++ "\",\"size\":4096}";
-const minimal_manifest_json =
-    "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[]}";
-const manifest_with_layer_json =
-    "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[" ++ layer_field ++ "]}";
+const CONFIG_FIELD = "{\"mediaType\":\"" ++ OCI_CONFIG_MT ++ "\",\"digest\":\"sha256:" ++ HEX_A ++ "\",\"size\":256}";
+const LAYER_FIELD = "{\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"digest\":\"sha256:" ++ HEX_B ++ "\",\"size\":4096}";
+const MINIMAL_MANIFEST_JSON =
+    "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":" ++ CONFIG_FIELD ++ ",\"layers\":[]}";
+const MANIFEST_WITH_LAYER_JSON =
+    "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":" ++ CONFIG_FIELD ++ ",\"layers\":[" ++ LAYER_FIELD ++ "]}";
+const DUPLICATE_MANIFEST_JSON =
+    "{\"schemaVersion\":2,\"schemaVersion\":2," ++
+    "\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"mediaType\":\"" ++ DOCKER_MANIFEST_MT ++ "\"," ++
+    "\"config\":" ++ CONFIG_FIELD ++ ",\"config\":{\"mediaType\":\"" ++ OCI_CONFIG_MT ++ "\",\"digest\":\"sha256:" ++ HEX_B ++ "\",\"size\":512}," ++
+    "\"layers\":[],\"layers\":[" ++ LAYER_FIELD ++ "]," ++
+    "\"annotations\":{\"source\":\"first\"},\"annotations\":{\"source\":\"last\"}}";
 
 test "Manifest jsonParse: valid OCI and Docker payloads parse expected fields" {
-    const minimal = try json.parse(Manifest, std.testing.allocator, minimal_manifest_json);
+    const minimal = try json.parse(Manifest, std.testing.allocator, MINIMAL_MANIFEST_JSON);
     defer minimal.deinit();
     try std.testing.expectEqual(@as(u8, 2), minimal.value.schema_version);
     try std.testing.expectEqual(MediaType.oci_manifest_v1, minimal.value.media_type);
@@ -156,13 +199,13 @@ test "Manifest jsonParse: valid OCI and Docker payloads parse expected fields" {
     try std.testing.expectEqual(@as(usize, 0), minimal.value.layers.len);
     try std.testing.expect(minimal.value.annotations == null);
 
-    const with_layer = try json.parse(Manifest, std.testing.allocator, manifest_with_layer_json);
+    const with_layer = try json.parse(Manifest, std.testing.allocator, MANIFEST_WITH_LAYER_JSON);
     defer with_layer.deinit();
     try std.testing.expectEqual(@as(usize, 1), with_layer.value.layers.len);
     try std.testing.expectEqual(@as(u64, 4096), with_layer.value.layers[0].size);
-    try std.testing.expectEqualSlices(u8, hex_b, with_layer.value.layers[0].digest.hex);
+    try std.testing.expectEqualSlices(u8, HEX_B, with_layer.value.layers[0].digest.hex);
 
-    const annotated_json = "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[],\"annotations\":{\"org.opencontainers.image.ref.name\":\"stable\"},\"vendorExtension\":\"value\"}";
+    const annotated_json = "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":" ++ CONFIG_FIELD ++ ",\"layers\":[],\"annotations\":{\"org.opencontainers.image.ref.name\":\"stable\"},\"vendorExtension\":\"value\"}";
     const annotated = try json.parse(Manifest, std.testing.allocator, annotated_json);
     defer annotated.deinit();
     try std.testing.expectEqualSlices(
@@ -171,7 +214,7 @@ test "Manifest jsonParse: valid OCI and Docker payloads parse expected fields" {
         annotated.value.annotations.?.object.get("org.opencontainers.image.ref.name").?.string,
     );
 
-    const docker_json = "{\"schemaVersion\":2,\"mediaType\":\"" ++ docker_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[]}";
+    const docker_json = "{\"schemaVersion\":2,\"mediaType\":\"" ++ DOCKER_MANIFEST_MT ++ "\",\"config\":" ++ CONFIG_FIELD ++ ",\"layers\":[]}";
     const docker = try json.parse(Manifest, std.testing.allocator, docker_json);
     defer docker.deinit();
     try std.testing.expectEqual(MediaType.docker_manifest_v2, docker.value.media_type);
@@ -180,7 +223,7 @@ test "Manifest jsonParse: valid OCI and Docker payloads parse expected fields" {
 test "Manifest jsonParse: rejects invalid roots, missing fields, unknown keys, and validation rules" {
     const missing_cases = [_][]const u8{
         "{}",
-        "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ "}",
+        "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":" ++ CONFIG_FIELD ++ "}",
     };
     for (missing_cases) |json_bytes| {
         try std.testing.expectError(error.MissingField, json.parse(Manifest, std.testing.allocator, json_bytes));
@@ -190,7 +233,7 @@ test "Manifest jsonParse: rejects invalid roots, missing fields, unknown keys, a
         try std.testing.expectError(error.UnexpectedToken, json.parse(Manifest, std.testing.allocator, json_bytes));
     }
 
-    const unknown_json = minimal_manifest_json[0 .. minimal_manifest_json.len - 1] ++ ",\"customField\":\"value\"}";
+    const unknown_json = MINIMAL_MANIFEST_JSON[0 .. MINIMAL_MANIFEST_JSON.len - 1] ++ ",\"customField\":\"value\"}";
     try std.testing.expectError(
         error.UnknownField,
         std.json.parseFromSlice(Manifest, std.testing.allocator, unknown_json, .{ .ignore_unknown_fields = false }),
@@ -198,11 +241,11 @@ test "Manifest jsonParse: rejects invalid roots, missing fields, unknown keys, a
 
     const validation_cases = [_]struct { []const u8, anyerror }{
         .{
-            "{\"schemaVersion\":1,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[]}",
+            "{\"schemaVersion\":1,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":" ++ CONFIG_FIELD ++ ",\"layers\":[]}",
             error.UnexpectedToken,
         },
         .{
-            "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"config\":" ++ config_field ++ ",\"layers\":[]}",
+            "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"config\":" ++ CONFIG_FIELD ++ ",\"layers\":[]}",
             error.UnexpectedToken,
         },
     };
@@ -211,18 +254,45 @@ test "Manifest jsonParse: rejects invalid roots, missing fields, unknown keys, a
     }
 }
 
+test "Manifest jsonParse: honors duplicate field behavior" {
+    try std.testing.expectError(
+        error.DuplicateField,
+        std.json.parseFromSlice(Manifest, std.testing.allocator, DUPLICATE_MANIFEST_JSON, .{}),
+    );
+
+    const first = try std.json.parseFromSlice(Manifest, std.testing.allocator, DUPLICATE_MANIFEST_JSON, .{
+        .duplicate_field_behavior = .use_first,
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, first.value.media_type);
+    try std.testing.expectEqualSlices(u8, HEX_A, first.value.config.digest.hex);
+    try std.testing.expectEqual(@as(u64, 256), first.value.config.size);
+    try std.testing.expectEqual(@as(usize, 0), first.value.layers.len);
+    try std.testing.expectEqualSlices(u8, "first", first.value.annotations.?.object.get("source").?.string);
+
+    const last = try std.json.parseFromSlice(Manifest, std.testing.allocator, DUPLICATE_MANIFEST_JSON, .{
+        .duplicate_field_behavior = .use_last,
+    });
+    defer last.deinit();
+    try std.testing.expectEqual(MediaType.docker_manifest_v2, last.value.media_type);
+    try std.testing.expectEqualSlices(u8, HEX_B, last.value.config.digest.hex);
+    try std.testing.expectEqual(@as(u64, 512), last.value.config.size);
+    try std.testing.expectEqual(@as(usize, 1), last.value.layers.len);
+    try std.testing.expectEqualSlices(u8, "last", last.value.annotations.?.object.get("source").?.string);
+}
+
 test "Manifest jsonParse: malformed nested values return specific errors" {
     const cases = [_]struct { []const u8, anyerror }{
         .{
-            "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":{\"mediaType\":\"" ++ oci_config_mt ++ "\",\"digest\":\"not-a-digest\",\"size\":1},\"layers\":[]}",
+            "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":{\"mediaType\":\"" ++ OCI_CONFIG_MT ++ "\",\"digest\":\"not-a-digest\",\"size\":1},\"layers\":[]}",
             error.UnexpectedToken,
         },
         .{
-            "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":\"not-an-object\",\"layers\":[]}",
+            "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":\"not-an-object\",\"layers\":[]}",
             error.UnexpectedToken,
         },
         .{
-            "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":\"not-an-array\"}",
+            "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":" ++ CONFIG_FIELD ++ ",\"layers\":\"not-an-array\"}",
             error.UnexpectedToken,
         },
     };
@@ -235,7 +305,7 @@ test "Manifest jsonParse: empty and truncated bodies return exact errors" {
     const cases = [_]struct { []const u8, anyerror }{
         .{ "", error.UnexpectedEndOfInput },
         .{ "{", error.UnexpectedEndOfInput },
-        .{ "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":" ++ config_field ++ ",\"layers\":[", error.UnexpectedEndOfInput },
+        .{ "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":" ++ CONFIG_FIELD ++ ",\"layers\":[", error.UnexpectedEndOfInput },
     };
     for (cases) |case| {
         try std.testing.expectError(case[1], json.parse(Manifest, std.testing.allocator, case[0]));
@@ -280,7 +350,7 @@ test "Manifest jsonParse: parses checked-in manifest fixtures" {
 }
 
 test "Manifest jsonParse: allocation failures do not leak" {
-    const json_bytes = "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":{\"mediaType\":\"" ++ oci_config_mt ++ "\",\"digest\":\"sha256:" ++ hex_c ++ "\",\"size\":7023},\"layers\":[{\"mediaType\":\"" ++ oci_layer_mt ++ "\",\"digest\":\"sha256:" ++ hex_b ++ "\",\"size\":32654}]}";
+    const json_bytes = "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":{\"mediaType\":\"" ++ OCI_CONFIG_MT ++ "\",\"digest\":\"sha256:" ++ HEX_C ++ "\",\"size\":7023},\"layers\":[{\"mediaType\":\"" ++ OCI_LAYER_MT ++ "\",\"digest\":\"sha256:" ++ HEX_B ++ "\",\"size\":32654}]}";
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
@@ -296,15 +366,15 @@ test "Manifest jsonParse: repeated parse rounds leave no residual allocations un
     defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
 
     for (0..16) |_| {
-        const parsed = try json.parse(Manifest, gpa.allocator(), minimal_manifest_json);
+        const parsed = try json.parse(Manifest, gpa.allocator(), MINIMAL_MANIFEST_JSON);
         parsed.deinit();
     }
 }
 
 test "Manifest parseMediaTypeShallow: extracts mediaType without full manifest validation" {
     const success_cases = [_]struct { []const u8, MediaType }{
-        .{ minimal_manifest_json, .oci_manifest_v1 },
-        .{ "{\"mediaType\":\"" ++ docker_manifest_mt ++ "\"}", .docker_manifest_v2 },
+        .{ MINIMAL_MANIFEST_JSON, .oci_manifest_v1 },
+        .{ "{\"mediaType\":\"" ++ DOCKER_MANIFEST_MT ++ "\"}", .docker_manifest_v2 },
         .{ "{\"mediaType\":\"application/vnd.oci.image.index.v1+json\"}", .oci_index_v1 },
     };
     for (success_cases) |case| {
@@ -314,12 +384,19 @@ test "Manifest parseMediaTypeShallow: extracts mediaType without full manifest v
 
     try std.testing.expectError(error.MissingField, Manifest.parseMediaTypeShallow(std.testing.allocator, "{\"schemaVersion\":2}"));
     try std.testing.expectError(error.UnexpectedToken, Manifest.parseMediaTypeShallow(std.testing.allocator, "null"));
+    try std.testing.expectError(
+        error.DuplicateField,
+        Manifest.parseMediaTypeShallow(
+            std.testing.allocator,
+            "{\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"mediaType\":\"" ++ DOCKER_MANIFEST_MT ++ "\"}",
+        ),
+    );
 }
 
 test "Manifest jsonStringify: omits null annotations" {
     const config = Descriptor{
         .media_type = .oci_manifest_v1,
-        .digest = try Digest.parse("sha256:" ++ hex_a),
+        .digest = try Digest.parse("sha256:" ++ HEX_A),
         .size = 256,
     };
     const m = Manifest{
@@ -329,18 +406,18 @@ test "Manifest jsonStringify: omits null annotations" {
         .layers = &.{},
     };
 
-    var aw = try json.stringifyForTest(m);
+    var aw = try json.stringifyForTest(std.testing.allocator, m);
     defer aw.deinit();
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\"annotations\"") == null);
 }
 
 test "Manifest jsonStringify: round-trip preserves all fields" {
-    const json_bytes = "{\"schemaVersion\":2,\"mediaType\":\"" ++ oci_manifest_mt ++ "\",\"config\":{\"mediaType\":\"" ++ oci_config_mt ++ "\",\"digest\":\"sha256:" ++ hex_1 ++ "\",\"size\":64},\"layers\":[" ++ layer_field ++ "],\"annotations\":{\"org.opencontainers.image.ref.name\":\"stable\"}}";
+    const json_bytes = "{\"schemaVersion\":2,\"mediaType\":\"" ++ OCI_MANIFEST_MT ++ "\",\"config\":{\"mediaType\":\"" ++ OCI_CONFIG_MT ++ "\",\"digest\":\"sha256:" ++ HEX_1 ++ "\",\"size\":64},\"layers\":[" ++ LAYER_FIELD ++ "],\"annotations\":{\"org.opencontainers.image.ref.name\":\"stable\"}}";
 
     const parsed = try json.parse(Manifest, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
-    var aw = try json.stringifyForTest(parsed.value);
+    var aw = try json.stringifyForTest(std.testing.allocator, parsed.value);
     defer aw.deinit();
 
     const reparsed = try json.parse(Manifest, std.testing.allocator, aw.written());

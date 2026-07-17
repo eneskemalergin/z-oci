@@ -708,7 +708,7 @@ const InspectionLeafOutcome = union(enum) {
 };
 const ResolveManySessionCache = struct {
     // Stack buffer for hit-path key formatting. Oversized keys fall back to heap.
-    const cache_key_stack_max = 1024;
+    const CACHE_KEY_STACK_MAX = 1024;
 
     map: std.StringHashMapUnmanaged(ResolveResult) = .empty,
 
@@ -728,7 +728,7 @@ const ResolveManySessionCache = struct {
     ) error{OutOfMemory}!?ResolveResult {
         const key_len = cacheKeyByteLen(ref) orelse return null;
 
-        var stack: [cache_key_stack_max]u8 = undefined;
+        var stack: [CACHE_KEY_STACK_MAX]u8 = undefined;
         var heap_key: ?[]u8 = null;
         defer if (heap_key) |owned| allocator.free(owned);
 
@@ -1990,8 +1990,8 @@ const readFixtureAlloc = test_matrix.readFixtureAlloc;
 const sha256DigestStringAlloc = test_matrix.sha256DigestStringAlloc;
 const buildIndexBodyAlloc = test_matrix.buildIndexBodyAlloc;
 
-const busybox_fixture = "fixtures/manifests/busybox-amd64-live-oci-manifest.json";
-const busybox_literal_ref = Reference{
+const BUSYBOX_FIXTURE = "fixtures/manifests/busybox-amd64-live-oci-manifest.json";
+const BUSYBOX_LITERAL_REF = Reference{
     .registry = "registry-1.docker.io",
     .repository = "library/busybox",
     .tag = "latest",
@@ -2018,7 +2018,7 @@ fn busyboxManifestExchange(
 ) resolver.ManifestExchangeError!resolver.ManifestHttpResponse {
     defer request.deinit(allocator);
 
-    const body = readFixtureAlloc(allocator, busybox_fixture, 16 * 1024) catch |err| switch (err) {
+    const body = readFixtureAlloc(allocator, BUSYBOX_FIXTURE, 16 * 1024) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.TransportFailed,
     };
@@ -4102,7 +4102,7 @@ test "resolveManyWithExchangers: allocation failures clean up mixed batch state"
 }
 
 test "resolveManyWithExchangers: targeted allocation failures clean up batch setup paths" {
-    const refs = [_]Reference{busybox_literal_ref};
+    const refs = [_]Reference{BUSYBOX_LITERAL_REF};
 
     const Case = enum {
         session_cache_ensure,
@@ -4150,7 +4150,7 @@ test "resolveManyWithExchangers: targeted allocation failures clean up batch set
                 try std.testing.expectError(error.OutOfMemory, result);
             },
             .cache_key => {
-                const result = ResolveManySessionCache.cacheKeyAlloc(allocator, busybox_literal_ref);
+                const result = ResolveManySessionCache.cacheKeyAlloc(allocator, BUSYBOX_LITERAL_REF);
 
                 try std.testing.expectError(error.OutOfMemory, result);
             },
@@ -4161,7 +4161,7 @@ test "resolveManyWithExchangers: targeted allocation failures clean up batch set
 
                 try std.testing.expectError(
                     error.OutOfMemory,
-                    cache.storeSuccess(allocator, busybox_literal_ref, result),
+                    cache.storeSuccess(allocator, BUSYBOX_LITERAL_REF, result),
                 );
             },
         }
@@ -4180,9 +4180,9 @@ test "ResolveManySessionCache: allocation failures clean up store and hit paths"
             var cache: ResolveManySessionCache = .{};
             defer cache.deinit(allocator);
 
-            try cache.storeSuccess(allocator, busybox_literal_ref, source);
+            try cache.storeSuccess(allocator, BUSYBOX_LITERAL_REF, source);
 
-            var hit = try cache.cloneHit(allocator, busybox_literal_ref) orelse
+            var hit = try cache.cloneHit(allocator, BUSYBOX_LITERAL_REF) orelse
                 return error.TestUnexpectedResult;
             defer hit.deinit(allocator);
 
@@ -4252,7 +4252,7 @@ test "ResolveManySessionCache: allocation shape for key, clone, store, hit, and 
 
     // cacheKeyAlloc: one exact-size allocation (no allocPrint growth).
     counting.reset();
-    const key = try ResolveManySessionCache.cacheKeyAlloc(alloc, busybox_literal_ref) orelse
+    const key = try ResolveManySessionCache.cacheKeyAlloc(alloc, BUSYBOX_LITERAL_REF) orelse
         return error.TestUnexpectedResult;
     defer alloc.free(key);
     const key_allocs = counting.allocations;
@@ -4272,14 +4272,14 @@ test "ResolveManySessionCache: allocation shape for key, clone, store, hit, and 
     var cache: ResolveManySessionCache = .{};
     defer cache.deinit(alloc);
     counting.reset();
-    try cache.storeSuccess(alloc, busybox_literal_ref, source);
+    try cache.storeSuccess(alloc, BUSYBOX_LITERAL_REF, source);
     const store_allocs = counting.allocations;
     try std.testing.expectEqual(key_allocs + clone_allocs + 1, store_allocs);
     try std.testing.expectEqual(@as(usize, 1), cache.map.count());
 
     // cloneHit: stack key for typical refs, so only the result clone allocates.
     counting.reset();
-    var hit = try cache.cloneHit(alloc, busybox_literal_ref) orelse
+    var hit = try cache.cloneHit(alloc, BUSYBOX_LITERAL_REF) orelse
         return error.TestUnexpectedResult;
     defer hit.deinit(alloc);
     const hit_allocs = counting.allocations;
@@ -4287,7 +4287,7 @@ test "ResolveManySessionCache: allocation shape for key, clone, store, hit, and 
 
     // Oversized key still hits correctly via heap fallback on lookup.
     {
-        const long_repo = "r" ** (ResolveManySessionCache.cache_key_stack_max);
+        const long_repo = "r" ** (ResolveManySessionCache.CACHE_KEY_STACK_MAX);
         const long_ref = Reference{
             .registry = "r.io",
             .repository = long_repo,
@@ -4517,7 +4517,7 @@ test "resolveManyWithExchangers: failure matrix preserves stored context" {
             std.testing.allocator,
             &client,
             test_matrix.scenarioConfig(scenario),
-            &.{busybox_literal_ref},
+            &.{BUSYBOX_LITERAL_REF},
             .{ .platform = test_matrix.scenarioPlatform(scenario) },
             refuseToken,
             MockHarness.manifestExchange,
@@ -4810,7 +4810,7 @@ test "resolveManyWithExchangers: shared AuthEngine reuses cached token across it
                 return error.TransportFailed;
             }
 
-            const body = readFixtureAlloc(allocator, busybox_fixture, 16 * 1024) catch |err| switch (err) {
+            const body = readFixtureAlloc(allocator, BUSYBOX_FIXTURE, 16 * 1024) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.TransportFailed,
             };
@@ -4875,7 +4875,7 @@ test "resolveWithExchangers: single-arch success pins digest and preserves parse
         var tag_ptr: ?[*]const u8 = null;
 
         switch (case) {
-            .literal_ref => ref = busybox_literal_ref,
+            .literal_ref => ref = BUSYBOX_LITERAL_REF,
             .parsed_ref_moves => {
                 ref = try Reference.parse(alloc, "registry-1.docker.io/library/busybox:latest");
                 registry_ptr = ref.registry.ptr;
@@ -4939,7 +4939,7 @@ test "resolveWithExchangers: authenticates on challenge then resolves manifest" 
                 return error.TransportFailed;
             }
 
-            const body = readFixtureAlloc(allocator, busybox_fixture, 16 * 1024) catch |err| switch (err) {
+            const body = readFixtureAlloc(allocator, BUSYBOX_FIXTURE, 16 * 1024) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.TransportFailed,
             };
@@ -4966,7 +4966,7 @@ test "resolveWithExchangers: authenticates on challenge then resolves manifest" 
         arena.allocator(),
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         MockHarness.tokenExchange,
         MockHarness.manifestExchange,
@@ -5014,7 +5014,7 @@ test "resolveWithExchangers: maps exhausted token transport timeout to timeout" 
         std.testing.allocator,
         &client,
         .{ .max_network_retries = 1 },
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         MockHarness.tokenExchange,
         MockHarness.manifestExchange,
@@ -5150,7 +5150,7 @@ test "resolveWithExchangers: multi-arch success selects child platform and diges
         arena.allocator(),
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         .{ .os = "linux", .architecture = "arm64" },
         refuseToken,
         MockHarness.manifestExchange,
@@ -5190,7 +5190,7 @@ test "resolveWithExchangers: failure scenarios map to ResolveError with full con
             std.testing.allocator,
             &client,
             test_matrix.scenarioConfig(scenario),
-            busybox_literal_ref,
+            BUSYBOX_LITERAL_REF,
             test_matrix.scenarioPlatform(scenario),
             refuseToken,
             MockHarness.manifestExchange,
@@ -5270,7 +5270,7 @@ test "resolveWithExchangers: depth_limit_exceeded for nested indexes beyond limi
         std.testing.allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         .{ .os = "linux", .architecture = "arm64" },
         refuseToken,
         MockHarness.manifestExchange,
@@ -5328,7 +5328,7 @@ test "validateWithExchangers: single-arch HEAD validation and HEAD-to-GET fallba
             std.testing.allocator,
             &client,
             Config{},
-            busybox_literal_ref,
+            BUSYBOX_LITERAL_REF,
             platform,
             refuseToken,
             MockHarness.manifestExchange,
@@ -5421,7 +5421,7 @@ test "validateWithExchangers: multi-arch child HEAD returns valid without GET" {
         std.testing.allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         .{ .os = "linux", .architecture = "arm64" },
         refuseToken,
         MockHarness.manifestExchange,
@@ -5454,7 +5454,7 @@ test "validateWithExchangers: failure scenarios map to outcome or ResolveError w
             std.testing.allocator,
             &client,
             test_matrix.scenarioConfig(scenario),
-            busybox_literal_ref,
+            BUSYBOX_LITERAL_REF,
             test_matrix.scenarioPlatform(scenario),
             refuseToken,
             MockHarness.manifestExchange,
@@ -5568,7 +5568,7 @@ test "validateWithExchangers: platform_required when multi-arch HEAD omits platf
         std.testing.allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         refuseToken,
         MockHarness.manifestExchange,
@@ -5620,7 +5620,7 @@ test "validateWithExchangers: platform_required when multi-arch index GET omits 
         std.testing.allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         refuseToken,
         MockHarness.manifestExchange,
@@ -5671,7 +5671,7 @@ test "getManifestWithExchangers: platform_required when multi-arch omits platfor
         std.testing.allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         refuseToken,
         MockHarness.manifestExchange,
@@ -5689,7 +5689,7 @@ test "getManifestWithExchangers: platform_required when multi-arch omits platfor
 }
 
 test "getManifestWithExchangers: single-arch success matches direct busybox fixture parse" {
-    const fixture_bytes = try readFixtureAlloc(std.testing.allocator, busybox_fixture, 16 * 1024);
+    const fixture_bytes = try readFixtureAlloc(std.testing.allocator, BUSYBOX_FIXTURE, 16 * 1024);
     defer std.testing.allocator.free(fixture_bytes);
 
     const direct = try json.parse(Manifest, std.testing.allocator, fixture_bytes);
@@ -5700,7 +5700,7 @@ test "getManifestWithExchangers: single-arch success matches direct busybox fixt
         std.testing.allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         refuseToken,
         busyboxManifestExchange,
@@ -5735,7 +5735,7 @@ test "getManifestWithExchangers: single-arch success stays leak-free under Debug
         allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         refuseToken,
         busyboxManifestExchange,
@@ -5769,7 +5769,7 @@ test "getManifestWithExchangers: failure scenarios map to ResolveError with full
             std.testing.allocator,
             &client,
             test_matrix.scenarioConfig(scenario),
-            busybox_literal_ref,
+            BUSYBOX_LITERAL_REF,
             test_matrix.scenarioPlatform(scenario),
             refuseToken,
             MockHarness.manifestExchange,
@@ -5885,7 +5885,7 @@ test "getManifestWithExchangers: nested index resolves to leaf manifest" {
         std.testing.allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         .{ .os = "linux", .architecture = "arm64" },
         refuseToken,
         MockHarness.manifestExchange,
@@ -5962,7 +5962,7 @@ test "inspectWithExchangers: preserves top-level index and selected leaf" {
         allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         refuseToken,
         MockHarness.manifestExchange,
@@ -5989,7 +5989,7 @@ test "inspectWithExchangers: preserves top-level index and selected leaf" {
         allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         .{ .os = "linux", .architecture = "arm64" },
         refuseToken,
         MockHarness.manifestExchange,
@@ -6016,7 +6016,7 @@ test "inspectWithExchangers: preserves top-level index and selected leaf" {
         allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         .{ .os = "windows", .architecture = "amd64" },
         refuseToken,
         MockHarness.manifestExchange,
@@ -6097,7 +6097,7 @@ test "inspectWithExchangers: Docker manifest list and malformed content preserve
         allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         .{ .os = "linux", .architecture = "amd64" },
         refuseToken,
         MockHarness.manifestExchange,
@@ -6125,7 +6125,7 @@ test "inspectWithExchangers: Docker manifest list and malformed content preserve
         allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         null,
         refuseToken,
         MockHarness.manifestExchange,
@@ -6223,7 +6223,7 @@ test "inspectWithExchangers: keeps the outer index while selecting through a nes
         allocator,
         &client,
         Config{},
-        busybox_literal_ref,
+        BUSYBOX_LITERAL_REF,
         .{ .os = "linux", .architecture = "arm64" },
         refuseToken,
         MockHarness.manifestExchange,
@@ -6552,7 +6552,7 @@ test "inspectWithExchangers: allocation failures release promoted documents" {
                 allocator,
                 &client,
                 Config{},
-                busybox_literal_ref,
+                BUSYBOX_LITERAL_REF,
                 null,
                 refuseToken,
                 busyboxManifestExchange,

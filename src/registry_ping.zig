@@ -56,11 +56,7 @@ pub const PingExchangeError = error{
 };
 
 pub const PingHttpRequest = struct {
-    url: []u8,
-
-    pub fn deinit(self: PingHttpRequest, allocator: std.mem.Allocator) void {
-        allocator.free(self.url);
-    }
+    url: []const u8,
 };
 
 pub const PingHttpResponse = struct {
@@ -72,35 +68,6 @@ pub const PingHttpExchanger = *const fn (
     client: *std.http.Client,
     request: PingHttpRequest,
 ) PingExchangeError!PingHttpResponse;
-
-fn pingRegistryUriAlloc(allocator: std.mem.Allocator, registry: []const u8) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(allocator, "https://{s}/v2/", .{registry});
-}
-
-fn classifyPingHttpStatus(status: std.http.Status) RegistryPingResult {
-    return switch (status) {
-        .ok => .{ .ok = .reachable_anonymous },
-        .unauthorized => .{ .ok = .reachable_auth_required },
-        else => .{ .failure = .{
-            .http_status = @intCast(@intFromEnum(status)),
-            .kind = .unexpected_status,
-        } },
-    };
-}
-
-fn mapPingExchangeError(err: PingExchangeError) RegistryPingFailure {
-    return switch (err) {
-        error.OutOfMemory => .{ .kind = .other },
-        error.Timeout => .{ .kind = .timeout },
-        error.TlsFailure => .{ .kind = .tls },
-        error.ConnectionResetByPeer,
-        error.NetworkUnreachable,
-        error.ConnectionRefused,
-        error.UnknownHostName,
-        error.TransportFailed,
-        => .{ .kind = .network },
-    };
-}
 
 /// Probe `https://{registry}/v2/` through `exchanger`. Caller owns CA setup.
 ///
@@ -132,7 +99,10 @@ pub fn livePingHttpExchanger(
     client: *std.http.Client,
     request: PingHttpRequest,
 ) PingExchangeError!PingHttpResponse {
-    const loopback_url = testing_loopback.cleartextLoopbackUrlAlloc(allocator, request.url) catch return error.OutOfMemory;
+    if (!std.mem.startsWith(u8, request.url, "https://")) return error.TransportFailed;
+
+    const loopback_url = testing_loopback.cleartextLoopbackUrlAlloc(allocator, request.url) catch
+        return error.OutOfMemory;
     defer if (loopback_url) |url| allocator.free(url);
     const request_url = loopback_url orelse request.url;
 
@@ -149,7 +119,11 @@ pub fn livePingHttpExchanger(
     const status = response.head.status;
 
     // Drain so keep-alive reuse after ping does not see a leftover body.
-    const body = resilience.readHttpResponseBodyAlloc(allocator, response.reader(&.{}), 64 * 1024) catch |err| switch (err) {
+    const body = resilience.readHttpResponseBodyAlloc(
+        allocator,
+        response.reader(&.{}),
+        64 * 1024,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.BodyTooLarge => return error.TransportFailed,
         else => return mapLivePingTransportError(err),
@@ -157,6 +131,37 @@ pub fn livePingHttpExchanger(
     allocator.free(body);
 
     return .{ .status = status };
+}
+
+// --- Private helpers ---
+
+fn pingRegistryUriAlloc(allocator: std.mem.Allocator, registry: []const u8) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(allocator, "https://{s}/v2/", .{registry});
+}
+
+fn classifyPingHttpStatus(status: std.http.Status) RegistryPingResult {
+    return switch (status) {
+        .ok => .{ .ok = .reachable_anonymous },
+        .unauthorized => .{ .ok = .reachable_auth_required },
+        else => .{ .failure = .{
+            .http_status = @intCast(@intFromEnum(status)),
+            .kind = .unexpected_status,
+        } },
+    };
+}
+
+fn mapPingExchangeError(err: PingExchangeError) RegistryPingFailure {
+    return switch (err) {
+        error.OutOfMemory => .{ .kind = .other },
+        error.Timeout => .{ .kind = .timeout },
+        error.TlsFailure => .{ .kind = .tls },
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.ConnectionRefused,
+        error.UnknownHostName,
+        error.TransportFailed,
+        => .{ .kind = .network },
+    };
 }
 
 fn mapLivePingTransportError(err: anyerror) PingExchangeError {
@@ -169,7 +174,9 @@ fn mapLivePingTransportError(err: anyerror) PingExchangeError {
         error.UnknownHostName => error.UnknownHostName,
         else => blk: {
             const name = @errorName(err);
-            if (std.mem.indexOf(u8, name, "Tls") != null or std.mem.indexOf(u8, name, "Certificate") != null) {
+            if (std.mem.indexOf(u8, name, "Tls") != null or
+                std.mem.indexOf(u8, name, "Certificate") != null)
+            {
                 break :blk error.TlsFailure;
             }
             break :blk error.TransportFailed;
@@ -264,6 +271,20 @@ test "mapPingExchangeError: timeout network tls and other kinds" {
     try std.testing.expectEqual(RegistryPingFailureKind.other, mapPingExchangeError(error.OutOfMemory).kind);
 }
 
+test "mapLivePingTransportError: preserves transport and classifies TLS failures" {
+    const cases = [_]struct { err: anyerror, expected: PingExchangeError }{
+        .{ .err = error.OutOfMemory, .expected = error.OutOfMemory },
+        .{ .err = error.TlsInitializationFailed, .expected = error.TlsFailure },
+        .{ .err = error.CertificateHostMismatch, .expected = error.TlsFailure },
+        .{ .err = error.ConnectionRefused, .expected = error.ConnectionRefused },
+        .{ .err = error.UnexpectedToken, .expected = error.TransportFailed },
+    };
+
+    for (cases) |tc| {
+        try std.testing.expectEqual(tc.expected, mapLivePingTransportError(tc.err));
+    }
+}
+
 test "livePingHttpExchanger: loopback mock peer uses cleartext rewrite" {
     const io = std.testing.io;
     const mock = try mock_registry.MockRegistry.startWithHandler(
@@ -291,6 +312,43 @@ test "livePingHttpExchanger: loopback mock peer uses cleartext rewrite" {
 
     const response = try livePingHttpExchanger(std.testing.allocator, &client, .{ .url = url });
     try std.testing.expectEqual(std.http.Status.unauthorized, response.status);
+}
+
+test "livePingHttpExchanger: oversized response body maps to TransportFailed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const body = try allocator.alloc(u8, 64 * 1024 + 1);
+    defer allocator.free(body);
+    @memset(body, 'x');
+
+    const MockHarness = struct {
+        body: []const u8,
+
+        fn handle(reg: *mock_registry.MockRegistry, request: *std.http.Server.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            try request.respond(self.body, .{ .status = .ok, .keep_alive = false });
+        }
+    };
+    var harness = MockHarness{ .body = body };
+    const mock = try mock_registry.MockRegistry.startWithHandler(
+        allocator,
+        io,
+        1,
+        MockHarness.handle,
+        &harness,
+    );
+    defer mock.deinit();
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const url = try pingRegistryUriAlloc(allocator, mock.registry_host);
+    defer allocator.free(url);
+
+    try std.testing.expectError(
+        error.TransportFailed,
+        livePingHttpExchanger(allocator, &client, .{ .url = url }),
+    );
 }
 
 test "pingRegistryWithExchanger: allocation failures do not leak ping URL" {
@@ -375,5 +433,18 @@ test "livePingHttpExchanger: invalid URL maps to TransportFailed" {
     try std.testing.expectError(
         error.TransportFailed,
         livePingHttpExchanger(std.testing.allocator, &client, .{ .url = url }),
+    );
+}
+
+test "livePingHttpExchanger: rejects non-HTTPS URLs before network" {
+    var client: std.http.Client = undefined;
+
+    try std.testing.expectError(
+        error.TransportFailed,
+        livePingHttpExchanger(
+            std.testing.allocator,
+            &client,
+            .{ .url = "http://registry.example.test/v2/" },
+        ),
     );
 }

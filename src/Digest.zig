@@ -1,7 +1,8 @@
 //! OCI content digest: algorithm + hex string.
 //!
 //! Parses "algorithm:hex" strings (e.g. "sha256:<64 hex chars>").
-//! The hex slice borrows from the input. No allocation.
+//! `parse` returns a borrowed hex slice without allocation. `jsonParse` duplicates
+//! the hex into its parse arena.
 //! SHA256 is the only algorithm in v1. The Algorithm enum is extensible.
 
 const std = @import("std");
@@ -77,10 +78,13 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
 }
 
 pub fn jsonStringify(self: Digest, jw: anytype) !void {
-    // "sha256:" (7) + 64 hex = 71; headroom for future algorithms.
-    var buf: [128]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{s}:{s}", .{ @tagName(self.algorithm), self.hex }) catch unreachable;
-    try jw.write(s);
+    try jw.beginWriteRaw();
+    try jw.writer.writeByte('"');
+    try jw.writer.writeAll(@tagName(self.algorithm));
+    try jw.writer.writeByte(':');
+    try std.json.Stringify.encodeJsonStringChars(self.hex, jw.options, jw.writer);
+    try jw.writer.writeByte('"');
+    jw.endWriteRaw();
 }
 
 test "Digest.parse: valid inputs borrow hex slice and return expected fields" {
@@ -176,6 +180,17 @@ test "Digest: format and jsonStringify emit canonical algorithm:hex" {
     var ws: std.json.Stringify = .{ .writer = &aw.writer };
     try ws.write(d);
     try std.testing.expectEqualSlices(u8, "\"sha256:" ++ "b" ** 64 ++ "\"", aw.written());
+}
+
+test "Digest jsonStringify: streams hex slices larger than the stack buffer" {
+    const d = Digest{ .algorithm = .sha256, .hex = "a" ** 256 };
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var ws: std.json.Stringify = .{ .writer = &aw.writer };
+    try ws.write(d);
+
+    try std.testing.expectEqualSlices(u8, "\"sha256:" ++ "a" ** 256 ++ "\"", aw.written());
 }
 
 test "Digest.jsonParse: round-trip preserves digest and arena-owns hex" {

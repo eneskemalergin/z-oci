@@ -94,6 +94,8 @@ pub const CredentialHandle = struct {
     release_fn: ?*const fn (allocator: std.mem.Allocator, credential: Credential) void = null,
     release_allocator: std.mem.Allocator = undefined,
 
+    /// Releases storage for an owned credential handle; no-op for borrowed handles.
+    /// Call once when the credential is no longer needed.
     pub fn release(self: CredentialHandle) void {
         if (self.release_fn) |release_fn| release_fn(self.release_allocator, self.credential);
     }
@@ -229,6 +231,12 @@ fn caBundlePemContainsPrivateKey(pem_bytes: []const u8) bool {
     return false;
 }
 
+fn secureFreeCaBundleBytes(allocator: std.mem.Allocator, bytes: []u8) void {
+    if (bytes.len == 0) return;
+    std.crypto.secureZero(u8, bytes);
+    allocator.rawFree(bytes, .of(u8), @returnAddress());
+}
+
 const AddCertsFromPemBytesError = std.mem.Allocator.Error ||
     std.crypto.Certificate.Bundle.ParseCertError ||
     std.base64.Error ||
@@ -273,7 +281,7 @@ fn loadCaBundleFromOpenFile(
 
     const read_len = std.math.cast(usize, stat.size) orelse return error.CaBundleInvalid;
     const pem_bytes = gpa.alloc(u8, read_len) catch return error.OutOfMemory;
-    defer gpa.free(pem_bytes);
+    defer secureFreeCaBundleBytes(gpa, pem_bytes);
 
     var file_reader = file.reader(io, &.{});
     const n = file_reader.interface.readSliceShort(pem_bytes) catch return error.CaBundleInvalid;
@@ -597,8 +605,12 @@ test "Config.applyToClient: rejects PEM containing a private key marker" {
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
     const markers = [_][]const u8{
         "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
         "-----BEGIN DSA PRIVATE KEY-----",
         "-----BEGIN ED25519 PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
     };
     for (markers, 0..) |marker, index| {
         var rel_buf: [32]u8 = undefined;
@@ -614,6 +626,38 @@ test "Config.applyToClient: rejects PEM containing a private key marker" {
 
         try expectApplyError(try tmpFileAbsPath(tmp, rel_path, &abs_buf), error.CaBundleContainsPrivateKey);
     }
+}
+
+test "Config.applyToClient: zeroes rejected CA bytes before release" {
+    try skipUnlessTls();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rel_path = "ca-with-private-key.pem";
+    const secret = "config-private-key-secret";
+    {
+        var file = try tmp.dir.createFile(std.testing.io, rel_path, .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(
+            std.testing.io,
+            "-----BEGIN PRIVATE KEY-----\n" ++ secret ++ "\n-----END PRIVATE KEY-----\n",
+        );
+    }
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ca_path = try tmpFileAbsPath(tmp, rel_path, &abs_buf);
+    var storage: [4096]u8 = undefined;
+    @memset(&storage, 0xaa);
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var client = std.http.Client{ .allocator = fixed.allocator(), .io = std.testing.io };
+    defer client.deinit();
+
+    try std.testing.expectError(
+        error.CaBundleContainsPrivateKey,
+        (Config{ .ca_bundle_path = ca_path }).applyToClient(&client),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, &storage, secret) == null);
 }
 
 test "Config.applyToClient: allocation failures do not leak" {

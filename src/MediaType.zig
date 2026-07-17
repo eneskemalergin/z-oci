@@ -84,7 +84,7 @@ pub const MediaType = enum {
     }
 };
 
-const all_media_types = [_]MediaType{
+const ALL_MEDIA_TYPES = [_]MediaType{
     .oci_manifest_v1,
     .oci_index_v1,
     .oci_config_v1,
@@ -103,7 +103,7 @@ const all_media_types = [_]MediaType{
 };
 
 test "MediaType.fromString: known MIME strings round-trip through toString" {
-    for (all_media_types) |mt| {
+    for (ALL_MEDIA_TYPES) |mt| {
         try std.testing.expectEqual(mt, MediaType.fromString(mt.toString()).?);
         try std.testing.expectEqualStrings(mt.toString(), MediaType.fromString(mt.toString()).?.toString());
     }
@@ -187,7 +187,7 @@ test "MediaType jsonParse: maps string tokens and rejects non-matching input" {
 }
 
 test "MediaType jsonStringify: round-trip preserves every variant" {
-    for (all_media_types) |mt| {
+    for (ALL_MEDIA_TYPES) |mt| {
         var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer aw.deinit();
         var ws: std.json.Stringify = .{ .writer = &aw.writer };

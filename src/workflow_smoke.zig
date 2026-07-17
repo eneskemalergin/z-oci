@@ -9,7 +9,7 @@ const z_oci = @import("z_oci");
 
 const tm = z_oci.testing.test_matrix;
 
-const busybox_ref = z_oci.Reference{
+const BUSYBOX_REF = z_oci.Reference{
     .registry = "registry-1.docker.io",
     .repository = "library/busybox",
     .tag = "latest",
@@ -17,7 +17,7 @@ const busybox_ref = z_oci.Reference{
     .digest_raw = null,
 };
 
-const child_manifest_json =
+const CHILD_MANIFEST_JSON =
     \\{
     \\  "schemaVersion": 2,
     \\  "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -35,7 +35,7 @@ const ChildArtifacts = struct {
     digest: []u8,
 
     fn alloc(allocator: std.mem.Allocator) !ChildArtifacts {
-        const body = try allocator.dupe(u8, child_manifest_json);
+        const body = try allocator.dupe(u8, CHILD_MANIFEST_JSON);
         errdefer allocator.free(body);
         const digest = try tm.sha256DigestStringAlloc(allocator, body);
         errdefer allocator.free(digest);
@@ -147,7 +147,7 @@ test "workflow smoke: ResolveResult clone survives arena teardown" {
         defer arena.deinit();
 
         const original = z_oci.ResolveResult{
-            .reference = busybox_ref,
+            .reference = BUSYBOX_REF,
             .digest = .{ .algorithm = .sha256, .hex = "b8d1827e38a1d49cd17217efd7b07d689e4ea174e39c7dcbb95533d175bea65" },
             .media_type = z_oci.MediaType.oci_manifest_v1,
             .platform = .{ .os = "linux", .architecture = "arm64", .variant = "v8" },
@@ -219,7 +219,7 @@ test "workflow smoke: public validate follows selected multi-arch child" {
         std.testing.allocator,
         &client,
         z_oci.Config{},
-        busybox_ref,
+        BUSYBOX_REF,
         .{ .os = "linux", .architecture = "arm64" },
         MockHarness.tokenExchange,
         MockHarness.manifestExchange,
@@ -239,7 +239,7 @@ test "workflow smoke: z_oci.testing resolveWithExchangers propagates network_err
         allocator,
         &client,
         z_oci.Config{},
-        busybox_ref,
+        BUSYBOX_REF,
         null,
         ScenarioHarness.tokenExchange,
         struct {
@@ -277,7 +277,7 @@ test "workflow smoke: resolveWithExchangers never probes registry /v2/ root" {
             if (std.mem.endsWith(u8, request.url, "/v2/") or std.mem.eql(u8, request.url, "https://registry-1.docker.io/v2")) {
                 saw_v2_root = true;
             }
-            const body = try allocator.dupe(u8, child_manifest_json);
+            const body = try allocator.dupe(u8, CHILD_MANIFEST_JSON);
             errdefer allocator.free(body);
             const digest = try tm.sha256DigestStringAlloc(allocator, body);
             errdefer allocator.free(digest);
@@ -356,7 +356,7 @@ test "workflow smoke: z_oci.testing validateWithExchangers propagates scenario f
             allocator,
             &client,
             tm.scenarioConfig(scenario),
-            busybox_ref,
+            BUSYBOX_REF,
             tm.scenarioPlatform(scenario),
             ScenarioHarness.tokenExchange,
             ScenarioHarness.manifestExchange,
@@ -382,7 +382,7 @@ test "workflow smoke: z_oci.testing getManifestWithExchangers propagates scenari
             allocator,
             &client,
             tm.scenarioConfig(scenario),
-            busybox_ref,
+            BUSYBOX_REF,
             tm.scenarioPlatform(scenario),
             ScenarioHarness.tokenExchange,
             ScenarioHarness.manifestExchange,
@@ -435,7 +435,7 @@ test "workflow smoke: public resolve maps exhausted token 429 to rate_limited" {
         std.testing.allocator,
         &client,
         .{ .max_rate_limit_retries = 0 },
-        busybox_ref,
+        BUSYBOX_REF,
         null,
         RateLimitHarness.tokenExchange,
         RateLimitHarness.manifestExchange,
@@ -491,7 +491,7 @@ test "workflow smoke: public resolve maps missing CA bundle before manifest fetc
             std.testing.allocator,
             &tls_client,
             .{ .ca_bundle_path = "/nonexistent/z-oci-ca-bundle.pem" },
-            busybox_ref,
+            BUSYBOX_REF,
             null,
             CaHarness.tokenExchange,
             CaHarness.manifestExchange,
@@ -581,7 +581,7 @@ test "workflow smoke: public resolve preemptively sleeps before child fetch when
         arena.allocator(),
         &client,
         .{ .rate_limit_enabled = true },
-        busybox_ref,
+        BUSYBOX_REF,
         .{ .os = "linux", .architecture = "arm64" },
         MockHarness.tokenExchange,
         MockHarness.manifestExchange,

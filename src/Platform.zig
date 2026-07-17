@@ -41,11 +41,6 @@ pub fn match(candidate: Platform, filter: Platform) bool {
     return true;
 }
 
-fn osVersionMatches(candidate: []const u8, filter: []const u8) bool {
-    if (!std.mem.startsWith(u8, candidate, filter)) return false;
-    return candidate.len == filter.len or candidate[filter.len] == '.';
-}
-
 pub fn eql(a: Platform, b: Platform) bool {
     if (!std.mem.eql(u8, a.os, b.os)) return false;
     if (!std.mem.eql(u8, a.architecture, b.architecture)) return false;
@@ -61,6 +56,9 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
     var result = Platform{ .os = "", .architecture = "" };
     var seen_os = false;
     var seen_arch = false;
+    var seen_variant = false;
+    var seen_os_version = false;
+    var seen_os_features = false;
     while (true) {
         const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         const field_name: []const u8 = switch (tok) {
@@ -73,17 +71,55 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
             else => {},
         };
         if (std.mem.eql(u8, field_name, "os")) {
+            switch (try duplicateFieldAction(options, seen_os)) {
+                .ignore => {
+                    _ = try std.json.innerParse([]const u8, allocator, source, options);
+                    continue;
+                },
+                .parse => {},
+            }
             result.os = try std.json.innerParse([]const u8, allocator, source, options);
             seen_os = true;
         } else if (std.mem.eql(u8, field_name, "architecture")) {
+            switch (try duplicateFieldAction(options, seen_arch)) {
+                .ignore => {
+                    _ = try std.json.innerParse([]const u8, allocator, source, options);
+                    continue;
+                },
+                .parse => {},
+            }
             result.architecture = try std.json.innerParse([]const u8, allocator, source, options);
             seen_arch = true;
         } else if (std.mem.eql(u8, field_name, "variant")) {
+            switch (try duplicateFieldAction(options, seen_variant)) {
+                .ignore => {
+                    _ = try std.json.innerParse(?[]const u8, allocator, source, options);
+                    continue;
+                },
+                .parse => {},
+            }
             result.variant = try std.json.innerParse(?[]const u8, allocator, source, options);
+            seen_variant = true;
         } else if (std.mem.eql(u8, field_name, "os.version")) {
+            switch (try duplicateFieldAction(options, seen_os_version)) {
+                .ignore => {
+                    _ = try std.json.innerParse(?[]const u8, allocator, source, options);
+                    continue;
+                },
+                .parse => {},
+            }
             result.os_version = try std.json.innerParse(?[]const u8, allocator, source, options);
+            seen_os_version = true;
         } else if (std.mem.eql(u8, field_name, "os.features")) {
+            switch (try duplicateFieldAction(options, seen_os_features)) {
+                .ignore => {
+                    _ = try std.json.innerParse(?[]const []const u8, allocator, source, options);
+                    continue;
+                },
+                .parse => {},
+            }
             result.os_features = try std.json.innerParse(?[]const []const u8, allocator, source, options);
+            seen_os_features = true;
         } else {
             if (!options.ignore_unknown_fields) return error.UnknownField;
             try source.skipValue();
@@ -115,6 +151,22 @@ pub fn jsonStringify(self: Platform, jw: anytype) !void {
     try jw.endObject();
 }
 
+const DuplicateFieldAction = enum { parse, ignore };
+
+fn duplicateFieldAction(options: std.json.ParseOptions, seen: bool) !DuplicateFieldAction {
+    if (!seen) return .parse;
+    return switch (options.duplicate_field_behavior) {
+        .use_first => .ignore,
+        .@"error" => error.DuplicateField,
+        .use_last => .parse,
+    };
+}
+
+fn osVersionMatches(candidate: []const u8, filter: []const u8) bool {
+    if (!std.mem.startsWith(u8, candidate, filter)) return false;
+    return candidate.len == filter.len or candidate[filter.len] == '.';
+}
+
 fn sliceEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -131,15 +183,30 @@ fn featuresEql(a: ?[]const []const u8, b: ?[]const []const u8) bool {
     return true;
 }
 
-const minimal_platform_json = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
+const MINIMAL_PLATFORM_JSON = "{\"os\": \"linux\", \"architecture\": \"amd64\"}";
 
-const full_platform_json =
+const FULL_PLATFORM_JSON =
     \\{
     \\  "os": "windows",
     \\  "architecture": "amd64",
     \\  "variant": "v1",
     \\  "os.version": "10.0.17763",
     \\  "os.features": ["win32k", "hyperv"]
+    \\}
+;
+
+const DUPLICATE_PLATFORM_JSON =
+    \\{
+    \\  "os": "linux",
+    \\  "os": "windows",
+    \\  "architecture": "amd64",
+    \\  "architecture": "arm64",
+    \\  "variant": "v1",
+    \\  "variant": "v2",
+    \\  "os.version": "10.0",
+    \\  "os.version": "11.0",
+    \\  "os.features": ["first"],
+    \\  "os.features": ["last"]
     \\}
 ;
 
@@ -337,7 +404,7 @@ test "Platform.eql: strict equality matrix" {
 }
 
 test "Platform jsonParse: parses required and optional OCI fields" {
-    const minimal = try parsePlatformJson(minimal_platform_json, .{ .ignore_unknown_fields = true });
+    const minimal = try parsePlatformJson(MINIMAL_PLATFORM_JSON, .{ .ignore_unknown_fields = true });
     defer minimal.deinit();
     try std.testing.expectEqualSlices(u8, "linux", minimal.value.os);
     try std.testing.expectEqualSlices(u8, "amd64", minimal.value.architecture);
@@ -345,7 +412,7 @@ test "Platform jsonParse: parses required and optional OCI fields" {
     try std.testing.expect(minimal.value.os_version == null);
     try std.testing.expect(minimal.value.os_features == null);
 
-    const full = try parsePlatformJson(full_platform_json, .{ .ignore_unknown_fields = true });
+    const full = try parsePlatformJson(FULL_PLATFORM_JSON, .{ .ignore_unknown_fields = true });
     defer full.deinit();
     try std.testing.expectEqualSlices(u8, "windows", full.value.os);
     try std.testing.expectEqualSlices(u8, "amd64", full.value.architecture);
@@ -384,6 +451,33 @@ test "Platform jsonParse: exact errors for malformed input" {
 
     const unknown_field_json = "{\"os\": \"linux\", \"architecture\": \"amd64\", \"customField\": \"value\"}";
     try std.testing.expectError(error.UnknownField, parsePlatformJson(unknown_field_json, .{ .ignore_unknown_fields = false }));
+}
+
+test "Platform jsonParse: honors duplicate field behavior" {
+    try std.testing.expectError(
+        error.DuplicateField,
+        parsePlatformJson(DUPLICATE_PLATFORM_JSON, .{}),
+    );
+
+    const first = try parsePlatformJson(DUPLICATE_PLATFORM_JSON, .{
+        .duplicate_field_behavior = .use_first,
+    });
+    defer first.deinit();
+    try std.testing.expectEqualSlices(u8, "linux", first.value.os);
+    try std.testing.expectEqualSlices(u8, "amd64", first.value.architecture);
+    try std.testing.expectEqualSlices(u8, "v1", first.value.variant.?);
+    try std.testing.expectEqualSlices(u8, "10.0", first.value.os_version.?);
+    try std.testing.expectEqualSlices(u8, "first", first.value.os_features.?[0]);
+
+    const last = try parsePlatformJson(DUPLICATE_PLATFORM_JSON, .{
+        .duplicate_field_behavior = .use_last,
+    });
+    defer last.deinit();
+    try std.testing.expectEqualSlices(u8, "windows", last.value.os);
+    try std.testing.expectEqualSlices(u8, "arm64", last.value.architecture);
+    try std.testing.expectEqualSlices(u8, "v2", last.value.variant.?);
+    try std.testing.expectEqualSlices(u8, "11.0", last.value.os_version.?);
+    try std.testing.expectEqualSlices(u8, "last", last.value.os_features.?[0]);
 }
 
 test "Platform jsonParse: allocation failures do not leak" {

@@ -102,7 +102,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
 
     if (std.mem.indexOfScalar(u8, last_seg, ':')) |colon_in_seg| {
         tag_str = last_seg[colon_in_seg + 1 ..];
-        if (tag_str.?.len == 0) return error.InvalidReference;
+        if (!isValidTag(tag_str.?)) return error.InvalidReference;
         repo_str = path_str[0 .. last_seg_start + colon_in_seg];
     }
 
@@ -137,13 +137,6 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Referen
     };
 }
 
-fn duplicateLibraryRepositoryPath(allocator: std.mem.Allocator, repository: []const u8) ![]const u8 {
-    const owned = try allocator.alloc(u8, DOCKER_HUB_LIBRARY_PREFIX.len + repository.len);
-    @memcpy(owned[0..DOCKER_HUB_LIBRARY_PREFIX.len], DOCKER_HUB_LIBRARY_PREFIX);
-    @memcpy(owned[DOCKER_HUB_LIBRARY_PREFIX.len..], repository);
-    return owned;
-}
-
 /// Manual construction must keep `digest.hex` inside `digest_raw` (Debug-asserted).
 pub fn deinit(self: *Reference, allocator: std.mem.Allocator) void {
     if (builtin.mode == .Debug) {
@@ -162,12 +155,6 @@ pub fn deinit(self: *Reference, allocator: std.mem.Allocator) void {
     // digest.hex points inside digest_raw, so freeing digest_raw is enough.
 }
 
-fn slicePointsInto(inner: []const u8, outer: []const u8) bool {
-    const inner_start = @intFromPtr(inner.ptr);
-    const outer_start = @intFromPtr(outer.ptr);
-    return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
-}
-
 pub fn repositoryPath(self: Reference) []const u8 {
     return self.repository;
 }
@@ -178,18 +165,81 @@ pub fn refString(self: Reference) []const u8 {
     return self.tag orelse "latest";
 }
 
+fn duplicateLibraryRepositoryPath(allocator: std.mem.Allocator, repository: []const u8) ![]const u8 {
+    const owned = try allocator.alloc(u8, DOCKER_HUB_LIBRARY_PREFIX.len + repository.len);
+    @memcpy(owned[0..DOCKER_HUB_LIBRARY_PREFIX.len], DOCKER_HUB_LIBRARY_PREFIX);
+    @memcpy(owned[DOCKER_HUB_LIBRARY_PREFIX.len..], repository);
+    return owned;
+}
+
+fn slicePointsInto(inner: []const u8, outer: []const u8) bool {
+    const inner_start = @intFromPtr(inner.ptr);
+    const outer_start = @intFromPtr(outer.ptr);
+    return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
+}
+
 fn looksLikeRegistry(segment: []const u8) bool {
-    if (std.mem.indexOfScalar(u8, segment, '.') != null) return true;
     if (std.ascii.eqlIgnoreCase(segment, "localhost")) return true;
-    if (std.mem.indexOfScalar(u8, segment, ':')) |colon| {
-        const after = segment[colon + 1 ..];
-        if (after.len == 0) return false;
-        for (after) |c| {
-            if (c < '0' or c > '9') return false;
-        }
-        return true;
+    if (segment.len > 0 and segment[0] == '[') {
+        return isValidBracketedRegistry(segment);
     }
-    return false;
+
+    var host = segment;
+    const has_port = if (std.mem.indexOfScalar(u8, segment, ':')) |colon| blk: {
+        host = segment[0..colon];
+        break :blk isValidPort(segment[colon + 1 ..]);
+    } else false;
+    if (std.mem.indexOfScalar(u8, segment, ':') != null and !has_port) return false;
+    if (!has_port and std.mem.indexOfScalar(u8, host, '.') == null) return false;
+    return isValidRegistryHost(host);
+}
+
+fn isValidBracketedRegistry(segment: []const u8) bool {
+    const close = std.mem.indexOfScalar(u8, segment, ']') orelse return false;
+    if (!isValidBracketedHost(segment[1..close])) return false;
+    if (close + 1 == segment.len) return true;
+    if (segment[close + 1] != ':') return false;
+    return isValidPort(segment[close + 2 ..]);
+}
+
+fn isValidBracketedHost(host: []const u8) bool {
+    if (host.len == 0) return false;
+    for (host) |c| {
+        switch (c) {
+            '0'...'9', 'a'...'f', 'A'...'F', ':' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn isValidPort(port: []const u8) bool {
+    if (port.len == 0) return false;
+    for (port) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+fn isValidRegistryHost(host: []const u8) bool {
+    var start: usize = 0;
+    while (true) {
+        const end = std.mem.indexOfScalarPos(u8, host, start, '.') orelse host.len;
+        if (!isValidRegistryDomainComponent(host[start..end])) return false;
+        if (end == host.len) return true;
+        start = end + 1;
+    }
+}
+
+fn isValidRegistryDomainComponent(component: []const u8) bool {
+    if (component.len == 0) return false;
+    if (!isAsciiAlphaNum(component[0]) or !isAsciiAlphaNum(component[component.len - 1])) return false;
+    if (component.len > 2) {
+        for (component[1 .. component.len - 1]) |c| {
+            if (!isAsciiAlphaNum(c) and c != '-') return false;
+        }
+    }
+    return true;
 }
 
 fn validateRepositoryPath(repository: []const u8) ParseError!void {
@@ -205,20 +255,51 @@ fn validateRepositoryPath(repository: []const u8) ParseError!void {
 fn isValidRepositoryComponent(segment: []const u8) bool {
     if (segment.len == 0) return false;
     if (!isRepositoryAlphaNum(segment[0])) return false;
-    if (!isRepositoryAlphaNum(segment[segment.len - 1])) return false;
 
-    for (segment) |c| {
-        switch (c) {
-            'a'...'z', '0'...'9', '.', '_', '-' => {},
+    var index: usize = 1;
+    while (index < segment.len) {
+        if (isRepositoryAlphaNum(segment[index])) {
+            index += 1;
+            continue;
+        }
+        switch (segment[index]) {
+            '.' => index += 1,
+            '_' => {
+                index += 1;
+                if (index < segment.len and segment[index] == '_') index += 1;
+            },
+            '-' => {
+                while (index < segment.len and segment[index] == '-') index += 1;
+            },
             else => return false,
         }
+        if (index == segment.len or !isRepositoryAlphaNum(segment[index])) return false;
     }
 
     return true;
 }
 
+fn isValidTag(tag: []const u8) bool {
+    if (tag.len == 0 or tag.len > 128) return false;
+    switch (tag[0]) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_' => {},
+        else => return false,
+    }
+    for (tag[1..]) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '.', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 fn isRepositoryAlphaNum(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
+}
+
+fn isAsciiAlphaNum(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9');
 }
 
 const ReferenceCorpusCase = struct {
@@ -255,6 +336,10 @@ test "Reference.parse: happy path and Docker Hub normalization table" {
         .{ .input = "localhost/myimage:dev", .registry = "localhost", .repository = "myimage", .tag = "dev", .ref_string = "dev" },
         .{ .input = "registry.example.com/org/team/image:latest", .registry = "registry.example.com", .repository = "org/team/image", .tag = "latest", .ref_string = "latest" },
         .{ .input = "registry.example.com:443/repo:tag", .registry = "registry.example.com:443", .repository = "repo", .tag = "tag", .ref_string = "tag" },
+        .{ .input = "x.io/repo:tag", .registry = "x.io", .repository = "repo", .tag = "tag", .ref_string = "tag" },
+        .{ .input = "[::1]:5000/team/api:dev", .registry = "[::1]:5000", .repository = "team/api", .tag = "dev", .ref_string = "dev" },
+        .{ .input = "ghcr.io/owner__repo:latest", .registry = "ghcr.io", .repository = "owner__repo", .tag = "latest", .ref_string = "latest" },
+        .{ .input = "ghcr.io/owner---repo:latest", .registry = "ghcr.io", .repository = "owner---repo", .tag = "latest", .ref_string = "latest" },
         .{ .input = "docker.io/library/ubuntu:20.04", .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .tag = "20.04", .ref_string = "20.04" },
         .{ .input = "index.docker.io/library/alpine:3.18", .registry = DOCKER_HUB_REGISTRY, .repository = "library/alpine", .tag = "3.18", .ref_string = "3.18" },
         .{ .input = "DOCKER.IO/library/ubuntu:latest", .registry = DOCKER_HUB_REGISTRY, .repository = "library/ubuntu", .tag = "latest", .ref_string = "latest" },
@@ -315,12 +400,30 @@ test "Reference.parse: maps malformed input to exact ParseError" {
         .{ .input = "@sha256:" ++ hex, .expected = error.InvalidReference },
         .{ .input = "ubuntu@notadigest", .expected = error.InvalidDigest },
         .{ .input = "ubuntu:", .expected = error.InvalidReference },
+        .{ .input = "ubuntu:.tag", .expected = error.InvalidReference },
+        .{ .input = "ubuntu:-tag", .expected = error.InvalidReference },
+        .{ .input = "ubuntu:tag:extra", .expected = error.InvalidReference },
+        .{ .input = "ubuntu:" ++ "a" ** 129, .expected = error.InvalidReference },
         .{ .input = "myorg/", .expected = error.InvalidReference },
         .{ .input = "ghcr.io/Owner/repo:latest", .expected = error.InvalidReference },
         .{ .input = "ghcr.io/owner//repo:latest", .expected = error.InvalidReference },
+        .{ .input = "ghcr.io/owner..repo:latest", .expected = error.InvalidReference },
+        .{ .input = "ghcr.io/owner___repo:latest", .expected = error.InvalidReference },
+        .{ .input = "ghcr.io/owner._repo:latest", .expected = error.InvalidReference },
         .{ .input = "ghcr.io/owner:team/repo:latest", .expected = error.InvalidReference },
+        .{ .input = "registry..example/repo:latest", .expected = error.InvalidReference },
+        .{ .input = "-registry.example/repo:latest", .expected = error.InvalidReference },
+        .{ .input = "registry-.example/repo:latest", .expected = error.InvalidReference },
     };
     for (cases) |case| try expectParseError(case.input, case.expected);
+}
+
+test "Reference.parse: accepts the maximum Docker tag length" {
+    const max_tag = "a" ** 128;
+    var ref = try parse(std.testing.allocator, "ubuntu:" ++ max_tag);
+    defer ref.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(u8, max_tag, ref.tag.?);
 }
 
 test "Reference: repositoryPath and refString match parse on real-world corpus" {

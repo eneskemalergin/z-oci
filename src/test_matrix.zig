@@ -17,7 +17,7 @@ const resolver = @import("resolver.zig");
 pub const max_child_manifest_depth: usize = 4;
 pub const index_child_digest = "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
-const depth_levels: usize = max_child_manifest_depth + 1;
+const DEPTH_LEVELS: usize = max_child_manifest_depth + 1;
 
 pub const Scenario = enum {
     auth_failed,
@@ -171,8 +171,8 @@ const ResponsePlan = struct {
 pub const Fixtures = struct {
     var index_body: ?[]u8 = null;
     var index_digest: ?[]u8 = null;
-    var depth_bodies: [depth_levels][]u8 = undefined;
-    var depth_digests: [depth_levels][]u8 = undefined;
+    var depth_bodies: [DEPTH_LEVELS][]u8 = undefined;
+    var depth_digests: [DEPTH_LEVELS][]u8 = undefined;
     var depth_ready: bool = false;
 
     pub fn reset(allocator: std.mem.Allocator) void {
@@ -188,8 +188,13 @@ pub const Fixtures = struct {
     }
 
     fn ensureIndex(allocator: std.mem.Allocator) !void {
-        if (index_body != null) return;
-        index_body = try buildIndexBodyAlloc(
+        if (index_body != null and index_digest != null) return;
+        if (index_body) |body| allocator.free(body);
+        if (index_digest) |digest| allocator.free(digest);
+        index_body = null;
+        index_digest = null;
+
+        const body = try buildIndexBodyAlloc(
             allocator,
             MediaType.oci_index_v1.toString(),
             MediaType.oci_manifest_v1.toString(),
@@ -197,16 +202,30 @@ pub const Fixtures = struct {
             "linux",
             "arm64",
         );
-        index_digest = try sha256DigestStringAlloc(allocator, index_body.?);
+        errdefer allocator.free(body);
+
+        const digest = try sha256DigestStringAlloc(allocator, body);
+        index_body = body;
+        index_digest = digest;
     }
 
     fn ensureDepthChain(allocator: std.mem.Allocator) !void {
         if (depth_ready) return;
+
+        var bodies: [DEPTH_LEVELS][]u8 = undefined;
+        var digests: [DEPTH_LEVELS][]u8 = undefined;
+        var body_count: usize = 0;
+        var digest_count: usize = 0;
+        errdefer {
+            for (bodies[DEPTH_LEVELS - body_count ..]) |body| allocator.free(body);
+            for (digests[DEPTH_LEVELS - digest_count ..]) |digest| allocator.free(digest);
+        }
+
         var next_digest: []const u8 = index_child_digest;
-        var reverse_index: usize = depth_bodies.len;
+        var reverse_index: usize = DEPTH_LEVELS;
         while (reverse_index > 0) {
             reverse_index -= 1;
-            depth_bodies[reverse_index] = try buildIndexBodyAlloc(
+            bodies[reverse_index] = try buildIndexBodyAlloc(
                 allocator,
                 MediaType.oci_index_v1.toString(),
                 MediaType.oci_index_v1.toString(),
@@ -214,9 +233,14 @@ pub const Fixtures = struct {
                 "linux",
                 "arm64",
             );
-            depth_digests[reverse_index] = try sha256DigestStringAlloc(allocator, depth_bodies[reverse_index]);
-            next_digest = depth_digests[reverse_index];
+            body_count += 1;
+            digests[reverse_index] = try sha256DigestStringAlloc(allocator, bodies[reverse_index]);
+            digest_count += 1;
+            next_digest = digests[reverse_index];
         }
+
+        depth_bodies = bodies;
+        depth_digests = digests;
         depth_ready = true;
     }
 };
@@ -514,10 +538,13 @@ test "test_matrix: failure scenario tables align with ResolveError tags and cove
 
         var listed = false;
         for (resolve_errors) |entry| {
-            if (entry.scenario == scenario) listed = true;
+            if (entry.scenario == scenario) {
+                listed = true;
+                try std.testing.expectEqual(PublicApi.resolve, entry.api);
+                try std.testing.expectEqual(ApiCoverageSurface.resolve_error, entry.surface);
+            }
         }
         try std.testing.expect(listed);
-        try std.testing.expectEqual(PublicApi.resolve, resolve_errors[0].api);
     }
 
     for (validate_failure_scenarios) |scenario| {
@@ -613,6 +640,34 @@ test "test_matrix: scenario metadata helpers match expected HTTP status, referen
             try std.testing.expect(platform == null);
         }
     }
+}
+
+test "Fixtures: index allocation failures leave no partial state" {
+    Fixtures.reset(std.testing.allocator);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, Fixtures.ensureIndex(failing.allocator()));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expect(Fixtures.index_body == null);
+    try std.testing.expect(Fixtures.index_digest == null);
+
+    try Fixtures.ensureIndex(std.testing.allocator);
+    try std.testing.expect(Fixtures.index_body != null);
+    try std.testing.expect(Fixtures.index_digest != null);
+    Fixtures.reset(std.testing.allocator);
+}
+
+test "Fixtures: depth allocation failures leave no partial state" {
+    Fixtures.reset(std.testing.allocator);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, Fixtures.ensureDepthChain(failing.allocator()));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expect(!Fixtures.depth_ready);
+
+    try Fixtures.ensureDepthChain(std.testing.allocator);
+    try std.testing.expect(Fixtures.depth_ready);
+    Fixtures.reset(std.testing.allocator);
 }
 
 test "test_matrix.sha256DigestStringAlloc: prefixes sha256 and sizes digest string" {

@@ -26,6 +26,8 @@ pub fn authorityHost(authority: []const u8) ?[]const u8 {
     if (authority[0] == '[') {
         const close = std.mem.indexOfScalar(u8, authority, ']') orelse return null;
         if (close < 1) return null;
+        const suffix = authority[close + 1 ..];
+        if (suffix.len != 0 and (suffix[0] != ':' or !isAllDigits(suffix[1..]))) return null;
         return authority[1..close];
     }
     if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
@@ -81,6 +83,8 @@ test "authorityHost: host port and bracketed ipv6" {
 test "authorityHost: empty and malformed bracketed ipv6" {
     try std.testing.expect(authorityHost("") == null);
     try std.testing.expect(authorityHost("[::1") == null);
+    try std.testing.expect(authorityHost("[::1]@registry.example") == null);
+    try std.testing.expect(authorityHost("[::1]:5000@registry.example") == null);
 }
 
 test "cleartextLoopbackUrlAlloc: rewrites loopback https only" {
@@ -101,5 +105,6 @@ test "cleartextLoopbackUrlAlloc: rewrites loopback https only" {
     try std.testing.expect(try cleartextLoopbackUrlAlloc(alloc, "https://ghcr.io/v2/") == null);
     try std.testing.expect(try cleartextLoopbackUrlAlloc(alloc, "https://registry-1.docker.io/v2/") == null);
     try std.testing.expect(try cleartextLoopbackUrlAlloc(alloc, "https://10.0.0.1:5000/v2/") == null);
+    try std.testing.expect(try cleartextLoopbackUrlAlloc(alloc, "https://[::1]@registry-1.docker.io/v2/") == null);
     try std.testing.expect(try cleartextLoopbackUrlAlloc(alloc, "http://127.0.0.1/v2/") == null);
 }

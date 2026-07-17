@@ -4,8 +4,9 @@
 //! options callers need for OCI payloads: ignore unknown fields (the spec
 //! allows extension fields) and allocate strings from the provided allocator.
 //!
-//! The returned std.json.Parsed(T) owns an arena. Call .deinit() when done.
-//! All string slices in the parsed value point into that arena.
+//! `parse()` returns an arena-owned std.json.Parsed(T); call `.deinit()` when
+//! done. `parseBorrowing()` can retain string slices into its input, which must
+//! outlive the parsed value; call `.deinit()` for its arena as well.
 
 const std = @import("std");
 
@@ -29,7 +30,10 @@ pub fn parseBorrowing(comptime T: type, allocator: std.mem.Allocator, bytes: []c
     });
 }
 
-/// Moves a transient `Parsed(T)` onto `caller_allocator` (input is deinitialized).
+/// Moves a transient `Parsed(T)` onto `caller_allocator`.
+///
+/// On success, deinitializes `parsed`. On error, leaves `parsed` owned by the
+/// caller, which must deinitialize it.
 pub fn promoteParsed(
     comptime T: type,
     caller_allocator: std.mem.Allocator,
@@ -51,8 +55,8 @@ pub fn promoteParsed(
 }
 
 /// Caller owns the returned writer (`deinit` required).
-pub fn stringifyForTest(value: anytype) !std.Io.Writer.Allocating {
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+pub fn stringifyForTest(allocator: std.mem.Allocator, value: anytype) !std.Io.Writer.Allocating {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var ws: std.json.Stringify = .{ .writer = &aw.writer };
     try ws.write(value);
@@ -235,7 +239,7 @@ test "json.parseBorrowing: parsed Platform aliases input buffer after mutation" 
 test "json.stringifyForTest: round-trips Platform through parseBorrowing" {
     const platform = Platform{ .os = "linux", .architecture = "amd64" };
 
-    var aw = try stringifyForTest(platform);
+    var aw = try stringifyForTest(std.testing.allocator, platform);
     defer aw.deinit();
 
     const reparsed = try parseBorrowing(Platform, std.testing.allocator, aw.written());
@@ -296,7 +300,7 @@ test "json: pseudo-random payloads never panic when parsed as Manifest" {
         const result = parse(Manifest, std.testing.allocator, buf[0..len]);
         if (result) |parsed| {
             defer parsed.deinit();
-            try std.testing.expect(parsed.value.schema_version <= std.math.maxInt(u8));
+            try std.testing.expectEqual(@as(u8, 2), parsed.value.schema_version);
         } else |_| {}
     }
 }

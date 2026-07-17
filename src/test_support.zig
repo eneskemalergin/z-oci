@@ -31,11 +31,11 @@ fn readBoundedFixture(path: []const u8, buffer: []u8, max_bytes: usize) ![]u8 {
     return bytes;
 }
 
-const descriptor_fixture = "fixtures/descriptors/oci-descriptor-artifact-spec-example.json";
-const descriptor_fixture_limit = 16 * 1024;
+const DESCRIPTOR_FIXTURE = "fixtures/descriptors/oci-descriptor-artifact-spec-example.json";
+const DESCRIPTOR_FIXTURE_LIMIT = 16 * 1024;
 
 test "test_support.parseFixture: copies fixture bytes into caller-owned arena" {
-    const parsed = try parseFixture(Descriptor, descriptor_fixture, descriptor_fixture_limit);
+    const parsed = try parseFixture(Descriptor, DESCRIPTOR_FIXTURE, DESCRIPTOR_FIXTURE_LIMIT);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u64, 123), parsed.value.size);
@@ -54,10 +54,10 @@ test "test_support.parseFixture: copies fixture bytes into caller-owned arena" {
 test "test_support.parseFixture: maps missing file and oversize stream to exact errors" {
     try std.testing.expectError(
         error.FileNotFound,
-        parseFixture(Descriptor, "fixtures/does-not-exist.json", descriptor_fixture_limit),
+        parseFixture(Descriptor, "fixtures/does-not-exist.json", DESCRIPTOR_FIXTURE_LIMIT),
     );
 
-    try std.testing.expectError(error.StreamTooLong, parseFixture(Descriptor, descriptor_fixture, 32));
+    try std.testing.expectError(error.StreamTooLong, parseFixture(Descriptor, DESCRIPTOR_FIXTURE, 32));
 }
 
 test "test_support.parseFixture: stays leak-free under DebugAllocator" {
@@ -67,8 +67,8 @@ test "test_support.parseFixture: stays leak-free under DebugAllocator" {
     const parsed = try parseFixtureWithAllocator(
         Descriptor,
         gpa.allocator(),
-        descriptor_fixture,
-        descriptor_fixture_limit,
+        DESCRIPTOR_FIXTURE,
+        DESCRIPTOR_FIXTURE_LIMIT,
     );
     parsed.deinit();
 }

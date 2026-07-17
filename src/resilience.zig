@@ -360,11 +360,6 @@ pub fn retryAfterDelayMs(retry_after: RetryAfter, now_unix_seconds: i64) u32 {
         },
     }
 }
-fn clampDelaySecondsMs(seconds: u64) u32 {
-    const max_delay_seconds = @as(u64, std.math.maxInt(u32)) / 1000;
-    if (seconds > max_delay_seconds) return std.math.maxInt(u32);
-    return @intCast(seconds * 1000);
-}
 pub fn retryBudgetConfig(config: Config) RetryBudgetConfig {
     return .{
         .max_network_retries = config.max_network_retries,
@@ -490,6 +485,7 @@ pub fn isTrustworthyPreemptiveRateLimit(info: RateLimitInfo) bool {
     if (info.source != .registry_rate_limit) return false;
     if (info.limit == null or info.remaining == null) return false;
     if (info.reset_unix_seconds == null) return false;
+    if (info.reset_unix_seconds.? > MAX_I64_AS_U64) return false;
     return true;
 }
 /// `null` when disabled, untrusted, remaining above threshold, or reset already passed.
@@ -547,18 +543,19 @@ pub fn parseRetryAfterFromHeaders(
     headers: []const HttpHeader,
     response_date_unix_seconds: ?i64,
 ) ResilienceParseError!?RetryAfter {
+    const raw = if (findHeaderValue(headers, "Retry-After")) |value|
+        value
+    else if (findHeaderValue(headers, "X-Retry-After")) |value|
+        value
+    else
+        return null;
+
     const response_date: ?i64 = if (response_date_unix_seconds) |date|
         date
     else
         try responseDateUnixSecondsFromHeaders(headers);
 
-    if (findHeaderValue(headers, "Retry-After")) |raw| {
-        return try parseRetryAfterHeaderValue(raw, response_date);
-    }
-    if (findHeaderValue(headers, "X-Retry-After")) |raw| {
-        return try parseRetryAfterHeaderValue(raw, response_date);
-    }
-    return null;
+    return try parseRetryAfterHeaderValue(raw, response_date);
 }
 /// No response `Date` anchoring.
 pub fn parseRetryAfterValue(raw: []const u8) ResilienceParseError!RetryAfter {
@@ -609,13 +606,19 @@ fn exponentialBackoffDelayMs(
 ) u32 {
     const shift: u4 = @intCast(@min(attempt_index, 15));
     const multiplier: u32 = @as(u32, 1) << shift;
-    const uncapped = config.base_delay_ms *% multiplier;
-    const capped = @min(uncapped, config.max_delay_ms);
+    const uncapped = @as(u64, config.base_delay_ms) * @as(u64, multiplier);
+    const capped: u32 = @intCast(@min(uncapped, @as(u64, config.max_delay_ms)));
     if (capped == 0) return 0;
     return @intCast(random_u64 % (@as(u64, capped) + 1));
 }
+fn clampDelaySecondsMs(seconds: u64) u32 {
+    const max_delay_seconds = @as(u64, std.math.maxInt(u32)) / 1000;
+    if (seconds > max_delay_seconds) return std.math.maxInt(u32);
+    return @intCast(seconds * 1000);
+}
 // Numeric `Retry-After` values at or above this are treated as Unix epoch seconds.
 const RETRY_AFTER_UNIX_EPOCH_THRESHOLD: u64 = 1_000_000_000;
+const MAX_I64_AS_U64: u64 = @intCast(std.math.maxInt(i64));
 const epoch = std.time.epoch;
 fn parseRetryAfterHeaderValue(
     raw: []const u8,
@@ -633,6 +636,7 @@ fn parseRetryAfterHeaderValue(
 
     const parsed = std.fmt.parseInt(u64, trimmed, 10) catch return error.InvalidRetryAfterHeader;
     if (parsed >= RETRY_AFTER_UNIX_EPOCH_THRESHOLD) {
+        if (parsed > MAX_I64_AS_U64) return error.InvalidRetryAfterHeader;
         return .{ .retry_at_unix_seconds = @intCast(parsed) };
     }
 
@@ -640,7 +644,11 @@ fn parseRetryAfterHeaderValue(
     const delay_seconds: u32 = @intCast(parsed);
 
     if (response_date_unix_seconds) |response_date| {
-        return .{ .retry_at_unix_seconds = response_date + @as(i64, delay_seconds) };
+        const delay_as_i64: i64 = @intCast(delay_seconds);
+        if (response_date > std.math.maxInt(i64) - delay_as_i64) {
+            return error.InvalidRetryAfterHeader;
+        }
+        return .{ .retry_at_unix_seconds = response_date + delay_as_i64 };
     }
 
     return .{ .delay_seconds = delay_seconds };
@@ -903,7 +911,7 @@ test "resilience.configView: exposes transport and CA fields" {
         .connect_timeout_ms = 5_000,
         .read_timeout_ms = 60_000,
         .max_retries = 9,
-        .ca_bundle_path = "/tmp/custom-ca.pem",
+        .ca_bundle_path = "custom-ca.pem",
         .rate_limit_enabled = false,
     };
 
@@ -911,7 +919,7 @@ test "resilience.configView: exposes transport and CA fields" {
 
     try std.testing.expectEqual(@as(u32, 5_000), view.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 60_000), view.read_timeout_ms);
-    try std.testing.expectEqualStrings("/tmp/custom-ca.pem", view.ca_bundle_path.?);
+    try std.testing.expectEqualStrings("custom-ca.pem", view.ca_bundle_path.?);
     try std.testing.expect(!view.rate_limit_enabled);
 }
 
@@ -1082,6 +1090,15 @@ test "parseRetryAfterFromHeaders: prefers Retry-After over X-Retry-After and anc
     }, null) == null);
 }
 
+test "parseRetryAfterFromHeaders: ignores malformed Date without retry headers" {
+    const headers = [_]HttpHeader{.{
+        .name = "Date",
+        .value = "not an HTTP date",
+    }};
+
+    try std.testing.expect((try parseRetryAfterFromHeaders(&headers, null)) == null);
+}
+
 test "parseRetryAfterFromHeaders: conflicting fixture prefers Retry-After" {
     var fixture_buffer: [2 * 1024]u8 = undefined;
     const fixture = try loadResilienceFixture(
@@ -1116,6 +1133,20 @@ test "retryAfterFromHeaders: reads Retry-After when rate-limit headers present" 
 test "parseRetryAfterValue: rejects empty and malformed HTTP-date strings" {
     try std.testing.expectError(error.InvalidRetryAfterHeader, parseRetryAfterValue(""));
     try std.testing.expectError(error.InvalidHttpDate, parseRetryAfterValue("Thu, 99 Foo 2025 99:99:99 GMT"));
+}
+
+test "parseRetryAfterValue: rejects out-of-range epoch and anchored delay values" {
+    try std.testing.expectError(
+        error.InvalidRetryAfterHeader,
+        parseRetryAfterValue("18446744073709551615"),
+    );
+    try std.testing.expectError(
+        error.InvalidRetryAfterHeader,
+        parseRetryAfterFromHeaders(
+            &[_]HttpHeader{.{ .name = "Retry-After", .value = "1" }},
+            std.math.maxInt(i64),
+        ),
+    );
 }
 
 test "resilience header parsers: pseudo-random inputs never panic" {
@@ -1230,6 +1261,12 @@ test "isTrustworthyPreemptiveRateLimit: registry snapshots trusted and API snaps
         .remaining = 0,
         .reset_unix_seconds = 1_700_000_045,
     }));
+    try std.testing.expect(!isTrustworthyPreemptiveRateLimit(.{
+        .source = .registry_rate_limit,
+        .limit = 100,
+        .remaining = 0,
+        .reset_unix_seconds = std.math.maxInt(u64),
+    }));
 }
 
 test "preemptiveRateLimitDelayMs: returns delay only when enabled and registry exhausted" {
@@ -1341,6 +1378,22 @@ test "RetryPolicy.decideHttpRetry: jitter backoff when Retry-After absent" {
     const gateway = policy.decideHttpRetry(.bad_gateway, null);
 
     try std.testing.expectEqual(@as(u32, 4), gateway.delay_ms);
+}
+
+test "RetryPolicy.decideHttpRetry: caps backoff before integer wrap" {
+    test_policy_random_u64 = std.math.maxInt(u64);
+    var policy = RetryPolicy.init(.{
+        .budget = .{ .max_network_retries = 0, .max_rate_limit_retries = 2 },
+        .backoff = .{
+            .base_delay_ms = std.math.maxInt(u32),
+            .max_delay_ms = std.math.maxInt(u32),
+        },
+    }, testPolicyRandomU64, .{ .now_unix_seconds = testPolicyNowUnixSeconds });
+
+    _ = policy.decideHttpRetry(.too_many_requests, null);
+    const second = policy.decideHttpRetry(.too_many_requests, null);
+
+    try std.testing.expectEqual(std.math.maxInt(u32), second.delay_ms);
 }
 
 test "RetryPolicy.decideTransportRetry: retries reset until budget exhausted then gives up" {

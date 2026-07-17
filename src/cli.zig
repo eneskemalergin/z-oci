@@ -881,7 +881,8 @@ fn helpCommand(target: HelpTarget) []const u8 {
 }
 
 fn expectUsage(args: []const []const u8, reason: UsageReason, target: HelpTarget) !void {
-    const outcome = try parse(std.testing.allocator, args);
+    var outcome = try parse(std.testing.allocator, args);
+    defer if (outcome == .command) outcome.command.deinit(std.testing.allocator);
     switch (outcome) {
         .usage => |failure| {
             try std.testing.expectEqual(reason, failure.reason);
@@ -892,7 +893,8 @@ fn expectUsage(args: []const []const u8, reason: UsageReason, target: HelpTarget
 }
 
 fn expectHelp(args: []const []const u8, target: HelpTarget) !void {
-    const outcome = try parse(std.testing.allocator, args);
+    var outcome = try parse(std.testing.allocator, args);
+    defer if (outcome == .command) outcome.command.deinit(std.testing.allocator);
     switch (outcome) {
         .help => |actual| try std.testing.expectEqual(target, actual),
         else => return error.UnexpectedParseOutcome,
@@ -900,11 +902,29 @@ fn expectHelp(args: []const []const u8, target: HelpTarget) !void {
 }
 
 fn expectVersion(args: []const []const u8, target: HelpTarget) !void {
-    const outcome = try parse(std.testing.allocator, args);
+    var outcome = try parse(std.testing.allocator, args);
+    defer if (outcome == .command) outcome.command.deinit(std.testing.allocator);
     switch (outcome) {
         .version => |actual| try std.testing.expectEqual(target, actual),
         else => return error.UnexpectedParseOutcome,
     }
+}
+
+test "parse assertion helpers release unexpected command outcomes" {
+    const args = [_][]const u8{ "z-oci", "resolve", "ubuntu" };
+
+    try std.testing.expectError(
+        error.UnexpectedParseOutcome,
+        expectUsage(&args, .missing_command, .top_level),
+    );
+    try std.testing.expectError(
+        error.UnexpectedParseOutcome,
+        expectHelp(&args, .resolve),
+    );
+    try std.testing.expectError(
+        error.UnexpectedParseOutcome,
+        expectVersion(&args, .resolve),
+    );
 }
 
 test "parse: valid commands preserve options and owned references" {

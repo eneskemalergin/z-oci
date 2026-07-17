@@ -9,6 +9,10 @@
 //!
 //! jsonParse and jsonStringify on each type map camelCase JSON field names
 //! (schemaVersion, mediaType) to snake_case Zig fields.
+//!
+//! Values produced by `json.parse` borrow descriptor, platform, digest, and
+//! annotation storage from their parsed arena. Keep the parsed value alive
+//! while using `descriptors()` or a selected descriptor.
 
 const std = @import("std");
 const MediaType = @import("MediaType.zig").MediaType;
@@ -33,6 +37,7 @@ pub const OciImageIndex = struct {
         var seen_schema_version = false;
         var seen_media_type = false;
         var seen_manifests = false;
+        var seen_annotations = false;
         while (true) {
             const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
             const field_name: []const u8 = switch (tok) {
@@ -45,16 +50,33 @@ pub const OciImageIndex = struct {
                 else => {},
             };
             if (std.mem.eql(u8, field_name, "schemaVersion")) {
-                result.schema_version = try std.json.innerParse(u8, allocator, source, options);
-                seen_schema_version = true;
+                if (try duplicateFieldAction(options, seen_schema_version) == .ignore) {
+                    _ = try std.json.innerParse(u8, allocator, source, options);
+                } else {
+                    result.schema_version = try std.json.innerParse(u8, allocator, source, options);
+                    seen_schema_version = true;
+                }
             } else if (std.mem.eql(u8, field_name, "mediaType")) {
-                result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
-                seen_media_type = true;
+                if (try duplicateFieldAction(options, seen_media_type) == .ignore) {
+                    _ = try std.json.innerParse(MediaType, allocator, source, options);
+                } else {
+                    result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
+                    seen_media_type = true;
+                }
             } else if (std.mem.eql(u8, field_name, "manifests")) {
-                result.manifests = try std.json.innerParse([]const Descriptor, allocator, source, options);
-                seen_manifests = true;
+                if (try duplicateFieldAction(options, seen_manifests) == .ignore) {
+                    _ = try std.json.innerParse([]const Descriptor, allocator, source, options);
+                } else {
+                    result.manifests = try std.json.innerParse([]const Descriptor, allocator, source, options);
+                    seen_manifests = true;
+                }
             } else if (std.mem.eql(u8, field_name, "annotations")) {
-                result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+                if (try duplicateFieldAction(options, seen_annotations) == .ignore) {
+                    _ = try std.json.innerParse(?std.json.Value, allocator, source, options);
+                } else {
+                    result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+                    seen_annotations = true;
+                }
             } else {
                 if (!options.ignore_unknown_fields) return error.UnknownField;
                 try source.skipValue();
@@ -109,14 +131,26 @@ pub const DockerManifestList = struct {
                 else => {},
             };
             if (std.mem.eql(u8, field_name, "schemaVersion")) {
-                result.schema_version = try std.json.innerParse(u8, allocator, source, options);
-                seen_schema_version = true;
+                if (try duplicateFieldAction(options, seen_schema_version) == .ignore) {
+                    _ = try std.json.innerParse(u8, allocator, source, options);
+                } else {
+                    result.schema_version = try std.json.innerParse(u8, allocator, source, options);
+                    seen_schema_version = true;
+                }
             } else if (std.mem.eql(u8, field_name, "mediaType")) {
-                result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
-                seen_media_type = true;
+                if (try duplicateFieldAction(options, seen_media_type) == .ignore) {
+                    _ = try std.json.innerParse(MediaType, allocator, source, options);
+                } else {
+                    result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
+                    seen_media_type = true;
+                }
             } else if (std.mem.eql(u8, field_name, "manifests")) {
-                result.manifests = try std.json.innerParse([]const Descriptor, allocator, source, options);
-                seen_manifests = true;
+                if (try duplicateFieldAction(options, seen_manifests) == .ignore) {
+                    _ = try std.json.innerParse([]const Descriptor, allocator, source, options);
+                } else {
+                    result.manifests = try std.json.innerParse([]const Descriptor, allocator, source, options);
+                    seen_manifests = true;
+                }
             } else {
                 if (!options.ignore_unknown_fields) return error.UnknownField;
                 try source.skipValue();
@@ -145,6 +179,8 @@ pub const MultiArchManifest = union(enum) {
     oci: OciImageIndex,
     docker: DockerManifestList,
 
+    /// Returns descriptors borrowed from the underlying index. The returned
+    /// slice and its fields remain valid only while their source storage lives.
     pub fn descriptors(self: MultiArchManifest) []const Descriptor {
         return switch (self) {
             .oci => |idx| idx.manifests,
@@ -152,6 +188,8 @@ pub const MultiArchManifest = union(enum) {
         };
     }
 
+    /// Returns the first matching descriptor. Its slice fields borrow from the
+    /// underlying index.
     pub fn filterByPlatform(self: MultiArchManifest, filter: Platform) ?Descriptor {
         for (self.descriptors()) |desc| {
             const plat = desc.platform orelse continue;
@@ -161,6 +199,7 @@ pub const MultiArchManifest = union(enum) {
     }
 
     /// Like `filterByPlatform`, but only media types the resolver can fetch as children.
+    /// The returned descriptor's slice fields borrow from the underlying index.
     pub fn selectChildDescriptorByPlatform(self: MultiArchManifest, filter: Platform) ?Descriptor {
         for (self.descriptors()) |desc| {
             const plat = desc.platform orelse continue;
@@ -183,6 +222,17 @@ fn isResolvableChildMediaType(media_type: MediaType) bool {
 }
 
 // --- Private helpers ---
+
+const DuplicateFieldAction = enum { parse, ignore };
+
+fn duplicateFieldAction(options: std.json.ParseOptions, seen: bool) !DuplicateFieldAction {
+    if (!seen) return .parse;
+    return switch (options.duplicate_field_behavior) {
+        .use_first => .ignore,
+        .@"error" => error.DuplicateField,
+        .use_last => .parse,
+    };
+}
 
 const TestDescriptor = struct {
     descriptor: Descriptor,
@@ -414,7 +464,7 @@ test "OciImageIndex.jsonParse: annotations round-trip through stringifyForTest" 
     const annotated = try json.parse(OciImageIndex, std.testing.allocator, annotated_json);
     defer annotated.deinit();
 
-    var aw = try json.stringifyForTest(annotated.value);
+    var aw = try json.stringifyForTest(std.testing.allocator, annotated.value);
     defer aw.deinit();
     const out = aw.written();
 
@@ -460,6 +510,70 @@ test "OciImageIndex.jsonParse: rejects unknown fields when ignore_unknown_fields
         .allocate = .alloc_always,
         .max_value_len = std.json.default_max_value_len,
     }));
+}
+
+test "Index jsonParse: honors duplicate field behavior" {
+    const duplicate_oci_json =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.oci.image.index.v1+json",
+        \\  "manifests": [],
+        \\  "annotations": { "source": "first" },
+        \\  "annotations": { "source": "last" }
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.DuplicateField,
+        std.json.parseFromSlice(OciImageIndex, std.testing.allocator, duplicate_oci_json, .{}),
+    );
+
+    const first_oci = try std.json.parseFromSlice(OciImageIndex, std.testing.allocator, duplicate_oci_json, .{
+        .duplicate_field_behavior = .use_first,
+    });
+    defer first_oci.deinit();
+    try std.testing.expectEqualSlices(u8, "first", first_oci.value.annotations.?.object.get("source").?.string);
+
+    const last_oci = try std.json.parseFromSlice(OciImageIndex, std.testing.allocator, duplicate_oci_json, .{
+        .duplicate_field_behavior = .use_last,
+    });
+    defer last_oci.deinit();
+    try std.testing.expectEqualSlices(u8, "last", last_oci.value.annotations.?.object.get("source").?.string);
+
+    const duplicate_docker_json =
+        \\{
+        \\  "schemaVersion": 2,
+        \\  "schemaVersion": 2,
+        \\  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+        \\  "manifests": [
+        \\    {
+        \\      "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        \\      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\      "size": 1024,
+        \\      "platform": { "os": "linux", "architecture": "arm64" }
+        \\    }
+        \\  ],
+        \\  "manifests": []
+        \\}
+    ;
+
+    try std.testing.expectError(
+        error.DuplicateField,
+        std.json.parseFromSlice(DockerManifestList, std.testing.allocator, duplicate_docker_json, .{}),
+    );
+
+    const first_docker = try std.json.parseFromSlice(DockerManifestList, std.testing.allocator, duplicate_docker_json, .{
+        .duplicate_field_behavior = .use_first,
+    });
+    defer first_docker.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first_docker.value.manifests.len);
+
+    const last_docker = try std.json.parseFromSlice(DockerManifestList, std.testing.allocator, duplicate_docker_json, .{
+        .duplicate_field_behavior = .use_last,
+    });
+    defer last_docker.deinit();
+    try std.testing.expectEqual(@as(usize, 0), last_docker.value.manifests.len);
 }
 
 test "DockerManifestList.jsonParse: parses minimal manifest list" {

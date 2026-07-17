@@ -22,6 +22,17 @@ artifact_type: ?[]const u8 = null,
 
 const Descriptor = @This();
 
+const DuplicateFieldAction = enum { parse, ignore };
+
+fn duplicateFieldAction(options: std.json.ParseOptions, seen: bool) !DuplicateFieldAction {
+    if (!seen) return .parse;
+    return switch (options.duplicate_field_behavior) {
+        .use_first => .ignore,
+        .@"error" => error.DuplicateField,
+        .use_last => .parse,
+    };
+}
+
 pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Descriptor {
     if (.object_begin != try source.next()) return error.UnexpectedToken;
     var result = Descriptor{
@@ -32,6 +43,10 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
     var seen_media_type = false;
     var seen_digest = false;
     var seen_size = false;
+    var seen_platform = false;
+    var seen_urls = false;
+    var seen_annotations = false;
+    var seen_artifact_type = false;
     while (true) {
         const tok = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         const field_name: []const u8 = switch (tok) {
@@ -44,22 +59,54 @@ pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.jso
             else => {},
         };
         if (std.mem.eql(u8, field_name, "mediaType")) {
-            result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
-            seen_media_type = true;
+            if (try duplicateFieldAction(options, seen_media_type) == .ignore) {
+                _ = try std.json.innerParse(MediaType, allocator, source, options);
+            } else {
+                result.media_type = try std.json.innerParse(MediaType, allocator, source, options);
+                seen_media_type = true;
+            }
         } else if (std.mem.eql(u8, field_name, "digest")) {
-            result.digest = try std.json.innerParse(Digest, allocator, source, options);
-            seen_digest = true;
+            if (try duplicateFieldAction(options, seen_digest) == .ignore) {
+                _ = try std.json.innerParse(Digest, allocator, source, options);
+            } else {
+                result.digest = try std.json.innerParse(Digest, allocator, source, options);
+                seen_digest = true;
+            }
         } else if (std.mem.eql(u8, field_name, "size")) {
-            result.size = try std.json.innerParse(u64, allocator, source, options);
-            seen_size = true;
+            if (try duplicateFieldAction(options, seen_size) == .ignore) {
+                _ = try std.json.innerParse(u64, allocator, source, options);
+            } else {
+                result.size = try std.json.innerParse(u64, allocator, source, options);
+                seen_size = true;
+            }
         } else if (std.mem.eql(u8, field_name, "platform")) {
-            result.platform = try std.json.innerParse(?Platform, allocator, source, options);
+            if (try duplicateFieldAction(options, seen_platform) == .ignore) {
+                _ = try std.json.innerParse(?Platform, allocator, source, options);
+            } else {
+                result.platform = try std.json.innerParse(?Platform, allocator, source, options);
+                seen_platform = true;
+            }
         } else if (std.mem.eql(u8, field_name, "urls")) {
-            result.urls = try std.json.innerParse(?[]const []const u8, allocator, source, options);
+            if (try duplicateFieldAction(options, seen_urls) == .ignore) {
+                _ = try std.json.innerParse(?[]const []const u8, allocator, source, options);
+            } else {
+                result.urls = try std.json.innerParse(?[]const []const u8, allocator, source, options);
+                seen_urls = true;
+            }
         } else if (std.mem.eql(u8, field_name, "annotations")) {
-            result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+            if (try duplicateFieldAction(options, seen_annotations) == .ignore) {
+                _ = try std.json.innerParse(?std.json.Value, allocator, source, options);
+            } else {
+                result.annotations = try std.json.innerParse(?std.json.Value, allocator, source, options);
+                seen_annotations = true;
+            }
         } else if (std.mem.eql(u8, field_name, "artifactType")) {
-            result.artifact_type = try std.json.innerParse(?[]const u8, allocator, source, options);
+            if (try duplicateFieldAction(options, seen_artifact_type) == .ignore) {
+                _ = try std.json.innerParse(?[]const u8, allocator, source, options);
+            } else {
+                result.artifact_type = try std.json.innerParse(?[]const u8, allocator, source, options);
+                seen_artifact_type = true;
+            }
         } else {
             if (!options.ignore_unknown_fields) return error.UnknownField;
             try source.skipValue();
@@ -178,6 +225,50 @@ test "Descriptor jsonParse: rejects invalid roots, missing fields, and unknown k
     );
 }
 
+test "Descriptor jsonParse: honors duplicate field behavior" {
+    const duplicate_json =
+        "{\"mediaType\":\"" ++ manifest_media_type ++
+        "\",\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\"" ++
+        ",\"digest\":\"sha256:" ++ hex_a ++ "\",\"digest\":\"sha256:" ++ hex_d ++
+        "\",\"size\":1,\"size\":2" ++
+        ",\"platform\":{\"os\":\"linux\",\"architecture\":\"amd64\"}" ++
+        ",\"platform\":{\"os\":\"linux\",\"architecture\":\"arm64\"}" ++
+        ",\"urls\":[\"first\"],\"urls\":[\"second\"]" ++
+        ",\"annotations\":{\"source\":\"first\"},\"annotations\":{\"source\":\"second\"}" ++
+        ",\"artifactType\":\"first\",\"artifactType\":\"second\"}";
+
+    try std.testing.expectError(
+        error.DuplicateField,
+        std.json.parseFromSlice(Descriptor, std.testing.allocator, duplicate_json, .{ .ignore_unknown_fields = true }),
+    );
+
+    const first = try std.json.parseFromSlice(Descriptor, std.testing.allocator, duplicate_json, .{
+        .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .use_first,
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(MediaType.oci_manifest_v1, first.value.media_type);
+    try std.testing.expectEqualSlices(u8, hex_a, first.value.digest.hex);
+    try std.testing.expectEqual(@as(u64, 1), first.value.size);
+    try std.testing.expectEqualSlices(u8, "amd64", first.value.platform.?.architecture);
+    try std.testing.expectEqualSlices(u8, "first", first.value.urls.?[0]);
+    try std.testing.expectEqualSlices(u8, "first", first.value.annotations.?.object.get("source").?.string);
+    try std.testing.expectEqualSlices(u8, "first", first.value.artifact_type.?);
+
+    const last = try std.json.parseFromSlice(Descriptor, std.testing.allocator, duplicate_json, .{
+        .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .use_last,
+    });
+    defer last.deinit();
+    try std.testing.expectEqual(MediaType.docker_manifest_v2, last.value.media_type);
+    try std.testing.expectEqualSlices(u8, hex_d, last.value.digest.hex);
+    try std.testing.expectEqual(@as(u64, 2), last.value.size);
+    try std.testing.expectEqualSlices(u8, "arm64", last.value.platform.?.architecture);
+    try std.testing.expectEqualSlices(u8, "second", last.value.urls.?[0]);
+    try std.testing.expectEqualSlices(u8, "second", last.value.annotations.?.object.get("source").?.string);
+    try std.testing.expectEqualSlices(u8, "second", last.value.artifact_type.?);
+}
+
 test "Descriptor jsonParse: malformed field values return specific errors" {
     const prefix = "{\"mediaType\":\"" ++ manifest_media_type ++ "\",";
     const cases = [_]struct { []const u8, anyerror }{
@@ -253,7 +344,7 @@ test "Descriptor jsonStringify: omits null optional fields" {
         .size = 0,
     };
 
-    var aw = try json.stringifyForTest(d);
+    var aw = try json.stringifyForTest(std.testing.allocator, d);
     defer aw.deinit();
     const out = aw.written();
 
@@ -269,7 +360,7 @@ test "Descriptor jsonStringify: round-trip preserves all fields" {
     const parsed = try json.parse(Descriptor, std.testing.allocator, json_bytes);
     defer parsed.deinit();
 
-    var aw = try json.stringifyForTest(parsed.value);
+    var aw = try json.stringifyForTest(std.testing.allocator, parsed.value);
     defer aw.deinit();
 
     const reparsed = try json.parse(Descriptor, std.testing.allocator, aw.written());

@@ -16,6 +16,7 @@ const http = std.http;
 
 const testing_loopback = @import("testing_loopback.zig");
 
+/// Manifest data borrowed by `MockRegistry` until `deinit()`.
 pub const ManifestScript = struct {
     repository: []const u8,
     tag: []const u8,
@@ -40,7 +41,8 @@ pub const MockRegistry = struct {
     handler: ServeHandler,
     user_data: ?*anyopaque,
 
-    /// Anonymous scripted peer. `request_budget` bounds accepts for teardown.
+    /// Anonymous scripted peer. The script's slices must remain valid until `deinit()`.
+    /// `request_budget` bounds accepts for teardown.
     pub fn start(
         allocator: std.mem.Allocator,
         io: Io,
@@ -59,7 +61,8 @@ pub const MockRegistry = struct {
         return self;
     }
 
-    /// Scripted peer with a caller handler. `user_data` is passed through `self.user_data`.
+    /// Scripted peer with a caller handler. `user_data` is borrowed until `deinit()` and is
+    /// passed through `self.user_data`.
     pub fn startWithHandler(
         allocator: std.mem.Allocator,
         io: Io,
@@ -329,10 +332,10 @@ test "MockRegistry: GET /v2/ returns distribution api version" {
 }
 
 test "requestAuthorization: captures Authorization header on mock connection" {
-    const State = struct {
+    const MockHarness = struct {
         var authorization: ?[]const u8 = null;
     };
-    defer State.authorization = null;
+    defer MockHarness.authorization = null;
 
     const io = std.testing.io;
     const mock = try MockRegistry.startWithHandler(
@@ -341,7 +344,7 @@ test "requestAuthorization: captures Authorization header on mock connection" {
         1,
         struct {
             fn handle(_: *MockRegistry, request: *http.Server.Request) anyerror!void {
-                State.authorization = requestAuthorization(request);
+                MockHarness.authorization = requestAuthorization(request);
                 try request.respond("{}", .{ .status = .ok, .keep_alive = false });
             }
         }.handle,
@@ -366,14 +369,14 @@ test "requestAuthorization: captures Authorization header on mock connection" {
 
     var redirect_buffer: [4 * 1024]u8 = undefined;
     _ = try http_request.receiveHead(&redirect_buffer);
-    try std.testing.expectEqualStrings("Bearer secret", State.authorization.?);
+    try std.testing.expectEqualStrings("Bearer secret", MockHarness.authorization.?);
 }
 
 test "requestAuthorization: absent when client sends no Authorization header" {
-    const State = struct {
+    const MockHarness = struct {
         var saw_authorization: bool = false;
     };
-    defer State.saw_authorization = false;
+    defer MockHarness.saw_authorization = false;
 
     const io = std.testing.io;
     const mock = try MockRegistry.startWithHandler(
@@ -382,7 +385,7 @@ test "requestAuthorization: absent when client sends no Authorization header" {
         1,
         struct {
             fn handle(_: *MockRegistry, request: *http.Server.Request) anyerror!void {
-                State.saw_authorization = requestAuthorization(request) != null;
+                MockHarness.saw_authorization = requestAuthorization(request) != null;
                 try request.respond("{}", .{ .status = .ok, .keep_alive = false });
             }
         }.handle,
@@ -403,7 +406,7 @@ test "requestAuthorization: absent when client sends no Authorization header" {
 
     var redirect_buffer: [4 * 1024]u8 = undefined;
     _ = try http_request.receiveHead(&redirect_buffer);
-    try std.testing.expect(!State.saw_authorization);
+    try std.testing.expect(!MockHarness.saw_authorization);
 }
 
 test "MockRegistry: anonymous handler returns not_found for unknown manifest path" {
@@ -477,10 +480,10 @@ test "MockRegistry: imageReferenceAlloc fails without anonymous script" {
 }
 
 test "MockRegistry: failed serve does not consume request budget" {
-    const State = struct {
+    const MockHarness = struct {
         var calls: usize = 0;
     };
-    defer State.calls = 0;
+    defer MockHarness.calls = 0;
 
     const io = std.testing.io;
     const mock = try MockRegistry.startWithHandler(
@@ -489,8 +492,8 @@ test "MockRegistry: failed serve does not consume request budget" {
         1,
         struct {
             fn handle(_: *MockRegistry, request: *http.Server.Request) anyerror!void {
-                State.calls += 1;
-                if (State.calls == 1) return error.SimulatedServeFailure;
+                MockHarness.calls += 1;
+                if (MockHarness.calls == 1) return error.SimulatedServeFailure;
                 try request.respond("{}", .{ .status = .ok, .keep_alive = false });
             }
         }.handle,
@@ -524,7 +527,7 @@ test "MockRegistry: failed serve does not consume request budget" {
         try std.testing.expectEqual(http.Status.ok, response.head.status);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), State.calls);
+    try std.testing.expectEqual(@as(usize, 2), MockHarness.calls);
 }
 
 test "MockRegistry: start allocation failures release listening socket" {
@@ -558,10 +561,10 @@ test "MockRegistry: anonymous start allocation failures release digest and liste
 }
 
 test "MockRegistry: deinit while client awaits response does not hang" {
-    const State = struct {
+    const MockHarness = struct {
         var handler_entered: std.atomic.Value(bool) = .init(false);
     };
-    defer State.handler_entered.store(false, .monotonic);
+    defer MockHarness.handler_entered.store(false, .monotonic);
 
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -572,7 +575,7 @@ test "MockRegistry: deinit while client awaits response does not hang" {
         2,
         struct {
             fn handle(_: *MockRegistry, _: *http.Server.Request) !void {
-                State.handler_entered.store(true, .release);
+                MockHarness.handler_entered.store(true, .release);
                 // Never respond: client blocks until peer teardown closes the connection.
             }
         }.handle,
@@ -603,7 +606,7 @@ test "MockRegistry: deinit while client awaits response does not hang" {
     var client_future = try io.concurrent(ClientCtx.run, .{&ctx});
 
     var spins: usize = 0;
-    while (!State.handler_entered.load(.acquire)) {
+    while (!MockHarness.handler_entered.load(.acquire)) {
         spins += 1;
         if (spins > 1_000_000) return error.TestTimeout;
     }

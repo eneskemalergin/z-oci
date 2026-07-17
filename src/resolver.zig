@@ -632,11 +632,12 @@ pub fn liveManifestHttpExchanger(
                 next_url = rewritten;
             }
 
-            const keep_authorization = shouldKeepAuthorizationOnRedirect(uri, next_url) catch false;
+            const keep_authorization = current_authorization != null and
+                (shouldKeepAuthorizationOnRedirect(uri, next_url) catch false);
             if (owned_redirect_url) |url| allocator.free(url);
             owned_redirect_url = next_url;
             current_url = next_url;
-            current_authorization = if (keep_authorization) request.authorization else null;
+            if (!keep_authorization) current_authorization = null;
 
             continue;
         }
@@ -1723,6 +1724,7 @@ fn testHttpHeadFromLines(allocator: std.mem.Allocator, status_line: []const u8, 
 // --- Tests ---
 
 const test_matrix = @import("test_matrix.zig");
+const mock_registry_peer = @import("mock_registry.zig");
 const sha256DigestStringAlloc = test_matrix.sha256DigestStringAlloc;
 
 const ResolverTestHarness = struct {
@@ -2245,6 +2247,100 @@ test "liveManifestHttpExchanger: valid URL reaches transport layer" {
 
     const result = liveManifestHttpExchanger(std.testing.allocator, &client, request);
     try std.testing.expectError(error.ConnectionRefused, result);
+}
+
+test "liveManifestHttpExchanger: does not restore bearer after cross-origin redirect" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const FinalHarness = struct {
+        saw_authorization: bool = false,
+
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            const target = request.head.target;
+
+            if (std.mem.eql(u8, target, "/cross")) {
+                var location_buf: [128]u8 = undefined;
+                const location = try std.fmt.bufPrint(
+                    &location_buf,
+                    "https://{s}/final",
+                    .{reg.registry_host},
+                );
+                try request.respond("", .{
+                    .status = .temporary_redirect,
+                    .keep_alive = false,
+                    .extra_headers = &.{.{ .name = "Location", .value = location }},
+                });
+                return;
+            }
+
+            if (std.mem.eql(u8, target, "/final")) {
+                self.saw_authorization = mock_registry_peer.requestAuthorization(request) != null;
+                try request.respond("", .{ .status = .ok, .keep_alive = false });
+                return;
+            }
+
+            try request.respond("", .{ .status = .not_found, .keep_alive = false });
+        }
+    };
+
+    var final_harness: FinalHarness = .{};
+    const final_mock = try mock_registry_peer.MockRegistry.startWithHandler(
+        allocator,
+        io,
+        2,
+        FinalHarness.handle,
+        &final_harness,
+    );
+    defer final_mock.deinit();
+
+    const FirstHarness = struct {
+        final_host: []const u8,
+
+        fn handle(reg: *mock_registry_peer.MockRegistry, request: *std.http.Server.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(reg.user_data.?));
+            var location_buf: [128]u8 = undefined;
+            const location = try std.fmt.bufPrint(
+                &location_buf,
+                "https://{s}/cross",
+                .{self.final_host},
+            );
+            try request.respond("", .{
+                .status = .temporary_redirect,
+                .keep_alive = false,
+                .extra_headers = &.{.{ .name = "Location", .value = location }},
+            });
+        }
+    };
+
+    var first_harness: FirstHarness = .{ .final_host = final_mock.registry_host };
+    const first_mock = try mock_registry_peer.MockRegistry.startWithHandler(
+        allocator,
+        io,
+        1,
+        FirstHarness.handle,
+        &first_harness,
+    );
+    defer first_mock.deinit();
+
+    const url = try std.fmt.allocPrint(allocator, "https://{s}/start", .{first_mock.registry_host});
+    const authorization = allocator.dupe(u8, "Bearer should-not-leak") catch |err| {
+        allocator.free(url);
+        return err;
+    };
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    var response = try liveManifestHttpExchanger(allocator, &client, .{
+        .method = .head,
+        .url = url,
+        .authorization = authorization,
+    });
+    defer response.deinit(allocator);
+
+    try std.testing.expectEqual(std.http.Status.ok, response.metadata.status);
+    try std.testing.expect(!final_harness.saw_authorization);
 }
 
 test "mapLiveManifestTransportError: maps transport and oversize errors without erasure" {
