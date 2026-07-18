@@ -5,14 +5,18 @@ All notable changes to z-oci are documented here. The format follows [Keep a Cha
 
 Versions listed here may be prepared ahead of the matching git tag. Tags follow once the release is cut.
 
-## [0.7.1] - Unreleased
+## [0.7.2] - 2026-07-17 - [Tagged]
 
-v0.7.1 collects the audit, cleanup, security, and documentation work after `v0.7.0`. It tightens ownership and sensitive-data cleanup, adds boundary coverage, and aligns public guidance with the shipped library and CLI.
+v0.7.2 is the full distribution release after `v0.7.0`. It tightens ownership and sensitive-data cleanup, adds boundary coverage, aligns public guidance with the shipped library and CLI, and provides package metadata, CI, release binaries, and dependency guidance for broader use.
 
 ### Added
 
 - **Coverage**
   - Bounded generated-input tests cover platform and descriptor parsing, including descriptor-size overflow.
+  - Added deterministic examples for digest validation and authenticated Bearer resolution alongside the public live-resolution and batch examples.
+- **Release and package integration**
+  - Added exact-tag GitHub Actions release gating, native Linux and macOS binary archives, checksums, artifact attestations, and a draft-first publication flow.
+  - Added an external-consumer fixture that verifies importing the published `z_oci` module through Zig 0.16 package-manager conventions.
 - **Documentation**
   - Added the registry compatibility page and expanded library, CLI, credential, configuration, platform, and troubleshooting guidance.
 
@@ -22,7 +26,7 @@ v0.7.1 collects the audit, cleanup, security, and documentation work after `v0.7
   - Simplified ownership boundaries by removing shared CA-bundle cache state, narrowing internal test seams, and removing unused resolver helpers.
   - Extended the benchmark `--counting` report with allocated, freed, peak, and live byte counts. Non-cache cases assert zero live bytes; authentication cache cases report retained state before engine teardown.
 - **Public guidance**
-  - Normalized source and benchmark terminology, corrected fixture and benchmark guidance, and kept the README focused on orientation rather than reference detail.
+  - Normalized source and benchmark terminology, corrected fixture and benchmark guidance, documented x86_64 versus aarch64 release targets, and kept the README focused on orientation rather than reference detail.
 
 ### Fixed
 
@@ -37,7 +41,9 @@ v0.7.1 collects the audit, cleanup, security, and documentation work after `v0.7
 
 ### Verified
 
-- The complete gate passes with 37/37 build steps and 426/426 tests, including CLI, workflow, examples, and security checks.
+- The complete gate passes with 37/37 build steps and 447/447 tests, including CLI, workflow, examples, and security checks.
+- The published release provides Linux x86_64, Linux aarch64, macOS Intel x86_64, and macOS Apple Silicon aarch64 CLI archives with SHA-256 checksums and artifact attestations.
+- The external package-consumer fixture imports `z_oci` through Zig 0.16 package-manager conventions and passes its public API smoke test.
 - ReleaseFast and ReleaseSmall builds, formatting, and benchmark compilation pass. The opt-in local `registry:2` integration remains separate and was not run as part of this offline verification.
 - Representative counting runs show zero live bytes after non-cache operations; cache-miss authentication reports retained token-cache bytes before engine teardown.
 
@@ -664,3 +670,4 @@ Production resilience for live registry traffic: reactive retries and rate-limit
 [0.5.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.5.0
 [0.6.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.6.0
 [0.7.0]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.7.0
+[0.7.2]: https://github.com/eneskemalergin/z-oci/releases/tag/v0.7.2

@@ -8,7 +8,8 @@
 //! - `workflow-smoke`: offline workflow smoke tests only.
 //! - `examples`: build all packaged example programs.
 //! - `example-normalize-reference`, `example-inspect-manifest`, `example-select-platform`,
-//!   `example-resolve-many`, and `example-resolve-reference`: run one example with forwarded CLI args.
+//!   `example-resolve-many`, `example-validate-reference`, `example-resolve-authenticated`,
+//!   and `example-resolve-reference`: run one example with forwarded CLI args.
 //! - `examples-smoke`: run offline examples with fixed fixture inputs.
 //! - `bench`: build and install the benchmark CLI to `zig-out/bin/z-oci-bench`.
 //! - `security-check`: reject private-key PEM blocks, high-confidence credential
@@ -17,9 +18,16 @@
 //!   clear-fails if absent; never part of `test`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const package = @import("build.zig.zon");
 
+const minimum_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
+
 pub fn build(b: *std.Build) void {
+    if (comptime builtin.zig_version.order(minimum_zig_version) == .lt) {
+        @compileError("z-oci requires Zig 0.16.0 or later");
+    }
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -204,17 +212,45 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const validate_reference_example = b.addExecutable(.{
+        .name = "validate-reference",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/validate-reference.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "z_oci", .module = mod },
+            },
+        }),
+    });
+
+    const resolve_authenticated_example = b.addExecutable(.{
+        .name = "resolve-authenticated",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/resolve-authenticated.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "z_oci", .module = mod },
+            },
+        }),
+    });
+
     const examples_step = b.step("examples", "Build all packaged example programs");
-    examples_step.dependOn(&normalize_reference_example.step);
-    examples_step.dependOn(&inspect_manifest_example.step);
-    examples_step.dependOn(&select_platform_example.step);
-    examples_step.dependOn(&resolve_many_example.step);
-    examples_step.dependOn(&resolve_reference_example.step);
-    b.installArtifact(normalize_reference_example);
-    b.installArtifact(inspect_manifest_example);
-    b.installArtifact(select_platform_example);
-    b.installArtifact(resolve_many_example);
-    b.installArtifact(resolve_reference_example);
+    const normalize_reference_install = b.addInstallArtifact(normalize_reference_example, .{});
+    const inspect_manifest_install = b.addInstallArtifact(inspect_manifest_example, .{});
+    const select_platform_install = b.addInstallArtifact(select_platform_example, .{});
+    const resolve_many_install = b.addInstallArtifact(resolve_many_example, .{});
+    const resolve_reference_install = b.addInstallArtifact(resolve_reference_example, .{});
+    const validate_reference_install = b.addInstallArtifact(validate_reference_example, .{});
+    const resolve_authenticated_install = b.addInstallArtifact(resolve_authenticated_example, .{});
+    examples_step.dependOn(&normalize_reference_install.step);
+    examples_step.dependOn(&inspect_manifest_install.step);
+    examples_step.dependOn(&select_platform_install.step);
+    examples_step.dependOn(&resolve_many_install.step);
+    examples_step.dependOn(&resolve_reference_install.step);
+    examples_step.dependOn(&validate_reference_install.step);
+    examples_step.dependOn(&resolve_authenticated_install.step);
 
     const run_normalize_reference_step = b.step("example-normalize-reference", "Run the normalize-reference example");
     const run_normalize_reference = b.addRunArtifact(normalize_reference_example);
@@ -241,6 +277,16 @@ pub fn build(b: *std.Build) void {
     run_resolve_reference_step.dependOn(&run_resolve_reference.step);
     if (b.args) |args| run_resolve_reference.addArgs(args);
 
+    const run_validate_reference_step = b.step("example-validate-reference", "Run the offline digest-validation example");
+    const run_validate_reference = b.addRunArtifact(validate_reference_example);
+    run_validate_reference_step.dependOn(&run_validate_reference.step);
+    if (b.args) |args| run_validate_reference.addArgs(args);
+
+    const run_resolve_authenticated_step = b.step("example-resolve-authenticated", "Run the offline authenticated-resolution example");
+    const run_resolve_authenticated = b.addRunArtifact(resolve_authenticated_example);
+    run_resolve_authenticated_step.dependOn(&run_resolve_authenticated.step);
+    if (b.args) |args| run_resolve_authenticated.addArgs(args);
+
     // --- Benchmark CLI ---
 
     const bench = b.addExecutable(.{
@@ -255,7 +301,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const bench_install = b.addInstallArtifact(bench, .{});
-    b.getInstallStep().dependOn(&bench_install.step);
 
     const bench_step = b.step("bench", "Build and install the benchmark CLI");
     bench_step.dependOn(&bench_install.step);
@@ -275,6 +320,12 @@ pub fn build(b: *std.Build) void {
 
     const smoke_resolve_many = b.addRunArtifact(resolve_many_example);
     smoke_examples_step.dependOn(&smoke_resolve_many.step);
+
+    const smoke_validate_reference = b.addRunArtifact(validate_reference_example);
+    smoke_examples_step.dependOn(&smoke_validate_reference.step);
+
+    const smoke_resolve_authenticated = b.addRunArtifact(resolve_authenticated_example);
+    smoke_examples_step.dependOn(&smoke_resolve_authenticated.step);
 
     test_step.dependOn(smoke_examples_step);
 

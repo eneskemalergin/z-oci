@@ -16,7 +16,7 @@ zig build
 
 Registry commands may contact a live HTTPS registry. Credentials are configured through the process adapter; they are not command-line arguments. See [Credentials](Credentials.md) for the supported process sources.
 
-`z-oci --version` prints `z-oci 0.7.0`. Use `z-oci --help` or `z-oci <command> --help` for the complete option text.
+`z-oci --version` prints `z-oci 0.7.2`. Use `z-oci --help` or `z-oci <command> --help` for the complete option text.
 
 ## Commands and options
 

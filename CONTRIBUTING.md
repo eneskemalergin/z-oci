@@ -46,6 +46,16 @@ zig build -Doptimize=ReleaseSmall
 zig build bench
 ```
 
+## GitHub Actions
+
+The required CI workflow runs the complete offline gate on Ubuntu 24.04 and macOS 15 Intel, checks the package through a clean consumer project, verifies ReleaseFast and ReleaseSmall builds, compiles the benchmark CLI, and cross-compiles the public library for selected Linux, macOS, and Windows targets. Release binaries distinguish x86_64 (Intel/AMD 64-bit, or x64) from aarch64 (64-bit ARM); macOS release builds cover both Intel Macs and Apple Silicon. Windows runtime support is not claimed by that compile-only check.
+
+Workflow files are audited separately when `.github/workflows/` changes. GitHub Actions dependencies are pinned to commits and maintained by the weekly Dependabot configuration. Docker and live-registry checks remain opt-in and are not required for ordinary pull requests.
+
+## Publishing a release
+
+Update the version in `build.zig.zon` and add the matching version section to `CHANGELOG.md`, then push an annotated `v<major>.<minor>.<patch>` tag. The release workflow reruns the complete CI graph against that tag, builds the supported Linux and macOS binaries, creates checksums and attestations, and publishes the changelog section as the GitHub Release notes. Any failed CI, build, upload, or attestation job prevents publication; an interrupted publish leaves a draft release that can be safely resumed by rerunning the workflow.
+
 When a change affects public API or cross-module behavior, run `workflow-smoke` and `examples-smoke` directly while iterating. When it affects credentials, fixtures, or registry integration, run `security-check` and keep the Docker integration opt-in.
 
 ## Opt-in interoperability (requires Docker; never part of `zig build test`)

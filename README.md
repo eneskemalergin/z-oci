@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-    <img src="https://img.shields.io/badge/version-v0.7.0-8B5CF6?style=flat-square" alt="v0.7.0">
+    <img src="https://img.shields.io/badge/version-v0.7.2-8B5CF6?style=flat-square" alt="v0.7.2">
     <img src="https://img.shields.io/badge/status-released-2D7D46?style=flat-square" alt="Status: released">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
@@ -22,8 +22,6 @@
 ## What is z-oci?
 
 z-oci is a read-only OCI and Docker Registry client for Zig. It parses image references, authenticates when configured, fetches manifests, verifies digests, and selects platforms from multi-arch images. It does not pull layers or push images.
-
-The current package and latest tagged release are `v0.7.0`.
 
 ## What it provides
 
@@ -46,7 +44,7 @@ The library uses Zig 0.16.0 or later and has no third-party runtime dependencies
 Fetch the current tagged release:
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.7.0
+zig fetch --save git+https://github.com/eneskemalergin/z-oci#v0.7.2
 ```
 
 Import the module from `build.zig`:
@@ -90,32 +88,17 @@ Use `--format text|json` for output selection, `--verbose` for elapsed time and 
 
 Command options go before the image argument. The [CLI guide](docs/CLI.md) has the complete grammar, output examples, stream routing, and exit-code mapping.
 
-## Credentials and limits
+## Limits and credentials
 
-Credentials are never accepted as CLI arguments. The CLI explicitly wires process credential sources into the library, while the library remains anonymous unless its caller injects credentials.
+Credentials are never accepted as CLI arguments. The CLI wires process credential sources explicitly; the library remains anonymous unless its caller injects credentials.
 
 Live HTTPS registry traffic is verified on Linux and macOS. Windows is not a verified supported build target for this repository. Per-request network timeout control is also limited by the Zig 0.16 HTTP client. The helper timeout applies to credential-helper I/O, not registry requests.
 
-For platform matching, CA bundles, configuration defaults, timeout scope, registry coverage, and other boundaries, see [Platform and limits](docs/Platform.md), [Registry compatibility](docs/RegistryCompatibility.md), and [Troubleshooting](docs/Troubleshooting.md).
+See [Credentials](docs/Credentials.md), [Platform and limits](docs/Platform.md), [Registry compatibility](docs/RegistryCompatibility.md), and [Troubleshooting](docs/Troubleshooting.md) for the detailed boundaries.
 
 ## Examples
 
-The first four examples use checked-in fixtures or injected exchanges and are offline:
-
-```sh
-zig build example-normalize-reference -- ubuntu:22.04
-zig build example-inspect-manifest
-zig build example-select-platform
-zig build example-resolve-many
-```
-
-The live example may contact a registry:
-
-```sh
-zig build example-resolve-reference -- ubuntu:22.04
-```
-
-See the [examples guide](docs/Examples.md) for the source files, ownership notes, and offline versus live boundaries.
+Run the deterministic offline examples with `zig build examples-smoke`. See the [examples guide](docs/Examples.md) for the individual programs and the separate live-registry example.
 
 ## Documentation
 

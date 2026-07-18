@@ -33,6 +33,6 @@ The platform selector handles OCI image indexes and Docker manifest lists. The [
 
 ## Project facts
 
-The package requires Zig 0.16.0 or later, has no external package dependencies, and is released under the MIT License. The current package and latest tagged release are `v0.7.0`.
+The package requires Zig 0.16.0 or later, has no external package dependencies, and is released under the MIT License. The current package and latest published release are `v0.7.2`.
 
 For registry evidence and known boundaries, see [Registry compatibility](RegistryCompatibility.md). The [documentation pages](Installation.md) are the maintained starting point for using the package.
