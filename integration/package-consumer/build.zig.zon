@@ -1,0 +1,14 @@
+.{
+    .name = .z_oci_consumer_smoke,
+    .version = "0.0.0",
+    .fingerprint = 0xd6a728e913a91a47,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .z_oci = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}
