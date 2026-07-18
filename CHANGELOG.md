@@ -5,7 +5,7 @@ All notable changes to z-oci are documented here. The format follows [Keep a Cha
 
 Versions listed here may be prepared ahead of the matching git tag. Tags follow once the release is cut.
 
-## [0.7.2] - 2026-07-17 - [Tagged]
+## [0.7.2] - 2026-07-17
 
 v0.7.2 is the full distribution release after `v0.7.0`. It tightens ownership and sensitive-data cleanup, adds boundary coverage, aligns public guidance with the shipped library and CLI, and provides package metadata, CI, release binaries, and dependency guidance for broader use.
 
@@ -41,8 +41,8 @@ v0.7.2 is the full distribution release after `v0.7.0`. It tightens ownership an
 
 ### Verified
 
-- The complete gate passes with 37/37 build steps and 447/447 tests, including CLI, workflow, examples, and security checks.
-- The published release provides Linux x86_64, Linux aarch64, macOS Intel x86_64, and macOS Apple Silicon aarch64 CLI archives with SHA-256 checksums and artifact attestations.
+- The complete gate passes with 41/41 build steps and 447/447 tests, including CLI, workflow, examples, and security checks.
+- The release workflow provides Linux x86_64, Linux aarch64, macOS Intel x86_64, and macOS Apple Silicon aarch64 CLI archives with SHA-256 checksums and artifact attestations.
 - The external package-consumer fixture imports `z_oci` through Zig 0.16 package-manager conventions and passes its public API smoke test.
 - ReleaseFast and ReleaseSmall builds, formatting, and benchmark compilation pass. The opt-in local `registry:2` integration remains separate and was not run as part of this offline verification.
 - Representative counting runs show zero live bytes after non-cache operations; cache-miss authentication reports retained token-cache bytes before engine teardown.

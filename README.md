@@ -11,7 +11,7 @@
 
 <p align="center">
     <img src="https://img.shields.io/badge/version-v0.7.2-8B5CF6?style=flat-square" alt="v0.7.2">
-    <img src="https://img.shields.io/badge/status-released-2D7D46?style=flat-square" alt="Status: released">
+    <img src="https://img.shields.io/badge/status-release--ready-2D7D46?style=flat-square" alt="Status: release-ready">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/OCI-Distribution%20Spec-0066CC?style=flat-square" alt="OCI Distribution Spec">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -65,6 +65,8 @@ With Zig 0.16.0 installed and available as `zig`:
 zig build
 ./zig-out/bin/z-oci --help
 ```
+
+For prebuilt v0.7.2 CLI archives and checksums, see the [installation guide](docs/Installation.md).
 
 ## Library usage
 

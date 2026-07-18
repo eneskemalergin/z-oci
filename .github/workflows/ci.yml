@@ -143,9 +143,9 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      # This intentionally compiles only the public library. The top-level
-      # build also installs examples and benchmarks, whose platform-specific
-      # libc requirements are not part of the Windows runtime support claim.
+      # This intentionally compiles only the public library. Examples and
+      # benchmarks are separate build steps and are not part of the Windows
+      # runtime support claim.
       - name: Compile public library
         shell: bash
         run: zig build-lib src/root.zig -target "${{ matrix.target }}" -O ReleaseSafe -fno-emit-bin

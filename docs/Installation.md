@@ -22,11 +22,11 @@ exe.root_module.addImport("z_oci", z_oci.module("z_oci"));
 
 The package declares no external dependencies. `zig fetch --save` records the fetched package in `build.zig.zon`.
 
-The published package is distributed from the `v0.7.2` git tag. Its package name is `.z_oci`, its importable module is `z_oci`, its fingerprint is `0xdf1b7d025f2687bf`, and it requires Zig `0.16.0` or later. Zig 0.16 records the fetched source hash in the consumer's `build.zig.zon`, so consumers do not need to clone or vendor the repository manually.
+The v0.7.2 package is distributed from its matching git tag. Its package name is `.z_oci`, its importable module is `z_oci`, its fingerprint is `0xdf1b7d025f2687bf`, and it requires Zig `0.16.0` or later. Zig 0.16 records the fetched source hash in the consumer's `build.zig.zon`, so consumers do not need to clone or vendor the repository manually.
 
 ## Install the CLI
 
-The `v0.7.2` [GitHub Release](https://github.com/eneskemalergin/z-oci/releases/tag/v0.7.2) includes native CLI archives and checksums. Download the archive for your system, unpack `z-oci`, and place it on your `PATH`. Windows is not a supported target; the published CLI archives target Linux and macOS.
+The `v0.7.2` [GitHub Release](https://github.com/eneskemalergin/z-oci/releases/tag/v0.7.2) includes native CLI archives and checksums. Download the archive for your system, unpack `z-oci`, and place it on your `PATH`. Windows is not a supported target; the release archives target Linux and macOS.
 
 ## Build the checkout
 
