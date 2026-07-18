@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Optional ref to test when called by another workflow
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-24.04
+          - name: macOS Intel
+            runner: macos-15-intel
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      # setup-zig also preserves Zig's global build cache between runs. Keep
+      # the workflow free of a second overlapping cache implementation.
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(zig version)" = "$ZIG_VERSION"
+
+      - name: Check formatting
+        shell: bash
+        run: zig fmt --check src/ examples/ benchmarks/ build.zig tools/ integration/
+
+      - name: Run complete offline gate
+        shell: bash
+        run: zig build test --summary all
+
+      - name: Verify package consumer
+        shell: bash
+        working-directory: integration/package-consumer
+        run: |
+          zig build test \
+            --cache-dir "$RUNNER_TEMP/z-oci-consumer-cache" \
+            --global-cache-dir "$RUNNER_TEMP/z-oci-consumer-global-cache"
+
+      - name: Verify package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^    \.name = \.z_oci,$' build.zig.zon
+          grep -Eq '^    \.version = "[0-9]+\.[0-9]+\.[0-9]+",$' build.zig.zon
+          grep -Eq '^    \.fingerprint = 0x[0-9a-f]+,$' build.zig.zon
+          grep -Eq '^    \.minimum_zig_version = "0\.16\.0",$' build.zig.zon
+          for path in build.zig build.zig.zon LICENSE README.md src examples fixtures benchmarks; do
+            test -e "$path"
+          done
+
+  release-check:
+    name: Release build checks
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build ReleaseFast
+        shell: bash
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Build ReleaseSmall
+        shell: bash
+        run: zig build -Doptimize=ReleaseSmall
+
+      - name: Compile benchmark CLI
+        shell: bash
+        run: zig build bench
+
+  cross-compile:
+    name: Cross-compile library (${{ matrix.target }})
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-windows
+          - x86_64-macos
+          - aarch64-linux
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # This intentionally compiles only the public library. The top-level
+      # build also installs examples and benchmarks, whose platform-specific
+      # libc requirements are not part of the Windows runtime support claim.
+      - name: Compile public library
+        shell: bash
+        run: zig build-lib src/root.zig -target "${{ matrix.target }}" -O ReleaseSafe -fno-emit-bin

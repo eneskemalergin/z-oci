@@ -1,0 +1,213 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  # Run the same complete CI graph used for pull requests and main. Because
+  # this is a reusable-workflow call, it tests the exact commit behind the tag
+  # and gives the release a hard dependency on every required CI matrix job.
+  ci:
+    name: Required CI
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.ref }}
+    permissions:
+      contents: read
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: ci
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64 (Intel/AMD 64-bit)
+            id: x86_64-linux-gnu
+            target: x86_64-linux-gnu
+            runner: ubuntu-24.04
+          - name: Linux ARM64 (aarch64)
+            id: aarch64-linux-gnu
+            target: aarch64-linux-gnu
+            runner: ubuntu-24.04
+          - name: macOS Intel (x86_64)
+            id: x86_64-macos
+            target: x86_64-macos
+            runner: macos-15-intel
+          - name: macOS Apple Silicon ARM64 (aarch64)
+            id: aarch64-macos
+            target: aarch64-macos
+            runner: macos-15
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Validate tag and package version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${RELEASE_TAG#v}"
+          package_version="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
+          test -n "$package_version"
+          test "$package_version" = "$version"
+          fingerprint="$(sed -n 's/^[[:space:]]*\.fingerprint = \(.*\),/\1/p' build.zig.zon)"
+          minimum_zig_version="$(sed -n 's/^[[:space:]]*\.minimum_zig_version = "\([^"]*\)".*/\1/p' build.zig.zon)"
+          test "$fingerprint" = 0xdf1b7d025f2687bf
+          test "$minimum_zig_version" = 0.16.0
+          grep -Eq '^    \.name = \.z_oci,$' build.zig.zon
+          for path in build.zig build.zig.zon LICENSE README.md src examples fixtures benchmarks; do
+            test -e "$path"
+          done
+          test "$(zig version)" = "$ZIG_VERSION"
+
+      - name: Build release binary
+        shell: bash
+        run: zig build -Dtarget="${{ matrix.target }}" -Doptimize=ReleaseFast
+
+      - name: Package release binary
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/${{ matrix.id }}"
+          mkdir -p "$stage"
+          install -m 0755 zig-out/bin/z-oci "$stage/z-oci"
+          install -m 0644 LICENSE "$stage/LICENSE"
+          test -x "$stage/z-oci"
+          tar -C "$stage" -czf "$RUNNER_TEMP/z-oci-${RELEASE_TAG}-${{ matrix.id }}.tar.gz" z-oci LICENSE
+
+      - name: Upload release package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.id }}
+          path: ${{ runner.temp }}/z-oci-${{ github.ref_name }}-${{ matrix.id }}.tar.gz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/release-downloads
+
+      - name: Prepare notes and checksums
+        id: metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          package_version="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
+          test "$package_version" = "$version"
+
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          find "$RUNNER_TEMP/release-downloads" -type f -name '*.tar.gz' -exec cp {} "$RUNNER_TEMP/release-assets/" \;
+          test "$(find "$RUNNER_TEMP/release-assets" -maxdepth 1 -type f -name "z-oci-${RELEASE_TAG}-*.tar.gz" | wc -l)" -eq 4
+
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
+
+          (cd "$RUNNER_TEMP/release-assets" && sha256sum ./*.tar.gz > SHA256SUMS)
+          cat > "$RUNNER_TEMP/release-assets/PACKAGE-METADATA.txt" <<EOF
+          package: z_oci
+          version: $version
+          tag: $RELEASE_TAG
+          commit: $GITHUB_SHA
+          fingerprint: $(sed -n 's/^[[:space:]]*\.fingerprint = \(.*\),/\1/p' build.zig.zon)
+          minimum_zig_version: $(sed -n 's/^[[:space:]]*\.minimum_zig_version = "\([^"]*\)".*/\1/p' build.zig.zon)
+          module: z_oci
+          source: https://github.com/${GITHUB_REPOSITORY}/tree/$RELEASE_TAG
+          EOF
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create or resume draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if release_state="$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            test "$release_state" = true
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --title "z-oci $RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/release-assets"/* --clobber
+
+      - name: Attest release assets
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-checksums: ${{ runner.temp }}/release-assets/SHA256SUMS
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_TAG" --draft=false --latest --verify-tag
